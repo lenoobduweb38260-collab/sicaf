@@ -1,0 +1,53 @@
+name: Construire l'application Windows
+
+# Produit l'installateur et la version portable (.exe) de la GMAO avec Electron.
+# - À chaque push sur main : les .exe sont disponibles dans l'onglet « Actions » (artefacts).
+# - À chaque tag vX.Y.Z : une « Release » GitHub est créée avec les .exe attachés.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Tests API
+        run: npm test
+
+  windows:
+    needs: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Installer Electron et electron-builder
+        run: npm install --no-audit --no-fund
+      - name: Construire l'installateur et la version portable
+        run: npm run dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publier les exécutables (artefacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: GMAO-SICAF-windows
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+          if-no-files-found: error
+      - name: Créer la release (sur tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

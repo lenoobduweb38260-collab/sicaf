@@ -1,0 +1,52 @@
+{
+  "name": "gmao-sicaf",
+  "productName": "GMAO SICAF",
+  "version": "1.0.0",
+  "description": "GMAO (Gestion de Maintenance Assistée par Ordinateur) complète et personnalisable pour Windows 10/11, avec comptes internes, profils hiérarchiques et secteurs.",
+  "main": "electron/main.js",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server/index.js --open",
+    "serve": "node server/index.js",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "test:e2e": "node tests/e2e/run.js",
+    "electron": "electron .",
+    "dist": "electron-builder --win",
+    "dist:portable": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "fr.sicaf.gmao",
+    "productName": "GMAO SICAF",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "server/**/*",
+      "client/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "artifactName": "GMAO-SICAF-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "GMAO SICAF",
+      "language": "1036"
+    }
+  }
+}

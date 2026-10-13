@@ -1,0 +1,16 @@
+# Données locales de la GMAO (base, sauvegardes)
+data/
+*.corrompu-*
+
+# Dépendances et constructions
+node_modules/
+dist/
+build/
+
+# Divers
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+tests/e2e/captures/
