@@ -489,7 +489,8 @@ describe('Tableau de bord — données de démonstration complètes et portée p
 
   test('activité récente : journal d\'audit filtré par portée et par droit sur l\'entité', async () => {
     // Une action réelle produit des entrées d'audit
-    const otId = srv.db.list('ot', (o) => !st().estFinal(o.statut) && o.secteurId != null && !prodIds.has(Number(o.secteurId)))[0].id;
+    const s = st();
+    const otId = srv.db.list('ot', (o) => !s.estFinal(o.statut) && o.secteurId != null && !prodIds.has(Number(o.secteurId)))[0].id;
     await admin.ok('POST', `/api/ot/${otId}/commentaires`, { texte: 'Point fait avec le chef d\'équipe.' });
     const a = await admin.ok('GET', '/api/dashboard');
     assert.equal(a.sources.activites, 'audit');
@@ -503,9 +504,38 @@ describe('Tableau de bord — données de démonstration complètes et portée p
     assert.equal(c.listes.dernieresActivites.some((x) => x.entite === 'ot' && x.entiteId === otId), false);
   });
 
-  test('performance : calcul rapide sur la base de démonstration', async () => {
-    const t0 = Date.now();
+  test('lecture seule : le calcul ne crée ni OT, ni audit, ni notification', async () => {
+    const avant = ['ot', 'demandes', 'audit', 'notifications', 'plansPreventifs', 'articles'].map((c) => [c, srv.db.count(c)]);
+    const majOt = srv.db.list('ot').map((o) => o.updatedAt).join();
+    for (const c of [admin, techProd, jbernard, spetit]) await c.ok('GET', '/api/dashboard');
+    for (const [c, n] of avant) assert.equal(srv.db.count(c), n, `collection ${c} inchangée`);
+    assert.equal(srv.db.list('ot').map((o) => o.updatedAt).join(), majOt, 'aucun OT modifié');
+  });
+
+  test('performance : calcul rapide sur la base de démonstration et sur une base volumineuse', async () => {
+    let t0 = Date.now();
     for (let i = 0; i < 5; i++) await admin.ok('GET', '/api/dashboard');
     assert.ok((Date.now() - t0) / 5 < 500, 'moins de 500 ms par calcul');
+    // Base volumineuse : 4 000 OT, 1 500 demandes soumises, 1 000 articles, logo de 200 Ko dans la configuration
+    const cfg = srv.db.getConfig(); cfg.societe.logo = 'data:image/png;base64,' + 'A'.repeat(200000); srv.db.setConfig(cfg);
+    const eqs = srv.db.list('equipements').map((e) => e.id);
+    const statuts = ['nouveau', 'planifie', 'en_cours', 'termine', 'termine', 'annule'];
+    const col = srv.db.data.collections;
+    for (let i = 0; i < 4000; i++) {
+      const d = new Date(Date.now() - (i % 360) * 86400000).toISOString();
+      col.ot.push({ id: 100000 + i, numero: `OT-V${i}`, titre: `OT volumineux ${i}`, statut: statuts[i % 6], typeCode: i % 2 ? 'correctif' : 'preventif', prioriteCode: 'normale', equipementId: eqs[i % eqs.length], secteurId: PROD, technicienId: uTechProd.id, techniciens: [uTechProd.id], datePrevue: d.slice(0, 10), dateFin: d, tempsPasse: [{ date: d.slice(0, 10), heures: 1.5, userId: uTechProd.id }], pieces: [], taches: [], historique: [], createdAt: d, updatedAt: d, createdBy: 1, coutPieces: 12, coutMainOeuvre: 67.5, coutExterne: 0 });
+    }
+    for (let i = 0; i < 1500; i++) col.demandes.push({ id: 100000 + i, numero: `DI-V${i}`, titre: `Demande ${i}`, statut: 'soumise', prioriteCode: 'haute', secteurId: PROD, demandeurId: uTechProd.id, dateDemande: new Date().toISOString(), createdAt: new Date().toISOString(), createdBy: uTechProd.id });
+    for (let i = 0; i < 1000; i++) col.articles.push({ id: 100000 + i, code: `ART-V${i}`, designation: `Article ${i}`, quantite: i % 5, seuilMin: 2, actif: true });
+    srv.db.touch();
+    t0 = Date.now();
+    const d = await admin.ok('GET', '/api/dashboard');
+    const duree = Date.now() - t0;
+    assert.ok(d.kpis.otOuverts >= 2000 && d.kpis.demandesAValider >= 1500 && d.listes.mesOT !== undefined);
+    assert.ok(duree < 1500, `calcul en ${duree} ms sur une base volumineuse (< 1,5 s attendu)`);
+    const t = await techProd.ok('GET', '/api/dashboard');
+    const s = st();
+    assert.equal(t.compteurs.mesOT, srv.db.count('ot', (o) => Number(o.technicienId) === uTechProd.id && !s.estFinal(o.statut)));
+    assert.equal(t.listes.mesOT.length, 8);
   });
 });

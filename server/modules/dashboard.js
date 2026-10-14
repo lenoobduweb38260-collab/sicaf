@@ -26,7 +26,8 @@
  * Tout est robuste aux collections vides et à l'absence des autres modules (calculs de repli).
  *
  * Services consommés (appelés paresseusement) : ctx.services.ot.{ statuts },
- *   ctx.services.demandes.{ peutValider, STATUTS }, ctx.services.preventif.echeances,
+ *   ctx.services.demandes.STATUTS (la règle de validation peutValider est réévaluée localement, à l'identique),
+ *   ctx.services.preventif.echeances,
  *   ctx.services.stock.alertes, ctx.services.equipements.visible.
  * Services publiés : ctx.services.dashboard.calculer(req).
  * Événements : aucun émis ni écouté (calcul à la demande, sans état).
@@ -107,10 +108,20 @@ function derniersMois(jour, n) {
   return out;
 }
 const texte = (v) => (v == null ? '' : String(v));
-const parTexte = (a, b) => texte(a).localeCompare(texte(b), 'fr', { numeric: true });
+const COLLATEUR = new Intl.Collator('fr', { numeric: true, sensitivity: 'base' });
+const parTexte = (a, b) => COLLATEUR.compare(texte(a), texte(b));
 
 function register(ctx) {
   const { router, db, perms } = ctx;
+
+  // ----- Configuration : lue une seule fois par calcul (le calcul est synchrone) ------------
+  let configCalcul = null;
+  const config = () => configCalcul || ctx.config();
+  /** Liste de valeurs configurée, triée (équivalent de ctx.liste sans relire la configuration). */
+  function liste(nomListe) {
+    const l = (config().listes || {})[nomListe];
+    return Array.isArray(l) ? l.slice().sort((a, b) => (a.ordre || 0) - (b.ordre || 0)) : [];
+  }
 
   // ----- Statuts (services des modules, sinon repli sur les listes configurées) -----------
   function statutsOt() {
@@ -118,48 +129,55 @@ function register(ctx) {
     if (s && typeof s.statuts === 'function') {
       try { const st = s.statuts(); if (st && Array.isArray(st.liste) && typeof st.estFinal === 'function') return st; } catch (e) { /* repli */ }
     }
-    const configuree = ctx.liste('statutsOT');
-    const liste = configuree.length ? configuree : STATUTS_OT_DEFAUT;
-    const item = (code) => liste.find((x) => x.code === code) || null;
+    const configuree = liste('statutsOT');
+    const lst = configuree.length ? configuree : STATUTS_OT_DEFAUT;
+    const item = (code) => lst.find((x) => x.code === code) || null;
     const estFinal = (code) => { const x = item(code); return !!(x && x.final); };
     const estAnnulation = (code) => { const x = item(code); return !!(x && x.final && (x.code === 'annule' || /annul/i.test(x.label || ''))); };
-    const nonFinal = (code, re) => { const x = item(code); if (x && !x.final) return x.code; const t = liste.find((y) => !y.final && re.test(`${y.code} ${y.label || ''}`)); return t ? t.code : null; };
-    const finaux = liste.filter((x) => x.final);
+    const nonFinal = (code, re) => { const x = item(code); if (x && !x.final) return x.code; const t = lst.find((y) => !y.final && re.test(`${y.code} ${y.label || ''}`)); return t ? t.code : null; };
+    const finaux = lst.filter((x) => x.final);
     const termine = (finaux.find((x) => x.code === 'termine') || finaux.find((x) => !estAnnulation(x.code)) || finaux[0] || { code: 'termine' }).code;
     return {
-      liste, item, estFinal, estAnnulation, termine,
-      initial: (liste.find((x) => !x.final) || { code: 'nouveau' }).code,
+      liste: lst, item, estFinal, estAnnulation, termine,
+      initial: (lst.find((x) => !x.final) || { code: 'nouveau' }).code,
       enCours: nonFinal('en_cours', /cours/i), attente: nonFinal('en_attente', /attente/i), planifie: nonFinal('planifie', /planifi/i),
       libelle: (code) => { const x = item(code); return x ? x.label : texte(code); },
     };
   }
   function statutsDemande() {
-    const liste = ctx.liste('statutsDemande');
-    const finaux = new Set(liste.filter((x) => x.final).map((x) => x.code));
+    const lst = liste('statutsDemande');
+    const finaux = new Set(lst.filter((x) => x.final).map((x) => x.code));
     let soumise = null;
     const s = ctx.services.demandes;
     if (s) { try { soumise = s.STATUTS && s.STATUTS.soumise; } catch (e) { soumise = null; } }
-    if (!soumise) soumise = liste.some((x) => x.code === 'soumise') ? 'soumise' : ((liste.find((x) => !x.final) || {}).code || 'soumise');
-    return { liste, finaux, soumise };
+    if (!soumise) soumise = lst.some((x) => x.code === 'soumise') ? 'soumise' : ((lst.find((x) => !x.final) || {}).code || 'soumise');
+    return { liste: lst, finaux, soumise };
   }
   /** Codes d'état d'équipement « à l'arrêt / hors service » (hors réformés). */
   function etatsArret() {
-    const liste = ctx.liste('etatsEquipement');
-    if (!liste.length) return ['arret', 'hors_service'];
+    const etats = liste('etatsEquipement');
+    if (!etats.length) return ['arret', 'hors_service'];
     const reforme = (x) => /r[ée]form|rebut|c[ée]d[ée]|vendu/i.test(`${x.code} ${x.label || ''}`);
-    return liste.filter((x) => !reforme(x) && (x.code === 'arret' || x.code === 'hors_service' || /arr[eê]t|hors.?service|en panne|\bhs\b/i.test(`${x.code} ${x.label || ''}`))).map((x) => x.code);
+    return etats.filter((x) => !reforme(x) && (x.code === 'arret' || x.code === 'hors_service' || /arr[eê]t|hors.?service|en panne|\bhs\b/i.test(`${x.code} ${x.label || ''}`))).map((x) => x.code);
   }
   function etatsDegrades() {
-    return ctx.liste('etatsEquipement').filter((x) => x.code === 'degrade' || /d[ée]grad/i.test(`${x.code} ${x.label || ''}`)).map((x) => x.code);
+    return liste('etatsEquipement').filter((x) => x.code === 'degrade' || /d[ée]grad/i.test(`${x.code} ${x.label || ''}`)).map((x) => x.code);
   }
-  /** Classement d'un type d'intervention : preventif | correctif | autre. */
-  function familleType(code, planPreventifId) {
-    const it = ctx.liste('typesIntervention').find((x) => x.code === code);
-    const t = `${texte(code)} ${it ? it.label || '' : ''}`;
-    if (code === 'preventif' || /pr[ée]venti/i.test(t)) return 'preventif';
-    if (code === 'correctif' || /correcti|curati|d[ée]pann|panne/i.test(t)) return 'correctif';
-    if (planPreventifId != null) return 'preventif';
-    return 'autre';
+  /**
+   * Classement des types d'intervention (preventif | correctif | autre), calculé une fois par requête :
+   * retourne une fonction (code, planPreventifId) → famille.
+   */
+  function classeurTypes(types) {
+    const familles = new Map();
+    const famille = (code) => {
+      if (familles.has(code)) return familles.get(code);
+      const it = types.find((x) => x.code === code);
+      const t = `${texte(code)} ${it ? it.label || '' : ''}`;
+      const f = code === 'preventif' || /pr[ée]venti/i.test(t) ? 'preventif' : (code === 'correctif' || /correcti|curati|d[ée]pann|panne/i.test(t) ? 'correctif' : 'autre');
+      familles.set(code, f);
+      return f;
+    };
+    return (code, planPreventifId) => { const f = famille(code); return f === 'autre' && planPreventifId != null ? 'preventif' : f; };
   }
 
   // ----- Portée (mêmes règles que les modules propriétaires) -------------------------------
@@ -176,13 +194,18 @@ function register(ctx) {
     if (s && typeof s.visible === 'function') { try { return !!s.visible(req, e); } catch (err) { /* repli */ } }
     return ctx.canSee(req, e);
   }
-  function peutValiderDemande(req, d, wf) {
-    const s = ctx.services.demandes;
-    if (s && typeof s.peutValider === 'function') { try { return !!s.peutValider(req, d); } catch (e) { /* repli */ } }
+  /**
+   * L'utilisateur peut-il valider cette demande ? Même règle que le module Demandes
+   * (ctx.services.demandes.peutValider) : droit demandes.valider, demande dans sa portée ou demandeur
+   * dont il est le N+1, et, si config.workflow.validerParSuperieurUniquement, N+1 uniquement (sauf
+   * administrateur). Évaluée ici avec la configuration lue une seule fois : le service relit la
+   * configuration complète à chaque appel, ce qui devient coûteux sur des milliers de demandes.
+   */
+  function peutValiderDemande(req, d, wf, refs) {
     if (!perms.can(req.perms, 'demandes', 'valider')) return false;
-    const dem = d.demandeurId != null ? db.get('users', d.demandeurId) : null;
+    const dem = d.demandeurId != null ? refs.users().get(Number(d.demandeurId)) : null;
     const estSuperieur = !!(dem && dem.managerId != null && Number(dem.managerId) === req.user.id);
-    if (!estSuperieur && !ctx.canSee(req, d)) return false;
+    if (!estSuperieur && !perms.canSeeRecord(req.perms, req.user, d)) return false;
     if (wf.validerParSuperieurUniquement && !req.perms.estAdmin && !estSuperieur) return false;
     return true;
   }
@@ -196,7 +219,7 @@ function register(ctx) {
       secteurs: charger('secteurs', () => new Map(db.list('secteurs').map((s) => [s.id, s]))),
       users: charger('users', () => new Map(db.list('users').map((u) => [u.id, u]))),
       fournisseurs: charger('fournisseurs', () => new Map(db.list('fournisseurs').map((f) => [f.id, f]))),
-      priorites: charger('priorites', () => new Map(ctx.liste('priorites').map((p) => [p.code, p]))),
+      priorites: charger('priorites', () => new Map(liste('priorites').map((p) => [p.code, p]))),
     };
   }
   function nomUser(refs, id) {
@@ -256,8 +279,10 @@ function register(ctx) {
     const st = statutsOt();
     const uid = req.user.id;
     const mois = auj.slice(0, 7);
-    const taux = num((ctx.config().general || {}).tauxHoraire);
+    const taux = num((config().general || {}).tauxHoraire);
     const ots = db.list('ot').filter((o) => otVisible(req, o));
+    const types = liste('typesIntervention');
+    const familleType = classeurTypes(types);
     const estFinal = (o) => st.estFinal(o.statut);
     const estTermine = (o) => estFinal(o) && !st.estAnnulation(o.statut);
     const annule = (o) => estFinal(o) && st.estAnnulation(o.statut);
@@ -300,7 +325,6 @@ function register(ctx) {
 
     const depuis30 = ajouterJours(auj, -(JOURS_TYPES - 1));
     const recents30 = ots.filter((o) => !annule(o) && jourDe(o.createdAt) >= depuis30);
-    const types = ctx.liste('typesIntervention');
     const parType = new Map();
     for (const o of recents30) { const k = types.some((t) => t.code === o.typeCode) ? o.typeCode : null; parType.set(k, (parType.get(k) || 0) + 1); }
     const otParType30j = types.map((t) => ({ code: t.code, label: t.label || t.code, couleur: t.couleur || '#2563eb', valeur: parType.get(t.code) || 0 }));
@@ -378,11 +402,11 @@ function register(ctx) {
 
   function sectionDemandes(req, out, refs) {
     const sd = statutsDemande();
-    const wf = ctx.config().workflow || {};
+    const wf = config().workflow || {};
     const uid = req.user.id;
     const dems = db.list('demandes').filter((d) => demandeVisible(req, d));
     const ouvertes = dems.filter((d) => !sd.finaux.has(d.statut));
-    const aValider = dems.filter((d) => d.statut === sd.soumise && peutValiderDemande(req, d, wf));
+    const aValider = dems.filter((d) => d.statut === sd.soumise && peutValiderDemande(req, d, wf, refs));
     const estMienne = (d) => Number(d.demandeurId) === uid || Number(d.createdBy) === uid;
     const prio = (d) => rangPriorite(refs, d.prioriteCode);
     const dateD = (d) => texte(d.dateDemande || d.createdAt);
@@ -479,7 +503,7 @@ function register(ctx) {
     const degrades = new Set(etatsDegrades());
     const visibles = db.list('equipements', (e) => e.actif !== false && (arret.has(e.etatCode) || degrades.has(e.etatCode))).filter((e) => equipementVisible(req, e));
     const enArret = visibles.filter((e) => arret.has(e.etatCode));
-    const crit = new Map(ctx.liste('criticites').map((c) => [c.code, num(c.ordre)]));
+    const crit = new Map(liste('criticites').map((c) => [c.code, num(c.ordre)]));
     out.kpis.equipementsArret = enArret.length;
     out.compteurs.equipementsDegrades = visibles.filter((e) => degrades.has(e.etatCode)).length;
     out.filtres.etatsArret = Array.from(arret);
@@ -547,10 +571,14 @@ function register(ctx) {
 
   /** Calcule le tableau de bord de l'utilisateur de la requête. */
   function calculer(req) {
+    configCalcul = ctx.config();
+    try { return calculerAvecConfig(req); } finally { configCalcul = null; }
+  }
+  function calculerAvecConfig(req) {
     const p = req.perms;
     const voir = (m) => perms.can(p, m, 'voir');
     const auj = dateLocale();
-    const cfg = ctx.config();
+    const cfg = config();
     const u = req.user;
     const refs = references();
     const out = {
