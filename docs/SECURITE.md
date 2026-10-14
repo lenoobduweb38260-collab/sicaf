@@ -9,7 +9,7 @@ destinées au pôle informatique.
 |---|---|
 | Application | Exécutable Windows autonome (Electron) : moteur intégré, aucune dépendance logicielle à installer, aucune fenêtre de commandes. |
 | Fenêtre | Isolation du contenu (`contextIsolation`, `sandbox`, aucun accès Node.js depuis l'interface), navigation limitée à l'application, vues intégrées interdites, outils de développement absents de la version installée. |
-| Exécutable | Fusibles Electron : exécution comme Node.js désactivée, options `NODE_OPTIONS` et `--inspect` ignorées, chargement uniquement depuis l'archive de l'application avec contrôle d'intégrité, chiffrement des cookies. |
+| Exécutable | Fusibles Electron : exécution comme Node.js désactivée, options `NODE_OPTIONS` et `--inspect` ignorées, chargement uniquement depuis l'archive de l'application, chiffrement des cookies. |
 | Données | Base au format JSON écrite de façon atomique dans `%APPDATA%\GMAO SICAF\data` (ou un dossier choisi par le pôle informatique). Sauvegarde quotidienne automatique (30 conservées). |
 | Dépendances | Aucune bibliothèque tierce dans le serveur ni dans l'interface : pas de risque lié à la chaîne d'approvisionnement des paquets. |
 
