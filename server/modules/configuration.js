@@ -87,9 +87,17 @@ function register(ctx) {
       });
     }
     if (b.securite) {
+      const bs = b.securite;
+      const bool = (k) => (bs[k] === undefined ? cfg.securite[k] : !!bs[k]);
       cfg.securite = Object.assign({}, cfg.securite, {
-        longueurMinMdp: Math.min(64, Math.max(1, Number(b.securite.longueurMinMdp) || cfg.securite.longueurMinMdp)),
-        forcerChangementMdpInitial: b.securite.forcerChangementMdpInitial === undefined ? cfg.securite.forcerChangementMdpInitial : !!b.securite.forcerChangementMdpInitial,
+        longueurMinMdp: Math.min(64, Math.max(8, Number(bs.longueurMinMdp) || cfg.securite.longueurMinMdp)),
+        complexite: bool('complexite'),
+        refuserCourants: bool('refuserCourants'),
+        interdireIdentifiant: bool('interdireIdentifiant'),
+        forcerChangementMdpInitial: bool('forcerChangementMdpInitial'),
+        notifierBlocages: bool('notifierBlocages'),
+        inactiviteMinutes: Math.min(24 * 60, Math.max(5, Number(bs.inactiviteMinutes) || cfg.securite.inactiviteMinutes || 60)),
+        dureeSessionHeures: Math.min(72, Math.max(1, Number(bs.dureeSessionHeures) || cfg.securite.dureeSessionHeures || 12)),
       });
     }
     if (b.numerotation) {
@@ -136,8 +144,19 @@ function register(ctx) {
     // Sections simples des modules (étiquettes, inventaire, achats, RH, plans, sauvegardes) :
     // seules les clés connues sont acceptées, avec le même type que la valeur par défaut.
     const defaut = configParDefaut();
-    for (const section of ['etiquettes', 'inventaire', 'achats', 'rh', 'plans', 'sauvegardes']) { // « reseau » : module systeme uniquement
+    for (const section of ['etiquettes', 'inventaire', 'achats', 'rh', 'plans', 'visites', 'sauvegardes']) { // « reseau » : module systeme uniquement
       if (b[section] && typeof b[section] === 'object') cfg[section] = fusionTypee(cfg[section], b[section], defaut[section], section === 'sauvegardes' ? SECRETS_SAUVEGARDE : []);
+    }
+    if (b.journal && typeof b.journal === 'object') {
+      const j = b.journal;
+      const actuel = cfg.journal || {};
+      const ids = new Set(db.list('profils').map((p) => p.id));
+      cfg.journal = {
+        notifications: j.notifications === undefined ? actuel.notifications !== false : !!j.notifications,
+        profilsNotifies: Array.isArray(j.profilsNotifies) ? Array.from(new Set(j.profilsNotifies.map(Number).filter((x) => ids.has(x)))) : (actuel.profilsNotifies || []),
+        actions: Array.isArray(j.actions) ? Array.from(new Set(j.actions.map(String).filter((x) => /^[a-z_]{2,40}$/.test(x)))) : (actuel.actions || []),
+        entites: Array.isArray(j.entites) ? Array.from(new Set(j.entites.map(String).filter((x) => /^[a-zA-Z]{2,40}$/.test(x)))) : (actuel.entites || []),
+      };
     }
     if (b.listes) {
       for (const k of Object.keys(b.listes)) {

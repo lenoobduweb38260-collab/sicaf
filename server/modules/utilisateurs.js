@@ -128,8 +128,10 @@ function register(ctx) {
 
   router.post('/api/utilisateurs', async (req) => {
     const data = validerUser(req, req.body || {}, null);
-    const pwd = req.body.password == null || req.body.password === '' ? 'changeme' : String(req.body.password);
-    const err = auth.validerMotDePasse(pwd, db.getConfig());
+    // Sans mot de passe fourni : mot de passe aléatoire conforme, renvoyé une seule fois pour être communiqué
+    const genere = req.body.password == null || req.body.password === '';
+    const pwd = genere ? auth.genererMotDePasse() : String(req.body.password);
+    const err = auth.validerMotDePasse(pwd, db.getConfig(), { login: data.login });
     if (err) throw new HttpError(400, err);
     data.passwordHash = auth.hashPassword(pwd);
     data.doitChangerMdp = req.body.doitChangerMdp === undefined ? true : !!req.body.doitChangerMdp;
@@ -138,7 +140,7 @@ function register(ctx) {
     data.createdBy = req.user.id;
     const u = db.insert('users', data);
     ctx.audit(req, 'creation', 'users', u.id, `Utilisateur ${u.login}`);
-    return clean(u);
+    return Object.assign(clean(u), genere ? { motDePasseInitial: pwd } : {});
   }, { perm: ['utilisateurs', 'creer'] });
 
   router.put('/api/utilisateurs/:id', async (req) => {
@@ -154,7 +156,7 @@ function register(ctx) {
     const data = validerUser(req, body, existant);
     verifierDernierAdmin(existant, data);
     if (body.password) {
-      const err = auth.validerMotDePasse(body.password, db.getConfig());
+      const err = auth.validerMotDePasse(body.password, db.getConfig(), { login: data.login });
       if (err) throw new HttpError(400, err);
       data.passwordHash = auth.hashPassword(body.password);
       data.doitChangerMdp = body.doitChangerMdp === undefined ? true : !!body.doitChangerMdp;
@@ -192,8 +194,8 @@ function register(ctx) {
     const existant = db.get('users', req.params.id);
     if (!existant) throw new HttpError(404, 'Utilisateur introuvable');
     if (!perms.canManageUser(req.perms, db.get('profils', existant.profilId))) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
-    const pwd = req.body && req.body.password ? String(req.body.password) : Math.random().toString(36).slice(2, 10);
-    const err = auth.validerMotDePasse(pwd, db.getConfig());
+    const pwd = req.body && req.body.password ? String(req.body.password) : auth.genererMotDePasse();
+    const err = auth.validerMotDePasse(pwd, db.getConfig(), { login: existant.login });
     if (err) throw new HttpError(400, err);
     db.update('users', existant.id, { passwordHash: auth.hashPassword(pwd), doitChangerMdp: true });
     ctx.sessions.destroyUser(existant.id);

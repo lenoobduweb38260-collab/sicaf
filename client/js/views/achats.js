@@ -976,11 +976,12 @@
       <div class="cond">${c.conditions ? `<strong>Conditions particulières :</strong> ${nl(c.conditions)}<br>` : ''}Merci de rappeler le numéro de commande <strong>${esc(c.numero)}</strong> sur le bon de livraison et la facture.${c.validationAuto ? '' : (c.valideurNom ? `<br>Commande validée par ${esc(c.valideurNom)} le ${esc(ui.formatDate(c.dateValidation))}.` : '')}</div>
       <div class="sign"><div>Émetteur<br><span class="petit">${esc(c.demandeurNom || '')}</span></div><div>Bon pour accord<br><span class="petit">${esc(c.validationAuto ? '' : (c.valideurNom || ''))}</span></div><div>Accusé de réception du fournisseur<br><span class="petit">date, cachet et signature</span></div></div>
       <div class="pied">${esc(soc.nom || '')} — Bon de commande ${esc(c.numero)} — imprimé le ${esc(ui.formatDateHeure(new Date()))}</div>
-      <script>window.onload=function(){window.print();}<\/script></body></html>`;
+      </body></html>`;
     const w = window.open('', '_blank', 'width=900,height=1000');
     if (!w) { toast('Fenêtre bloquée : autorisez les fenêtres surgissantes pour imprimer', 'alerte'); return; }
     w.document.write(html);
     w.document.close();
+    ui.lancerImpression(w);
   }
 
   async function afficherCommande(container, id) {

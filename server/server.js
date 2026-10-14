@@ -4,6 +4,9 @@
  * Aucune dépendance externe (modules Node intégrés uniquement).
  */
 const http = require('http');
+const net = require('net');
+const os = require('os');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
@@ -44,14 +47,47 @@ function readBody(req, max) {
   });
 }
 
+/**
+ * En-têtes de sécurité appliqués à toutes les réponses.
+ * CSP : aucun script externe ni en ligne, aucune intégration de la GMAO dans une page tierce.
+ */
+const POLITIQUE_CONTENU = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
+  "font-src 'self' data:",
+  "connect-src 'self'",
+  "frame-src 'self' blob: data:",
+  "object-src 'self' blob: data:",
+  "worker-src 'self' blob:",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join('; ');
+function entetesSecurite(res) {
+  res.setHeader('Content-Security-Policy', POLITIQUE_CONTENU);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(), geolocation=(), payment=(), usb=()');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+}
+
 function sendJson(res, status, data) {
   const body = JSON.stringify(data === undefined ? null : data);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff',
   });
   res.end(body);
+}
+
+/** Lecture JSON sans clés dangereuses (pollution de prototype). */
+function analyserJson(texte) {
+  return JSON.parse(texte, (k, v) => (k === '__proto__' || k === 'constructor' || k === 'prototype' ? undefined : v));
 }
 
 /**
@@ -62,7 +98,11 @@ function createApp(options = {}) {
   const dataDir = options.dataDir || process.env.GMAO_DATA_DIR || path.join(__dirname, '..', 'data');
   const db = new Db(dataDir, { inMemory: !!options.inMemory, saveDelay: options.saveDelay }).load();
   seed(db, { adminPassword: options.adminPassword });
-  const sessions = new auth.Sessions();
+  const sec = () => (db.getConfig().securite || {});
+  const sessions = new auth.Sessions({
+    inactiviteMs: () => Math.max(5, Number(sec().inactiviteMinutes) || 60) * 60 * 1000,
+    dureeMaxMs: () => Math.max(1, Number(sec().dureeSessionHeures) || 12) * 60 * 60 * 1000,
+  });
   const router = new Router();
   const log = options.log || ((...a) => console.log(new Date().toISOString(), ...a));
   const hooks = {}; // événements inter-modules : ctx.on('ot:cree', fn) / ctx.emit('ot:cree', data)
@@ -131,6 +171,7 @@ function createApp(options = {}) {
       });
       if (col.length > AUDIT_MAX) col.splice(0, col.length - AUDIT_MAX);
       db.touch();
+      try { notifierJournal(req, action, entite, entiteId, details); } catch (e) { log('Notification du journal impossible', e.message); }
     },
 
     /** Notification interne pour un ou plusieurs utilisateurs. */
@@ -193,6 +234,44 @@ function createApp(options = {}) {
     },
   };
 
+  /**
+   * Journal d'activité → notification des rôles responsables (config.journal) : les événements
+   * semblables (même action, même entité) sont regroupés dans une notification non lue de moins de 15 min.
+   */
+  const LIBELLES_ACTION = { creation: 'Création', suppression: 'Suppression', modification: 'Modification', desactivation: 'Désactivation', restauration: 'Restauration', import: 'Import de données', reinitialisation_mdp: 'Réinitialisation de mot de passe', validation: 'Validation', cloture: 'Clôture' };
+  const LIBELLES_ENTITE = { users: 'Utilisateurs', profils: 'Profils', secteurs: 'Secteurs', configuration: 'Configuration', equipements: 'Équipements', demandes: 'Demandes', ot: 'Ordres de travail', plansPreventifs: 'Préventif', articles: 'Stock', fournisseurs: 'Fournisseurs', plans: 'Plans 3D', inventaires: 'Inventaires', commandes: 'Commandes', factures: 'Factures', personnel: 'Personnel', visites: 'Audits & visites' };
+  function notifierJournal(req, action, entite, entiteId, details) {
+    const j = db.getConfig().journal || {};
+    if (!j.notifications || !Array.isArray(j.actions) || !j.actions.includes(action)) return;
+    if (Array.isArray(j.entites) && j.entites.length && !j.entites.includes(entite)) return;
+    const profils = new Set((j.profilsNotifies || []).map(Number));
+    if (!profils.size) return;
+    const auteurId = req && req.user ? req.user.id : null;
+    const auteur = req && req.user ? (`${req.user.prenom || ''} ${req.user.nom || ''}`.trim() || req.user.login) : 'système';
+    const dest = db.list('users', (u) => u.actif !== false && profils.has(Number(u.profilId)) && u.id !== auteurId);
+    if (!dest.length) return;
+    const titre = `${LIBELLES_ACTION[action] || action} — ${LIBELLES_ENTITE[entite] || entite}`;
+    const texte = `${auteur} : ${String(details || (entiteId != null ? '#' + entiteId : '')).slice(0, 160)}`;
+    const cle = `journal:${action}:${entite}`;
+    const limite = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    const col = db.data.collections.notifications;
+    const nouveaux = [];
+    for (const u of dest) {
+      const existante = col.find((n) => n.userId === u.id && n.cle === cle && !n.lu && n.date >= limite);
+      if (existante) {
+        existante.nombre = (existante.nombre || 1) + 1;
+        existante.titre = `${titre} (${existante.nombre})`;
+        existante.message = texte;
+        existante.date = new Date().toISOString();
+        db.touch();
+      } else nouveaux.push(u.id);
+    }
+    if (nouveaux.length) {
+      ctx.notify(nouveaux, { titre, message: texte, lien: `#/audit?entite=${encodeURIComponent(entite)}&action=${encodeURIComponent(action)}`, type: 'journal' });
+      for (const n of col.slice(-nouveaux.length)) { n.cle = cle; n.nombre = 1; }
+    }
+  }
+
   // ----- Routes cœur : authentification & amorçage -------------------------
   registerCoreRoutes(ctx);
   loadModules(ctx);
@@ -216,7 +295,7 @@ function createApp(options = {}) {
       if (route.opts.brut) {
         req.body = raw; // corps binaire brut (ex. réception d'une sauvegarde d'un autre site)
       } else if (raw.length && ct.includes('application/json')) {
-        try { req.body = JSON.parse(raw.toString('utf8')); } catch (e) { throw new HttpError(400, 'JSON invalide'); }
+        try { req.body = analyserJson(raw.toString('utf8')); } catch (e) { throw new HttpError(400, 'JSON invalide'); }
       } else if (raw.length && ct.includes('text/')) {
         req.body = raw.toString('utf8');
       } else {
@@ -254,10 +333,12 @@ function createApp(options = {}) {
   }
 
   function serveStatic(req, res, url) {
-    let p = decodeURIComponent(url.pathname);
+    let p;
+    try { p = decodeURIComponent(url.pathname); } catch (e) { res.writeHead(400); return res.end('Adresse invalide'); }
+    if (p.includes('\0')) { res.writeHead(400); return res.end('Adresse invalide'); }
     if (p === '/' || p === '') p = '/index.html';
     const file = path.normalize(path.join(CLIENT_DIR, p));
-    if (!file.startsWith(CLIENT_DIR)) { res.writeHead(403); return res.end('Accès refusé'); }
+    if (file !== CLIENT_DIR && !file.startsWith(CLIENT_DIR + path.sep)) { res.writeHead(403); return res.end('Accès refusé'); }
     fs.stat(file, (err, st) => {
       if (err || !st.isFile()) {
         // Application monopage : on renvoie index.html pour les chemins inconnus (hors fichiers avec extension)
@@ -286,8 +367,32 @@ function createApp(options = {}) {
   }
   const PAGE_APPLICATION = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>GMAO SICAF</title><style>body{font-family:Segoe UI,Arial,sans-serif;background:#0f172a;color:#e5e7eb;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}div{max-width:520px;background:#1e293b;padding:28px 32px;border-radius:12px}h1{color:#60a5fa;margin-top:0}</style></head><body><div><h1>GMAO SICAF</h1><p>La GMAO s'utilise avec l'<strong>application GMAO SICAF</strong> installée sur votre poste (mode « Se connecter à la GMAO d'un autre poste »).</p><p>L'accès par un navigateur web est désactivé. Contactez le pôle informatique.</p></div></body></html>`;
 
+  /**
+   * Protection contre le « DNS rebinding » : seules les adresses IP, localhost, le nom du poste
+   * et les noms déclarés par le pôle informatique (config.reseau.nomsAutorises) sont acceptés.
+   */
+  function hoteAutorise(req) {
+    const brut = String(req.headers.host || '').trim().toLowerCase();
+    if (!brut) return false;
+    let hote = brut;
+    if (hote.startsWith('[')) hote = hote.slice(1, hote.indexOf(']')); // IPv6 [::1]:8585
+    else hote = hote.replace(/:\d+$/, '');
+    if (net.isIP(hote)) return true;
+    if (hote === 'localhost' || hote.endsWith('.localhost')) return true;
+    const poste = os.hostname().toLowerCase();
+    if (hote === poste || hote.split('.')[0] === poste.split('.')[0]) return true;
+    const noms = ((db.getConfig().reseau || {}).nomsAutorises || []).map((n) => String(n).toLowerCase().trim()).filter(Boolean);
+    return noms.includes(hote);
+  }
+
   function handler(req, res) {
-    const url = new URL(req.url, 'http://localhost');
+    entetesSecurite(res);
+    if (!hoteAutorise(req)) {
+      res.writeHead(421, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Nom de serveur non autorisé. Le pôle informatique peut l\'ajouter dans Système & informatique › Réseau.');
+    }
+    let url;
+    try { url = new URL(req.url, 'http://localhost'); } catch (e) { res.writeHead(400); return res.end('Adresse invalide'); }
     if (accesNavigateurRefuse(req, url)) {
       if (url.pathname.startsWith('/api/')) return sendJson(res, 403, { erreur: 'Accès réservé à l\'application GMAO SICAF (accès par navigateur désactivé par le pôle informatique)' });
       res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -299,8 +404,10 @@ function createApp(options = {}) {
         if (err instanceof HttpError) {
           sendJson(res, err.status, { erreur: err.message, details: err.details });
         } else {
-          log('Erreur serveur', req.method, url.pathname, err && err.stack ? err.stack : err);
-          sendJson(res, 500, { erreur: 'Erreur interne : ' + (err && err.message ? err.message : String(err)) });
+          // Aucun détail technique n'est renvoyé au poste : référence d'incident à communiquer au pôle informatique
+          const reference = crypto.randomBytes(4).toString('hex').toUpperCase();
+          log('Erreur serveur', reference, req.method, url.pathname, err && err.stack ? err.stack : err);
+          sendJson(res, 500, { erreur: `Erreur interne du serveur (référence ${reference}). Si le problème persiste, contactez le pôle informatique.` });
         }
       });
       return;
@@ -355,21 +462,43 @@ function registerCoreRoutes(ctx) {
     };
   }
 
+  /** Prévient le pôle informatique (droit Système › Modifier) d'un blocage de compte. */
+  function notifierBlocage(login, ip) {
+    if ((db.getConfig().securite || {}).notifierBlocages === false) return;
+    const ids = ctx.usersAvecDroit('systeme', 'modifier').map((u) => u.id);
+    ctx.notify(ids, { titre: 'Compte temporairement bloqué', message: `Trop de mots de passe incorrects pour l'identifiant « ${String(login).slice(0, 60)} » depuis ${ip || 'un poste inconnu'}. Accès bloqué 10 minutes.`, lien: '#/audit?action=echec_connexion', type: 'alerte' });
+  }
+
   router.post('/api/auth/login', async (req, res) => {
-    const { login, password } = req.body || {};
-    const cle = String(req.socket.remoteAddress || '') + '|' + String(login || '').toLowerCase();
-    const bloc = sessions.blocage(cle);
-    if (bloc > 0) throw new HttpError(429, `Trop de tentatives. Réessayez dans ${bloc} s`);
-    const user = db.findOne('users', (u) => String(u.login).toLowerCase() === String(login || '').toLowerCase());
-    if (!user || !auth.verifyPassword(password, user.passwordHash)) {
-      sessions.echec(cle);
+    const b = req.body || {};
+    const login = typeof b.login === 'string' ? b.login.trim().slice(0, 100) : '';
+    const password = typeof b.password === 'string' ? b.password.slice(0, 500) : '';
+    const ip = String(req.socket.remoteAddress || '');
+    // Deux compteurs : par poste + identifiant, et par identifiant seul (attaque depuis plusieurs postes)
+    const clePoste = ip + '|' + login.toLowerCase();
+    const cleCompte = 'compte|' + login.toLowerCase();
+    const bloc = Math.max(sessions.blocage(clePoste), sessions.blocage(cleCompte));
+    if (bloc > 0) throw new HttpError(429, `Trop de tentatives. Réessayez dans ${Math.ceil(bloc / 60)} min`);
+    const user = login ? db.findOne('users', (u) => String(u.login).toLowerCase() === login.toLowerCase()) : null;
+    // Vérification exécutée même si le compte n'existe pas (temps de réponse identique)
+    const ok = auth.verifyPassword(password, user ? user.passwordHash : 'scrypt$00$00') && !!user;
+    if (!ok) {
+      const bloquePoste = sessions.echec(clePoste);
+      const bloqueCompte = sessions.echec(cleCompte);
+      ctx.audit({ socket: req.socket }, 'echec_connexion', 'users', user ? user.id : null, `Identifiant « ${login.slice(0, 60)} »${user ? '' : ' (inconnu)'}`);
+      if (bloquePoste || bloqueCompte) {
+        ctx.audit({ socket: req.socket }, 'blocage', 'users', user ? user.id : null, `Blocage après échecs répétés : « ${login.slice(0, 60)} »`);
+        notifierBlocage(login, ip);
+      }
       throw new HttpError(401, 'Identifiant ou mot de passe incorrect');
     }
     if (user.actif === false) throw new HttpError(403, 'Ce compte est désactivé');
-    sessions.succes(cle);
-    const token = sessions.create(user.id, { ua: String(req.headers['user-agent'] || '').slice(0, 300), ip: req.socket.remoteAddress || '' });
+    sessions.succes(clePoste);
+    sessions.succes(cleCompte);
+    const token = sessions.create(user.id, { ua: String(req.headers['user-agent'] || '').slice(0, 300), ip });
     db.update('users', user.id, { derniereConnexion: new Date().toISOString() });
-    res.setHeader('Set-Cookie', `gmao_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(auth.SESSION_DUREE_MS / 1000)}`);
+    const securise = req.socket.encrypted ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `gmao_session=${token}; Path=/; HttpOnly; SameSite=Strict${securise}; Max-Age=${Math.floor(sessions.dureeMaxMs() / 1000)}`);
     req.user = db.get('users', user.id);
     req.profil = db.get('profils', req.user.profilId);
     req.perms = perms.effectivePermissions(db, req.user, req.profil, db.getConfig());
@@ -388,16 +517,22 @@ function registerCoreRoutes(ctx) {
 
   router.get('/api/auth/infos', async () => {
     const c = db.getConfig();
-    return { societe: c.societe || {}, general: { theme: (c.general || {}).theme, couleurPrincipale: (c.general || {}).couleurPrincipale, messageAccueil: (c.general || {}).messageAccueil }, version: ctx.version };
+    // L'aide « compte initial » n'est affichée que tant que l'administrateur n'a jamais été utilisé
+    const admin = db.findOne('users', (u) => u.login === 'admin');
+    const premierDemarrage = !!(admin && admin.doitChangerMdp && !admin.derniereConnexion && db.count('users') === 1);
+    const soc = c.societe || {};
+    return { societe: { nom: soc.nom, slogan: soc.slogan, logo: soc.logo }, general: { theme: (c.general || {}).theme, couleurPrincipale: (c.general || {}).couleurPrincipale, messageAccueil: (c.general || {}).messageAccueil }, version: ctx.version, premierDemarrage };
   }, { public: true });
 
   /** Changement de son propre mot de passe. */
   router.post('/api/auth/mot-de-passe', async (req) => {
     const { ancien, nouveau } = req.body || {};
     if (!req.user.doitChangerMdp && !auth.verifyPassword(ancien, req.user.passwordHash)) throw new HttpError(400, 'Ancien mot de passe incorrect');
-    const err = auth.validerMotDePasse(nouveau, db.getConfig());
+    const err = auth.validerMotDePasse(nouveau, db.getConfig(), { login: req.user.login });
     if (err) throw new HttpError(400, err);
-    db.update('users', req.user.id, { passwordHash: auth.hashPassword(nouveau), doitChangerMdp: false });
+    if (auth.verifyPassword(nouveau, req.user.passwordHash)) throw new HttpError(400, 'Le nouveau mot de passe doit être différent de l\'ancien');
+    db.update('users', req.user.id, { passwordHash: auth.hashPassword(nouveau), doitChangerMdp: false, dateMdp: new Date().toISOString() });
+    sessions.destroyUserSauf(req.user.id, req.session.token); // les autres postes connectés sont déconnectés
     ctx.audit(req, 'changement_mdp', 'users', req.user.id, '');
     return { ok: true };
   });

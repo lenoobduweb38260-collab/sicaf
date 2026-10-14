@@ -9,9 +9,9 @@
   const LIBELLES_ENTITE = { users: 'Utilisateurs', profils: 'Profils', secteurs: 'Secteurs', configuration: 'Configuration', equipements: 'Équipements', demandes: 'Demandes', ot: 'Ordres de travail', plansPreventifs: 'Plans préventifs', articles: 'Articles', mouvementsStock: 'Mouvements de stock', fournisseurs: 'Fournisseurs' };
 
   GMAO.registerView('audit', {
-    titre: 'Journal d\'audit', icone: 'audit',
-    async rendu(container) {
-      const filtres = { entite: '', action: '', userId: '', du: '', au: '', recherche: '' };
+    titre: 'Journal d\'activité', icone: 'audit',
+    async rendu(container, { query }) {
+      const filtres = { entite: (query && query.entite) || '', action: (query && query.action) || '', userId: '', du: '', au: '', recherche: '' };
       const selEntite = el('select', { onchange: () => { filtres.entite = selEntite.value; charger(); } });
       const selAction = el('select', { onchange: () => { filtres.action = selAction.value; charger(); } });
       const selUser = el('select', { onchange: () => { filtres.userId = selUser.value; charger(); } }, [{ value: '', label: 'Tous les utilisateurs' }].concat(ui.optionsUsers({ vide: false, inactifs: true })).map((o) => el('option', { value: o.value }, o.label)));
@@ -39,14 +39,14 @@
           const r = await api.get('/api/audit', { entite: filtres.entite, action: filtres.action, userId: filtres.userId, du: filtres.du, au: filtres.au, recherche: filtres.recherche, limite: 1000 });
           tableau.maj(r.lignes);
           compteur.textContent = `${r.total} entrée(s)${r.total > r.lignes.length ? ` (${r.lignes.length} affichées)` : ''}`;
-          const remplir = (sel, valeurs, libelles, vide) => { const cur = sel.value; ui.vider(sel); sel.appendChild(el('option', { value: '' }, vide)); valeurs.forEach((v) => sel.appendChild(el('option', { value: v }, libelles[v] || v))); sel.value = cur; };
+          const remplir = (sel, valeurs, libelles, vide) => { const cur = sel.value || (sel === selEntite ? filtres.entite : sel === selAction ? filtres.action : ''); ui.vider(sel); sel.appendChild(el('option', { value: '' }, vide)); valeurs.forEach((v) => sel.appendChild(el('option', { value: v }, libelles[v] || v))); sel.value = cur; };
           remplir(selEntite, r.entites, LIBELLES_ENTITE, 'Toutes les entités');
           remplir(selAction, r.actions, LIBELLES_ACTION, 'Toutes les actions');
         } catch (e) { erreur(e); }
       }
 
       container.appendChild(ui.pageEntete({
-        titre: GMAO.moduleLabel('audit'), icone: 'audit', sousTitre: 'Qui a fait quoi, et quand.',
+        titre: GMAO.moduleLabel('audit'), icone: 'audit', sousTitre: 'Journal de toutes les actions (logs). Les rôles responsables sont notifiés des événements importants (Configuration › Journal & notifications).',
         actions: [
           ui.bouton('Actualiser', { icone: 'rafraichir', onClic: charger }),
           GMAO.can('audit', 'exporter') ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => { const qs = new URLSearchParams(Object.entries(filtres).filter(([, v]) => v)).toString(); api.telecharger('/api/audit/export' + (qs ? '?' + qs : ''), 'journal-audit.csv').catch(erreur); } }) : null,

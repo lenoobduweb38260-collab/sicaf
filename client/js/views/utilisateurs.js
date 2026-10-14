@@ -76,7 +76,7 @@
       { type: 'html', label: 'Accès aux autres sites', rendu: () => rendreAccesSites(existant, verrou, (api) => { accesSites = api; }) },
       { nom: 'porteeOverride', label: 'Portée des données (surcharge)', type: 'select', options: [{ value: '', label: 'Héritée du profil' }].concat(Object.entries(GMAO.catalogue.portees || {}).map(([k, v]) => ({ value: k, label: v }))), disabled: verrou },
       { type: 'separateur', label: 'Mot de passe' },
-      { nom: 'password', label: creation ? 'Mot de passe initial' : 'Nouveau mot de passe (vide = inchangé)', type: 'mdp', aide: creation ? 'Vide = « changeme »' : '' },
+      { nom: 'password', label: creation ? 'Mot de passe initial' : 'Nouveau mot de passe (vide = inchangé)', type: 'mdp', aide: creation ? 'Vide = mot de passe aléatoire sécurisé, affiché une seule fois' : '' },
       { nom: 'doitChangerMdp', label: 'Obliger à changer le mot de passe à la prochaine connexion', type: 'booleen', valeur: true },
       ...ui.champsPersoDefs('utilisateurs'),
     ];
@@ -100,6 +100,9 @@
         for (const k of Object.keys(body)) if (k.startsWith('champs.')) delete body[k];
         const res = creation ? await api.post('/api/utilisateurs', body) : await api.put('/api/utilisateurs/' + existant.id, body);
         toast(creation ? 'Utilisateur créé' : 'Utilisateur enregistré', 'succes');
+        if (res && res.motDePasseInitial) {
+          ui.modal({ titre: 'Mot de passe initial', taille: 'petite', contenu: frag(el('p', null, `Mot de passe généré pour ${res.login} :`), el('p', null, el('code', { style: { fontSize: '16px', userSelect: 'all' } }, res.motDePasseInitial)), el('p', { class: 'texte-2 texte-petit' }, 'Communiquez-le à l\'utilisateur de façon confidentielle : il ne sera plus affiché. Il devra le changer à sa première connexion.')), boutons: [{ label: 'Fermer' }] });
+        }
         if (estMoi) await GMAO.refresh(false); else await GMAO.refreshRefs();
         if (apres) apres(res);
       },

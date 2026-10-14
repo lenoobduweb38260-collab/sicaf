@@ -70,6 +70,7 @@
     glisser: '<circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/>',
     haut: '<path d="M18 15l-6-6-6 6"/>',
     bas: '<path d="M6 9l6 6 6-6"/>',
+    visite: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><rect x="15" y="3" width="7" height="9" rx="1"/><path d="M17 6h3M17 9h3"/>',
     serveur: '<rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/>',
     codebarre: '<path d="M3 5v14M6 5v14M8 5v14M11 5v14M14 5v14M16 5v14M19 5v14M21 5v14"/>',
     plan3d: '<path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 22V12M21 7l-9 5-9-5"/>',
@@ -868,8 +869,28 @@
       dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px}dt{font-weight:600;color:#444}dd{margin:0}.signature{margin-top:30px;display:flex;gap:40px}.signature div{flex:1;border-top:1px solid #333;padding-top:4px}
       .badge{display:inline-block;padding:1px 6px;border:1px solid #666;border-radius:8px;font-size:11px}@media print{button{display:none}}</style></head>
       <body><div class="entete"><div><div class="soc">${esc(societe)}</div><div>${esc(titre)}</div></div><div>Imprimé le ${esc(formatDateHeure(new Date()))}</div></div>${html}
-      <script>window.onload=function(){window.print();}</script></body></html>`);
+      </body></html>`);
     w.document.close();
+    lancerImpression(w);
+  }
+
+  /**
+   * Fenêtre d'impression : la politique de sécurité interdit tout script dans la fenêtre imprimée ;
+   * l'impression est donc pilotée depuis l'application (boutons [data-imprimer], impression automatique
+   * une fois les images chargées).
+   */
+  function lancerImpression(w, options = {}) {
+    if (!w || !w.document) return;
+    const doc = w.document;
+    doc.querySelectorAll('[data-imprimer]').forEach((b) => b.addEventListener('click', () => { w.focus(); w.print(); }));
+    if (options.auto === false) return;
+    const images = Array.from(doc.images || []).filter((img) => !img.complete);
+    const go = () => setTimeout(() => { try { w.focus(); w.print(); } catch (e) { /* fenêtre fermée */ } }, options.delai || 300);
+    if (!images.length) return go();
+    let restant = images.length;
+    const fin = () => { restant -= 1; if (restant <= 0) go(); };
+    images.forEach((img) => { img.addEventListener('load', fin); img.addEventListener('error', fin); });
+    setTimeout(go, 3000); // au pire, impression après 3 s
   }
 
   // ----- Composants de page -------------------------------------------------
@@ -1063,7 +1084,7 @@
     optionsListe, optionsUsers, optionsSecteurs, optionsProfils,
     badge, badgeListe, pastille, toast, erreur, modal, fermerModales, confirm, prompt,
     form, formModal, lireFichier, champsPersoDefs, champsPersoValeurs, champsPersoInitiaux, champsPersoAffichage,
-    table, exportCsv, telecharger, imprimer,
+    table, exportCsv, telecharger, imprimer, lancerImpression,
     pageEntete, bouton, vide, chargement, kpi, details, alerte, carte, onglets, arbre, avatar, lien, graphiqueBarres,
   };
 })();

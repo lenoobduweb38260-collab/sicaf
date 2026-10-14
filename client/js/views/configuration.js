@@ -26,11 +26,15 @@
     { cle: 'statutsCommande', label: 'Achats : statuts des commandes', couleur: true, final: true },
     { cle: 'statutsFacture', label: 'Achats : statuts des factures', couleur: true, final: true },
     { cle: 'categoriesDepense', label: 'Achats : catégories de dépense', couleur: true },
+    { cle: 'typesVisite', label: 'Audits & visites : types', couleur: true },
+    { cle: 'statutsVisite', label: 'Audits & visites : statuts', couleur: true, final: true },
+    { cle: 'typesConstat', label: 'Audits : types de constat', couleur: true },
+    { cle: 'statutsAction', label: 'Audits : statuts des actions', couleur: true, final: true },
   ];
   const ENTITES_CHAMPS = [
     { cle: 'equipements', label: 'Équipements' }, { cle: 'ot', label: 'Ordres de travail' }, { cle: 'demandes', label: 'Demandes d\'intervention' },
     { cle: 'articles', label: 'Articles (stock)' }, { cle: 'fournisseurs', label: 'Fournisseurs' }, { cle: 'utilisateurs', label: 'Utilisateurs' },
-    { cle: 'personnel', label: 'Personnel (RH)' }, { cle: 'commandes', label: 'Commandes fournisseurs' }, { cle: 'factures', label: 'Factures' },
+    { cle: 'personnel', label: 'Personnel (RH)' }, { cle: 'commandes', label: 'Commandes fournisseurs' }, { cle: 'factures', label: 'Factures' }, { cle: 'visites', label: 'Audits & visites' },
   ];
   const TYPES_CHAMPS = [['texte', 'Texte'], ['texte_long', 'Texte long'], ['nombre', 'Nombre'], ['date', 'Date'], ['liste', 'Liste de choix'], ['booleen', 'Oui / Non']];
 
@@ -71,8 +75,14 @@
       { nom: 'general.tauxHoraire', label: 'Taux horaire main d\'œuvre (pour les coûts)', type: 'nombre', min: 0 },
       { nom: 'general.messageAccueil', label: 'Message affiché sur la page de connexion', type: 'texte_long', lignes: 2 },
       { type: 'separateur', label: 'Sécurité' },
-      { nom: 'securite.longueurMinMdp', label: 'Longueur minimale des mots de passe', type: 'nombre', min: 1, max: 64 },
+      { nom: 'securite.longueurMinMdp', label: 'Longueur minimale des mots de passe', type: 'nombre', min: 8, max: 64 },
+      { nom: 'securite.inactiviteMinutes', label: 'Déconnexion après inactivité (minutes)', type: 'nombre', min: 5, max: 1440 },
+      { nom: 'securite.dureeSessionHeures', label: 'Durée maximale d\'une session (heures)', type: 'nombre', min: 1, max: 72 },
+      { nom: 'securite.complexite', label: 'Exiger au moins 3 types de caractères (minuscules, majuscules, chiffres, spéciaux)', type: 'booleen' },
+      { nom: 'securite.refuserCourants', label: 'Refuser les mots de passe trop courants', type: 'booleen' },
+      { nom: 'securite.interdireIdentifiant', label: 'Refuser un mot de passe contenant l\'identifiant', type: 'booleen' },
       { nom: 'securite.forcerChangementMdpInitial', label: 'Forcer le changement du mot de passe initial', type: 'booleen' },
+      { nom: 'securite.notifierBlocages', label: 'Prévenir le pôle informatique quand un compte est bloqué (mots de passe erronés)', type: 'booleen' },
       { type: 'separateur', label: 'Circuit de travail (workflow)' },
       { nom: 'workflow.validationDemandes', label: 'Les demandes d\'intervention doivent être validées avant de devenir des OT', type: 'booleen', sansDecalage: true },
       { nom: 'workflow.validerParSuperieurUniquement', label: 'Seul le supérieur hiérarchique du demandeur (ou un admin) peut valider sa demande', type: 'booleen', sansDecalage: true },
@@ -88,6 +98,8 @@
       'societe.nom': c.societe.nom, 'societe.slogan': c.societe.slogan, 'societe.adresse': c.societe.adresse, 'societe.telephone': c.societe.telephone, 'societe.email': c.societe.email, 'societe.logo': c.societe.logo,
       'general.couleurPrincipale': c.general.couleurPrincipale, 'general.theme': c.general.theme, 'general.formatDate': c.general.formatDate, 'general.devise': c.general.devise, 'general.lignesParPage': c.general.lignesParPage, 'general.heuresParJour': c.general.heuresParJour, 'general.tauxHoraire': c.general.tauxHoraire, 'general.messageAccueil': c.general.messageAccueil,
       'securite.longueurMinMdp': c.securite.longueurMinMdp, 'securite.forcerChangementMdpInitial': c.securite.forcerChangementMdpInitial,
+      'securite.inactiviteMinutes': c.securite.inactiviteMinutes, 'securite.dureeSessionHeures': c.securite.dureeSessionHeures, 'securite.complexite': c.securite.complexite,
+      'securite.refuserCourants': c.securite.refuserCourants, 'securite.interdireIdentifiant': c.securite.interdireIdentifiant, 'securite.notifierBlocages': c.securite.notifierBlocages,
       'workflow.validationDemandes': c.workflow.validationDemandes, 'workflow.validerParSuperieurUniquement': c.workflow.validerParSuperieurUniquement, 'workflow.otAutoDepuisDemande': c.workflow.otAutoDepuisDemande, 'workflow.cloturerDemandeAvecOt': c.workflow.cloturerDemandeAvecOt, 'workflow.notifierValidateurs': c.workflow.notifierValidateurs, 'workflow.autoriserTechnicienCloture': c.workflow.autoriserTechnicienCloture, 'workflow.stockNegatif': c.workflow.stockNegatif,
       'preventif.genererAuto': c.preventif.genererAuto, 'preventif.horizonJours': c.preventif.horizonJours,
     } });
@@ -196,6 +208,29 @@
     rendre();
   }
 
+  // ----- Onglet Journal & notifications ---------------------------------------
+  const ACTIONS_JOURNAL = [
+    ['creation', 'Créations'], ['suppression', 'Suppressions'], ['modification', 'Modifications'], ['desactivation', 'Désactivations'],
+    ['validation', 'Validations'], ['cloture', 'Clôtures'], ['restauration', 'Restaurations de sauvegarde'], ['import', 'Imports de données'],
+    ['reinitialisation_mdp', 'Réinitialisations de mot de passe'],
+  ];
+  const ENTITES_JOURNAL = [
+    ['users', 'Utilisateurs'], ['profils', 'Profils'], ['secteurs', 'Secteurs & sites'], ['configuration', 'Configuration'], ['equipements', 'Équipements'],
+    ['plans', 'Plans 3D'], ['demandes', 'Demandes'], ['ot', 'Ordres de travail'], ['plansPreventifs', 'Préventif'], ['articles', 'Stock'],
+    ['inventaires', 'Inventaires'], ['fournisseurs', 'Fournisseurs'], ['commandes', 'Commandes'], ['factures', 'Factures'], ['personnel', 'Personnel (RH)'], ['visites', 'Audits & visites'],
+  ];
+  function ongletJournal() {
+    const j = config.journal || {};
+    const f = ui.form({ colonnes: 1, champs: [
+      { nom: 'notifications', label: 'Notifier les rôles responsables des événements du journal d\'activité', type: 'interrupteur', valeur: j.notifications !== false },
+      { nom: 'profilsNotifies', label: 'Profils notifiés', type: 'cases', options: GMAO.refs.profils.filter((p) => p.actif !== false).sort((a, b) => a.niveau - b.niveau).map((p) => ({ value: p.id, label: `${p.nom} (niveau ${p.niveau})`, couleur: p.couleur })), valeur: j.profilsNotifies || [], aide: 'Chaque utilisateur actif de ces profils reçoit la notification (sauf l\'auteur de l\'action).' },
+      { nom: 'actions', label: 'Actions notifiées', type: 'cases', options: ACTIONS_JOURNAL.map(([v, l]) => ({ value: v, label: l })), valeur: j.actions || [] },
+      { nom: 'entites', label: 'Limiter à ces éléments (aucune case = tous)', type: 'cases', options: ENTITES_JOURNAL.map(([v, l]) => ({ value: v, label: l })), valeur: j.entites || [] },
+    ] });
+    const btn = ui.bouton('Enregistrer', { classe: 'btn-primaire', icone: 'check', disabled: !peutModifier(), onClic: async () => { await enregistrer({ journal: f.valeurs() }, 'Notifications du journal enregistrées'); } });
+    return ui.carte('Journal d\'activité & notifications', frag(el('p', { class: 'texte-2 texte-petit' }, 'Toutes les actions sont enregistrées dans le journal d\'activité. Choisissez ici quels événements déclenchent une notification aux rôles responsables (ex. création ou suppression d\'équipements, de comptes, d\'articles). Les événements semblables sont regroupés dans une même notification pendant 15 minutes.'), f.el, el('div', { class: 'mt texte-droite' }, btn)));
+  }
+
   // ----- Onglet Listes de valeurs ------------------------------------------
   function ongletListes() {
     const cont = el('div');
@@ -285,6 +320,7 @@
       { nom: 'fac', label: 'Factures (référence interne)', type: 'texte', requis: true, valeur: n.fac },
       { nom: 'pl', label: 'Plans 3D', type: 'texte', requis: true, valeur: n.pl },
       { nom: 'mat', label: 'Matricules du personnel', type: 'texte', requis: true, valeur: n.mat },
+      { nom: 'vis', label: 'Audits & visites', type: 'texte', requis: true, valeur: n.vis },
     ] });
     const btn = ui.bouton('Enregistrer', { classe: 'btn-primaire', icone: 'check', disabled: !peutModifier(), onClic: async () => { if (!f.valider()) return; await enregistrer({ numerotation: f.valeurs() }); } });
     return ui.carte('Numérotation automatique', frag(el('p', { class: 'texte-2 texte-petit' }, 'Gabarits disponibles : {annee} (2026), {aa} (26), {mois} (01), {num:4} (compteur sur 4 chiffres, réinitialisé chaque année si {annee} est présent). Exemple : OT-{annee}-{num:4} → OT-2026-0001.'), f.el, el('div', { class: 'mt texte-droite' }, btn)));
@@ -304,6 +340,7 @@
         { cle: 'listes', label: 'Listes de valeurs', icone: 'filtre', rendu: () => ongletListes() },
         { cle: 'champs', label: 'Champs personnalisés', icone: 'modifier', rendu: () => ongletChamps() },
         { cle: 'numerotation', label: 'Numérotation', icone: 'ot', rendu: () => ongletNumerotation() },
+        { cle: 'journal', label: 'Journal & notifications', icone: 'cloche', rendu: () => ongletJournal() },
       ], { hash: true }).el);
     },
   });

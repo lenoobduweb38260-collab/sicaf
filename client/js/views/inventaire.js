@@ -330,9 +330,10 @@ ${CSS_ETIQUETTES}
 .barre span{opacity:.85}
 @media screen{body{background:#6b7280}.et-planche{margin:8mm auto;box-shadow:0 2px 12px rgba(0,0,0,.45)}}
 @media print{.barre{display:none}}
-</style></head><body><div class="barre"><button onclick="window.print()">Imprimer</button><span>${esc(titre)} — ${pluriel(r.nbPages, 'page')}. Réglez l'impression sur « Taille réelle / 100 % » et « Marges : aucune ».</span></div>${r.html}
-<script>window.onload=function(){setTimeout(function(){window.print();},300);};<\/script></body></html>`);
+</style></head><body><div class="barre"><button type="button" data-imprimer>Imprimer</button><span>${esc(titre)} — ${pluriel(r.nbPages, 'page')}. Réglez l'impression sur « Taille réelle / 100 % » et « Marges : aucune ».</span></div>${r.html}
+</body></html>`);
     w.document.close();
+    ui.lancerImpression(w);
     toast(`${pluriel(r.nbEtiquettes, 'étiquette')} envoyée${r.nbEtiquettes > 1 ? 's' : ''} à l'impression (${pluriel(r.nbPages, 'page')})`, 'succes');
   }
 
@@ -952,7 +953,7 @@ ${CSS_ETIQUETTES}
       ui.vider(zoneAlerteMvts);
       const nbMv = (inv.lignes || []).filter((l) => l.nbMouvementsDepuis > 0).length;
       if (enCours && nbMv) {
-        zoneAlerteMvts.appendChild(ui.alerte(frag(el('strong', null, `Des mouvements de stock ont eu lieu depuis l'ouverture sur ${pluriel(nbMv, 'article')}. `), 'La validation fixe le stock à la quantité comptée : vérifiez que ces comptages tiennent compte des entrées et sorties effectuées pendant l\'inventaire. ', el('a', { href: 'javascript:void(0)', onclick: () => { etat.segment = 'mouvements'; majSegments(); table.maj(lignesSegment()); } }, 'Voir les articles concernés')), 'alerte'));
+        zoneAlerteMvts.appendChild(ui.alerte(frag(el('strong', null, `Des mouvements de stock ont eu lieu depuis l'ouverture sur ${pluriel(nbMv, 'article')}. `), 'La validation fixe le stock à la quantité comptée : vérifiez que ces comptages tiennent compte des entrées et sorties effectuées pendant l\'inventaire. ', el('a', { href: '#', onclick: (ev) => { ev.preventDefault(); etat.segment = 'mouvements'; majSegments(); table.maj(lignesSegment()); } }, 'Voir les articles concernés')), 'alerte'));
       }
     }
 

@@ -41,7 +41,7 @@ async function main() {
     await page.fill('#f_password', 'admin'); await page.click('button[type=submit]');
     await page.waitForSelector('.modal #f_nouveau', { timeout: 10000 });
     etape('Changement de mot de passe forcé à la première connexion', true);
-    await page.fill('#f_nouveau', 'admin1234'); await page.fill('#f_confirmation', 'admin1234'); await page.click('.modal .btn-primaire');
+    await page.fill('#f_nouveau', 'Gmao-Essai#2026'); await page.fill('#f_confirmation', 'Gmao-Essai#2026'); await page.click('.modal .btn-primaire');
     await page.waitForSelector('.sidebar-nav .nav-item');
     const nav = await page.$$eval('.sidebar-nav .nav-item', (a) => a.map((x) => x.dataset.module));
     etape('Navigation construite', nav.length >= 4, nav.join(', '));
@@ -66,6 +66,10 @@ async function main() {
     await boutonsSurcharge[0].click(); // dashboard › voir : bascule
     await page.click('.modal-pied .btn-primaire');
     await page.waitForSelector('.toast.succes');
+    // Mot de passe initial généré : affiché une seule fois dans une fenêtre
+    await page.waitForSelector('.modal code');
+    etape('Mot de passe initial aléatoire affiché une seule fois', /^.{14}$/.test(await page.textContent('.modal code')));
+    await page.keyboard.press('Escape');
     etape('Utilisateur créé depuis l\'interface', true);
     await page.click('text=Test E2E'); await page.waitForSelector('.modal .onglets');
     await page.click('.modal .onglets button:nth-child(2)');

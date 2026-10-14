@@ -7,6 +7,12 @@ const { createApp } = require('../server/server');
 
 async function demarrer(options = {}) {
   const app = createApp(Object.assign({ inMemory: true, log: () => {} }, options));
+  // Environnement de test : mots de passe courts acceptés (la politique réelle est testée dans securite.test.js)
+  if (!options.politiqueReelle) {
+    const cfg = app.db.getConfig();
+    cfg.securite = Object.assign({}, cfg.securite, { longueurMinMdp: 4, complexite: false, refuserCourants: false, interdireIdentifiant: false });
+    app.db.setConfig(cfg);
+  }
   const addr = await app.start(0);
   const base = `http://127.0.0.1:${addr.port}`;
 

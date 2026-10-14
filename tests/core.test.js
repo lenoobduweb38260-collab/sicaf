@@ -26,7 +26,7 @@ describe('Noyau : authentification, profils, utilisateurs, hiérarchie, configur
     const me = await admin.ok('GET', '/api/auth/me');
     assert.equal(me.user.login, 'admin');
     assert.equal(me.permissions.estAdmin, true);
-    assert.equal(me.modules.length, 18);
+    assert.equal(me.modules.length, 19);
     assert.ok(me.references.secteurs.length >= 5);
     assert.ok(me.references.profils.length >= 5);
     assert.ok(me.config.listes.statutsOT.length > 0);
@@ -141,9 +141,11 @@ describe('Noyau : authentification, profils, utilisateurs, hiérarchie, configur
     const audit = await admin.ok('GET', '/api/audit?entite=users');
     assert.ok(audit.total > 0);
     assert.ok(audit.lignes.every((l) => l.entite === 'users'));
+    const avant = (await admin.ok('GET', '/api/notifications')).nonLues;
     srv.ctx.notify([1], { titre: 'Test', message: 'Bonjour', lien: '#/ot' });
     const n = await admin.ok('GET', '/api/notifications');
-    assert.equal(n.nonLues, 1);
+    assert.equal(n.nonLues, avant + 1);
+    assert.ok(n.notifications.some((x) => x.titre === 'Test' && x.lien === '#/ot'));
     await admin.ok('POST', '/api/notifications/lues', {});
     assert.equal((await admin.ok('GET', '/api/notifications')).nonLues, 0);
     const exp = await admin.get('/api/export');

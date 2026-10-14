@@ -14,6 +14,7 @@
   const GROUPES = {
     exploitation: { label: 'Exploitation', modules: ['dashboard', 'equipements', 'plans', 'demandes', 'ot', 'preventif', 'planning'] },
     magasin: { label: 'Magasin & achats', modules: ['stock', 'inventaire', 'fournisseurs', 'achats'] },
+    qualite: { label: 'Qualité & visites', modules: ['visites'] },
     pilotage: { label: 'Pilotage', modules: ['rapports', 'rh'] },
     administration: { label: 'Administration', modules: ['utilisateurs', 'profils', 'configuration', 'systeme', 'audit'] },
   };
@@ -74,7 +75,7 @@
     ouvrirChangementMdp(force) {
       const f = ui.form({ colonnes: 1, champs: [
         force ? null : { nom: 'ancien', label: 'Mot de passe actuel', type: 'mdp', requis: true },
-        { nom: 'nouveau', label: 'Nouveau mot de passe', type: 'mdp', requis: true, aide: `Au moins ${((GMAO.config.securite || {}).longueurMinMdp) || 4} caractères` },
+        { nom: 'nouveau', label: 'Nouveau mot de passe', type: 'mdp', requis: true, aide: (() => { const sc = GMAO.config.securite || {}; return `Au moins ${sc.longueurMinMdp || 10} caractères${sc.complexite !== false ? ', en mélangeant minuscules, majuscules, chiffres ou caractères spéciaux' : ''}.`; })() },
         { nom: 'confirmation', label: 'Confirmer le nouveau mot de passe', type: 'mdp', requis: true, valider: (v, vals) => (v !== vals.nouveau ? 'Les mots de passe ne correspondent pas' : '') },
       ] });
       const m = ui.modal({
@@ -217,7 +218,7 @@
       el('div', { class: 'connexion-logo' }, soc.logo ? el('img', { src: soc.logo, alt: soc.nom }) : el('div', { class: 'connexion-titre' }, soc.nom || 'GMAO'), el('div', { class: 'connexion-sous-titre' }, soc.slogan || 'Gestion de Maintenance Assistée par Ordinateur')),
       (infos.general || {}).messageAccueil ? el('div', { class: 'connexion-accueil' }, infos.general.messageAccueil) : null,
       err, f.el,
-      el('div', { class: 'connexion-pied' }, `GMAO ${infos.version ? 'v' + infos.version : ''} · Compte initial : admin / admin`))));
+      el('div', { class: 'connexion-pied' }, `GMAO ${infos.version ? 'v' + infos.version : ''}${infos.premierDemarrage ? ' · Première connexion : admin / admin (mot de passe à changer immédiatement)' : ''}`))));
     setTimeout(() => { const i = f.el.querySelector('input'); if (i) i.focus(); }, 50);
   }
 

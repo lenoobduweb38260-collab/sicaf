@@ -175,7 +175,7 @@ describe('Module Équipements', () => {
     const audit = await admin.ok('GET', '/api/audit?entite=equipements&action=statut');
     assert.ok(audit.lignes.some((l) => l.entiteId === compresseur.id && /Fuite/.test(l.details)), 'ligne d\'audit « statut »');
     const notifs = srv.db.list('notifications', (n) => n.userId === resp.id);
-    assert.ok(notifs.length >= 1 && notifs[0].lien === '#/equipements/' + compresseur.id, 'notification du responsable avec lien vers la fiche');
+    assert.ok(notifs.some((n) => n.lien === '#/equipements/' + compresseur.id && n.type !== 'journal'), 'notification du responsable avec lien vers la fiche');
 
     // La modification classique d'un état est aussi historisée
     const e2 = await admin.ok('PUT', '/api/equipements/' + compresseur.id, { etatCode: 'en_service' });

@@ -26,6 +26,7 @@ const ACTIONS = {
 const MODULES = [
   { key: 'dashboard', label: 'Tableau de bord', icon: 'dashboard', ordre: 10, actions: ['voir'], description: 'Indicateurs et synthèse de la maintenance' },
   { key: 'equipements', label: 'Équipements', icon: 'equipements', ordre: 20, actions: ['voir', 'creer', 'modifier', 'supprimer', 'exporter'], description: 'Arborescence et fiches des équipements' },
+  { key: 'visites', label: 'Audits & visites', icon: 'visite', ordre: 28, actions: ['voir', 'creer', 'modifier', 'supprimer', 'valider', 'exporter'], description: 'Audits clients, certifications, visites du site : planning, registre des visiteurs, badges, constats et plans d\'actions' },
   { key: 'demandes', label: "Demandes d'intervention", icon: 'demandes', ordre: 30, actions: ['voir', 'creer', 'modifier', 'supprimer', 'valider', 'exporter'], description: 'Signalements et demandes avec circuit de validation' },
   { key: 'ot', label: 'Ordres de travail', icon: 'ot', ordre: 40, actions: ['voir', 'creer', 'modifier', 'supprimer', 'affecter', 'cloturer', 'exporter'], description: 'Interventions correctives, préventives et améliorations' },
   { key: 'plans', label: 'Plans 3D', icon: 'plan3d', ordre: 25, actions: ['voir', 'creer', 'modifier', 'supprimer'], description: 'Plans 3D des sites : implantation des bâtiments, zones, machines et installations' },
@@ -41,7 +42,7 @@ const MODULES = [
   { key: 'profils', label: 'Profils & droits', icon: 'profils', ordre: 110, actions: ['voir', 'creer', 'modifier', 'supprimer'], description: 'Profils, matrice des droits, secteurs' },
   { key: 'configuration', label: 'Configuration', icon: 'configuration', ordre: 120, actions: ['voir', 'modifier'], description: 'Paramètres, listes de valeurs, champs personnalisés, sauvegardes' },
   { key: 'systeme', label: 'Système & informatique', icon: 'serveur', ordre: 125, actions: ['voir', 'modifier'], description: 'Base de données, sauvegardes, réseau, postes connectés, mises à jour (réservé au pôle informatique)' },
-  { key: 'audit', label: "Journal d'audit", icon: 'audit', ordre: 130, actions: ['voir', 'exporter'], description: 'Traçabilité des actions' },
+  { key: 'audit', label: "Journal d'activité", icon: 'audit', ordre: 130, actions: ['voir', 'exporter'], description: 'Journal de toutes les actions (logs) et notifications aux responsables' },
 ];
 
 const PORTEES = {

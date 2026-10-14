@@ -21,8 +21,8 @@ function configParDefaut() {
       heuresParJour: 8,
       tauxHoraire: 45,
     },
-    securite: { longueurMinMdp: 4, forcerChangementMdpInitial: true, dureeSessionHeures: 12 },
-    numerotation: { ot: 'OT-{annee}-{num:4}', di: 'DI-{annee}-{num:4}', eq: 'EQ-{num:4}', art: 'ART-{num:4}', pp: 'PP-{num:3}', inv: 'INV-{annee}-{num:3}', cmd: 'CMD-{annee}-{num:4}', fac: 'FAC-{annee}-{num:4}', pl: 'PL-{num:3}', mat: 'MAT-{num:4}' },
+    securite: { longueurMinMdp: 10, complexite: true, refuserCourants: true, interdireIdentifiant: true, forcerChangementMdpInitial: true, dureeSessionHeures: 12, inactiviteMinutes: 60, notifierBlocages: true },
+    numerotation: { ot: 'OT-{annee}-{num:4}', di: 'DI-{annee}-{num:4}', eq: 'EQ-{num:4}', art: 'ART-{num:4}', pp: 'PP-{num:3}', inv: 'INV-{annee}-{num:3}', vis: 'VIS-{annee}-{num:3}', cmd: 'CMD-{annee}-{num:4}', fac: 'FAC-{annee}-{num:4}', pl: 'PL-{num:3}', mat: 'MAT-{num:4}' },
     etiquettes: {
       format: 'a4-3x7', symbologie: 'code128', hauteurCodeMm: 12, decalage: 0,
       contenu: { codeBarre: true, code: true, designation: true, emplacement: true, referenceFournisseur: false, unite: false, categorie: false, societe: true, prix: false, secteur: false },
@@ -32,7 +32,21 @@ function configParDefaut() {
     achats: { tauxTVA: 20, seuilValidationHT: 1000, delaiPaiementJours: 30, entreeStockAReception: true, alerteEcheanceJours: 7 },
     rh: { alerteJoursAvantEcheance: 60, afficherAbsencesPlanning: true, heuresHebdo: 35 },
     plans: { grilleM: 0.5, uniteAffichage: 'm', couleurParDefaut: 'etat', afficherEtiquettes: true },
-    reseau: { accesNavigateur: false },
+    visites: {
+      charteSecurite: 'Port des équipements de protection individuelle obligatoire dans les zones de production. Interdiction de photographier sans autorisation. Respect des cheminements piétons et des consignes de l\'accompagnateur. En cas d\'alarme, suivre l\'accompagnateur jusqu\'au point de rassemblement.',
+      accompagnementObligatoire: true,
+      rappelJoursAvant: 2,
+      badgeAvecCodeBarre: true,
+      demanderPieceIdentite: false,
+      conserverVisiteursJours: 365,
+    },
+    reseau: { accesNavigateur: false, nomsAutorises: [] },
+    journal: {
+      notifications: true,
+      profilsNotifies: null, // null = profils « Responsable maintenance » et « Pôle informatique » (renseigné au premier démarrage)
+      actions: ['creation', 'suppression', 'desactivation', 'restauration', 'import', 'reinitialisation_mdp'],
+      entites: [],           // vide = toutes les entités
+    },
     sauvegardes: {
       automatique: true, frequenceHeures: 24, heure: '22:00', conserverLocal: 30, compresser: true, chiffrer: false,
       destinations: [], cleReception: '', accepterReception: false,
@@ -121,6 +135,36 @@ function configParDefaut() {
         { code: 'prestataire', label: 'Prestataire de services', ordre: 2 },
         { code: 'constructeur', label: 'Constructeur', ordre: 3 },
       ],
+      typesVisite: [
+        { code: 'audit_client', label: 'Audit client', couleur: '#2563eb', ordre: 1 },
+        { code: 'audit_certification', label: 'Audit de certification (ISO, IFS, BRC…)', couleur: '#7c3aed', ordre: 2 },
+        { code: 'audit_interne', label: 'Audit interne', couleur: '#0891b2', ordre: 3 },
+        { code: 'inspection', label: 'Inspection (autorité, assureur, DREAL…)', couleur: '#dc2626', ordre: 4 },
+        { code: 'visite_client', label: 'Visite client / prospect', couleur: '#16a34a', ordre: 5 },
+        { code: 'visite_fournisseur', label: 'Visite fournisseur / prestataire', couleur: '#f59e0b', ordre: 6 },
+        { code: 'visite_groupe', label: 'Visite de groupe (école, presse…)', couleur: '#6b7280', ordre: 7 },
+      ],
+      statutsVisite: [
+        { code: 'planifiee', label: 'Planifiée', couleur: '#6b7280', ordre: 1, final: false },
+        { code: 'confirmee', label: 'Confirmée', couleur: '#2563eb', ordre: 2, final: false },
+        { code: 'en_cours', label: 'En cours', couleur: '#f59e0b', ordre: 3, final: false },
+        { code: 'terminee', label: 'Terminée', couleur: '#16a34a', ordre: 4, final: true },
+        { code: 'annulee', label: 'Annulée', couleur: '#dc2626', ordre: 5, final: true },
+      ],
+      typesConstat: [
+        { code: 'nc_majeure', label: 'Non-conformité majeure', couleur: '#dc2626', ordre: 1 },
+        { code: 'nc_mineure', label: 'Non-conformité mineure', couleur: '#f59e0b', ordre: 2 },
+        { code: 'observation', label: 'Observation / remarque', couleur: '#2563eb', ordre: 3 },
+        { code: 'piste_amelioration', label: 'Piste d\'amélioration', couleur: '#0891b2', ordre: 4 },
+        { code: 'point_fort', label: 'Point fort', couleur: '#16a34a', ordre: 5 },
+      ],
+      statutsAction: [
+        { code: 'a_faire', label: 'À faire', couleur: '#6b7280', ordre: 1, final: false },
+        { code: 'en_cours', label: 'En cours', couleur: '#f59e0b', ordre: 2, final: false },
+        { code: 'realisee', label: 'Réalisée (à vérifier)', couleur: '#2563eb', ordre: 3, final: false },
+        { code: 'verifiee', label: 'Vérifiée / efficace', couleur: '#16a34a', ordre: 4, final: true },
+        { code: 'abandonnee', label: 'Abandonnée', couleur: '#9ca3af', ordre: 5, final: true },
+      ],
       typesSecteur: [
         { code: 'site', label: 'Site / usine', couleur: '#0f766e', ordre: 1 },
         { code: 'batiment', label: 'Bâtiment', couleur: '#7c3aed', ordre: 2 },
@@ -193,7 +237,7 @@ function configParDefaut() {
         { code: 'inconnue', label: 'Inconnue', ordre: 6 },
       ],
     },
-    champsPersonnalises: { equipements: [], ot: [], demandes: [], articles: [], fournisseurs: [], utilisateurs: [], personnel: [], commandes: [], factures: [] },
+    champsPersonnalises: { equipements: [], ot: [], demandes: [], articles: [], fournisseurs: [], utilisateurs: [], personnel: [], commandes: [], factures: [], visites: [] },
   };
 }
 
@@ -220,11 +264,11 @@ function profilsParDefaut() {
     },
     {
       nom: 'Responsable maintenance', description: 'Pilote la maintenance : valide, affecte, clôture, gère le stock et le préventif', niveau: 2, estAdmin: false, portee: 'tous', couleur: '#2563eb', systeme: true,
-      permissions: set(vide(), Object.assign(TOUT(['dashboard', 'equipements', 'plans', 'demandes', 'ot', 'preventif', 'planning', 'stock', 'inventaire', 'fournisseurs', 'rapports']), { achats: ['voir', 'creer', 'modifier', 'valider', 'exporter'], rh: ['voir', 'creer', 'modifier', 'valider', 'exporter'], utilisateurs: ['voir'], profils: ['voir'], audit: ['voir', 'exporter'], configuration: ['voir'] })),
+      permissions: set(vide(), Object.assign(TOUT(['dashboard', 'equipements', 'plans', 'demandes', 'ot', 'preventif', 'planning', 'stock', 'inventaire', 'fournisseurs', 'rapports']), { achats: ['voir', 'creer', 'modifier', 'valider', 'exporter'], rh: ['voir', 'creer', 'modifier', 'valider', 'exporter'], visites: ['voir', 'creer', 'modifier', 'exporter'], utilisateurs: ['voir'], profils: ['voir'], audit: ['voir', 'exporter'], configuration: ['voir'] })),
     },
     {
       nom: 'Chef de secteur', description: 'Valide les demandes et suit les interventions de son secteur', niveau: 3, estAdmin: false, portee: 'secteurs', couleur: '#8b5cf6', systeme: true,
-      permissions: set(vide(), { dashboard: ['voir'], equipements: ['voir', 'modifier'], demandes: ['voir', 'creer', 'modifier', 'valider', 'exporter'], ot: ['voir', 'creer', 'modifier', 'affecter', 'cloturer', 'exporter'], preventif: ['voir'], planning: ['voir', 'modifier'], stock: ['voir'], fournisseurs: ['voir'], rapports: ['voir', 'exporter'], utilisateurs: ['voir'], plans: ['voir'], inventaire: ['voir'], achats: ['voir', 'creer'], rh: ['voir'] }),
+      permissions: set(vide(), { dashboard: ['voir'], equipements: ['voir', 'modifier'], demandes: ['voir', 'creer', 'modifier', 'valider', 'exporter'], ot: ['voir', 'creer', 'modifier', 'affecter', 'cloturer', 'exporter'], preventif: ['voir'], planning: ['voir', 'modifier'], stock: ['voir'], fournisseurs: ['voir'], rapports: ['voir', 'exporter'], utilisateurs: ['voir'], plans: ['voir'], inventaire: ['voir'], achats: ['voir', 'creer'], rh: ['voir'], visites: ['voir', 'modifier'] }),
     },
     {
       nom: 'Technicien', description: 'Réalise les interventions et renseigne les comptes rendus', niveau: 4, estAdmin: false, portee: 'secteurs', couleur: '#16a34a', systeme: true,
@@ -233,6 +277,10 @@ function profilsParDefaut() {
     {
       nom: 'Demandeur', description: 'Signale les pannes et suit ses demandes', niveau: 5, estAdmin: false, portee: 'perso', couleur: '#6b7280', systeme: true,
       permissions: set(vide(), { dashboard: ['voir'], demandes: ['voir', 'creer', 'modifier'], equipements: ['voir'], plans: ['voir'] }),
+    },
+    {
+      nom: 'Responsable qualité', description: 'Organise les audits clients, certifications et visites du site ; suit les constats et les plans d\'actions', niveau: 2, estAdmin: false, portee: 'site', couleur: '#7c3aed', systeme: true,
+      permissions: set(vide(), { dashboard: ['voir'], visites: ['voir', 'creer', 'modifier', 'supprimer', 'valider', 'exporter'], demandes: ['voir', 'creer'], ot: ['voir'], equipements: ['voir'], plans: ['voir'], rapports: ['voir', 'exporter'], fournisseurs: ['voir'], rh: ['voir'], audit: ['voir'] }),
     },
     {
       nom: 'Gestionnaire RH', description: 'Suit le personnel : contrats, habilitations, formations, visites médicales, absences', niveau: 3, estAdmin: false, portee: 'site', couleur: '#db2777', systeme: true,
@@ -297,6 +345,13 @@ function seed(db, options = {}) {
     db.insert('profils', Object.assign({ secteurId: null, actif: true }, profilsParDefaut()[0]));
   }
   migrerProfilsSysteme(db);
+
+  // Journal d'activité : destinataires des notifications par défaut (rôles responsables)
+  const cfgJ = db.getConfig();
+  if (cfgJ.journal && !Array.isArray(cfgJ.journal.profilsNotifies)) {
+    cfgJ.journal.profilsNotifies = db.list('profils', (p) => ['Responsable maintenance', 'Pôle informatique'].includes(p.nom)).map((p) => p.id);
+    db.setConfig(cfgJ);
+  }
 
   // Secteurs : un site principal et ses services
   if (db.count('secteurs') === 0) {
