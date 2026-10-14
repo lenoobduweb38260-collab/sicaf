@@ -7,6 +7,8 @@
  * - Les segments ":nom" sont capturés dans req.params.
  * - Une route marquée { public: true } ne nécessite pas d'authentification.
  * - { perm: [module, action] } vérifie automatiquement la permission.
+ * - { maxBody: octets } relève la taille maximale du corps (25 Mo par défaut).
+ * - { brut: true } fournit le corps binaire brut (Buffer) dans req.body (à combiner avec public + authentification propre).
  * - La valeur retournée par le gestionnaire est sérialisée en JSON.
  */
 

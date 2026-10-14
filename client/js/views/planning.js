@@ -278,7 +278,11 @@
       const body = {};
       const jourActuel = jourDe(o.datePrevue);
       if (jour !== undefined && jour !== jourActuel) body.datePrevue = jour;
-      if (technicienId !== undefined && g.source !== undefined && technicienId !== g.source && technicienId !== o.technicienId) body.technicienId = technicienId;
+      if (technicienId !== undefined && technicienId !== o.technicienId) {
+        // Depuis une ligne de technicien : seul un changement de ligne réaffecte ; depuis le panneau : la ligne cible fait foi
+        const changeLigne = g.source === undefined ? true : technicienId !== g.source;
+        if (changeLigne) body.technicienId = technicienId;
+      }
       if (!Object.keys(body).length) return;
       try {
         const r = await api.put('/api/planning/ot/' + o.id, body);
@@ -382,14 +386,14 @@
       const { du, au, mois } = bornes();
       const moisCourant = mois.slice(0, 7);
       const idx = parJour();
-      const cal = el('div', { class: 'calendrier', role: 'grid', 'aria-label': `Planning de ${libellePeriode()}` });
+      const cal = el('div', { class: 'calendrier', role: 'region', 'aria-label': `Planning de ${libellePeriode()}` });
       JOURS_COURTS.forEach((j, i) => cal.appendChild(el('div', { class: 'cal-entete', title: majuscule(JOURS[i]) }, j)));
       for (let jour = du; jour <= au; jour = ajouterJours(jour, 1)) {
         const items = idx.get(jour) || { ot: [], ech: [] };
         const horsMois = jour.slice(0, 7) !== moisCourant;
         const weekEnd = jourSemaine(jour) >= 5;
         const cell = el('div', {
-          class: 'cal-jour' + (horsMois ? ' hors-mois' : '') + (jour === donnees.aujourdhui ? ' aujourdhui' : ''), dataset: { jour }, role: 'gridcell',
+          class: 'cal-jour' + (horsMois ? ' hors-mois' : '') + (jour === donnees.aujourdhui ? ' aujourdhui' : ''), dataset: { jour },
           style: Object.assign({ minHeight: '112px', minWidth: 0 }, weekEnd && !horsMois ? { background: 'var(--surface-2)' } : {}),
           title: peutCreerOt() ? 'Double-clic : nouvel OT ce jour' : null,
         });
@@ -416,7 +420,7 @@
       const { du } = bornes();
       const idx = parJour();
       const jours = Array.from({ length: 7 }, (_, i) => ajouterJours(du, i));
-      const cal = el('div', { class: 'calendrier', role: 'grid', 'aria-label': `Planning de la ${libellePeriode()}` });
+      const cal = el('div', { class: 'calendrier', role: 'region', 'aria-label': `Planning de la ${libellePeriode()}` });
       jours.forEach((jour, i) => {
         const items = idx.get(jour) || { ot: [], ech: [] };
         const estAuj = jour === donnees.aujourdhui;
@@ -432,7 +436,7 @@
       jours.forEach((jour) => {
         const items = idx.get(jour) || { ot: [], ech: [] };
         const cell = el('div', {
-          class: 'cal-jour' + (jour === donnees.aujourdhui ? ' aujourdhui' : ''), dataset: { jour }, role: 'gridcell',
+          class: 'cal-jour' + (jour === donnees.aujourdhui ? ' aujourdhui' : ''), dataset: { jour },
           style: Object.assign({ minHeight: '380px', padding: '6px', minWidth: 0 }, jourSemaine(jour) >= 5 ? { background: 'var(--surface-2)' } : {}),
         });
         items.ot.forEach((o) => cell.appendChild(carteOt(o, { glissable: peutModifier() && o.deplacable })));
@@ -824,7 +828,7 @@
       const html = `<h1>${esc(libellePeriode())}</h1>`
         + `<p>Du ${esc(ui.formatDate(du))} au ${esc(ui.formatDate(au))}${filtres.length ? ' · ' + esc(filtres.join(' · ')) : ''}<br>`
         + `${esc(pluriel(t.nbOt || 0, 'ordre de travail', 'ordres de travail'))} (${esc(duree(t.heures))} estimées)${etat.echeances ? ' · ' + esc(pluriel(t.nbEcheances || 0, 'échéance préventive', 'échéances préventives')) : ''} · ${esc(pluriel(t.nbNonPlanifies || 0, 'OT non planifié', 'OT non planifiés'))}</p>`
-        + `<h2>${esc(VUES.find((v) => v.cle === etat.vue).label === 'Mois' ? 'Calendrier du mois' : (etat.vue === 'semaine' ? 'Calendrier de la semaine' : 'Planning par technicien'))}</h2>${grille}`
+        + `<h2>${esc({ mois: 'Calendrier du mois', semaine: 'Calendrier de la semaine', technicien: 'Planning par technicien' }[etat.vue])}</h2>${grille}`
         + `<h2>Détail des interventions (${lignes.length})</h2>${detail}`;
       ui.imprimer(`Planning — ${libellePeriode()}`, html);
     }

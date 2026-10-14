@@ -320,6 +320,12 @@
           peutModifier() ? ui.bouton('Exporter toutes les données (JSON)', { icone: 'export', onClic: () => api.telecharger('/api/export').catch(erreur) }) : null,
           peutModifier() ? ui.bouton('Importer un fichier d\'export', { icone: 'import', onClic: () => inputImport.click() }) : null, inputImport),
         tableau.el)));
+      // Sauvegardes avancées (destinations multiples, autres sites) fournies par client/js/lib/sauvegardes-ui.js
+      if (typeof GMAO.rendreSauvegardesAvancees === 'function') {
+        const zone = el('div');
+        cont.appendChild(zone);
+        try { GMAO.rendreSauvegardesAvancees(zone); } catch (e) { zone.appendChild(ui.alerte('Sauvegardes avancées indisponibles : ' + e.message, 'danger')); }
+      }
       cont.appendChild(ui.carte('Données de démonstration', frag(
         el('p', { class: 'texte-2 texte-petit' }, 'Ajoute des utilisateurs (mot de passe « demo »), secteurs, équipements, interventions, articles et fournisseurs d\'exemple pour découvrir l\'application. Les données existantes sont conservées.'),
         peutModifier() ? ui.bouton('Charger les données de démonstration', { icone: 'lecture', onClic: async () => {

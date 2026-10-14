@@ -29,13 +29,14 @@ const MAX_BODY = 25 * 1024 * 1024; // 25 Mo (logos, pièces jointes en base64)
 const AUDIT_MAX = 5000;
 const NOTIF_MAX = 2000;
 
-function readBody(req) {
+function readBody(req, max) {
+  const limite = max || MAX_BODY;
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
     req.on('data', (c) => {
       size += c.length;
-      if (size > MAX_BODY) { reject(new HttpError(413, 'Requête trop volumineuse')); req.destroy(); return; }
+      if (size > limite) { reject(new HttpError(413, 'Requête trop volumineuse')); req.destroy(); return; }
       chunks.push(c);
     });
     req.on('end', () => resolve(Buffer.concat(chunks)));
@@ -208,9 +209,11 @@ function createApp(options = {}) {
 
     // Corps JSON
     if (req.method !== 'GET' && req.method !== 'HEAD') {
-      const raw = await readBody(req);
+      const raw = await readBody(req, route.opts.maxBody);
       const ct = String(req.headers['content-type'] || '');
-      if (raw.length && ct.includes('application/json')) {
+      if (route.opts.brut) {
+        req.body = raw; // corps binaire brut (ex. réception d'une sauvegarde d'un autre site)
+      } else if (raw.length && ct.includes('application/json')) {
         try { req.body = JSON.parse(raw.toString('utf8')); } catch (e) { throw new HttpError(400, 'JSON invalide'); }
       } else if (raw.length && ct.includes('text/')) {
         req.body = raw.toString('utf8');
@@ -218,7 +221,7 @@ function createApp(options = {}) {
         req.body = raw.length ? raw : {};
       }
       // Protection CSRF simple : en-tête personnalisé obligatoire pour les mutations
-      if (!route.opts.public && req.headers['x-requested-with'] !== 'GMAO') {
+      if (!route.opts.public && !route.opts.brut && req.headers['x-requested-with'] !== 'GMAO') {
         throw new HttpError(403, 'En-tête X-Requested-With manquant');
       }
     } else {
