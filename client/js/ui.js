@@ -70,6 +70,16 @@
     glisser: '<circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/>',
     haut: '<path d="M18 15l-6-6-6 6"/>',
     bas: '<path d="M6 9l6 6 6-6"/>',
+    codebarre: '<path d="M3 5v14M6 5v14M8 5v14M11 5v14M14 5v14M16 5v14M19 5v14M21 5v14"/>',
+    plan3d: '<path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 22V12M21 7l-9 5-9-5"/>',
+    site: '<path d="M2 21h20M4 21V10l6-4v15M10 21V4l10 5v12M14 9v.01M14 13v.01M14 17v.01M17 11v.01M17 15v.01M7 13v.01M7 17v.01"/>',
+    camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+    cube: '<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>',
+    achats: '<circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/>',
+    facture: '<path d="M4 2v20l3-2 3 2 3-2 3 2 3-2 1 .67V2l-1 .67L16 2l-3 2-3-2-3 2z"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+    rh: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6M22 11h-6"/>',
+    diplome: '<circle cx="12" cy="8" r="6"/><path d="M15.48 12.89L17 22l-5-3-5 3 1.52-9.11"/>',
+    calendrier: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
     engrenage: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
   };
 
@@ -201,15 +211,30 @@
     if (opts.vide !== false) out.unshift({ value: '', label: opts.vide || '— Choisir —' });
     return out;
   }
+  /** Identifiants des secteurs du site choisi dans l'en-tête (null = tous les sites). */
+  function secteursDuSiteCourant() {
+    const g = G();
+    const siteId = g.siteCourant ? g.siteCourant() : null;
+    if (siteId == null) return null;
+    const all = refs().secteurs;
+    const out = new Set([siteId]);
+    let change = true;
+    while (change) { change = false; for (const s of all) if (s.parentId != null && out.has(Number(s.parentId)) && !out.has(s.id)) { out.add(s.id); change = true; } }
+    return out;
+  }
   function optionsUsers(opts = {}) {
     let us = refs().users.filter((u) => opts.inactifs ? true : u.actif !== false);
+    const duSite = opts.tousSites ? null : secteursDuSiteCourant();
+    if (duSite) us = us.filter((u) => !(u.secteurIds || []).length || u.secteurIds.some((s) => duSite.has(Number(s))) || (u.siteAcces || []).some((a) => duSite.has(Number(a.siteId))));
     if (opts.filtre) us = us.filter(opts.filtre);
     const out = us.sort((a, b) => nomUser(a.id).localeCompare(nomUser(b.id))).map((u) => ({ value: u.id, label: nomUser(u.id) + (u.fonction ? ` (${u.fonction})` : '') }));
     if (opts.vide !== false) out.unshift({ value: '', label: opts.vide || '— Aucun —' });
     return out;
   }
   function optionsSecteurs(opts = {}) {
-    const all = refs().secteurs.filter((s) => opts.inactifs ? true : s.actif !== false);
+    const duSite = opts.tousSites ? null : secteursDuSiteCourant();
+    const all = refs().secteurs.filter((s) => (opts.inactifs ? true : s.actif !== false) && (!duSite || duSite.has(s.id)));
+    if (opts.typeSite) return all.filter((s) => s.type === 'site').map((s) => ({ value: s.id, label: s.nom, couleur: s.couleur }));
     const out = [];
     const walk = (parentId, niveau) => {
       all.filter((s) => (s.parentId == null ? null : s.parentId) === parentId).sort((a, b) => (a.ordre || 0) - (b.ordre || 0) || a.nom.localeCompare(b.nom)).forEach((s) => {
@@ -218,8 +243,8 @@
       });
     };
     walk(null, 0);
-    // secteurs orphelins (parent supprimé)
-    all.filter((s) => s.parentId != null && !all.some((p) => p.id === s.parentId) && !out.some((o) => o.value === s.id)).forEach((s) => out.push({ value: s.id, label: s.nom, couleur: s.couleur }));
+    // racines du sous-arbre (site courant) et secteurs orphelins (parent supprimé ou hors site)
+    all.filter((s) => s.parentId != null && !all.some((p) => p.id === s.parentId) && !out.some((o) => o.value === s.id)).forEach((s) => { out.push({ value: s.id, label: s.nom, couleur: s.couleur }); walk(s.id, 1); });
     if (opts.vide !== false) out.unshift({ value: '', label: opts.vide || '— Aucun —' });
     return out;
   }
@@ -1033,7 +1058,7 @@
   window.ui = {
     ICONES, icone, esc, el, frag, vider, append, debounce, matriceDroits,
     formatDate, formatHeure, formatDateHeure, dateISO, dateHeureLocale, aujourdhui, formatNombre, formatMontant, formatDuree, relatif, joursEntre, initiales, parseDate,
-    liste, itemListe, libelle, couleur, user, nomUser, secteur, nomSecteur, cheminSecteur, profil, nomProfil,
+    liste, itemListe, libelle, couleur, user, nomUser, secteur, nomSecteur, cheminSecteur, profil, nomProfil, secteursDuSiteCourant,
     optionsListe, optionsUsers, optionsSecteurs, optionsProfils,
     badge, badgeListe, pastille, toast, erreur, modal, fermerModales, confirm, prompt,
     form, formModal, lireFichier, champsPersoDefs, champsPersoValeurs, champsPersoInitiaux, champsPersoAffichage,

@@ -90,18 +90,29 @@ function createApp(options = {}) {
       }
     },
 
-    /** L'utilisateur courant peut-il voir cet enregistrement (portée) ? */
-    canSee(req, record) { return perms.canSeeRecord(req.perms, req.user, record); },
+    /**
+     * L'utilisateur courant peut-il voir cet enregistrement (portée, site courant) ?
+     * Pendant une requête de modification (POST/PUT/PATCH/DELETE), les sites accessibles
+     * en lecture seule sont exclus.
+     */
+    canSee(req, record) { return perms.canSeeRecord(req.perms, req.user, record, { ecriture: !!req.ecriture }); },
 
-    /** Filtre une liste selon la portée de l'utilisateur. */
-    scope(req, rows) { return (rows || []).filter((r) => perms.canSeeRecord(req.perms, req.user, r)); },
+    /** Filtre une liste selon la portée de l'utilisateur (et le site courant). */
+    scope(req, rows) { const o = { ecriture: !!req.ecriture }; return (rows || []).filter((r) => perms.canSeeRecord(req.perms, req.user, r, o)); },
 
-    /** Récupère un enregistrement visible ou lève 404. */
+    /** Récupère un enregistrement visible ou lève 404 (403 si le site n'est accessible qu'en lecture). */
     getVisible(req, collection, id) {
       const rec = db.get(collection, id);
-      if (!rec || !perms.canSeeRecord(req.perms, req.user, rec)) throw new HttpError(404, 'Élément introuvable');
-      return rec;
+      if (!rec) throw new HttpError(404, 'Élément introuvable');
+      if (perms.canSeeRecord(req.perms, req.user, rec, { ecriture: !!req.ecriture })) return rec;
+      if (req.ecriture && perms.canSeeRecord(req.perms, req.user, rec)) {
+        throw new HttpError(403, 'Ce site est accessible en lecture seule pour vous : modification impossible');
+      }
+      throw new HttpError(404, 'Élément introuvable');
     },
+
+    /** Site (secteur de type « site ») d'un secteur, ou null. */
+    siteDuSecteur(secteurId) { return perms.siteDuSecteur(db, secteurId); },
 
     /** Journal d'audit. */
     audit(req, action, entite, entiteId, details) {
@@ -221,9 +232,11 @@ function createApp(options = {}) {
     req.session = session;
     req.user = session ? db.get('users', session.userId) : null;
     if (req.user && req.user.actif === false) { sessions.destroy(session.token); req.user = null; req.session = null; }
+    req.ecriture = req.method !== 'GET' && req.method !== 'HEAD';
     if (req.user) {
       req.profil = db.get('profils', req.user.profilId);
       req.perms = perms.effectivePermissions(db, req.user, req.profil, db.getConfig());
+      perms.appliquerSiteCourant(db, req.perms, req.headers['x-gmao-site']);
     }
 
     if (!route.opts.public && !req.user) throw new HttpError(401, 'Authentification requise');
@@ -302,16 +315,19 @@ function registerCoreRoutes(ctx) {
 
   function bootstrap(req) {
     const config = db.getConfig();
+    // Les secrets de sauvegarde ne sont jamais envoyés au navigateur
+    if (config.sauvegardes) { delete config.sauvegardes.cleReception; delete config.sauvegardes.destinations; delete config.sauvegardes.motDePasseChiffrement; }
     const modules = perms.modulesConfigures(config);
-    const secteurs = db.list('secteurs').sort((a, b) => (a.ordre || 0) - (b.ordre || 0) || a.nom.localeCompare(b.nom));
+    const secteurs = db.list('secteurs').sort((a, b) => (a.ordre || 0) - (b.ordre || 0) || a.nom.localeCompare(b.nom))
+      .map((s) => Object.assign({}, s, { siteId: perms.siteDuSecteur(db, s.id) }));
     const profils = db.list('profils').map((p) => ({ id: p.id, nom: p.nom, niveau: p.niveau, couleur: p.couleur, secteurId: p.secteurId, estAdmin: !!p.estAdmin, portee: p.portee, actif: p.actif !== false }));
-    const users = db.list('users').map((u) => ({ id: u.id, login: u.login, nom: u.nom, prenom: u.prenom, profilId: u.profilId, secteurIds: u.secteurIds || [], managerId: u.managerId, actif: u.actif !== false, fonction: u.fonction || '' }));
+    const users = db.list('users').map((u) => ({ id: u.id, login: u.login, nom: u.nom, prenom: u.prenom, profilId: u.profilId, secteurIds: u.secteurIds || [], siteAcces: u.siteAcces || [], managerId: u.managerId, actif: u.actif !== false, fonction: u.fonction || '' }));
     return {
       user: auth.cleanUser(req.user),
       permissions: req.perms,
       config,
       modules,
-      catalogue: { modules: perms.MODULES, actions: perms.ACTIONS, portees: perms.PORTEES },
+      catalogue: { modules: perms.MODULES, actions: perms.ACTIONS, portees: perms.PORTEES, modesSite: perms.MODES_SITE },
       references: { secteurs, profils, users },
       version: ctx.version,
       serveur: { heure: new Date().toISOString() },
@@ -336,6 +352,7 @@ function registerCoreRoutes(ctx) {
     req.user = db.get('users', user.id);
     req.profil = db.get('profils', req.user.profilId);
     req.perms = perms.effectivePermissions(db, req.user, req.profil, db.getConfig());
+    perms.appliquerSiteCourant(db, req.perms, req.headers['x-gmao-site']);
     ctx.audit(req, 'connexion', 'users', user.id, '');
     return bootstrap(req);
   }, { public: true });
@@ -387,9 +404,13 @@ function registerCoreRoutes(ctx) {
 
   /** Liste des vues client (fichiers client/js/views/*.js) pour chargement dynamique. */
   router.get('/api/views', async () => {
-    const dir = path.join(ctx.clientDir, 'js', 'views');
-    if (!fs.existsSync(dir)) return [];
-    return fs.readdirSync(dir).filter((f) => f.endsWith('.js')).sort().map((f) => '/js/views/' + f);
+    const lister = (sous) => {
+      const dir = path.join(ctx.clientDir, 'js', sous);
+      if (!fs.existsSync(dir)) return [];
+      return fs.readdirSync(dir).filter((f) => f.endsWith('.js')).sort().map((f) => `/js/${sous}/${f}`);
+    };
+    // Bibliothèques partagées (client/js/lib) chargées avant les vues (client/js/views)
+    return { libs: lister('lib'), vues: lister('views') };
   }, { public: true });
 }
 

@@ -15,6 +15,11 @@
     }
   }
 
+  /** Site choisi dans l'en-tête (« tous » ou identifiant), mémorisé sur le poste. */
+  function siteCourant() {
+    try { return localStorage.getItem('gmao.site') || ''; } catch (e) { return ''; }
+  }
+
   async function request(method, url, body, options = {}) {
     if (options.query) {
       const qs = new URLSearchParams();
@@ -23,6 +28,8 @@
       if (s) url += (url.includes('?') ? '&' : '?') + s;
     }
     const headers = { 'X-Requested-With': 'GMAO' };
+    const site = siteCourant();
+    if (site) headers['X-GMAO-Site'] = site;
     let payload;
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -54,6 +61,8 @@
 
   window.api = {
     ApiError,
+    siteCourant,
+    setSiteCourant(v) { try { if (v) localStorage.setItem('gmao.site', String(v)); else localStorage.removeItem('gmao.site'); } catch (e) { /* ignore */ } },
     get: (url, query, options) => request('GET', url, undefined, Object.assign({ query }, options || {})),
     post: (url, body, options) => request('POST', url, body === undefined ? {} : body, options),
     put: (url, body, options) => request('PUT', url, body === undefined ? {} : body, options),
@@ -61,7 +70,9 @@
     del: (url, options) => request('DELETE', url, undefined, options),
     /** Télécharge un fichier produit par l'API (CSV, export JSON). */
     telecharger: async (url, nomFichier) => {
-      const res = await fetch(url, { credentials: 'same-origin', headers: { 'X-Requested-With': 'GMAO' } });
+      const h = { 'X-Requested-With': 'GMAO' };
+      if (siteCourant()) h['X-GMAO-Site'] = siteCourant();
+      const res = await fetch(url, { credentials: 'same-origin', headers: h });
       if (!res.ok) {
         let msg = `Erreur ${res.status}`;
         try { msg = (await res.json()).erreur || msg; } catch (e) { /* ignore */ }

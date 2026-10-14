@@ -8,6 +8,17 @@ const { test, describe, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { demarrer } = require('./helpers');
 
+/** Recherche récursive d'un nœud de secteur dans l'arbre (les services sont sous un site). */
+function noeudSecteur(noeuds, id) {
+  for (const n of noeuds || []) {
+    if (n.type === 'secteur' && n.id === id) return n;
+    const r = noeudSecteur((n.enfants || []).filter((e) => e.type === 'secteur'), id);
+    if (r) return r;
+  }
+  return null;
+}
+function tousLesSecteurs(noeuds) { return (noeuds || []).filter((n) => n.type === 'secteur').flatMap((n) => [n, ...tousLesSecteurs(n.enfants)]); }
+
 describe('Module Équipements', () => {
   let srv, admin, prod, maint, log, profils;
   let compresseur, moteur;
@@ -52,7 +63,7 @@ describe('Module Équipements', () => {
     assert.equal(compresseur.criticiteCode, 'A');
     assert.equal(compresseur.actif, true);
     assert.equal(compresseur.createdBy, 1);
-    assert.equal(compresseur.secteurChemin, 'Production');
+    assert.ok(compresseur.secteurChemin.endsWith('Production'), compresseur.secteurChemin);
     assert.deepEqual(compresseur.compteur, { valeur: 100, unite: 'heures' });
     assert.equal(compresseur.compteurReleves.length, 1, 'un relevé initial est historisé quand la valeur est non nulle');
     assert.equal(compresseur.nbOtOuverts, 0);
@@ -112,8 +123,9 @@ describe('Module Équipements', () => {
 
   test('arbre : secteurs → équipements → sous-équipements avec compteurs', async () => {
     const arbre = await admin.ok('GET', '/api/equipements-arbre');
-    assert.ok(arbre.length >= 5 && arbre.every((n) => n.type === 'secteur'));
-    const nProd = arbre.find((n) => n.id === prod.id);
+    assert.ok(arbre.length >= 1 && arbre.every((n) => n.type === 'secteur'));
+    assert.ok(tousLesSecteurs(arbre).length >= 5, 'site et services présents dans l\'arbre');
+    const nProd = noeudSecteur(arbre, prod.id);
     assert.ok(nProd, 'secteur Production présent');
     const nComp = nProd.enfants.find((n) => n.type === 'equipement' && n.id === compresseur.id);
     assert.ok(nComp, 'le compresseur est sous Production');
@@ -344,9 +356,9 @@ describe('Module Équipements', () => {
     assert.equal((await chef.get('/api/equipements-export')).status, 403, 'chef de secteur : pas de droit exporter');
 
     const arbre = await chef.ok('GET', '/api/equipements-arbre');
-    const nMaint = arbre.find((n) => n.id === maint.id);
+    const nMaint = noeudSecteur(arbre, maint.id);
     assert.equal(nMaint.nbEquipements, 0, 'secteur hors portée vide dans l\'arbre');
-    assert.ok(arbre.find((n) => n.id === prod.id).nbEquipements >= 1);
+    assert.ok(noeudSecteur(arbre, prod.id).nbEquipements >= 1);
 
     // Portée « perso » (demandeur) : équipements visibles par secteur de rattachement
     const demLog = await creerUtilisateur('demlog', 'Demandeur', [log.id]);

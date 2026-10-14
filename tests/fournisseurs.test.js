@@ -239,7 +239,7 @@ describe('Module Fournisseurs & prestataires', () => {
       assert.equal(d.stats.coutExterneTotal, 2350.5);
       assert.equal(d.stats.totalAchats, 755);
       assert.equal(d.stats.nbEquipementsSousGarantie, 1);
-      assert.deepEqual(d.references, { articles: 2, equipements: 2, ot: 3, mouvements: 4, total: 11 });
+      assert.deepEqual(d.references, { articles: 2, equipements: 2, ot: 3, mouvements: 4, autres: {}, total: 11 });
       const liste = await admin.ok('GET', '/api/fournisseurs');
       const l = liste.find((f) => f.id === atlas.id);
       assert.equal(l.nbArticles, 2);
@@ -389,6 +389,23 @@ describe('Module Fournisseurs & prestataires', () => {
       assert.equal(sans.status, 200);
       assert.ok(!sans.body.split('\r\n')[0].includes('Total des achats'));
     });
+  });
+
+  test('suppression : références d\'autres modules (ex. commandes d\'achat) prises en compte', async () => {
+    const f = await admin.ok('POST', '/api/fournisseurs', { nom: 'Fournisseur commandé' });
+    const cde = srv.db.insert('commandes', { numero: 'CDE-T-001', fournisseurId: f.id, lignes: [] });
+    const contrat = srv.db.insert('contrats', { objet: 'Maintenance', fournisseurIds: [f.id] });
+    let d = await admin.ok('GET', '/api/fournisseurs/' + f.id);
+    assert.deepEqual(d.references.autres, { commandes: 1, contrats: 1 });
+    assert.equal(d.references.total, 2);
+    const r = await admin.ok('DELETE', '/api/fournisseurs/' + f.id);
+    assert.equal(r.desactive, true, 'référencé par une commande : désactivé');
+    assert.match(derniersAudits(1)[0].details, /1 commande\(s\) fournisseur, 1 contrat\(s\)/);
+    srv.db.remove('commandes', cde.id);
+    srv.db.remove('contrats', contrat.id);
+    d = await admin.ok('GET', '/api/fournisseurs/' + f.id);
+    assert.equal(d.references.total, 0);
+    assert.equal((await admin.ok('DELETE', '/api/fournisseurs/' + f.id)).desactive, false);
   });
 
   test('champs personnalisés : validation et stockage', async () => {

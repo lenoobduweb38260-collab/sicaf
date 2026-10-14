@@ -7,7 +7,7 @@
 const nom = 'Secteurs';
 
 function register(ctx) {
-  const { router, db, HttpError } = ctx;
+  const { router, db, HttpError, perms } = ctx;
 
   function valider(body, existant) {
     const out = {};
@@ -38,7 +38,25 @@ function register(ctx) {
     if (responsableId != null && !db.get('users', responsableId)) throw new HttpError(400, 'Responsable invalide');
     out.responsableId = responsableId;
     out.actif = body.actif === undefined ? (existant ? existant.actif !== false : true) : !!body.actif;
+    out.type = ctx.codeListe('typesSecteur', body.type === undefined ? (existant ? existant.type : (parentId == null ? 'site' : 'service')) : body.type);
+    // Informations propres à un site (adresse, téléphone…)
+    if (out.type === 'site') {
+      const src = body.infosSite || (existant && existant.infosSite) || {};
+      out.infosSite = { adresse: String(src.adresse || '').slice(0, 300), ville: String(src.ville || '').slice(0, 120), telephone: String(src.telephone || '').slice(0, 40), email: String(src.email || '').slice(0, 120) };
+    }
     return out;
+  }
+
+  /** Gestion des secteurs : Configuration › Modifier, ou Plans 3D › Modifier (le responsable maintenance modélise ses sites). */
+  function exigerGestion(req, cible) {
+    if (!perms.can(req.perms, 'configuration', 'modifier') && !perms.can(req.perms, 'plans', 'modifier')) {
+      throw new HttpError(403, 'Droit insuffisant : Configuration › Modifier ou Plans 3D › Modifier');
+    }
+    if (req.perms.estAdmin || req.perms.portee === 'tous') return;
+    // Périmètre : on ne gère que les secteurs (et sous-secteurs) de ses propres sites / secteurs
+    const ids = (cible || []).filter((x) => x != null).map(Number);
+    if (!ids.length) throw new HttpError(403, 'Seul un utilisateur ayant accès à tous les sites peut créer un nouveau site racine');
+    for (const id of ids) if (!req.perms.secteurIds.includes(id)) throw new HttpError(403, 'Ce secteur est hors de votre périmètre');
   }
 
   function enrichir(s) {
@@ -48,6 +66,8 @@ function register(ctx) {
       nbUtilisateurs: db.count('users', (u) => (u.secteurIds || []).includes(s.id)),
       nbProfils: db.count('profils', (p) => p.secteurId === s.id),
       nbEquipements: db.count('equipements', (e) => e.secteurId === s.id),
+      siteId: perms.siteDuSecteur(db, s.id),
+      typeLabel: (ctx.liste('typesSecteur').find((t) => t.code === s.type) || {}).label || s.type || '',
     });
   }
 
@@ -64,6 +84,13 @@ function register(ctx) {
     return racines;
   });
 
+  /** Sites (secteurs de type « site ») ; `accessibles` = ceux de l'utilisateur courant avec leur mode d'accès. */
+  router.get('/api/sites', async (req) => ({
+    sites: perms.sites(db).map(enrichir),
+    accessibles: req.perms.sites,
+    siteCourantId: req.perms.siteCourantId,
+  }));
+
   router.get('/api/secteurs/:id', async (req) => {
     const s = db.get('secteurs', req.params.id);
     if (!s) throw new HttpError(404, 'Secteur introuvable');
@@ -71,18 +98,22 @@ function register(ctx) {
   });
 
   router.post('/api/secteurs', async (req) => {
-    const s = db.insert('secteurs', valider(req.body || {}, null));
+    const body = req.body || {};
+    exigerGestion(req, [body.parentId == null || body.parentId === '' ? null : Number(body.parentId)]);
+    const s = db.insert('secteurs', valider(body, null));
     ctx.audit(req, 'creation', 'secteurs', s.id, `Secteur ${s.nom}`);
     return enrichir(s);
-  }, { perm: ['configuration', 'modifier'] });
+  });
 
   router.put('/api/secteurs/:id', async (req) => {
     const existant = db.get('secteurs', req.params.id);
     if (!existant) throw new HttpError(404, 'Secteur introuvable');
+    const body = req.body || {};
+    exigerGestion(req, [existant.id, body.parentId === undefined ? existant.parentId : (body.parentId === '' ? null : body.parentId)]);
     const s = db.update('secteurs', existant.id, valider(req.body || {}, existant));
     ctx.audit(req, 'modification', 'secteurs', s.id, `Secteur ${s.nom}`);
     return enrichir(s);
-  }, { perm: ['configuration', 'modifier'] });
+  });
 
   router.delete('/api/secteurs/:id', async (req) => {
     const existant = db.get('secteurs', req.params.id);

@@ -27,6 +27,13 @@ function register(ctx) {
       if (it.final !== undefined) out.final = !!it.final;
       if (it.delaiHeures !== undefined) out.delaiHeures = Number(it.delaiHeures) || 0;
       if (it.description !== undefined) out.description = String(it.description || '');
+      // Propriétés complémentaires propres à une liste (ex. dureeMois des habilitations) : valeurs simples uniquement
+      for (const [k, v] of Object.entries(it || {})) {
+        if (out[k] !== undefined || ['code', 'label', 'ordre'].includes(k) || !/^[a-zA-Z]\w{0,30}$/.test(k)) continue;
+        if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+        else if (typeof v === 'boolean') out[k] = v;
+        else if (typeof v === 'string' && v.length <= 200) out[k] = v;
+      }
       return out;
     });
   }
@@ -126,6 +133,12 @@ function register(ctx) {
         genererAuto: b.preventif.genererAuto === undefined ? cfg.preventif.genererAuto : !!b.preventif.genererAuto,
       });
     }
+    // Sections simples des modules (étiquettes, inventaire, achats, RH, plans, sauvegardes) :
+    // seules les clés connues sont acceptées, avec le même type que la valeur par défaut.
+    const defaut = configParDefaut();
+    for (const section of ['etiquettes', 'inventaire', 'achats', 'rh', 'plans', 'sauvegardes']) {
+      if (b[section] && typeof b[section] === 'object') cfg[section] = fusionTypee(cfg[section], b[section], defaut[section], section === 'sauvegardes' ? SECRETS_SAUVEGARDE : []);
+    }
     if (b.listes) {
       for (const k of Object.keys(b.listes)) {
         if (!/^[a-zA-Z][\w]{0,40}$/.test(k)) continue;
@@ -141,14 +154,14 @@ function register(ctx) {
     return cfg;
   }
 
-  router.get('/api/configuration', async () => completer(db.getConfig(), configParDefaut()), { perm: ['configuration', 'voir'] });
+  router.get('/api/configuration', async () => masquerSecrets(completer(db.getConfig(), configParDefaut())), { perm: ['configuration', 'voir'] });
 
   router.put('/api/configuration', async (req) => {
     const cfg = validerConfig(req.body);
     db.setConfig(cfg);
     ctx.audit(req, 'modification', 'configuration', null, Object.keys(req.body || {}).join(', '));
     ctx.emit('configuration:modifiee', cfg);
-    return cfg;
+    return masquerSecrets(cfg);
   }, { perm: ['configuration', 'modifier'] });
 
   /** Réinitialise une section à ses valeurs par défaut (ex. listes). */
@@ -160,7 +173,7 @@ function register(ctx) {
     cfg[section] = def[section];
     db.setConfig(cfg);
     ctx.audit(req, 'reinitialisation', 'configuration', null, section);
-    return cfg;
+    return masquerSecrets(cfg);
   }, { perm: ['configuration', 'modifier'] });
 
   // ----- Sauvegardes ------------------------------------------------------
@@ -217,4 +230,38 @@ function register(ctx) {
 
 const DEMARRAGE = new Date().toISOString();
 
-module.exports = { nom, register, TYPES_CHAMPS };
+/** Clés secrètes de la section sauvegardes : jamais renvoyées au client, jamais modifiées par PUT /api/configuration. */
+const SECRETS_SAUVEGARDE = ['cleReception', 'destinations', 'motDePasseChiffrement'];
+
+/**
+ * Fusionne `src` dans `cible` en n'acceptant que les clés présentes dans `defaut`, avec le même type
+ * (booléen, nombre fini, chaîne ≤ 500 caractères, objet → récursif). Les tableaux et les clés `interdites` sont ignorés.
+ */
+function fusionTypee(cible, src, defaut, interdites) {
+  const out = Object.assign({}, defaut || {}, cible || {});
+  for (const [k, v] of Object.entries(src || {})) {
+    if ((interdites || []).includes(k) || !defaut || !(k in defaut)) continue;
+    const d = defaut[k];
+    if (Array.isArray(d)) continue;
+    if (typeof d === 'boolean') out[k] = !!v;
+    else if (typeof d === 'number') { const n = Number(v); if (Number.isFinite(n)) out[k] = n; }
+    else if (typeof d === 'string') { if (v != null) out[k] = String(v).slice(0, 500); }
+    else if (d && typeof d === 'object' && v && typeof v === 'object') out[k] = fusionTypee(out[k], v, d, []);
+  }
+  return out;
+}
+
+/** Copie de la configuration sans les secrets (clé de réception, destinations de sauvegarde). */
+function masquerSecrets(cfg) {
+  const c = JSON.parse(JSON.stringify(cfg || {}));
+  if (c.sauvegardes) {
+    c.sauvegardes.cleReceptionDefinie = !!c.sauvegardes.cleReception;
+    delete c.sauvegardes.cleReception;
+    delete c.sauvegardes.motDePasseChiffrement;
+    c.sauvegardes.nbDestinations = Array.isArray(c.sauvegardes.destinations) ? c.sauvegardes.destinations.length : 0;
+    delete c.sauvegardes.destinations;
+  }
+  return c;
+}
+
+module.exports = { nom, register, TYPES_CHAMPS, fusionTypee, masquerSecrets };

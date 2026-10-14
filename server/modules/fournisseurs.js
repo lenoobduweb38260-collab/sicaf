@@ -56,6 +56,14 @@ function douzeDerniersMois() {
 }
 function dateLocale(d) { const x = d ? new Date(d) : new Date(); return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`; }
 
+/** Collections traitées explicitement (ou sans lien possible avec un fournisseur) lors du comptage des références. */
+const COLLECTIONS_CONNUES = new Set([ENTITE, 'articles', 'equipements', 'ot', 'mouvementsStock', 'audit', 'notifications', 'users', 'profils', 'secteurs']);
+/** Libellés des collections d'autres modules pouvant référencer un fournisseur. */
+const LIBELLES_COLLECTIONS = {
+  commandes: 'commande(s) fournisseur', commandesFournisseurs: 'commande(s) fournisseur', receptions: 'réception(s)', factures: 'facture(s)',
+  contrats: 'contrat(s)', plansPreventifs: 'plan(s) préventif(s)', demandes: 'demande(s) d\'intervention', documents: 'document(s)',
+};
+
 /** Libellés des champs (journal d'audit des modifications). */
 const LIBELLES = {
   nom: 'nom', typeCode: 'type', contact: 'contact principal', telephone: 'téléphone', email: 'e-mail', adresse: 'adresse', siteWeb: 'site web',
@@ -213,19 +221,30 @@ function register(ctx) {
   };
   const montantMouvement = (m) => arrondi(num(m.quantite) * num(m.prixUnitaire));
 
-  /** Nombre de références (toutes portées confondues) : décide entre suppression et désactivation. */
+  /**
+   * Nombre de références (toutes portées confondues) : décide entre suppression et désactivation.
+   * Outre les collections connues, toute autre collection (ex. commandes ou factures d'un module
+   * d'achats) dont les enregistrements portent `fournisseurId` ou `fournisseurIds` est prise en compte.
+   */
   function nbReferences(id) {
     const r = {
       articles: db.count('articles', (a) => lie(a, id)),
       equipements: db.count('equipements', (e) => lie(e, id)),
       ot: db.count('ot', (o) => lie(o, id)),
       mouvements: db.count('mouvementsStock', (m) => lie(m, id)),
+      autres: {},
     };
-    r.total = r.articles + r.equipements + r.ot + r.mouvements;
+    for (const col of db.collections()) {
+      if (COLLECTIONS_CONNUES.has(col)) continue;
+      const n = db.count(col, (x) => !!x && typeof x === 'object' && (lie(x, id) || (Array.isArray(x.fournisseurIds) && x.fournisseurIds.map(Number).includes(id))));
+      if (n) r.autres[col] = n;
+    }
+    r.total = r.articles + r.equipements + r.ot + r.mouvements + Object.values(r.autres).reduce((s, n) => s + n, 0);
     return r;
   }
   function libelleReferences(r) {
-    return [r.articles ? `${r.articles} article(s)` : '', r.equipements ? `${r.equipements} équipement(s)` : '', r.ot ? `${r.ot} ordre(s) de travail` : '', r.mouvements ? `${r.mouvements} mouvement(s) de stock` : ''].filter(Boolean).join(', ');
+    return [r.articles ? `${r.articles} article(s)` : '', r.equipements ? `${r.equipements} équipement(s)` : '', r.ot ? `${r.ot} ordre(s) de travail` : '', r.mouvements ? `${r.mouvements} mouvement(s) de stock` : '']
+      .concat(Object.entries(r.autres || {}).map(([col, n]) => `${n} ${LIBELLES_COLLECTIONS[col] || `enregistrement(s) « ${col} »`}`)).filter(Boolean).join(', ');
   }
 
   /**

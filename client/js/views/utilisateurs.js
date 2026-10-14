@@ -20,11 +20,38 @@
 
   let rafraichir = () => {};
 
+  /** Tableau « site → aucun / lecture seule / complet » ; le site de rattachement est indiqué. */
+  function rendreAccesSites(existant, verrou, exposer) {
+    const sites = (GMAO.refs.secteurs || []).filter((s) => s.type === 'site');
+    const cont = el('div');
+    if (!sites.length) { cont.appendChild(el('p', { class: 'texte-2 texte-petit' }, 'Aucun site défini (Configuration › Secteurs & sites).')); exposer({ valeurs: () => [] }); return cont; }
+    const actuels = new Map(((existant && existant.siteAcces) || []).map((a) => [Number(a.siteId), a.mode]));
+    const mesSites = new Map(((GMAO.perms && GMAO.perms.sites) || []).map((x) => [x.id, x.mode]));
+    const selects = [];
+    const lignes = sites.map((site) => {
+      const rattache = ((existant && existant.secteurIds) || []).some((id) => { const sec = ui.secteur(id); return sec && sec.siteId === site.id; });
+      const peutLecture = GMAO.estAdmin() || GMAO.perms.portee === 'tous' || mesSites.has(site.id);
+      const peutComplet = GMAO.estAdmin() || GMAO.perms.portee === 'tous' || mesSites.get(site.id) === 'complet';
+      const sel = el('select', { disabled: verrou || !peutLecture, style: { maxWidth: '240px' } },
+        el('option', { value: '' }, rattache ? 'Site de rattachement' : 'Pas d\'accès'),
+        el('option', { value: 'lecture' }, 'Lecture seule'),
+        el('option', { value: 'complet', disabled: !peutComplet }, 'Accès complet'));
+      sel.value = actuels.get(site.id) || '';
+      selects.push({ site, sel });
+      return el('tr', null, el('td', null, ui.pastille(site.couleur), site.nom, rattache ? el('span', { class: 'texte-2 texte-petit' }, ' (rattachement)') : null), el('td', null, sel));
+    });
+    cont.appendChild(el('div', { class: 'tableau-conteneur' }, el('table', { class: 'tableau tableau-compact' }, el('thead', null, el('tr', null, el('th', null, 'Site'), el('th', null, 'Accès supplémentaire'))), el('tbody', null, lignes))));
+    cont.appendChild(el('div', { class: 'aide' }, 'Lecture seule : l\'utilisateur consulte les équipements, demandes, OT… de ce site sans pouvoir les modifier. Accès complet : il y agit selon les droits de son profil.'));
+    exposer({ valeurs: () => selects.filter((x) => x.sel.value).map((x) => ({ siteId: x.site.id, mode: x.sel.value })) });
+    return cont;
+  }
+
   async function ouvrirFormulaire(existant, apres) {
     const estMoi = !!existant && existant.id === GMAO.user.id;
     const creation = !existant;
     const verrou = estMoi && !GMAO.estAdmin();
     let matrice = null;
+    let accesSites = null;
     async function chargerBase(profilId) {
       if (!matrice || !profilId) return;
       try {
@@ -46,6 +73,7 @@
       { nom: 'profilId', label: 'Profil (niveau de droits)', type: 'select', requis: true, options: ui.optionsProfils({ vide: '— Choisir un profil —' }), disabled: verrou, onChange: (v) => chargerBase(v) },
       { nom: 'managerId', label: 'Supérieur hiérarchique (N+1)', type: 'select', options: ui.optionsUsers({ vide: '— Aucun —', filtre: (u) => !existant || u.id !== existant.id }), aide: 'Utilisé pour la validation des demandes et l\'organigramme' },
       { nom: 'secteurIds', label: 'Secteurs rattachés', type: 'multiselect', options: ui.optionsSecteurs({ vide: false }), aide: 'Aucun secteur coché = pas de restriction de secteur (si la portée le permet). Les sous-secteurs sont inclus automatiquement.', pleineLargeur: true, disabled: verrou },
+      { type: 'html', label: 'Accès aux autres sites', rendu: () => rendreAccesSites(existant, verrou, (api) => { accesSites = api; }) },
       { nom: 'porteeOverride', label: 'Portée des données (surcharge)', type: 'select', options: [{ value: '', label: 'Héritée du profil' }].concat(Object.entries(GMAO.catalogue.portees || {}).map(([k, v]) => ({ value: k, label: v }))), disabled: verrou },
       { type: 'separateur', label: 'Mot de passe' },
       { nom: 'password', label: creation ? 'Mot de passe initial' : 'Nouveau mot de passe (vide = inchangé)', type: 'mdp', aide: creation ? 'Vide = « changeme »' : '' },
@@ -67,6 +95,7 @@
       onSubmit: async (v) => {
         const body = Object.assign({}, v, { champs: ui.champsPersoValeurs(v), porteeOverride: v.porteeOverride || null, managerId: v.managerId === '' ? null : v.managerId });
         if (matrice) body.overrides = matrice.valeurs();
+        if (accesSites && !verrou) body.siteAcces = accesSites.valeurs();
         if (!body.password) delete body.password;
         for (const k of Object.keys(body)) if (k.startsWith('champs.')) delete body[k];
         const res = creation ? await api.post('/api/utilisateurs', body) : await api.put('/api/utilisateurs/' + existant.id, body);
@@ -94,6 +123,7 @@
             { label: 'Profil', valeur: profil ? frag(ui.pastille(profil.couleur), `${profil.nom} (niveau ${profil.niveau})`) : '' },
             { label: 'Portée des données', valeur: (GMAO.catalogue.portees || {})[p.portee] || p.portee },
             { label: 'Secteurs', valeur: (u.secteurIds || []).length ? u.secteurIds.map((s) => ui.cheminSecteur(s)).join(', ') : 'Tous (aucune restriction)' },
+            { label: 'Sites accessibles', valeur: (p.sites || []).length ? p.sites.map((x) => `${x.nom}${x.mode === 'lecture' ? ' (lecture seule)' : ''}`).join(', ') : '—' },
             { label: 'Supérieur hiérarchique', valeur: u.managerId != null ? el('a', { href: '#', onclick: (ev) => { ev.preventDefault(); m.fermer(); afficherFiche(u.managerId); } }, ui.nomUser(u.managerId)) : '—' },
             { label: 'Subordonnés', valeur: (u.subordonnes || []).length ? u.subordonnes.map((s) => nomComplet(s)).join(', ') : '—' },
             { label: 'Dernière connexion', valeur: ui.formatDateHeure(u.derniereConnexion) }, { label: 'Créé le', valeur: ui.formatDateHeure(u.createdAt) },

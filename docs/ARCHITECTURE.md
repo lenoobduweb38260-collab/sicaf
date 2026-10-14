@@ -16,7 +16,9 @@ server/                 serveur HTTP + API JSON
   modules/              UN FICHIER PAR MODULE MÉTIER, chargé automatiquement (ordre alphabétique)
 client/
   index.html, css/app.css, js/api.js, js/ui.js, js/app.js
-  js/views/<module>.js  UNE VUE PAR MODULE, chargée automatiquement (GET /api/views)
+  js/lib/<lib>.js       BIBLIOTHÈQUES PARTAGÉES (ex. codebarre.js, moteur3d.js), chargées automatiquement
+                        AVANT les vues, dans l'ordre alphabétique (GET /api/views → { libs, vues })
+  js/views/<module>.js  UNE VUE PAR MODULE, chargée automatiquement
 tests/                  node:test (API) + tests/e2e (Playwright)
 electron/               enveloppe Electron (fenêtre native, données dans %APPDATA%)
 ```
@@ -137,16 +139,23 @@ Champs communs : `id` (nombre), `createdAt`, `updatedAt`, `createdBy` (id utilis
 ### Collections existantes
 `users`, `profils`, `secteurs`, `audit`, `notifications`, `documents` (libre).
 
-## 4. Droits, portée, hiérarchie
+## 4. Droits, portée, hiérarchie, multi-site
 
 - Modules et actions : `server/permissions.js` (`MODULES`, `ACTIONS`). Actions existantes par module (ne pas en inventer) :
   dashboard[voir] · equipements[voir,creer,modifier,supprimer,exporter] · demandes[voir,creer,modifier,supprimer,valider,exporter] · ot[voir,creer,modifier,supprimer,affecter,cloturer,exporter] · preventif[voir,creer,modifier,supprimer,exporter] · planning[voir,modifier] · stock[voir,creer,modifier,supprimer,exporter] · fournisseurs[voir,creer,modifier,supprimer,exporter] · rapports[voir,exporter].
-- Portée (`req.perms.portee`) : `tous` | `secteurs` (`req.perms.secteurIds`, sous-secteurs inclus ; un enregistrement sans `secteurId` est visible) | `perso` (visible si `createdBy`, `demandeurId`, `technicienId`, `responsableId`, `assigneA` ou `techniciens[]` contient l'utilisateur).
+- Modules ajoutés : plans[voir,creer,modifier,supprimer] · inventaire[voir,creer,modifier,valider,supprimer,exporter] · achats[voir,creer,modifier,supprimer,valider,exporter] · rh[voir,creer,modifier,supprimer,valider,exporter].
+- Portée (`req.perms.portee`) : `tous` | `site` (tous les secteurs des sites de rattachement de l'utilisateur) | `secteurs` (`req.perms.secteurIds`, sous-secteurs inclus ; un enregistrement sans `secteurId` est visible) | `perso` (visible si `createdBy`, `demandeurId`, `technicienId`, `responsableId`, `assigneA` ou `techniciens[]` contient l'utilisateur).
+- **Multi-site** : un *site* est un secteur de `type: 'site'` (liste `typesSecteur` : site, batiment, service, atelier, ligne, zone, magasin). L'arborescence par défaut est `Site principal (SITE) › Production (PROD), Maintenance (MAINT), Logistique (LOG), Qualité (QUAL), Services généraux (SG)`. `ctx.siteDuSecteur(secteurId)` donne le site d'un secteur. Un utilisateur peut recevoir des accès à d'autres sites (`user.siteAcces = [{ siteId, mode: 'lecture' | 'complet' }]`).
+  - `req.perms.secteurIds` = secteurs **modifiables** ; `req.perms.secteurIdsLecture` = secteurs des sites en **lecture seule** ; `req.perms.sites` = sites accessibles `[{ id, nom, mode, attache }]`.
+  - Sélecteur de site dans l'en-tête → en-tête HTTP `X-GMAO-Site` → `req.perms.siteCourantId` et `req.perms.siteFiltre` (secteurs du site choisi). **Tout est automatique si vous utilisez `ctx.scope`, `ctx.canSee` et `ctx.getVisible`** : le filtre de site et la lecture seule s'appliquent (pendant une requête POST/PUT/DELETE, `req.ecriture` est vrai et les sites en lecture seule sont exclus ; `ctx.getVisible` lève alors 403 « lecture seule »). N'appelez `perms.canSeeRecord` directement qu'avec `{ ecriture: req.ecriture }`.
+  - Côté client : `GMAO.siteCourant()` (id ou null), `GMAO.siteLectureSeule(secteurId)` (masquer les boutons d'action), `ui.optionsSecteurs()` / `ui.optionsUsers()` sont déjà restreints au site courant (option `{ tousSites: true }` pour tout lister), `GMAO.refs.secteurs[i].siteId`.
 - Hiérarchie : `req.perms.niveau` (1 = plus haut), `req.user.managerId` (N+1). Option `config.workflow.validerParSuperieurUniquement` : seul le N+1 du demandeur (ou un administrateur) valide.
 - Options workflow (`config.workflow`) : `validationDemandes`, `validerParSuperieurUniquement`, `otAutoDepuisDemande`, `cloturerDemandeAvecOt`, `notifierValidateurs`, `autoriserTechnicienCloture`, `stockNegatif`. Préventif : `config.preventif.genererAuto`, `horizonJours`.
 
 ## 5. Listes de valeurs configurables (`config.listes`)
-`statutsOT`, `statutsDemande` (avec `final`), `typesIntervention`, `priorites` (avec `delaiHeures`), `typesEquipement`, `etatsEquipement`, `criticites`, `unites`, `categoriesArticles`, `typesFournisseur`, `causesPanne`. Chaque élément : `{ code, label, couleur?, ordre, final?, delaiHeures? }`. Toujours lire via `ctx.liste(...)` / `GMAO.liste(...)` et afficher via `ui.badgeListe`.
+`statutsOT`, `statutsDemande` (avec `final`), `typesIntervention`, `priorites` (avec `delaiHeures`), `typesEquipement`, `etatsEquipement`, `criticites`, `unites`, `categoriesArticles`, `typesFournisseur`, `causesPanne`, `typesSecteur`, `typesHabilitation` (avec `dureeMois`), `typesAbsence`, `typesContrat`, `statutsCommande` (avec `final`), `statutsFacture` (avec `final`), `categoriesDepense`.
+
+Sections de configuration des modules (valeurs par défaut dans `server/seed.js`, modifiables via `PUT /api/configuration { section: {...} }` — seules les clés existantes sont acceptées, avec le même type) : `etiquettes` (format, symbologie, hauteurCodeMm, decalage, contenu{…}, formatPersonnalise{…}), `inventaire` (aveugle, modeScan, sons, nonComptesAZero, scanGlobal), `achats` (tauxTVA, seuilValidationHT, delaiPaiementJours, entreeStockAReception, alerteEcheanceJours), `rh` (alerteJoursAvantEcheance, afficherAbsencesPlanning, heuresHebdo), `plans` (grilleM, uniteAffichage, couleurParDefaut, afficherEtiquettes), `sauvegardes` (automatique, frequenceHeures, heure, conserverLocal, compresser, chiffrer — `destinations`, `cleReception`, `motDePasseChiffrement` sont des **secrets** : jamais renvoyés au client ni modifiables par PUT /api/configuration ; le module sauvegardes les gère par ses propres routes et `db.getConfig()/db.setConfig()`). Numérotation : `numerotation.{ot,di,eq,art,pp,inv,cmd,fac,pl,mat}`. Champs personnalisés : entités `personnel`, `commandes`, `factures` en plus des précédentes. Chaque élément : `{ code, label, couleur?, ordre, final?, delaiHeures? }`. Toujours lire via `ctx.liste(...)` / `GMAO.liste(...)` et afficher via `ui.badgeListe`.
 
 ## 6. Services et événements inter-modules (contrat)
 

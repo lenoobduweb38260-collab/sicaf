@@ -12,7 +12,9 @@
   const { el, icone, toast, erreur, frag } = ui;
 
   const GROUPES = {
-    exploitation: { label: 'Exploitation', modules: ['dashboard', 'equipements', 'demandes', 'ot', 'preventif', 'planning', 'stock', 'fournisseurs', 'rapports'] },
+    exploitation: { label: 'Exploitation', modules: ['dashboard', 'equipements', 'plans', 'demandes', 'ot', 'preventif', 'planning'] },
+    magasin: { label: 'Magasin & achats', modules: ['stock', 'inventaire', 'fournisseurs', 'achats'] },
+    pilotage: { label: 'Pilotage', modules: ['rapports', 'rh'] },
     administration: { label: 'Administration', modules: ['utilisateurs', 'profils', 'configuration', 'audit'] },
   };
 
@@ -169,13 +171,19 @@
     root.setProperty('--primaire-clair', theme === 'sombre' ? `rgba(${r},${g},${b},0.28)` : `rgba(${r},${g},${b},0.14)`);
   }
 
-  async function chargerVues() {
-    const fichiers = await api.get('/api/views');
-    await Promise.all(fichiers.map((src) => new Promise((resolve) => {
+  function chargerScript(src) {
+    return new Promise((resolve) => {
       if (document.querySelector(`script[src="${src}"]`)) return resolve();
-      const s = el('script', { src, onload: resolve, onerror: () => { console.error('Vue non chargée', src); resolve(); } });
+      const s = el('script', { src, onload: resolve, onerror: () => { console.error('Script non chargé', src); resolve(); } });
       document.head.appendChild(s);
-    })));
+    });
+  }
+  async function chargerVues() {
+    const r = await api.get('/api/views');
+    const libs = Array.isArray(r) ? [] : (r.libs || []);
+    const vues = Array.isArray(r) ? r : (r.vues || []);
+    for (const src of libs) await chargerScript(src); // bibliothèques partagées, dans l'ordre
+    await Promise.all(vues.map(chargerScript));
   }
 
   // ----- Page de connexion -----------------------------------------------
@@ -225,6 +233,7 @@
       el('div', { class: 'sidebar-pied' }, el('span', null, 'GMAO v' + GMAO.version), el('button', { class: 'btn btn-icone', title: 'Réduire / agrandir le menu', style: { color: 'inherit' }, onclick: () => { app.firstChild.classList.toggle('sidebar-reduite'); try { localStorage.setItem('gmao.sidebar', app.firstChild.classList.contains('sidebar-reduite') ? '1' : '0'); } catch (e) { /* ignore */ } } }, icone('menu'))));
     const entete = el('header', { class: 'entete' },
       el('div', { class: 'entete-titre' }),
+      el('div', { class: 'entete-site' }),
       el('div', { style: { position: 'relative' } }, el('button', { class: 'btn btn-icone btn-notifs', title: 'Notifications', onclick: (ev) => { ev.stopPropagation(); basculerNotifications(); } }, icone('cloche'))),
       el('div', { style: { position: 'relative' } }, el('div', { class: 'entete-utilisateur', onclick: (ev) => { ev.stopPropagation(); basculerMenuUtilisateur(); } },
         ui.avatar(`${GMAO.user.prenom || ''} ${GMAO.user.nom || ''}`.trim() || GMAO.user.login),
@@ -242,7 +251,32 @@
     GMAO._notifTimer = setInterval(majNotifications, 60000);
   }
 
+  /** Sélecteur de site (multi-site) : affiché dès qu'au moins un site est accessible. */
+  function construireSelecteurSite() {
+    const zone = document.querySelector('.entete-site');
+    if (!zone) return;
+    ui.vider(zone);
+    const sites = (GMAO.perms && GMAO.perms.sites) || [];
+    if (!sites.length) return;
+    const courant = GMAO.perms.siteCourantId == null ? 'tous' : String(GMAO.perms.siteCourantId);
+    const sel = el('select', { class: 'select-site', title: 'Site affiché : les listes, tableaux de bord et rapports sont filtrés sur ce site' },
+      sites.length > 1 ? el('option', { value: 'tous' }, sites.length === GMAO.refs.secteurs.filter((s) => s.type === 'site').length ? 'Tous les sites' : 'Tous mes sites') : null,
+      sites.map((s) => el('option', { value: String(s.id) }, s.nom + (s.mode === 'lecture' ? ' (lecture seule)' : ''))));
+    sel.value = sites.length > 1 ? courant : String(sites[0].id);
+    sel.addEventListener('change', async () => {
+      api.setSiteCourant(sel.value);
+      try { await GMAO.refresh(true); toast(sel.value === 'tous' ? 'Affichage de tous vos sites' : `Site affiché : ${sel.options[sel.selectedIndex].text}`, 'info'); } catch (e) { erreur(e); }
+    });
+    zone.appendChild(el('label', { class: 'inline', style: { gap: '6px' } }, icone('site'), sel));
+  }
+  GMAO.siteCourant = () => (GMAO.perms && GMAO.perms.siteCourantId != null ? GMAO.perms.siteCourantId : null);
+  GMAO.siteLectureSeule = (secteurId) => {
+    const p = GMAO.perms || {};
+    return secteurId != null && Array.isArray(p.secteurIdsLecture) && p.secteurIdsLecture.includes(Number(secteurId));
+  };
+
   function construireNavigation() {
+    construireSelecteurSite();
     const logo = document.querySelector('.sidebar-logo');
     const nav = document.querySelector('.sidebar-nav');
     if (!logo || !nav) return;

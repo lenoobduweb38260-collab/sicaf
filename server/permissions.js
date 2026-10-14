@@ -28,11 +28,15 @@ const MODULES = [
   { key: 'equipements', label: 'Équipements', icon: 'equipements', ordre: 20, actions: ['voir', 'creer', 'modifier', 'supprimer', 'exporter'], description: 'Arborescence et fiches des équipements' },
   { key: 'demandes', label: "Demandes d'intervention", icon: 'demandes', ordre: 30, actions: ['voir', 'creer', 'modifier', 'supprimer', 'valider', 'exporter'], description: 'Signalements et demandes avec circuit de validation' },
   { key: 'ot', label: 'Ordres de travail', icon: 'ot', ordre: 40, actions: ['voir', 'creer', 'modifier', 'supprimer', 'affecter', 'cloturer', 'exporter'], description: 'Interventions correctives, préventives et améliorations' },
+  { key: 'plans', label: 'Plans 3D', icon: 'plan3d', ordre: 25, actions: ['voir', 'creer', 'modifier', 'supprimer'], description: 'Plans 3D des sites : implantation des bâtiments, zones, machines et installations' },
   { key: 'preventif', label: 'Maintenance préventive', icon: 'preventif', ordre: 50, actions: ['voir', 'creer', 'modifier', 'supprimer', 'exporter'], description: 'Plans et gammes de maintenance périodiques' },
   { key: 'planning', label: 'Planning', icon: 'planning', ordre: 60, actions: ['voir', 'modifier'], description: 'Calendrier des interventions' },
   { key: 'stock', label: 'Stock & pièces', icon: 'stock', ordre: 70, actions: ['voir', 'creer', 'modifier', 'supprimer', 'exporter'], description: 'Pièces détachées, mouvements et alertes de stock' },
+  { key: 'inventaire', label: 'Étiquettes & inventaire', icon: 'codebarre', ordre: 75, actions: ['voir', 'creer', 'modifier', 'valider', 'supprimer', 'exporter'], description: 'Étiquettes code-barres, scan et inventaires du magasin' },
   { key: 'fournisseurs', label: 'Fournisseurs', icon: 'fournisseurs', ordre: 80, actions: ['voir', 'creer', 'modifier', 'supprimer', 'exporter'], description: 'Fournisseurs et prestataires externes' },
+  { key: 'achats', label: 'Achats & factures', icon: 'achats', ordre: 85, actions: ['voir', 'creer', 'modifier', 'supprimer', 'valider', 'exporter'], description: 'Commandes fournisseurs, réceptions, factures et échéances de paiement' },
   { key: 'rapports', label: 'Rapports & historique', icon: 'rapports', ordre: 90, actions: ['voir', 'exporter'], description: 'Historique, statistiques et exports' },
+  { key: 'rh', label: 'Ressources humaines', icon: 'rh', ordre: 95, actions: ['voir', 'creer', 'modifier', 'supprimer', 'valider', 'exporter'], description: 'Personnel, habilitations, formations, visites médicales, absences' },
   { key: 'utilisateurs', label: 'Utilisateurs', icon: 'utilisateurs', ordre: 100, actions: ['voir', 'creer', 'modifier', 'supprimer'], description: 'Comptes internes et hiérarchie' },
   { key: 'profils', label: 'Profils & droits', icon: 'profils', ordre: 110, actions: ['voir', 'creer', 'modifier', 'supprimer'], description: 'Profils, matrice des droits, secteurs' },
   { key: 'configuration', label: 'Configuration', icon: 'configuration', ordre: 120, actions: ['voir', 'modifier'], description: 'Paramètres, listes de valeurs, champs personnalisés, sauvegardes' },
@@ -40,9 +44,16 @@ const MODULES = [
 ];
 
 const PORTEES = {
-  tous: 'Toutes les données',
+  tous: 'Toutes les données (tous les sites)',
+  site: 'Ses sites (tous les secteurs des sites de rattachement)',
   secteurs: 'Ses secteurs uniquement (et sous-secteurs)',
   perso: 'Ses propres éléments uniquement',
+};
+
+/** Modes d'accès à un site supplémentaire (champ utilisateur `siteAcces`). */
+const MODES_SITE = {
+  lecture: 'Lecture seule (consulter les problèmes, interventions, équipements…)',
+  complet: 'Accès complet (selon les droits du profil)',
 };
 
 function moduleByKey(key) { return MODULES.find((m) => m.key === key) || null; }
@@ -112,6 +123,40 @@ function secteursDescendants(db, ids) {
   return Array.from(result);
 }
 
+/** Secteurs de type « site ». */
+function sites(db) {
+  return db.list('secteurs', (s) => s.type === 'site').sort((a, b) => (a.ordre || 0) - (b.ordre || 0) || String(a.nom).localeCompare(String(b.nom)));
+}
+
+/** Site (ancêtre ou soi-même de type « site ») d'un secteur, ou null. */
+function siteDuSecteur(db, secteurId, cache) {
+  if (secteurId == null || secteurId === '') return null;
+  const all = cache || new Map(db.list('secteurs').map((s) => [s.id, s]));
+  let cur = all.get(Number(secteurId));
+  const vus = new Set();
+  while (cur && !vus.has(cur.id)) {
+    if (cur.type === 'site') return cur.id;
+    vus.add(cur.id);
+    cur = cur.parentId != null ? all.get(Number(cur.parentId)) : null;
+  }
+  return null;
+}
+
+/** Normalise `siteAcces` : [{ siteId, mode }] (sites existants uniquement, un seul mode par site). */
+function normaliserSiteAcces(db, input) {
+  if (!Array.isArray(input)) return [];
+  const ids = new Set(sites(db).map((s) => s.id));
+  const out = new Map();
+  for (const x of input) {
+    if (!x || typeof x !== 'object') continue;
+    const id = Number(x.siteId);
+    if (!ids.has(id) || !MODES_SITE[x.mode]) continue;
+    if (out.get(id) === 'complet') continue;
+    out.set(id, x.mode);
+  }
+  return Array.from(out.entries()).map(([siteId, mode]) => ({ siteId, mode }));
+}
+
 /** Modules visibles selon la configuration (actif + libellé personnalisé). */
 function modulesConfigures(config) {
   const cfg = (config && config.modules) || {};
@@ -157,14 +202,46 @@ function effectivePermissions(db, user, profil, config) {
     }
   }
 
-  const portee = estAdmin ? 'tous' : ((user && user.porteeOverride) || (profil && profil.portee) || 'tous');
-  const secteursBase = (user && Array.isArray(user.secteurIds)) ? user.secteurIds : [];
-  const secteurIds = portee === 'tous' ? secteursDescendants(db, secteursBase) : secteursDescendants(db, secteursBase);
+  let portee = estAdmin ? 'tous' : ((user && user.porteeOverride) || (profil && profil.portee) || 'tous');
+  if (!PORTEES[portee]) portee = 'tous';
+  const secteursBase = (user && Array.isArray(user.secteurIds)) ? user.secteurIds.map(Number) : [];
+
+  // ----- Sites : rattachement + accès supplémentaires (lecture seule ou complet) -----
+  const cache = new Map(db.list('secteurs').map((s) => [s.id, s]));
+  const tousSites = sites(db);
+  const sitesAttaches = Array.from(new Set(secteursBase.map((s) => siteDuSecteur(db, s, cache)).filter((x) => x != null)));
+  const acces = estAdmin || portee === 'tous' ? [] : normaliserSiteAcces(db, user && user.siteAcces);
+  const sitesComplets = new Set(acces.filter((a) => a.mode === 'complet').map((a) => a.siteId));
+  const sitesLecture = new Set(acces.filter((a) => a.mode === 'lecture').map((a) => a.siteId));
+
+  let secteurIds;
+  if (portee === 'site') secteurIds = secteursDescendants(db, sitesAttaches.concat(Array.from(sitesComplets)));
+  else if (portee === 'secteurs') secteurIds = secteursDescendants(db, secteursBase.concat(Array.from(sitesComplets)));
+  else if (portee === 'perso') secteurIds = secteursDescendants(db, secteursBase.concat(Array.from(sitesComplets)));
+  else secteurIds = secteursDescendants(db, secteursBase);
+  const ecriture = new Set(secteurIds);
+  const secteurIdsLecture = secteursDescendants(db, Array.from(sitesLecture)).filter((id) => !ecriture.has(id));
+
+  // Liste des sites accessibles (pour le sélecteur de site)
+  const sitesAccessibles = tousSites.filter((s) => {
+    if (portee === 'tous') return true;
+    if (sitesAttaches.includes(s.id) || sitesComplets.has(s.id) || sitesLecture.has(s.id)) return true;
+    // portée secteurs : site contenant au moins un des secteurs de l'utilisateur
+    return secteurIds.some((id) => siteDuSecteur(db, id, cache) === s.id);
+  }).map((s) => ({
+    id: s.id, nom: s.nom, code: s.code || '', couleur: s.couleur || '#6b7280',
+    mode: portee === 'tous' || sitesAttaches.includes(s.id) || sitesComplets.has(s.id) ? 'complet' : (sitesLecture.has(s.id) ? 'lecture' : 'complet'),
+    attache: sitesAttaches.includes(s.id),
+  }));
 
   return {
     modules,
-    portee: PORTEES[portee] ? portee : 'tous',
+    portee,
     secteurIds,
+    secteurIdsLecture,
+    sites: sitesAccessibles,
+    siteCourantId: null,
+    siteFiltre: null,
     niveau: profil ? Number(profil.niveau || 99) : 99,
     estAdmin,
     profilId: profil ? profil.id : null,
@@ -179,19 +256,39 @@ function can(perms, module, action) {
 /** Champs d'un enregistrement considérés comme « appartenance » pour la portée « perso ». */
 const CHAMPS_PERSO = ['createdBy', 'demandeurId', 'technicienId', 'responsableId', 'utilisateurId', 'assigneA'];
 
-/** L'utilisateur peut-il voir cet enregistrement selon sa portée ? */
-function canSeeRecord(perms, user, record) {
+/**
+ * L'utilisateur peut-il voir cet enregistrement selon sa portée ?
+ * @param {object} [options] { ecriture: true } pour une modification : les sites en lecture seule sont exclus.
+ * Le filtre de site courant (sélecteur de l'en-tête, `perms.siteFiltre`) s'applique en plus.
+ */
+function canSeeRecord(perms, user, record, options) {
   if (!record) return false;
-  if (!perms || perms.portee === 'tous') return true;
-  if (perms.portee === 'secteurs') {
-    if (record.secteurId == null || record.secteurId === '') return true; // élément non rattaché à un secteur
-    return perms.secteurIds.includes(Number(record.secteurId));
+  if (!perms) return true;
+  const sid = record.secteurId == null || record.secteurId === '' ? null : Number(record.secteurId);
+  if (sid != null && Array.isArray(perms.siteFiltre) && !perms.siteFiltre.includes(sid)) return false;
+  if (perms.portee === 'tous') return true;
+  const ecriture = !!(options && options.ecriture);
+  const lecture = !ecriture && sid != null && Array.isArray(perms.secteurIdsLecture) && perms.secteurIdsLecture.includes(sid);
+  if (perms.portee === 'secteurs' || perms.portee === 'site') {
+    if (sid == null) return true; // élément non rattaché à un secteur
+    return perms.secteurIds.includes(sid) || lecture;
   }
   // perso
+  if (lecture) return true;
   const uid = user.id;
   for (const c of CHAMPS_PERSO) if (record[c] != null && Number(record[c]) === uid) return true;
   if (Array.isArray(record.techniciens) && record.techniciens.map(Number).includes(uid)) return true;
   return false;
+}
+
+/** Applique le site choisi dans l'en-tête (« tous » ou id d'un site accessible). */
+function appliquerSiteCourant(db, perms, valeur) {
+  if (!perms || valeur == null || valeur === '' || valeur === 'tous') return perms;
+  const id = Number(valeur);
+  if (!perms.sites.some((s) => s.id === id)) return perms;
+  perms.siteCourantId = id;
+  perms.siteFiltre = secteursDescendants(db, [id]);
+  return perms;
 }
 
 /** Un utilisateur peut-il gérer (modifier, désactiver) un autre utilisateur ? Règle hiérarchique. */
@@ -217,7 +314,8 @@ function droitsNonPossedes(actorPerms, matrice) {
 }
 
 module.exports = {
-  ACTIONS, MODULES, PORTEES,
+  ACTIONS, MODULES, PORTEES, MODES_SITE,
+  sites, siteDuSecteur, normaliserSiteAcces, appliquerSiteCourant,
   moduleByKey, matriceVide, matricePleine, normaliserMatrice, normaliserOverrides,
   secteursDescendants, modulesConfigures, effectivePermissions, can, canSeeRecord,
   canManageUser, droitsNonPossedes,

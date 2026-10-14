@@ -94,8 +94,8 @@ async function main() {
     await page.click('text=Ajouter une valeur'); const inputs = await page.$$('.liste-editable .ligne:last-child input[type=text]');
     await inputs[0].fill('test_e2e'); await inputs[1].fill('Statut E2E'); await page.click('text=Enregistrer cette liste'); await page.waitForSelector('.toast.succes');
     etape('Liste de valeurs modifiée', true);
-    await page.goto(base + '/#/configuration?onglet=secteurs'); await page.waitForSelector('text=Nouveau secteur');
-    await page.click('text=Nouveau secteur'); await page.fill('#f_nom', 'Secteur E2E'); await page.click('.modal-pied .btn-primaire'); await page.waitForSelector('.toast.succes');
+    await page.goto(base + '/#/configuration?onglet=secteurs'); await page.waitForSelector('text=Nouveau site / secteur');
+    await page.click('text=Nouveau site / secteur'); await page.fill('#f_nom', 'Secteur E2E'); await page.click('.modal-pied .btn-primaire'); await page.waitForSelector('.toast.succes');
     etape('Secteur créé', true);
 
     // Thème sombre + déconnexion

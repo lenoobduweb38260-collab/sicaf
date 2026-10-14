@@ -26,7 +26,7 @@ describe('Noyau : authentification, profils, utilisateurs, hiérarchie, configur
     const me = await admin.ok('GET', '/api/auth/me');
     assert.equal(me.user.login, 'admin');
     assert.equal(me.permissions.estAdmin, true);
-    assert.equal(me.modules.length, 13);
+    assert.equal(me.modules.length, 17);
     assert.ok(me.references.secteurs.length >= 5);
     assert.ok(me.references.profils.length >= 5);
     assert.ok(me.config.listes.statutsOT.length > 0);
@@ -105,7 +105,8 @@ describe('Noyau : authentification, profils, utilisateurs, hiérarchie, configur
     const eff = await admin.ok('GET', '/api/profils-effectifs/' + u.id);
     assert.ok(eff.secteurIds.includes(ligne.id), 'le sous-secteur est inclus dans la portée');
     const arbre = await admin.ok('GET', '/api/secteurs-arbre');
-    assert.ok(arbre.find((s) => s.id === prod.id).enfants.some((e) => e.id === ligne.id));
+    const trouver = (noeuds, id) => { for (const n of noeuds) { if (n.id === id) return n; const r = trouver(n.enfants || [], id); if (r) return r; } return null; };
+    assert.ok(trouver(arbre, prod.id).enfants.some((e) => e.id === ligne.id));
     assert.equal((await admin.del('/api/secteurs/' + prod.id)).status, 400, 'suppression bloquée tant qu\'il y a des sous-secteurs');
   });
 

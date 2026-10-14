@@ -73,6 +73,20 @@ function register(ctx) {
       if (out.porteeOverride === 'tous' && req.perms.portee !== 'tous') throw new HttpError(403, 'Vous ne pouvez pas accorder une portée supérieure à la vôtre');
     } else if (!existant) out.porteeOverride = null;
 
+    // Accès aux autres sites (lecture seule ou complet) : on ne peut accorder que ce qu'on possède soi-même
+    if (body.siteAcces !== undefined) {
+      const acces = perms.normaliserSiteAcces(db, body.siteAcces);
+      if (!req.perms.estAdmin && req.perms.portee !== 'tous') {
+        for (const a of acces) {
+          const mien = (req.perms.sites || []).find((x) => x.id === a.siteId);
+          const nomSite = (db.get('secteurs', a.siteId) || {}).nom || a.siteId;
+          if (!mien) throw new HttpError(403, `Vous ne pouvez pas accorder l'accès au site « ${nomSite} » : vous n'y avez pas accès`);
+          if (a.mode === 'complet' && mien.mode !== 'complet') throw new HttpError(403, `Vous n'avez qu'un accès en lecture au site « ${nomSite} »`);
+        }
+      }
+      out.siteAcces = acces;
+    } else if (!existant) out.siteAcces = [];
+
     if (body.champs !== undefined || !existant) out.champs = ctx.champsPerso('utilisateurs', body.champs || (existant && existant.champs) || {});
     if (body.commentaire !== undefined) out.commentaire = String(body.commentaire || '');
     return out;
@@ -92,7 +106,12 @@ function register(ctx) {
   router.get('/api/utilisateurs', async (req) => {
     let rows = db.list('users');
     if (req.perms.portee !== 'tous') {
-      rows = rows.filter((u) => u.id === req.user.id || (u.secteurIds || []).length === 0 || (u.secteurIds || []).some((s) => req.perms.secteurIds.includes(Number(s))));
+      const visibles = new Set(req.perms.secteurIds.concat(req.perms.secteurIdsLecture || []));
+      rows = rows.filter((u) => u.id === req.user.id || (u.secteurIds || []).length === 0 || (u.secteurIds || []).some((s) => visibles.has(Number(s))));
+    }
+    if (req.perms.siteFiltre) {
+      const site = new Set(req.perms.siteFiltre);
+      rows = rows.filter((u) => u.id === req.user.id || !(u.secteurIds || []).length || u.secteurIds.some((x) => site.has(Number(x))) || (u.siteAcces || []).some((a) => site.has(Number(a.siteId))));
     }
     return rows.map(clean);
   }, { perm: ['utilisateurs', 'voir'] });
@@ -130,7 +149,7 @@ function register(ctx) {
     const body = req.body || {};
     // Un utilisateur qui se modifie lui-même ne peut pas changer son profil / ses droits
     if (existant.id === req.user.id && !req.perms.estAdmin) {
-      for (const k of ['profilId', 'overrides', 'porteeOverride', 'secteurIds', 'actif']) delete body[k];
+      for (const k of ['profilId', 'overrides', 'porteeOverride', 'secteurIds', 'siteAcces', 'actif']) delete body[k];
     }
     const data = validerUser(req, body, existant);
     verifierDernierAdmin(existant, data);

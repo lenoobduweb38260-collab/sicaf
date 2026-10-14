@@ -19,15 +19,25 @@
     { cle: 'categoriesArticles', label: 'Catégories d\'articles (stock)' },
     { cle: 'typesFournisseur', label: 'Types de fournisseur' },
     { cle: 'causesPanne', label: 'Causes de panne' },
+    { cle: 'typesSecteur', label: 'Types de secteur (site, bâtiment, service…)', couleur: true },
+    { cle: 'typesHabilitation', label: 'RH : habilitations et certifications', couleur: true, duree: true },
+    { cle: 'typesAbsence', label: 'RH : types d\'absence', couleur: true },
+    { cle: 'typesContrat', label: 'RH : types de contrat' },
+    { cle: 'statutsCommande', label: 'Achats : statuts des commandes', couleur: true, final: true },
+    { cle: 'statutsFacture', label: 'Achats : statuts des factures', couleur: true, final: true },
+    { cle: 'categoriesDepense', label: 'Achats : catégories de dépense', couleur: true },
   ];
   const ENTITES_CHAMPS = [
     { cle: 'equipements', label: 'Équipements' }, { cle: 'ot', label: 'Ordres de travail' }, { cle: 'demandes', label: 'Demandes d\'intervention' },
     { cle: 'articles', label: 'Articles (stock)' }, { cle: 'fournisseurs', label: 'Fournisseurs' }, { cle: 'utilisateurs', label: 'Utilisateurs' },
+    { cle: 'personnel', label: 'Personnel (RH)' }, { cle: 'commandes', label: 'Commandes fournisseurs' }, { cle: 'factures', label: 'Factures' },
   ];
   const TYPES_CHAMPS = [['texte', 'Texte'], ['texte_long', 'Texte long'], ['nombre', 'Nombre'], ['date', 'Date'], ['liste', 'Liste de choix'], ['booleen', 'Oui / Non']];
 
   let config = null;
   const peutModifier = () => GMAO.can('configuration', 'modifier');
+  /** Les secteurs et sites se gèrent aussi avec Plans 3D › Modifier (responsable maintenance). */
+  const peutGererSecteurs = () => GMAO.can('configuration', 'modifier') || GMAO.can('plans', 'modifier');
 
   async function enregistrer(partie, message) {
     try {
@@ -138,21 +148,22 @@
     cont.appendChild(ui.chargement());
     const formulaireSecteur = (existant) => {
       ui.formModal({
-        titre: existant ? `Modifier le secteur « ${existant.nom} »` : 'Nouveau secteur',
+        titre: existant && existant.id ? `Modifier « ${existant.nom} »` : 'Nouveau site / secteur',
         champs: [
           { nom: 'nom', label: 'Nom', type: 'texte', requis: true },
           { nom: 'code', label: 'Code court', type: 'texte', placeholder: 'ex. PROD' },
-          { nom: 'parentId', label: 'Secteur parent', type: 'select', options: ui.optionsSecteurs({ vide: '— Aucun (racine) —' }).filter((o) => !existant || o.value !== existant.id) },
+          { nom: 'type', label: 'Type', type: 'select', liste: 'typesSecteur', vide: false, requis: true, aide: 'Un « site » est une usine / un établissement : il porte les droits d\'accès multi-site.' },
+          { nom: 'parentId', label: 'Secteur parent', type: 'select', options: ui.optionsSecteurs({ vide: '— Aucun (racine) —', tousSites: true }).filter((o) => !existant || o.value !== existant.id) },
           { nom: 'responsableId', label: 'Responsable', type: 'select', options: ui.optionsUsers() },
           { nom: 'couleur', label: 'Couleur', type: 'couleur', valeur: '#2563eb' },
           { nom: 'ordre', label: 'Ordre d\'affichage', type: 'nombre', valeur: 0 },
           { nom: 'actif', label: 'Actif', type: 'booleen', valeur: true },
           { nom: 'description', label: 'Description', type: 'texte_long', lignes: 2 },
         ],
-        valeurs: existant ? Object.assign({}, existant, { parentId: existant.parentId == null ? '' : existant.parentId, responsableId: existant.responsableId == null ? '' : existant.responsableId }) : {},
+        valeurs: existant ? Object.assign({ type: existant.parentId == null ? 'site' : 'service' }, existant, { parentId: existant.parentId == null ? '' : existant.parentId, responsableId: existant.responsableId == null ? '' : existant.responsableId }) : { type: 'site' },
         onSubmit: async (v) => {
           const body = Object.assign({}, v, { parentId: v.parentId === '' ? null : v.parentId, responsableId: v.responsableId === '' ? null : v.responsableId });
-          if (existant) await api.put('/api/secteurs/' + existant.id, body); else await api.post('/api/secteurs', body);
+          if (existant && existant.id) await api.put('/api/secteurs/' + existant.id, body); else await api.post('/api/secteurs', body);
           toast('Secteur enregistré', 'succes');
           await GMAO.refresh(false); rendre();
         },
@@ -166,10 +177,10 @@
       const construire = (noeuds, niveau) => noeuds.forEach((s) => {
         liste.appendChild(el('div', { class: 'carte', style: { marginLeft: (niveau * 24) + 'px', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: '12px' } },
           ui.pastille(s.couleur),
-          el('div', { style: { flex: 1 } }, el('div', { class: 'texte-gras' }, s.nom, s.code ? el('span', { class: 'texte-2 texte-petit' }, ` (${s.code})`) : null, s.actif === false ? frag(' ', ui.badge('Inactif', '#6b7280')) : null),
+          el('div', { style: { flex: 1 } }, el('div', { class: 'texte-gras' }, s.type === 'site' ? frag(icone('site'), ' ') : null, s.nom, s.code ? el('span', { class: 'texte-2 texte-petit' }, ` (${s.code})`) : null, ' ', ui.badgeListe('typesSecteur', s.type, { contour: true }), s.actif === false ? frag(' ', ui.badge('Inactif', '#6b7280')) : null),
             el('div', { class: 'texte-2 texte-petit' }, [s.responsableNom ? 'Responsable : ' + s.responsableNom : null, `${s.nbUtilisateurs} utilisateur(s)`, `${s.nbProfils} profil(s)`, `${s.nbEquipements} équipement(s)`].filter(Boolean).join(' · '))),
-          peutModifier() ? el('div', null,
-            el('button', { class: 'btn btn-icone btn-sm', title: 'Ajouter un sous-secteur', onclick: () => formulaireSecteur({ parentId: s.id, nom: '', couleur: s.couleur, actif: true, ordre: 0 }) }, icone('plus')),
+          peutGererSecteurs() ? el('div', null,
+            el('button', { class: 'btn btn-icone btn-sm', title: 'Ajouter un sous-secteur', onclick: () => formulaireSecteur({ parentId: s.id, nom: '', couleur: s.couleur, actif: true, ordre: 0, type: s.type === 'site' ? 'service' : 'zone' }) }, icone('plus')),
             el('button', { class: 'btn btn-icone btn-sm', title: 'Modifier', onclick: () => formulaireSecteur(s) }, icone('modifier')),
             el('button', { class: 'btn btn-icone btn-sm texte-danger', title: 'Supprimer', onclick: async () => {
               if (!(await ui.confirm({ titre: 'Supprimer le secteur', message: `Supprimer « ${s.nom} » ? Les éléments rattachés seront détachés.`, okLabel: 'Supprimer', danger: true }))) return;
@@ -179,7 +190,7 @@
       });
       construire(arbre, 0);
       if (!arbre.length) liste.appendChild(ui.vide('Aucun secteur défini'));
-      cont.appendChild(el('div', { class: 'barre-outils' }, el('p', { class: 'texte-2 texte-petit', style: { margin: 0 } }, 'Les secteurs structurent l\'entreprise (sites, ateliers, lignes…). Ils servent à trier les profils et utilisateurs, à restreindre la portée des données et à classer les équipements.'), el('span', { class: 'espace' }), peutModifier() ? ui.bouton('Nouveau secteur', { icone: 'plus', classe: 'btn-primaire', onClic: () => formulaireSecteur(null) }) : null));
+      cont.appendChild(el('div', { class: 'barre-outils' }, el('p', { class: 'texte-2 texte-petit', style: { margin: 0 } }, 'Structurez l\'entreprise : sites (usines), puis bâtiments, services, ateliers, lignes, zones, magasins. Les sites portent les accès multi-site ; les secteurs servent à trier les profils et utilisateurs, à restreindre la portée des données et à classer les équipements.'), el('span', { class: 'espace' }), peutGererSecteurs() ? ui.bouton('Nouveau site / secteur', { icone: 'plus', classe: 'btn-primaire', onClic: () => formulaireSecteur(null) }) : null));
       cont.appendChild(liste);
     }
     rendre();
@@ -196,21 +207,21 @@
       const items = (config.listes[courante] || []).slice().sort((a, b) => (a.ordre || 0) - (b.ordre || 0)).map((x) => Object.assign({}, x));
       ui.vider(zone);
       const corps = el('div', { class: 'liste-editable' });
-      const colonnes = ['28px', '140px', '1fr'].concat(def.couleur ? ['60px'] : [], def.final ? ['70px'] : [], def.delai ? ['110px'] : [], ['36px']);
-      const entete = el('div', { class: 'ligne texte-2 texte-petit texte-gras', style: { gridTemplateColumns: colonnes.join(' ') } }, el('span'), el('span', null, 'Code'), el('span', null, 'Libellé'), def.couleur ? el('span', null, 'Couleur') : null, def.final ? el('span', null, 'Final') : null, def.delai ? el('span', null, 'Délai (h)') : null, el('span'));
+      const colonnes = ['28px', '140px', '1fr'].concat(def.couleur ? ['60px'] : [], def.final ? ['70px'] : [], def.delai ? ['110px'] : [], def.duree ? ['120px'] : [], ['36px']);
+      const entete = el('div', { class: 'ligne texte-2 texte-petit texte-gras', style: { gridTemplateColumns: colonnes.join(' ') } }, el('span'), el('span', null, 'Code'), el('span', null, 'Libellé'), def.couleur ? el('span', null, 'Couleur') : null, def.final ? el('span', null, 'Final') : null, def.delai ? el('span', null, 'Délai (h)') : null, def.duree ? el('span', null, 'Validité (mois)') : null, el('span'));
       corps.appendChild(entete);
       const lignes = [];
       const construire = () => {
         corps.querySelectorAll('.ligne:not(:first-child)').forEach((x) => x.remove());
         lignes.length = 0;
         items.forEach((it, i) => {
-          const l = { it, code: el('input', { type: 'text', value: it.code, disabled: !peutModifier() }), label: el('input', { type: 'text', value: it.label, disabled: !peutModifier() }), couleur: def.couleur ? el('input', { type: 'color', value: it.couleur || '#6b7280', disabled: !peutModifier() }) : null, final: def.final ? el('input', { type: 'checkbox', checked: !!it.final, disabled: !peutModifier() }) : null, delai: def.delai ? el('input', { type: 'number', value: it.delaiHeures || 0, disabled: !peutModifier() }) : null };
+          const l = { it, code: el('input', { type: 'text', value: it.code, disabled: !peutModifier() }), label: el('input', { type: 'text', value: it.label, disabled: !peutModifier() }), couleur: def.couleur ? el('input', { type: 'color', value: it.couleur || '#6b7280', disabled: !peutModifier() }) : null, final: def.final ? el('input', { type: 'checkbox', checked: !!it.final, disabled: !peutModifier() }) : null, delai: def.delai ? el('input', { type: 'number', value: it.delaiHeures || 0, disabled: !peutModifier() }) : null, duree: def.duree ? el('input', { type: 'number', value: it.dureeMois || 0, min: 0, disabled: !peutModifier() }) : null };
           lignes.push(l);
           const monter = el('button', { class: 'btn btn-icone btn-sm', title: 'Monter', type: 'button', disabled: i === 0 || !peutModifier(), onclick: () => { lire(); [items[i - 1], items[i]] = [items[i], items[i - 1]]; construire(); } }, icone('haut'));
-          corps.appendChild(el('div', { class: 'ligne', style: { gridTemplateColumns: colonnes.join(' ') } }, monter, l.code, l.label, l.couleur, l.final ? el('div', { class: 'texte-centre' }, l.final) : null, l.delai, el('button', { class: 'btn btn-icone btn-sm texte-danger', type: 'button', title: 'Supprimer', disabled: !peutModifier(), onclick: () => { lire(); items.splice(i, 1); construire(); } }, icone('supprimer'))));
+          corps.appendChild(el('div', { class: 'ligne', style: { gridTemplateColumns: colonnes.join(' ') } }, monter, l.code, l.label, l.couleur, l.final ? el('div', { class: 'texte-centre' }, l.final) : null, l.delai, l.duree, el('button', { class: 'btn btn-icone btn-sm texte-danger', type: 'button', title: 'Supprimer', disabled: !peutModifier(), onclick: () => { lire(); items.splice(i, 1); construire(); } }, icone('supprimer'))));
         });
       };
-      const lire = () => { lignes.forEach((l, i) => { l.it.code = l.code.value; l.it.label = l.label.value; if (l.couleur) l.it.couleur = l.couleur.value; if (l.final) l.it.final = l.final.checked; if (l.delai) l.it.delaiHeures = Number(l.delai.value) || 0; l.it.ordre = i + 1; }); };
+      const lire = () => { lignes.forEach((l, i) => { l.it.code = l.code.value; l.it.label = l.label.value; if (l.couleur) l.it.couleur = l.couleur.value; if (l.final) l.it.final = l.final.checked; if (l.delai) l.it.delaiHeures = Number(l.delai.value) || 0; if (l.duree) l.it.dureeMois = Number(l.duree.value) || 0; l.it.ordre = i + 1; }); };
       construire();
       zone.appendChild(corps);
       zone.appendChild(el('div', { class: 'mt', style: { display: 'flex', gap: '8px' } },
@@ -269,6 +280,11 @@
       { nom: 'eq', label: 'Équipements (code automatique)', type: 'texte', requis: true, valeur: n.eq },
       { nom: 'art', label: 'Articles de stock', type: 'texte', requis: true, valeur: n.art },
       { nom: 'pp', label: 'Plans de maintenance préventive', type: 'texte', requis: true, valeur: n.pp },
+      { nom: 'inv', label: 'Inventaires', type: 'texte', requis: true, valeur: n.inv },
+      { nom: 'cmd', label: 'Commandes fournisseurs', type: 'texte', requis: true, valeur: n.cmd },
+      { nom: 'fac', label: 'Factures (référence interne)', type: 'texte', requis: true, valeur: n.fac },
+      { nom: 'pl', label: 'Plans 3D', type: 'texte', requis: true, valeur: n.pl },
+      { nom: 'mat', label: 'Matricules du personnel', type: 'texte', requis: true, valeur: n.mat },
     ] });
     const btn = ui.bouton('Enregistrer', { classe: 'btn-primaire', icone: 'check', disabled: !peutModifier(), onClic: async () => { if (!f.valider()) return; await enregistrer({ numerotation: f.valeurs() }); } });
     return ui.carte('Numérotation automatique', frag(el('p', { class: 'texte-2 texte-petit' }, 'Gabarits disponibles : {annee} (2026), {aa} (26), {mois} (01), {num:4} (compteur sur 4 chiffres, réinitialisé chaque année si {annee} est présent). Exemple : OT-{annee}-{num:4} → OT-2026-0001.'), f.el, el('div', { class: 'mt texte-droite' }, btn)));
@@ -338,7 +354,7 @@
         { cle: 'general', label: 'Général', icone: 'configuration', rendu: () => ongletGeneral() },
         { cle: 'modules', label: 'Modules', icone: 'liste', rendu: () => ongletModules() },
         { cle: 'affichage', label: 'Profils & secteurs', icone: 'profils', rendu: () => ongletAffichage() },
-        { cle: 'secteurs', label: 'Secteurs', icone: 'secteur', rendu: (c) => { ongletSecteurs(c); } },
+        { cle: 'secteurs', label: 'Secteurs & sites', icone: 'site', rendu: (c) => { ongletSecteurs(c); } },
         { cle: 'listes', label: 'Listes de valeurs', icone: 'filtre', rendu: () => ongletListes() },
         { cle: 'champs', label: 'Champs personnalisés', icone: 'modifier', rendu: () => ongletChamps() },
         { cle: 'numerotation', label: 'Numérotation', icone: 'ot', rendu: () => ongletNumerotation() },

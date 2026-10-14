@@ -22,7 +22,20 @@ function configParDefaut() {
       tauxHoraire: 45,
     },
     securite: { longueurMinMdp: 4, forcerChangementMdpInitial: true, dureeSessionHeures: 12 },
-    numerotation: { ot: 'OT-{annee}-{num:4}', di: 'DI-{annee}-{num:4}', eq: 'EQ-{num:4}', art: 'ART-{num:4}', pp: 'PP-{num:3}' },
+    numerotation: { ot: 'OT-{annee}-{num:4}', di: 'DI-{annee}-{num:4}', eq: 'EQ-{num:4}', art: 'ART-{num:4}', pp: 'PP-{num:3}', inv: 'INV-{annee}-{num:3}', cmd: 'CMD-{annee}-{num:4}', fac: 'FAC-{annee}-{num:4}', pl: 'PL-{num:3}', mat: 'MAT-{num:4}' },
+    etiquettes: {
+      format: 'a4-3x7', symbologie: 'code128', hauteurCodeMm: 12, decalage: 0,
+      contenu: { codeBarre: true, code: true, designation: true, emplacement: true, referenceFournisseur: false, unite: false, categorie: false, societe: true, prix: false, secteur: false },
+      formatPersonnalise: { largeurMm: 63.5, hauteurMm: 38.1, colonnes: 3, lignes: 7, margeHautMm: 15.1, margeGaucheMm: 7.2, espaceHorizontalMm: 2.5, espaceVerticalMm: 0, pageLargeurMm: 210, pageHauteurMm: 297 },
+    },
+    inventaire: { aveugle: false, modeScan: 'quantite', sons: true, nonComptesAZero: false, scanGlobal: true },
+    achats: { tauxTVA: 20, seuilValidationHT: 1000, delaiPaiementJours: 30, entreeStockAReception: true, alerteEcheanceJours: 7 },
+    rh: { alerteJoursAvantEcheance: 60, afficherAbsencesPlanning: true, heuresHebdo: 35 },
+    plans: { grilleM: 0.5, uniteAffichage: 'm', couleurParDefaut: 'etat', afficherEtiquettes: true },
+    sauvegardes: {
+      automatique: true, frequenceHeures: 24, heure: '22:00', conserverLocal: 30, compresser: true, chiffrer: false,
+      destinations: [], cleReception: '', accepterReception: false,
+    },
     modules,
     profils: { triParSecteur: true, grouperParSecteur: true, afficherNiveau: true },
     utilisateurs: { triParSecteur: true, grouperParSecteur: false, afficherSuperieur: true },
@@ -107,6 +120,69 @@ function configParDefaut() {
         { code: 'prestataire', label: 'Prestataire de services', ordre: 2 },
         { code: 'constructeur', label: 'Constructeur', ordre: 3 },
       ],
+      typesSecteur: [
+        { code: 'site', label: 'Site / usine', couleur: '#0f766e', ordre: 1 },
+        { code: 'batiment', label: 'Bâtiment', couleur: '#7c3aed', ordre: 2 },
+        { code: 'service', label: 'Service', couleur: '#2563eb', ordre: 3 },
+        { code: 'atelier', label: 'Atelier', couleur: '#f59e0b', ordre: 4 },
+        { code: 'ligne', label: 'Ligne de production', couleur: '#16a34a', ordre: 5 },
+        { code: 'zone', label: 'Zone', couleur: '#6b7280', ordre: 6 },
+        { code: 'magasin', label: 'Magasin', couleur: '#0891b2', ordre: 7 },
+      ],
+      typesHabilitation: [
+        { code: 'elec_b0', label: 'Habilitation électrique B0/H0V', couleur: '#f59e0b', ordre: 1, dureeMois: 36 },
+        { code: 'elec_b1v', label: 'Habilitation électrique B1V', couleur: '#f59e0b', ordre: 2, dureeMois: 36 },
+        { code: 'elec_b2v', label: 'Habilitation électrique B2V / BR / BC', couleur: '#f59e0b', ordre: 3, dureeMois: 36 },
+        { code: 'elec_h1', label: 'Habilitation haute tension H1/H2', couleur: '#dc2626', ordre: 4, dureeMois: 36 },
+        { code: 'caces_r489', label: 'CACES R489 (chariots élévateurs)', couleur: '#2563eb', ordre: 5, dureeMois: 60 },
+        { code: 'caces_r486', label: 'CACES R486 (nacelles PEMP)', couleur: '#2563eb', ordre: 6, dureeMois: 60 },
+        { code: 'travail_hauteur', label: 'Travail en hauteur / harnais', couleur: '#8b5cf6', ordre: 7, dureeMois: 36 },
+        { code: 'atex', label: 'ATEX niveau 1 / 2', couleur: '#dc2626', ordre: 8, dureeMois: 36 },
+        { code: 'sst', label: 'Sauveteur secouriste du travail (SST)', couleur: '#16a34a', ordre: 9, dureeMois: 24 },
+        { code: 'permis_feu', label: 'Permis feu', couleur: '#dc2626', ordre: 10, dureeMois: 12 },
+        { code: 'frigoriste', label: 'Attestation d\'aptitude fluides frigorigènes', couleur: '#0891b2', ordre: 11, dureeMois: 60 },
+        { code: 'espaces_confines', label: 'Espaces confinés (CATEC)', couleur: '#6b7280', ordre: 12, dureeMois: 36 },
+      ],
+      typesAbsence: [
+        { code: 'conges', label: 'Congés payés', couleur: '#16a34a', ordre: 1 },
+        { code: 'rtt', label: 'RTT', couleur: '#0891b2', ordre: 2 },
+        { code: 'maladie', label: 'Arrêt maladie', couleur: '#dc2626', ordre: 3 },
+        { code: 'formation', label: 'Formation', couleur: '#8b5cf6', ordre: 4 },
+        { code: 'accident', label: 'Accident du travail', couleur: '#b91c1c', ordre: 5 },
+        { code: 'astreinte', label: 'Astreinte', couleur: '#f59e0b', ordre: 6 },
+        { code: 'autre', label: 'Autre absence', couleur: '#6b7280', ordre: 7 },
+      ],
+      typesContrat: [
+        { code: 'cdi', label: 'CDI', ordre: 1 }, { code: 'cdd', label: 'CDD', ordre: 2 }, { code: 'interim', label: 'Intérim', ordre: 3 },
+        { code: 'apprentissage', label: 'Apprentissage / alternance', ordre: 4 }, { code: 'stage', label: 'Stage', ordre: 5 }, { code: 'prestataire', label: 'Prestataire externe', ordre: 6 },
+      ],
+      statutsCommande: [
+        { code: 'brouillon', label: 'Brouillon', couleur: '#6b7280', ordre: 1, final: false },
+        { code: 'a_valider', label: 'À valider', couleur: '#f59e0b', ordre: 2, final: false },
+        { code: 'validee', label: 'Validée', couleur: '#2563eb', ordre: 3, final: false },
+        { code: 'envoyee', label: 'Envoyée au fournisseur', couleur: '#8b5cf6', ordre: 4, final: false },
+        { code: 'partielle', label: 'Reçue partiellement', couleur: '#0891b2', ordre: 5, final: false },
+        { code: 'recue', label: 'Reçue', couleur: '#16a34a', ordre: 6, final: true },
+        { code: 'annulee', label: 'Annulée', couleur: '#dc2626', ordre: 7, final: true },
+      ],
+      statutsFacture: [
+        { code: 'recue', label: 'Reçue / à contrôler', couleur: '#6b7280', ordre: 1, final: false },
+        { code: 'a_valider', label: 'À valider', couleur: '#f59e0b', ordre: 2, final: false },
+        { code: 'validee', label: 'Bon à payer', couleur: '#2563eb', ordre: 3, final: false },
+        { code: 'payee', label: 'Payée', couleur: '#16a34a', ordre: 4, final: true },
+        { code: 'litige', label: 'En litige', couleur: '#dc2626', ordre: 5, final: false },
+        { code: 'annulee', label: 'Annulée / avoir', couleur: '#9ca3af', ordre: 6, final: true },
+      ],
+      categoriesDepense: [
+        { code: 'pieces', label: 'Pièces détachées', couleur: '#2563eb', ordre: 1 },
+        { code: 'sous_traitance', label: 'Sous-traitance / prestations', couleur: '#8b5cf6', ordre: 2 },
+        { code: 'interim', label: 'Intérim / personnel extérieur', couleur: '#f59e0b', ordre: 3 },
+        { code: 'formation', label: 'Formation', couleur: '#16a34a', ordre: 4 },
+        { code: 'outillage', label: 'Outillage / EPI', couleur: '#0891b2', ordre: 5 },
+        { code: 'controle', label: 'Contrôles réglementaires', couleur: '#dc2626', ordre: 6 },
+        { code: 'investissement', label: 'Investissement', couleur: '#7c3aed', ordre: 7 },
+        { code: 'autre', label: 'Autre', couleur: '#6b7280', ordre: 8 },
+      ],
       causesPanne: [
         { code: 'usure', label: 'Usure', ordre: 1 },
         { code: 'casse', label: 'Casse', ordre: 2 },
@@ -116,7 +192,7 @@ function configParDefaut() {
         { code: 'inconnue', label: 'Inconnue', ordre: 6 },
       ],
     },
-    champsPersonnalises: { equipements: [], ot: [], demandes: [], articles: [], fournisseurs: [], utilisateurs: [] },
+    champsPersonnalises: { equipements: [], ot: [], demandes: [], articles: [], fournisseurs: [], utilisateurs: [], personnel: [], commandes: [], factures: [] },
   };
 }
 
@@ -139,31 +215,59 @@ function profilsParDefaut() {
     { nom: 'Administrateur', description: 'Accès complet à toute l\'application', niveau: 1, estAdmin: true, portee: 'tous', couleur: '#dc2626', permissions: vide(), systeme: true },
     {
       nom: 'Responsable maintenance', description: 'Pilote la maintenance : valide, affecte, clôture, gère le stock et le préventif', niveau: 2, estAdmin: false, portee: 'tous', couleur: '#2563eb', systeme: true,
-      permissions: set(vide(), Object.assign(TOUT(['dashboard', 'equipements', 'demandes', 'ot', 'preventif', 'planning', 'stock', 'fournisseurs', 'rapports']), { utilisateurs: ['voir', 'creer', 'modifier'], profils: ['voir'], audit: ['voir', 'exporter'], configuration: ['voir'] })),
+      permissions: set(vide(), Object.assign(TOUT(['dashboard', 'equipements', 'plans', 'demandes', 'ot', 'preventif', 'planning', 'stock', 'inventaire', 'fournisseurs', 'rapports']), { achats: ['voir', 'creer', 'modifier', 'valider', 'exporter'], rh: ['voir', 'creer', 'modifier', 'valider', 'exporter'], utilisateurs: ['voir', 'creer', 'modifier'], profils: ['voir'], audit: ['voir', 'exporter'], configuration: ['voir'] })),
     },
     {
       nom: 'Chef de secteur', description: 'Valide les demandes et suit les interventions de son secteur', niveau: 3, estAdmin: false, portee: 'secteurs', couleur: '#8b5cf6', systeme: true,
-      permissions: set(vide(), { dashboard: ['voir'], equipements: ['voir', 'modifier'], demandes: ['voir', 'creer', 'modifier', 'valider', 'exporter'], ot: ['voir', 'creer', 'modifier', 'affecter', 'cloturer', 'exporter'], preventif: ['voir'], planning: ['voir', 'modifier'], stock: ['voir'], fournisseurs: ['voir'], rapports: ['voir', 'exporter'], utilisateurs: ['voir'] }),
+      permissions: set(vide(), { dashboard: ['voir'], equipements: ['voir', 'modifier'], demandes: ['voir', 'creer', 'modifier', 'valider', 'exporter'], ot: ['voir', 'creer', 'modifier', 'affecter', 'cloturer', 'exporter'], preventif: ['voir'], planning: ['voir', 'modifier'], stock: ['voir'], fournisseurs: ['voir'], rapports: ['voir', 'exporter'], utilisateurs: ['voir'], plans: ['voir'], inventaire: ['voir'], achats: ['voir', 'creer'], rh: ['voir'] }),
     },
     {
       nom: 'Technicien', description: 'Réalise les interventions et renseigne les comptes rendus', niveau: 4, estAdmin: false, portee: 'secteurs', couleur: '#16a34a', systeme: true,
-      permissions: set(vide(), { dashboard: ['voir'], equipements: ['voir'], demandes: ['voir', 'creer'], ot: ['voir', 'creer', 'modifier', 'cloturer'], preventif: ['voir'], planning: ['voir'], stock: ['voir', 'modifier'], fournisseurs: ['voir'] }),
+      permissions: set(vide(), { dashboard: ['voir'], equipements: ['voir'], demandes: ['voir', 'creer'], ot: ['voir', 'creer', 'modifier', 'cloturer'], preventif: ['voir'], planning: ['voir'], stock: ['voir', 'modifier'], fournisseurs: ['voir'], plans: ['voir'], inventaire: ['voir', 'modifier'] }),
     },
     {
       nom: 'Demandeur', description: 'Signale les pannes et suit ses demandes', niveau: 5, estAdmin: false, portee: 'perso', couleur: '#6b7280', systeme: true,
-      permissions: set(vide(), { dashboard: ['voir'], demandes: ['voir', 'creer', 'modifier'], equipements: ['voir'] }),
+      permissions: set(vide(), { dashboard: ['voir'], demandes: ['voir', 'creer', 'modifier'], equipements: ['voir'], plans: ['voir'] }),
+    },
+    {
+      nom: 'Gestionnaire RH', description: 'Suit le personnel : contrats, habilitations, formations, visites médicales, absences', niveau: 3, estAdmin: false, portee: 'site', couleur: '#db2777', systeme: true,
+      permissions: set(vide(), { dashboard: ['voir'], rh: ['voir', 'creer', 'modifier', 'supprimer', 'valider', 'exporter'], utilisateurs: ['voir'], planning: ['voir'], rapports: ['voir'] }),
+    },
+    {
+      nom: 'Acheteur / comptabilité', description: 'Gère les commandes fournisseurs, les réceptions et les factures', niveau: 4, estAdmin: false, portee: 'site', couleur: '#ca8a04', systeme: true,
+      permissions: set(vide(), { dashboard: ['voir'], achats: ['voir', 'creer', 'modifier', 'supprimer', 'valider', 'exporter'], fournisseurs: ['voir', 'creer', 'modifier', 'exporter'], stock: ['voir', 'exporter'], ot: ['voir'], rapports: ['voir', 'exporter'] }),
     },
   ];
 }
 
+/** Site par défaut (racine) et ses services ; `parentCode` désigne le parent par son code. */
 function secteursParDefaut() {
   return [
-    { nom: 'Production', code: 'PROD', couleur: '#2563eb', ordre: 1, parentId: null },
-    { nom: 'Maintenance', code: 'MAINT', couleur: '#f59e0b', ordre: 2, parentId: null },
-    { nom: 'Logistique', code: 'LOG', couleur: '#16a34a', ordre: 3, parentId: null },
-    { nom: 'Qualité / Laboratoire', code: 'QUAL', couleur: '#8b5cf6', ordre: 4, parentId: null },
-    { nom: 'Services généraux', code: 'SG', couleur: '#6b7280', ordre: 5, parentId: null },
+    { nom: 'Site principal', code: 'SITE', type: 'site', couleur: '#0f766e', ordre: 1, parentCode: null, description: 'Renommez ce site (ex. « Usine de Carpentras ») et ajoutez vos autres sites dans Configuration › Secteurs & sites.' },
+    { nom: 'Production', code: 'PROD', type: 'service', couleur: '#2563eb', ordre: 1, parentCode: 'SITE' },
+    { nom: 'Maintenance', code: 'MAINT', type: 'service', couleur: '#f59e0b', ordre: 2, parentCode: 'SITE' },
+    { nom: 'Logistique', code: 'LOG', type: 'service', couleur: '#16a34a', ordre: 3, parentCode: 'SITE' },
+    { nom: 'Qualité / Laboratoire', code: 'QUAL', type: 'service', couleur: '#8b5cf6', ordre: 4, parentCode: 'SITE' },
+    { nom: 'Services généraux', code: 'SG', type: 'service', couleur: '#6b7280', ordre: 5, parentCode: 'SITE' },
   ];
+}
+
+/**
+ * Migration douce des profils fournis par défaut : ajoute les droits des modules apparus
+ * depuis leur création (ex. Plans 3D, Inventaire, Achats, RH) sans toucher aux droits existants.
+ */
+function migrerProfilsSysteme(db) {
+  const defauts = new Map(profilsParDefaut().map((p) => [p.nom, p]));
+  for (const p of db.list('profils', (x) => x.systeme && !x.estAdmin)) {
+    const def = defauts.get(p.nom);
+    if (!def) continue;
+    const perms = Object.assign({}, p.permissions || {});
+    let change = false;
+    for (const m of MODULES) {
+      if (perms[m.key] === undefined) { perms[m.key] = Object.assign({}, def.permissions[m.key]); change = true; }
+    }
+    if (change) db.update('profils', p.id, { permissions: perms });
+  }
 }
 
 /**
@@ -182,11 +286,18 @@ function seed(db, options = {}) {
   if (!db.findOne('profils', (p) => p.estAdmin)) {
     db.insert('profils', Object.assign({ secteurId: null, actif: true }, profilsParDefaut()[0]));
   }
+  migrerProfilsSysteme(db);
 
-  // Secteurs
+  // Secteurs : un site principal et ses services
   if (db.count('secteurs') === 0) {
-    for (const s of secteursParDefaut()) db.insert('secteurs', Object.assign({ responsableId: null, actif: true, description: '' }, s));
+    const ids = {};
+    for (const { parentCode, ...s } of secteursParDefaut()) {
+      const cree = db.insert('secteurs', Object.assign({ responsableId: null, actif: true, description: '' }, s, { parentId: parentCode ? ids[parentCode] : null }));
+      ids[s.code] = cree.id;
+    }
   }
+  // Secteurs sans type (bases antérieures) : racines = sites, autres = services
+  for (const s of db.list('secteurs', (x) => !x.type)) db.update('secteurs', s.id, { type: s.parentId == null ? 'site' : 'service' });
 
   // Compte administrateur initial
   if (db.count('users') === 0) {
@@ -201,6 +312,7 @@ function seed(db, options = {}) {
       passwordHash: hashPassword(options.adminPassword || 'admin'),
       profilId: admin.id,
       secteurIds: [],
+      siteAcces: [],
       managerId: null,
       actif: true,
       overrides: {},
