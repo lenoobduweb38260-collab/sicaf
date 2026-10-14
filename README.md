@@ -113,6 +113,13 @@ gabarits de **numérotation** (`OT-{annee}-{num:4}`), sauvegardes, export / impo
 Pour aller plus loin (ajouter un module, modifier l'interface), le code est volontairement simple et sans
 framework : voir [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+## Sécurité
+
+Mots de passe robustes et hachés, blocage des comptes après des échecs répétés, sessions limitées dans le
+temps, droits contrôlés par le serveur, accès multi-site en lecture seule ou complet, journal d'activité,
+en-têtes de sécurité stricts, aucune dépendance tierce, accès par navigateur désactivé par défaut, sauvegardes
+chiffrables sur plusieurs sites. Détails et recommandations de déploiement : [`docs/SECURITE.md`](docs/SECURITE.md).
+
 ## Données et sauvegardes
 
 - Base : un fichier JSON (`data/gmao.json`), écrit de manière atomique.

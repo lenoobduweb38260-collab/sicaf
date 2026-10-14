@@ -67,7 +67,8 @@ Règles :
 - Enregistrer `createdBy: req.user.id` à la création.
 - Les `secteurId` sont des nombres ou `null`. Lorsqu'un enregistrement référence un équipement, reprendre son `secteurId`.
 - Messages d'erreur et libellés en français.
-- Ne JAMAIS modifier les fichiers cœur (`server/*.js`, `client/js/app.js`, `client/js/ui.js`, `client/js/api.js`, `client/css/app.css`, modules `utilisateurs/profils/secteurs/configuration/audit`). Si un ajout cœur est indispensable, le signaler dans le rapport final.
+- Les fichiers du cœur (`server/*.js`, `client/js/app.js`, `client/js/ui.js`, `client/js/api.js`, `client/css/app.css`, modules `utilisateurs/profils/secteurs/configuration/systeme/audit`) sont partagés par tous les modules : toute évolution doit y rester rétrocompatible et être couverte par les tests du cœur (`tests/core.test.js`, `tests/sites.test.js`, `tests/securite.test.js`, `tests/systeme.test.js`).
+- Sécurité : aucun script en ligne (la politique de contenu l'interdit) ni attribut `onclick=…` dans du HTML généré, ni URL `javascript:` ; fenêtres d'impression via `ui.lancerImpression(w)` ; préférer `ui.el` (texte) à `innerHTML`, et échapper toute donnée avec `ui.esc` sinon. Voir aussi `docs/SECURITE.md`.
 
 ## 2. Vue client (`client/js/views/<module>.js`)
 
@@ -174,7 +175,7 @@ Réactions attendues : demandes écoute `ot:termine` (clôture la DI si `cloture
 
 ## 7. Tests
 
-- API : `tests/<module>.test.js` avec `node:test` et `tests/helpers.js` (`demarrer()` → `{ client(), db, ctx, stop }`, serveur en mémoire sur port aléatoire ; `client().login('admin','admin')`, `.ok(method, url, body)`). Tester : CRUD, validation, droits (403), portée par secteur, workflow.
+- API : `tests/<module>.test.js` avec `node:test` et `tests/helpers.js` (`demarrer()` → `{ client(), db, ctx, stop }`, serveur en mémoire sur port aléatoire ; `client().login('admin','admin')`, `.ok(method, url, body)`). Dans les tests, la politique de mot de passe est assouplie ; `demarrer({ politiqueReelle: true })` conserve la politique réelle. Tester : CRUD, validation, droits (403), portée par secteur et par site, workflow.
 - Lancer : `npm test` (tous) ou `node --test tests/ot.test.js`.
 - Démo : chaque module fournit `seedDemo(ctx)` idempotent (vérifier l'existence avant d'insérer) produisant des données réalistes en français (équipements industriels, pannes, pièces…), utilisées par le bouton « Charger les données de démonstration ».
-- Interface : vérifier avec Playwright (`require('playwright')`, Chromium préinstallé) : se connecter (admin/admin puis changement de mot de passe forcé via la modale : `#f_nouveau`, `#f_confirmation`), ouvrir la vue, capturer les erreurs console (`page.on('pageerror')`).
+- Interface : `node tests/e2e/run.js` (Playwright) parcourt toutes les vues ; pour un nouveau parcours, se connecter avec admin / admin puis changer le mot de passe dans la fenêtre imposée (`#f_nouveau`, `#f_confirmation`, mot de passe conforme à la politique), et surveiller `page.on('pageerror')` et les violations de la politique de contenu en console.
