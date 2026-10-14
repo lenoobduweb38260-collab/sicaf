@@ -29,6 +29,10 @@ plus ou moins de choses, ajustable utilisateur par utilisateur) et **secteurs**.
 
 ## Installation sous Windows 10/11
 
+> **Télécharger** : [dernière version de GMAO SICAF](https://github.com/lenoobduweb38260-collab/sicaf/releases/latest)
+> (`GMAO-SICAF-Setup-<version>.exe`). Chaque version publiée est aussi installée automatiquement sur les
+> postes déjà équipés.
+
 GMAO SICAF est une **application Windows à part entière** : elle s'ouvre dans sa propre fenêtre,
 sans navigateur ni barre d'adresse. **Aucun prérequis** (le moteur Node.js est intégré à l'exécutable)
 et **aucune fenêtre de commandes**.
