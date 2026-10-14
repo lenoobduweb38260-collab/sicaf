@@ -4,7 +4,12 @@
  * validation (valideurs selon la portée ou le supérieur hiérarchique N+1), conversion en ordre
  * de travail, commentaires, pièces jointes, chronologie des étapes, compteurs et export CSV.
  *
- * Services publiés   : ctx.services.demandes.{ get(id), lieeA(ot), ouvertesPour({ equipementId, secteurId }), peutValider(req, demande) }
+ * Statuts            : liste configurable `statutsDemande` ; chaque étape du circuit (soumise, validee,
+ *                      refusee, convertie, cloturee) est résolue dans la liste (voir resoudreStatuts),
+ *                      les codes par défaut ne servant que de repli.
+ * Portée             : règle commune (ctx.canSee) + le N+1 du demandeur voit les demandes de ses subordonnés.
+ * Services publiés   : ctx.services.demandes.{ get(id), lieeA(ot), ouvertesPour({ equipementId, secteurId }),
+ *                      peutValider(req, demande), STATUTS, resoudreStatuts(liste) }
  * Événements émis    : 'demande:soumise', 'demande:validee', 'demande:refusee', 'demande:convertie',
  *                      'demande:cloturee', 'demande:reouverte' (charge utile : la demande)
  * Événements écoutés : 'ot:termine' (clôture la DI liée si config.workflow.cloturerDemandeAvecOt),
@@ -16,13 +21,53 @@ const TAILLE_MAX_PJ = 5 * 1024 * 1024; // 5 Mo par pièce jointe
 const MAX_PJ = 20;
 const MAX_COMMENTAIRE = 4000;
 
-/** Codes de statut métier (repli lorsque la liste `statutsDemande` est absente). */
+/** Codes de statut métier par défaut (repli lorsque la liste `statutsDemande` ne les contient pas). */
 const S = { soumise: 'soumise', validee: 'validee', refusee: 'refusee', convertie: 'convertie', cloturee: 'cloturee' };
+/** Étapes finales du circuit et motifs de reconnaissance d'un statut renommé dans la configuration. */
+const ROLES_FINAUX = new Set(['refusee', 'cloturee']);
+const MOTIFS_ROLES = {
+  soumise: /soumi|nouve|attente|ouvert|signal/i,
+  validee: /valid|accept|approuv/i,
+  refusee: /refus|rejet|annul/i,
+  convertie: /conver|ordre|cours|trait|charge/i,
+  cloturee: /cl[oô]tur|termin|ferm|r[ée]solu|sold/i,
+};
+
+/**
+ * Associe chaque étape du circuit (soumise → validee / refusee → convertie → cloturee) à un code de la
+ * liste configurée `statutsDemande` : le code par défaut s'il existe ; sinon un statut reconnu par son
+ * code ou son libellé, du même type (indicateur `final`) ; sinon le premier statut libre de ce type
+ * (le dernier pour la clôture). Sans liste configurée, les codes par défaut sont utilisés.
+ */
+function resoudreStatuts(liste) {
+  const l = Array.isArray(liste) ? liste.filter((s) => s && s.code).slice().sort((a, b) => (a.ordre || 0) - (b.ordre || 0)) : [];
+  const out = Object.assign({}, S);
+  if (!l.length) return out;
+  const pris = new Set();
+  const restants = [];
+  for (const role of Object.keys(S)) {
+    if (l.some((s) => s.code === S[role])) pris.add(S[role]); else restants.push(role);
+  }
+  for (const role of restants) {
+    const candidats = l.filter((s) => !!s.final === ROLES_FINAUX.has(role) && !pris.has(s.code));
+    const it = candidats.find((s) => MOTIFS_ROLES[role].test(s.code) || MOTIFS_ROLES[role].test(s.label || ''))
+      || (role === 'cloturee' ? candidats[candidats.length - 1] : candidats[0]);
+    if (it) { out[role] = it.code; pris.add(it.code); }
+  }
+  return out;
+}
 const LIBELLES_ETAPES = {
   creation: 'Demande soumise', validation: 'Demande validée', refus: 'Demande refusée', conversion: 'Convertie en ordre de travail',
   cloture: 'Demande clôturée', reouverture: 'Demande réouverte', modification: 'Demande modifiée', ot_annule: 'Ordre de travail annulé',
 };
 const LIBELLES_CHAMPS = { titre: 'titre', description: 'description', equipementId: 'équipement', secteurId: 'secteur', prioriteCode: 'priorité', typeCode: 'type', arretProduction: 'arrêt de production', demandeurId: 'demandeur', dateDemande: 'date', champs: 'champs personnalisés' };
+
+/** Jour calendaire local (AAAA-MM-JJ) d'une date ISO : les filtres « du / au » portent sur la date locale. */
+function jourLocal(v) {
+  const d = v ? new Date(v) : null;
+  if (!d || Number.isNaN(d.getTime())) return '';
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 
 function csvEscape(v) {
   const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
@@ -32,19 +77,45 @@ function csvEscape(v) {
 function register(ctx) {
   const { router, db, HttpError, perms } = ctx;
 
-  // ----- Statuts --------------------------------------------------------------
+  // ----- Statuts (liste configurable `statutsDemande`) -------------------------
   const listeStatuts = () => ctx.liste('statutsDemande');
-  function libelleStatut(code) { const it = listeStatuts().find((s) => s.code === code); return it ? it.label : String(code || ''); }
-  function codesFinaux() {
-    const f = listeStatuts().filter((s) => s.final).map((s) => s.code);
-    return new Set(f.length ? f : [S.refusee, S.cloturee]);
+  let memoStatuts = { cle: undefined, roles: null, finaux: null };
+  /** Résolution mémorisée tant que la liste configurée ne change pas. */
+  function memo() {
+    const brute = ((db.data.config || {}).listes || {}).statutsDemande;
+    const cle = JSON.stringify(brute == null ? null : brute);
+    if (memoStatuts.cle !== cle) {
+      const roles = Object.freeze(resoudreStatuts(brute));
+      const f = (Array.isArray(brute) ? brute : []).filter((s) => s && s.final).map((s) => s.code);
+      memoStatuts = { cle, roles, finaux: f.length ? f : [roles.refusee, roles.cloturee] };
+    }
+    return memoStatuts;
   }
+  /** Codes effectifs des étapes du circuit : { soumise, validee, refusee, convertie, cloturee }. */
+  const st = () => memo().roles;
+  function libelleStatut(code) { const it = listeStatuts().find((s) => s.code === code); return it ? it.label : String(code || ''); }
+  function codesFinaux() { return new Set(memo().finaux); }
   const estFinal = (d) => codesFinaux().has(d.statut);
 
   // ----- Portée ---------------------------------------------------------------
+  /** Subordonnés directs (N-1) de l'utilisateur de la requête (mémorisés pour la requête). */
+  function subordonnes(req) {
+    if (!req._subordonnesDi) req._subordonnesDi = new Set(db.list('users', (u) => u.managerId != null && Number(u.managerId) === req.user.id).map((u) => u.id));
+    return req._subordonnesDi;
+  }
+  /**
+   * Portée d'une demande : règle commune (tous / secteurs / perso) et, en complément, le supérieur
+   * hiérarchique (N+1) voit toujours les demandes de ses subordonnés directs, qu'il peut avoir à valider.
+   */
+  function visible(req, d) {
+    if (!d) return false;
+    if (ctx.canSee(req, d)) return true;
+    return d.demandeurId != null && subordonnes(req).has(Number(d.demandeurId));
+  }
+  const scope = (req, rows) => (rows || []).filter((d) => visible(req, d));
   function getVisible(req, id) {
     const d = db.get(ENTITE, id);
-    if (!d || !ctx.canSee(req, d)) throw new HttpError(404, 'Demande introuvable');
+    if (!d || !visible(req, d)) throw new HttpError(404, 'Demande introuvable');
     return d;
   }
   /** Visibilité d'un équipement (déléguée au module Équipements lorsqu'il est présent). */
@@ -80,6 +151,19 @@ function register(ctx) {
   function valideursPour(d) {
     const wf = ctx.config().workflow || {};
     return ctx.usersAvecDroit(ENTITE, 'valider', (u, p) => peutValiderAvec(u, p, d, wf));
+  }
+  /**
+   * Valideurs attendus (notifiés) : tous les habilités dans la portée de la demande ; si la validation
+   * est réservée au supérieur hiérarchique, uniquement le N+1 du demandeur (repli sur les administrateurs
+   * habilités lorsque le demandeur n'a pas de N+1 capable de valider).
+   */
+  function valideursAttendus(d) {
+    const wf = ctx.config().workflow || {};
+    const valideurs = valideursPour(d);
+    if (!wf.validerParSuperieurUniquement) return valideurs;
+    const dem = demandeurDe(d);
+    const n1 = dem && dem.managerId != null ? valideurs.filter((u) => u.id === Number(dem.managerId)) : [];
+    return n1.length ? n1 : valideurs;
   }
 
   // ----- Utilitaires ----------------------------------------------------------
@@ -140,14 +224,14 @@ function register(ctx) {
     const final = estFinal(d);
     const sOt = ctx.services.ot;
     const otDisponible = !!(sOt && typeof sOt.creerDepuisDemande === 'function');
-    const validable = d.statut === S.soumise && peutValider(req, d);
+    const validable = d.statut === st().soumise && peutValider(req, d);
     return {
       valider: validable,
       refuser: validable,
-      convertir: d.statut === S.validee && d.otId == null && perms.can(req.perms, 'ot', 'creer'),
+      convertir: d.statut === st().validee && d.otId == null && perms.can(req.perms, 'ot', 'creer'),
       cloturer: !final && (estDemandeur || can('valider') || can('modifier')),
       reouvrir: final && (can('valider') || (can('modifier') && !estDemandeur)),
-      modifier: !final && ((estDemandeur && d.statut === S.soumise) || can('modifier')),
+      modifier: !final && ((estDemandeur && d.statut === st().soumise) || can('modifier')),
       supprimer: can('supprimer') && d.otId == null,
       commenter: true,
       joindre: (estDemandeur && !final) || can('modifier'),
@@ -175,7 +259,7 @@ function register(ctx) {
       otNumero: ot ? ot.numero : '', otStatut: ot ? ot.statut : null,
       nbCommentaires: (commentaires || []).length, nbPieceJointes: (pieceJointes || []).length,
       final, echeance, enRetard: !final && !!echeance && echeance < new Date().toISOString(),
-      peutValider: d.statut === S.soumise && peutValider(req, d, wf),
+      peutValider: d.statut === st().soumise && peutValider(req, d, wf),
       champs: d.champs || {},
     });
   }
@@ -192,7 +276,7 @@ function register(ctx) {
       commentaires: (d.commentaires || []).map(enrichCommentaire),
       pieceJointes: (d.pieceJointes || []).map(resumeDoc),
       historique: (d.historique || []).map((h) => Object.assign({}, h, { userNom: h.userId != null ? ctx.nomUser(h.userId) : 'Système' })),
-      valideurs: d.statut === S.soumise ? valideursPour(d).map(miniUser) : [],
+      valideurs: d.statut === st().soumise ? valideursAttendus(d).map(miniUser) : [],
       actions: actionsPossibles(req, d),
     });
   }
@@ -288,7 +372,7 @@ function register(ctx) {
   function notifierValideurs(req, d, titre) {
     const wf = ctx.config().workflow || {};
     if (wf.notifierValidateurs === false) return [];
-    const ids = valideursPour(d).map((u) => u.id).filter((id) => !req || !req.user || id !== req.user.id);
+    const ids = valideursAttendus(d).map((u) => u.id).filter((id) => !req || !req.user || id !== req.user.id);
     if (!ids.length) return ids;
     const urg = ctx.liste('priorites').slice(-1)[0];
     ctx.notify(ids, {
@@ -303,14 +387,14 @@ function register(ctx) {
     const wf = ctx.config().workflow || {};
     const now = new Date().toISOString();
     let ot = null; let avertissement = null;
-    const patch = { validateurId: req.user.id, dateValidation: now, motifRefus: '', statut: S.validee };
-    const hist = (d.historique || []).concat([entree(req, 'validation', S.validee, opts.auto ? 'Validation automatique (circuit de validation désactivé)' : (opts.commentaire || ''))]);
+    const patch = { validateurId: opts.auto ? null : req.user.id, dateValidation: now, motifRefus: '', statut: st().validee };
+    const hist = (d.historique || []).concat([opts.auto ? entree(null, 'validation', st().validee, 'Validation automatique (circuit de validation désactivé)') : entree(req, 'validation', st().validee, opts.commentaire || '')]);
     if (wf.otAutoDepuisDemande !== false) {
       const sOt = ctx.services.ot;
       if (sOt && typeof sOt.creerDepuisDemande === 'function') {
         try {
           ot = sOt.creerDepuisDemande(Object.assign({}, d, patch), req);
-          if (ot && ot.id != null) { patch.statut = S.convertie; patch.otId = ot.id; hist.push(entree(req, 'conversion', S.convertie, `Ordre de travail ${ot.numero || ot.id} créé automatiquement`)); }
+          if (ot && ot.id != null) { patch.statut = st().convertie; patch.otId = ot.id; hist.push(Object.assign(entree(opts.auto ? null : req, 'conversion', st().convertie, `Ordre de travail ${ot.numero || ot.id} créé automatiquement`), { otId: ot.id })); }
           else avertissement = 'La création automatique de l\'ordre de travail n\'a rien retourné : la demande est validée sans OT';
         } catch (e) {
           ot = null;
@@ -331,7 +415,7 @@ function register(ctx) {
   // ----- Filtres de liste -----------------------------------------------------
   function filtrer(req) {
     const q = req.query || {};
-    let rows = ctx.scope(req, db.list(ENTITE));
+    let rows = scope(req, db.list(ENTITE));
     const wf = ctx.config().workflow || {};
     if (q.statut) { const codes = String(q.statut).split(',').map((s) => s.trim()).filter(Boolean); rows = rows.filter((d) => codes.includes(d.statut)); }
     if (q.ouvertes === '1' || q.ouvertes === 'true') { const f = codesFinaux(); rows = rows.filter((d) => !f.has(d.statut)); }
@@ -343,9 +427,9 @@ function register(ctx) {
     if (q.demandeurId) rows = rows.filter((d) => Number(d.demandeurId) === Number(q.demandeurId));
     if (q.otId) rows = rows.filter((d) => Number(d.otId) === Number(q.otId));
     if (q.arretProduction === '1' || q.arretProduction === 'true') rows = rows.filter((d) => !!d.arretProduction);
-    if (q.du) rows = rows.filter((d) => String(d.dateDemande || d.createdAt || '').slice(0, 10) >= String(q.du).slice(0, 10));
-    if (q.au) rows = rows.filter((d) => String(d.dateDemande || d.createdAt || '').slice(0, 10) <= String(q.au).slice(0, 10));
-    if (q.aValider === '1' || q.aValider === 'true') rows = rows.filter((d) => d.statut === S.soumise && peutValider(req, d, wf));
+    if (q.du) rows = rows.filter((d) => jourLocal(d.dateDemande || d.createdAt) >= String(q.du).slice(0, 10));
+    if (q.au) rows = rows.filter((d) => jourLocal(d.dateDemande || d.createdAt) <= String(q.au).slice(0, 10));
+    if (q.aValider === '1' || q.aValider === 'true') rows = rows.filter((d) => d.statut === st().soumise && peutValider(req, d, wf));
     if (q.mesDemandes === '1' || q.mesDemandes === 'true') rows = rows.filter((d) => Number(d.demandeurId) === req.user.id || Number(d.createdBy) === req.user.id);
     if (q.recherche) {
       const s = String(q.recherche).toLowerCase();
@@ -364,7 +448,7 @@ function register(ctx) {
   }, { perm: [ENTITE, 'voir'] });
 
   router.get('/api/demandes-compteurs', async (req) => {
-    const rows = ctx.scope(req, db.list(ENTITE));
+    const rows = scope(req, db.list(ENTITE));
     const finaux = codesFinaux();
     const wf = ctx.config().workflow || {};
     const priorites = ctx.liste('priorites');
@@ -374,7 +458,7 @@ function register(ctx) {
     for (const d of rows) parStatut[d.statut] = (parStatut[d.statut] || 0) + 1;
     const estMienne = (d) => Number(d.demandeurId) === req.user.id || Number(d.createdBy) === req.user.id;
     return {
-      aValider: rows.filter((d) => d.statut === S.soumise && peutValider(req, d, wf)).length,
+      aValider: rows.filter((d) => d.statut === st().soumise && peutValider(req, d, wf)).length,
       mesOuvertes: rows.filter((d) => !finaux.has(d.statut) && estMienne(d)).length,
       mesDemandes: rows.filter(estMienne).length,
       ouvertes: rows.filter((d) => !finaux.has(d.statut)).length,
@@ -383,6 +467,8 @@ function register(ctx) {
       arretProduction: rows.filter((d) => !finaux.has(d.statut) && d.arretProduction).length,
       total: rows.length,
       parStatut,
+      statuts: Object.assign({}, st()),
+      finaux: Array.from(finaux),
     };
   }, { perm: [ENTITE, 'voir'] });
 
@@ -418,11 +504,12 @@ function register(ctx) {
     if (brutes.length > MAX_PJ) throw new HttpError(400, `Nombre maximal de pièces jointes dépassé (${MAX_PJ})`);
     const pieceJointes = brutes.filter((p) => p && typeof p === 'object' && p.contenu).map((p) => validerPieceJointe(p, req));
     const d = db.insert(ENTITE, Object.assign(data, {
-      numero: numeroUnique(cfg), statut: S.soumise, validateurId: null, dateValidation: null, motifRefus: '', otId: null, dateCloture: null,
-      commentaires: [], pieceJointes, historique: [entree(req, 'creation', S.soumise, data.demandeurId !== req.user.id ? `Saisie par ${ctx.nomUser(req.user.id)} pour ${ctx.nomUser(data.demandeurId)}` : '')],
+      numero: numeroUnique(cfg), statut: st().soumise, validateurId: null, dateValidation: null, motifRefus: '', otId: null, dateCloture: null,
+      commentaires: [], pieceJointes, historique: [entree(req, 'creation', st().soumise, data.demandeurId !== req.user.id ? `Saisie par ${ctx.nomUser(req.user.id)} pour ${ctx.nomUser(data.demandeurId)}` : '')],
       createdBy: req.user.id,
     }));
     ctx.audit(req, 'creation', ENTITE, d.id, `Demande ${d.numero} : ${d.titre}${d.arretProduction ? ' (arrêt de production)' : ''}`);
+    notifierDemandeur(req, d, `Demande ${d.numero} saisie en votre nom`, `${ctx.nomUser(req.user.id)} a saisi la demande « ${d.titre} » en votre nom`);
     ctx.emit('demande:soumise', d);
     let resultat = d; let ot = null; let avertissement = null;
     if (wf.validationDemandes === false) {
@@ -436,14 +523,15 @@ function register(ctx) {
   router.put('/api/demandes/:id', async (req) => {
     const existant = getVisible(req, req.params.id);
     if (estFinal(existant)) throw new HttpError(400, `Une demande au statut « ${libelleStatut(existant.statut)} » ne peut plus être modifiée : réouvrez-la d'abord`);
-    if (!actionsPossibles(req, existant).modifier) throw new HttpError(403, existant.statut === S.soumise ? 'Vous ne pouvez modifier que vos propres demandes tant qu\'elles sont soumises' : 'Droit insuffisant : seule une demande soumise peut être modifiée par son demandeur');
+    if (!actionsPossibles(req, existant).modifier) throw new HttpError(403, existant.statut === st().soumise ? 'Vous ne pouvez modifier que vos propres demandes tant qu\'elles sont soumises' : 'Droit insuffisant : seule une demande soumise peut être modifiée par son demandeur');
     const data = valider(req, req.body, existant);
     const norm = (v) => (v == null ? null : Number(v));
-    if (existant.statut !== S.soumise && norm(data.equipementId) !== norm(existant.equipementId)) throw new HttpError(400, 'L\'équipement ne peut plus être modifié après validation de la demande (l\'ordre de travail l\'a repris)');
+    if (existant.statut !== st().soumise && norm(data.equipementId) !== norm(existant.equipementId)) throw new HttpError(400, 'L\'équipement ne peut plus être modifié après validation de la demande (l\'ordre de travail l\'a repris)');
     const modifies = Object.keys(data).filter((k) => JSON.stringify(data[k] === undefined ? null : data[k]) !== JSON.stringify(existant[k] === undefined ? null : existant[k])).map((k) => LIBELLES_CHAMPS[k] || k);
     const hist = (existant.historique || []).concat(modifies.length ? [entree(req, 'modification', existant.statut, 'Champs modifiés : ' + modifies.join(', '))] : []);
     const d = db.update(ENTITE, existant.id, Object.assign(data, { historique: hist }));
     ctx.audit(req, 'modification', ENTITE, d.id, `Demande ${d.numero}${modifies.length ? ' : ' + modifies.join(', ') : ''}`);
+    if (modifies.length) notifierDemandeur(req, d, `Demande ${d.numero} modifiée`, `${ctx.nomUser(req.user.id)} a modifié votre demande « ${d.titre} » (${modifies.join(', ')})`);
     return detail(req, d);
   }, { perm: [ENTITE, 'voir'] });
 
@@ -453,12 +541,13 @@ function register(ctx) {
     if (ot) throw new HttpError(400, `Impossible de supprimer la demande ${existant.numero} : elle est liée à l'ordre de travail ${ot.numero || ot.id}`);
     db.remove(ENTITE, existant.id);
     ctx.audit(req, 'suppression', ENTITE, existant.id, `Demande ${existant.numero} : ${existant.titre}`);
+    if (existant.demandeurId != null && Number(existant.demandeurId) !== req.user.id) ctx.notify([existant.demandeurId], { titre: `Demande ${existant.numero} supprimée`, message: `${ctx.nomUser(req.user.id)} a supprimé votre demande « ${existant.titre} »`, lien: '#/demandes', type: 'alerte' });
     return { ok: true };
   }, { perm: [ENTITE, 'supprimer'] });
 
   // ----- Routes : workflow ----------------------------------------------------
   function verifierSoumise(d, verbe) {
-    if (d.statut !== S.soumise) throw new HttpError(400, `Seule une demande au statut « ${libelleStatut(S.soumise)} » peut être ${verbe} (statut actuel : ${libelleStatut(d.statut)})`);
+    if (d.statut !== st().soumise) throw new HttpError(400, `Seule une demande au statut « ${libelleStatut(st().soumise)} » peut être ${verbe} (statut actuel : ${libelleStatut(d.statut)})`);
   }
   function verifierValideur(req, d) {
     if (peutValider(req, d)) return;
@@ -481,7 +570,7 @@ function register(ctx) {
     verifierValideur(req, d);
     const motif = texteCommentaire(req.body, 'motif', true, 'Le motif du refus');
     const now = new Date().toISOString();
-    const maj = db.update(ENTITE, d.id, { statut: S.refusee, validateurId: req.user.id, dateValidation: now, motifRefus: motif, historique: (d.historique || []).concat([entree(req, 'refus', S.refusee, motif)]) });
+    const maj = db.update(ENTITE, d.id, { statut: st().refusee, validateurId: req.user.id, dateValidation: now, motifRefus: motif, historique: (d.historique || []).concat([entree(req, 'refus', st().refusee, motif)]) });
     ctx.audit(req, 'refus', ENTITE, d.id, `Demande ${d.numero} refusée : ${motif}`);
     notifierDemandeur(req, maj, `Demande ${maj.numero} refusée`, `Votre demande « ${maj.titre} » a été refusée : ${motif}`);
     ctx.emit('demande:refusee', maj);
@@ -490,7 +579,7 @@ function register(ctx) {
 
   router.post('/api/demandes/:id/convertir', async (req) => {
     const d = getVisible(req, req.params.id);
-    if (d.statut !== S.validee) throw new HttpError(400, `Seule une demande au statut « ${libelleStatut(S.validee)} » peut être convertie en ordre de travail (statut actuel : ${libelleStatut(d.statut)})`);
+    if (d.statut !== st().validee) throw new HttpError(400, `Seule une demande au statut « ${libelleStatut(st().validee)} » peut être convertie en ordre de travail (statut actuel : ${libelleStatut(d.statut)})`);
     const existantOt = otLie(d);
     if (existantOt) throw new HttpError(400, `La demande ${d.numero} est déjà liée à l'ordre de travail ${existantOt.numero || existantOt.id}`);
     const sOt = ctx.services.ot;
@@ -499,7 +588,7 @@ function register(ctx) {
     if (!ot || ot.id == null) throw new HttpError(500, 'La création de l\'ordre de travail a échoué');
     const commentaire = texteCommentaire(req.body, 'commentaire', false, 'Le commentaire');
     const courant = db.get(ENTITE, d.id) || d; // l'événement ot:cree a pu déjà mettre à jour la demande
-    const maj = db.update(ENTITE, d.id, { statut: S.convertie, otId: ot.id, historique: (courant.historique || d.historique || []).filter((h) => !(h.action === 'conversion' && h.otId === ot.id)).concat([Object.assign(entree(req, 'conversion', S.convertie, `Ordre de travail ${ot.numero || ot.id} créé${commentaire ? ' : ' + commentaire : ''}`), { otId: ot.id })]) });
+    const maj = db.update(ENTITE, d.id, { statut: st().convertie, otId: ot.id, historique: (courant.historique || d.historique || []).filter((h) => !(h.action === 'conversion' && h.otId === ot.id)).concat([Object.assign(entree(req, 'conversion', st().convertie, `Ordre de travail ${ot.numero || ot.id} créé${commentaire ? ' : ' + commentaire : ''}`), { otId: ot.id })]) });
     ctx.audit(req, 'conversion', ENTITE, d.id, `Demande ${d.numero} convertie en OT ${ot.numero || ot.id}`);
     notifierDemandeur(req, maj, `Demande ${maj.numero} prise en charge`, `Un ordre de travail ${ot.numero || ot.id} a été créé pour votre demande « ${maj.titre} »`);
     ctx.emit('demande:convertie', maj);
@@ -512,7 +601,7 @@ function register(ctx) {
     if (!actionsPossibles(req, d).cloturer) throw new HttpError(403, 'Vous ne pouvez pas clôturer cette demande');
     const commentaire = texteCommentaire(req.body, 'commentaire', false, 'Le commentaire');
     const now = new Date().toISOString();
-    const maj = db.update(ENTITE, d.id, { statut: S.cloturee, dateCloture: now, historique: (d.historique || []).concat([entree(req, 'cloture', S.cloturee, commentaire)]) });
+    const maj = db.update(ENTITE, d.id, { statut: st().cloturee, dateCloture: now, historique: (d.historique || []).concat([entree(req, 'cloture', st().cloturee, commentaire)]) });
     ctx.audit(req, 'cloture', ENTITE, d.id, `Demande ${d.numero} clôturée${commentaire ? ' : ' + commentaire : ''}`);
     notifierDemandeur(req, maj, `Demande ${maj.numero} clôturée`, `Votre demande « ${maj.titre} » a été clôturée par ${ctx.nomUser(req.user.id)}${commentaire ? ' : ' + commentaire : ''}`);
     ctx.emit('demande:cloturee', maj);
@@ -525,13 +614,13 @@ function register(ctx) {
     if (!actionsPossibles(req, d).reouvrir) throw new HttpError(403, 'Droit insuffisant pour réouvrir une demande (un demandeur ne peut pas réouvrir lui-même sa demande : créez-en une nouvelle)');
     const commentaire = texteCommentaire(req.body, 'commentaire', false, 'Le commentaire');
     const patch = { dateCloture: null };
-    if (d.statut === S.refusee) { patch.statut = S.soumise; patch.validateurId = null; patch.dateValidation = null; patch.motifRefus = ''; }
-    else { const ot = otLie(d); patch.statut = ot ? S.convertie : (d.dateValidation ? S.validee : S.soumise); }
+    if (d.statut === st().refusee) { patch.statut = st().soumise; patch.validateurId = null; patch.dateValidation = null; patch.motifRefus = ''; }
+    else { const ot = otLie(d); patch.statut = ot ? st().convertie : (d.dateValidation ? st().validee : st().soumise); }
     patch.historique = (d.historique || []).concat([entree(req, 'reouverture', patch.statut, commentaire)]);
     const maj = db.update(ENTITE, d.id, patch);
     ctx.audit(req, 'reouverture', ENTITE, d.id, `Demande ${d.numero} réouverte (${libelleStatut(maj.statut)})${commentaire ? ' : ' + commentaire : ''}`);
     notifierDemandeur(req, maj, `Demande ${maj.numero} réouverte`, `Votre demande « ${maj.titre} » a été réouverte par ${ctx.nomUser(req.user.id)}${commentaire ? ' : ' + commentaire : ''}`);
-    if (maj.statut === S.soumise) notifierValideurs(req, maj, `Demande réouverte à valider : ${maj.numero}`);
+    if (maj.statut === st().soumise) notifierValideurs(req, maj, `Demande réouverte à valider : ${maj.numero}`);
     ctx.emit('demande:reouverte', maj);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
@@ -607,7 +696,7 @@ function register(ctx) {
     const d = demandeLieeA(ot);
     if (!d || estFinal(d)) return;
     const now = new Date().toISOString();
-    const maj = db.update(ENTITE, d.id, { statut: S.cloturee, dateCloture: now, otId: d.otId == null ? ot.id : d.otId, historique: (d.historique || []).concat([entree(null, 'cloture', S.cloturee, `Clôture automatique : ordre de travail ${ot.numero || ot.id} terminé`)]) });
+    const maj = db.update(ENTITE, d.id, { statut: st().cloturee, dateCloture: now, otId: d.otId == null ? ot.id : d.otId, historique: (d.historique || []).concat([entree(null, 'cloture', st().cloturee, `Clôture automatique : ordre de travail ${ot.numero || ot.id} terminé`)]) });
     ctx.audit(null, 'cloture', ENTITE, d.id, `Demande ${d.numero} clôturée automatiquement (OT ${ot.numero || ot.id} terminé)`);
     if (maj.demandeurId != null) ctx.notify([maj.demandeurId], { titre: `Demande ${maj.numero} clôturée`, message: `L'intervention ${ot.numero || ot.id} est terminée${ot.rapport ? ' — ' + String(ot.rapport).slice(0, 200) : ''}`, lien: `#/demandes/${maj.id}`, type: 'info' });
     ctx.emit('demande:cloturee', maj);
@@ -621,10 +710,10 @@ function register(ctx) {
     if (!d || (d.otId != null && Number(d.otId) !== Number(ot.id))) return;
     const patch = {};
     if (d.otId == null) patch.otId = ot.id;
-    if (d.statut === S.soumise || d.statut === S.validee) {
-      patch.statut = S.convertie;
+    if (d.statut === st().soumise || d.statut === st().validee) {
+      patch.statut = st().convertie;
       if (!d.dateValidation) { patch.dateValidation = new Date().toISOString(); patch.validateurId = ot.createdBy == null ? null : ot.createdBy; }
-      patch.historique = (d.historique || []).concat([Object.assign(entree(null, 'conversion', S.convertie, `Ordre de travail ${ot.numero || ot.id} créé depuis la demande`), { otId: ot.id, userId: ot.createdBy == null ? null : ot.createdBy })]);
+      patch.historique = (d.historique || []).concat([Object.assign(entree(null, 'conversion', st().convertie, `Ordre de travail ${ot.numero || ot.id} créé depuis la demande`), { otId: ot.id, userId: ot.createdBy == null ? null : ot.createdBy })]);
     }
     if (Object.keys(patch).length) db.update(ENTITE, d.id, patch);
   });
@@ -633,8 +722,8 @@ function register(ctx) {
   ctx.on('ot:annule', (data) => {
     const ot = otDe(data);
     const d = demandeLieeA(ot);
-    if (!d || d.statut !== S.convertie) return;
-    const maj = db.update(ENTITE, d.id, { statut: S.validee, otId: null, historique: (d.historique || []).concat([entree(null, 'ot_annule', S.validee, `Ordre de travail ${ot.numero || ot.id} annulé : la demande redevient validée`)]) });
+    if (!d || d.statut !== st().convertie) return;
+    const maj = db.update(ENTITE, d.id, { statut: st().validee, otId: null, historique: (d.historique || []).concat([entree(null, 'ot_annule', st().validee, `Ordre de travail ${ot.numero || ot.id} annulé : la demande redevient validée`)]) });
     ctx.audit(null, 'statut', ENTITE, d.id, `Demande ${d.numero} : OT ${ot.numero || ot.id} annulé, retour au statut validée`);
     if (maj.demandeurId != null) ctx.notify([maj.demandeurId], { titre: `Demande ${maj.numero} : intervention annulée`, message: `L'ordre de travail ${ot.numero || ot.id} a été annulé ; votre demande reste validée`, lien: `#/demandes/${maj.id}`, type: 'alerte' });
   });
@@ -653,7 +742,9 @@ function register(ctx) {
     /** L'utilisateur de la requête peut-il valider cette demande ? */
     peutValider: (req, d) => peutValider(req, typeof d === 'object' ? d : db.get(ENTITE, d)),
     /** Codes de statut métier utilisés par le module. */
-    STATUTS: Object.assign({}, S),
+    get STATUTS() { return Object.assign({}, st()); },
+    /** Résolution des étapes du circuit pour une liste de statuts donnée. */
+    resoudreStatuts,
   };
 }
 
@@ -672,14 +763,19 @@ function seedDemo(ctx) {
   };
   if (db.findOne(ENTITE, (d) => d.titre === TITRE_TEMOIN)) { const n = relier(); return 'déjà présentes' + (n ? ` (${n} lien(s) OT complété(s))` : ''); }
 
-  // Les seeds s'exécutent dans l'ordre alphabétique des fichiers : on déclenche d'abord (idempotents)
-  // ceux dont on dépend (utilisateurs demandeurs, équipements), s'ils existent.
-  for (const m of ctx.modules || []) {
-    if (/^(utilisateurs|equipements)\.js$/.test(m.fichier || '') && typeof m.seedDemo === 'function') { try { m.seedDemo(ctx); } catch (e) { ctx.log('Demandes : seed dépendant en échec', m.fichier, e.message); } }
+  // Les seeds s'exécutent dans l'ordre alphabétique des fichiers (« demandes » passe avant « equipements »
+  // et « utilisateurs ») : on déclenche d'abord, dans l'ordre de leurs propres dépendances, les seeds
+  // (idempotents par contrat) dont nos données dépendent, lorsqu'ils existent. Leur second appel par le
+  // chargeur ne fait alors plus rien (« déjà présents »).
+  const DEPENDANCES = ['profils.js', 'secteurs.js', 'utilisateurs.js', 'fournisseurs.js', 'equipements.js'];
+  for (const fichier of DEPENDANCES) {
+    const m = (ctx.modules || []).find((x) => x.fichier === fichier);
+    if (m && typeof m.seedDemo === 'function') { try { m.seedDemo(ctx); } catch (e) { ctx.log('Demandes : seed dépendant en échec', fichier, e.message); } }
   }
 
   const cfg = db.getConfig();
   const gabarit = (cfg.numerotation || {}).di || 'DI-{annee}-{num:4}';
+  const ST = resoudreStatuts((cfg.listes || {}).statutsDemande);
   const admin = db.findOne('users', (u) => u.login === 'admin') || db.findOne('users', () => true);
   const userId = (login) => { const u = db.findOne('users', (x) => x.login === login); return u ? u.id : (admin ? admin.id : null); };
   const equipement = (nomEq) => db.findOne('equipements', (e) => e.nom === nomEq);
@@ -700,65 +796,65 @@ function seedDemo(ctx) {
     delete o.equipement; delete o.secteurCode;
     return db.insert(ENTITE, Object.assign({
       numero: numeroUnique(), description: '', equipementId: e ? e.id : null, secteurId: e ? (e.secteurId == null ? null : e.secteurId) : (o.secteurId == null ? secteurRepli : o.secteurId),
-      prioriteCode: 'normale', typeCode: 'correctif', statut: S.soumise, validateurId: null, dateValidation: null, motifRefus: '', otId: null, dateCloture: null,
+      prioriteCode: 'normale', typeCode: 'correctif', statut: ST.soumise, validateurId: null, dateValidation: null, motifRefus: '', otId: null, dateCloture: null,
       arretProduction: false, commentaires: [], pieceJointes: [], historique: [], champs: {}, createdBy: admin ? admin.id : null,
     }, o));
   };
 
   // 1. Convertie en OT (validée par le chef de secteur) avec photo et échange
   mk({
-    titre: TITRE_TEMOIN, equipement: 'Presse hydraulique 250 t', secteurCode: 'PROD', prioriteCode: 'haute', typeCode: 'correctif', statut: S.convertie,
+    titre: TITRE_TEMOIN, equipement: 'Presse hydraulique 250 t', secteurCode: 'PROD', prioriteCode: 'haute', typeCode: 'correctif', statut: ST.convertie,
     description: 'Traces d\'huile au sol sous le vérin principal depuis ce matin. Le niveau du réservoir hydraulique a baissé d\'environ 2 cm en une équipe. Pas de perte de pression constatée pour l\'instant.',
     demandeurId: userId('spetit'), createdBy: userId('spetit'), dateDemande: ilYa(290), validateurId: userId('pmartin'), dateValidation: ilYa(280),
     pieceJointes: [photo],
     commentaires: [com(286, 'pmartin', 'Merci Sophie. Je passe voir la presse en fin de matinée, merci de baliser la zone.'), com(275, 'jbernard', 'Vu sur place : joint de tige du vérin à remplacer. Pièce disponible en magasin, intervention planifiée.')],
-    historique: [etape(290, 'spetit', 'creation', S.soumise), etape(280, 'pmartin', 'validation', S.validee, 'Fuite confirmée, à traiter rapidement'), etape(280, 'pmartin', 'conversion', S.convertie, 'Ordre de travail créé automatiquement')],
+    historique: [etape(290, 'spetit', 'creation', ST.soumise), etape(280, 'pmartin', 'validation', ST.validee, 'Fuite confirmée, à traiter rapidement'), etape(280, 'pmartin', 'conversion', ST.convertie, 'Ordre de travail créé automatiquement')],
   });
   // 2. Validée, en attente de conversion manuelle
   mk({
-    titre: 'Bruit anormal au démarrage du compresseur GA 37', equipement: 'Compresseur d\'air GA 37', secteurCode: 'SG', prioriteCode: 'normale', typeCode: 'correctif', statut: S.validee,
+    titre: 'Bruit anormal au démarrage du compresseur GA 37', equipement: 'Compresseur d\'air GA 37', secteurCode: 'SG', prioriteCode: 'normale', typeCode: 'correctif', statut: ST.validee,
     description: 'Sifflement aigu pendant 10 à 15 secondes à chaque démarrage après un arrêt prolongé. Disparaît ensuite. Pression réseau normale.',
     demandeurId: userId('kleroy'), createdBy: userId('kleroy'), dateDemande: ilYa(120), validateurId: userId('mdupont'), dateValidation: ilYa(96),
     commentaires: [com(100, 'mdupont', 'À vérifier lors de la prochaine visite du prestataire Atlas Copco ; contrôler la courroie et le clapet d\'aspiration.')],
-    historique: [etape(120, 'kleroy', 'creation', S.soumise), etape(96, 'mdupont', 'validation', S.validee, 'Validée : à planifier avec le prestataire')],
+    historique: [etape(120, 'kleroy', 'creation', ST.soumise), etape(96, 'mdupont', 'validation', ST.validee, 'Validée : à planifier avec le prestataire')],
   });
   // 3. Urgente avec arrêt de production, convertie
   mk({
-    titre: 'Four de rétraction de la fardeleuse : résistance hors service', equipement: 'Fardeleuse', secteurCode: 'PROD', prioriteCode: 'urgente', typeCode: 'correctif', statut: S.convertie, arretProduction: true,
+    titre: 'Four de rétraction de la fardeleuse : résistance hors service', equipement: 'Fardeleuse', secteurCode: 'PROD', prioriteCode: 'urgente', typeCode: 'correctif', statut: ST.convertie, arretProduction: true,
     description: 'La résistance n°3 du four de rétraction est coupée (disjonction au réarmement). Les fardeaux ne sont plus conformes : cadence réduite de 20 % et rebuts. Ligne 1 à l\'arrêt depuis 14 h 10.',
     demandeurId: userId('spetit'), createdBy: userId('spetit'), dateDemande: ilYa(100), validateurId: userId('pmartin'), dateValidation: ilYa(99),
     commentaires: [com(99, 'pmartin', 'Priorité absolue : Karim est affecté à l\'intervention.')],
-    historique: [etape(100, 'spetit', 'creation', S.soumise), etape(99, 'pmartin', 'validation', S.validee, 'Arrêt de production : intervention immédiate'), etape(99, 'pmartin', 'conversion', S.convertie, 'Ordre de travail créé automatiquement')],
+    historique: [etape(100, 'spetit', 'creation', ST.soumise), etape(99, 'pmartin', 'validation', ST.validee, 'Arrêt de production : intervention immédiate'), etape(99, 'pmartin', 'conversion', ST.convertie, 'Ordre de travail créé automatiquement')],
   });
   // 4. Soumise (préventif / amélioration)
   mk({
-    titre: 'Remplacement trimestriel des filtres F7 de la CTA', equipement: 'CTA atelier conditionnement', secteurCode: 'SG', prioriteCode: 'basse', typeCode: 'preventif', statut: S.soumise,
+    titre: 'Remplacement trimestriel des filtres F7 de la CTA', equipement: 'CTA atelier conditionnement', secteurCode: 'SG', prioriteCode: 'basse', typeCode: 'preventif', statut: ST.soumise,
     description: 'Les filtres F7 de la centrale de traitement d\'air n\'ont pas été remplacés ce trimestre : perte de charge affichée à 280 Pa (seuil 250 Pa).',
     demandeurId: userId('jbernard'), createdBy: userId('jbernard'), dateDemande: ilYa(26),
-    historique: [etape(26, 'jbernard', 'creation', S.soumise)],
+    historique: [etape(26, 'jbernard', 'creation', ST.soumise)],
   });
   // 5. Clôturée après intervention
   mk({
-    titre: 'Chariot thermique n°2 : fuite hydraulique sur le vérin d\'inclinaison', equipement: 'Chariot élévateur thermique n°2', secteurCode: 'LOG', prioriteCode: 'haute', typeCode: 'correctif', statut: S.cloturee,
+    titre: 'Chariot thermique n°2 : fuite hydraulique sur le vérin d\'inclinaison', equipement: 'Chariot élévateur thermique n°2', secteurCode: 'LOG', prioriteCode: 'haute', typeCode: 'correctif', statut: ST.cloturee,
     description: 'Fuite d\'huile importante sur le vérin d\'inclinaison du mât, flaque sous le chariot au parking. Chariot immobilisé par sécurité.',
     demandeurId: userId('jbernard'), createdBy: userId('jbernard'), dateDemande: ilYa(480), validateurId: userId('mdupont'), dateValidation: ilYa(470), dateCloture: ilYa(360),
     commentaires: [com(380, 'kleroy', 'Joints du vérin remplacés, niveau refait, essai en charge OK.')],
-    historique: [etape(480, 'jbernard', 'creation', S.soumise), etape(470, 'mdupont', 'validation', S.validee, ''), etape(470, 'mdupont', 'conversion', S.convertie, 'Ordre de travail créé automatiquement'), etape(360, null, 'cloture', S.cloturee, 'Clôture automatique : intervention terminée')],
+    historique: [etape(480, 'jbernard', 'creation', ST.soumise), etape(470, 'mdupont', 'validation', ST.validee, ''), etape(470, 'mdupont', 'conversion', ST.convertie, 'Ordre de travail créé automatiquement'), etape(360, null, 'cloture', ST.cloturee, 'Clôture automatique : intervention terminée')],
   });
   // 6. Refusée avec motif (sans équipement, rattachée au secteur Production)
   mk({
-    titre: 'Ajout d\'un éclairage LED au poste 4 de la ligne 2', secteurId: secteur('PROD'), prioriteCode: 'basse', typeCode: 'amelioration', statut: S.refusee,
+    titre: 'Ajout d\'un éclairage LED au poste 4 de la ligne 2', secteurId: secteur('PROD'), prioriteCode: 'basse', typeCode: 'amelioration', statut: ST.refusee,
     description: 'Le poste de contrôle visuel n°4 manque de lumière en équipe de nuit (environ 250 lux mesurés). Demande d\'un éclairage LED complémentaire orientable.',
     demandeurId: userId('spetit'), createdBy: userId('spetit'), dateDemande: ilYa(200), validateurId: userId('pmartin'), dateValidation: ilYa(190),
     motifRefus: 'Hors périmètre maintenance : à intégrer au projet « éclairage 2027 » piloté par les services généraux. Demande à ressaisir avec le chiffrage.',
-    historique: [etape(200, 'spetit', 'creation', S.soumise), etape(190, 'pmartin', 'refus', S.refusee, 'Hors périmètre maintenance : à intégrer au projet « éclairage 2027 » piloté par les services généraux. Demande à ressaisir avec le chiffrage.')],
+    historique: [etape(200, 'spetit', 'creation', ST.soumise), etape(190, 'pmartin', 'refus', ST.refusee, 'Hors périmètre maintenance : à intégrer au projet « éclairage 2027 » piloté par les services généraux. Demande à ressaisir avec le chiffrage.')],
   });
   // 7. Soumise récente (contrôle réglementaire) avec relevé joint
   mk({
-    titre: 'Étalonnage de l\'étuve de laboratoire en retard', equipement: 'Étuve de laboratoire', secteurCode: 'QUAL', prioriteCode: 'normale', typeCode: 'reglementaire', statut: S.soumise,
+    titre: 'Étalonnage de l\'étuve de laboratoire en retard', equipement: 'Étuve de laboratoire', secteurCode: 'QUAL', prioriteCode: 'normale', typeCode: 'reglementaire', statut: ST.soumise,
     description: 'L\'étalonnage annuel de la sonde de température est dépassé de deux mois (écart constaté de -1,8 °C). Prévoir l\'intervention de l\'organisme accrédité.',
     demandeurId: userId('mdupont'), createdBy: userId('mdupont'), dateDemande: ilYa(2), pieceJointes: [note],
-    historique: [etape(2, 'mdupont', 'creation', S.soumise)],
+    historique: [etape(2, 'mdupont', 'creation', ST.soumise)],
   });
   const n = relier();
   return '7 demandes d\'intervention' + (n ? ` (${n} lien(s) OT)` : '');

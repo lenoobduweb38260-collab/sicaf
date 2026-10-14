@@ -8,7 +8,38 @@
   'use strict';
   const { el, icone, toast, erreur, frag } = ui;
   const ENTITE = 'demandes';
+  /** Codes par défaut des étapes du circuit : repli uniquement (voir statutsCircuit). */
   const S = { soumise: 'soumise', validee: 'validee', refusee: 'refusee', convertie: 'convertie', cloturee: 'cloturee' };
+  const ROLES_FINAUX = new Set(['refusee', 'cloturee']);
+  const MOTIFS_ROLES = {
+    soumise: /soumi|nouve|attente|ouvert|signal/i,
+    validee: /valid|accept|approuv/i,
+    refusee: /refus|rejet|annul/i,
+    convertie: /conver|ordre|cours|trait|charge/i,
+    cloturee: /cl[oô]tur|termin|ferm|r[ée]solu|sold/i,
+  };
+  let memoStatuts = { cle: undefined, roles: S };
+  /**
+   * Codes effectifs des étapes du circuit dans la liste configurée `statutsDemande` (même règle que le
+   * serveur) : code par défaut s'il existe, sinon statut reconnu par code / libellé et indicateur `final`.
+   */
+  function ST() {
+    const l = GMAO.liste('statutsDemande').filter((s) => s && s.code);
+    const cle = JSON.stringify(l);
+    if (memoStatuts.cle === cle) return memoStatuts.roles;
+    const out = Object.assign({}, S);
+    if (l.length) {
+      const pris = new Set(); const restants = [];
+      for (const role of Object.keys(S)) { if (l.some((s) => s.code === S[role])) pris.add(S[role]); else restants.push(role); }
+      for (const role of restants) {
+        const candidats = l.filter((s) => !!s.final === ROLES_FINAUX.has(role) && !pris.has(s.code));
+        const it = candidats.find((s) => MOTIFS_ROLES[role].test(s.code) || MOTIFS_ROLES[role].test(s.label || '')) || (role === 'cloturee' ? candidats[candidats.length - 1] : candidats[0]);
+        if (it) { out[role] = it.code; pris.add(it.code); }
+      }
+    }
+    memoStatuts = { cle, roles: Object.freeze(out) };
+    return memoStatuts.roles;
+  }
   const TAILLE_MAX_PJ = 5 * 1024 * 1024;
   const wf = () => (GMAO.config.workflow || {});
   const can = (a) => GMAO.can(ENTITE, a);
@@ -18,7 +49,13 @@
   // ----- Utilitaires ---------------------------------------------------------
   function statutsFinaux() {
     const l = GMAO.liste('statutsDemande').filter((s) => s.final).map((s) => s.code);
-    return new Set(l.length ? l : [S.refusee, S.cloturee]);
+    return new Set(l.length ? l : [ST().refusee, ST().cloturee]);
+  }
+  /** Un statut d'OT est-il final (clôturé) ? Lu dans la liste configurée `statutsOT`. */
+  function otFinal(code) {
+    const l = GMAO.liste('statutsOT');
+    const f = l.filter((s) => s.final).map((s) => s.code);
+    return (f.length ? f : ['termine', 'annule']).includes(code);
   }
   function codeParDefaut(liste, voulu) {
     const l = GMAO.liste(liste);
@@ -38,15 +75,37 @@
     if (!id) return el('span', { class: 'texte-2' }, d.secteurChemin ? 'Sans équipement · ' + d.secteurChemin : 'Sans équipement');
     return el('a', { href: '#/equipements/' + id, title: 'Ouvrir la fiche équipement', onclick: (ev) => ev.stopPropagation() }, el('div', { class: 'cellule-principale' }, nomEq || ('#' + id)), el('div', { class: 'cellule-secondaire' }, [numero, d.secteurChemin].filter(Boolean).join(' · ')));
   }
+  /** Identifiants d'un secteur et de ses sous-secteurs (filtre « secteur » de la liste). */
+  function secteurEtDescendants(id) {
+    const tous = (GMAO.refs && GMAO.refs.secteurs) || [];
+    const out = new Set([Number(id)]);
+    let ajout = true;
+    while (ajout) { ajout = false; for (const s of tous) if (s.parentId != null && out.has(Number(s.parentId)) && !out.has(s.id)) { out.add(s.id); ajout = true; } }
+    return out;
+  }
+  /** Badge de liste autorisé à passer à la ligne (libellés longs dans les colonnes étroites). */
+  function badgeSouple(liste, code) { const b = ui.badgeListe(liste, code); b.style.whiteSpace = 'normal'; return b; }
   function badgeArret(d) { return d.arretProduction ? ui.badge('Arrêt de production', '#dc2626', { contour: true, titre: 'Équipement à l\'arrêt : production impactée' }) : null; }
   function majBadgeNavigation(compteurs) {
     if (!can('valider')) { GMAO.setNavBadge(ENTITE, 0); return; }
     GMAO.setNavBadge(ENTITE, compteurs ? compteurs.aValider : 0);
   }
   async function rafraichirBadge() {
-    if (!can('valider')) return;
-    try { majBadgeNavigation(await api.get('/api/demandes-compteurs')); } catch (e) { /* silencieux */ }
+    if (!GMAO.user || !GMAO.moduleVisible(ENTITE) || !can('valider')) return;
+    try { majBadgeNavigation(await api.get('/api/demandes-compteurs', null, { silent401: true })); } catch (e) { /* silencieux */ }
   }
+  /** Badge « à valider » tenu à jour hors de la vue (navigation, toutes les minutes). */
+  let dernierBadge = 0;
+  function badgePeriodique(force) {
+    if (!GMAO.user || !GMAO.perms) return false;
+    if (!force && Date.now() - dernierBadge < 55000) return true;
+    dernierBadge = Date.now();
+    rafraichirBadge();
+    return true;
+  }
+  window.addEventListener('hashchange', () => setTimeout(() => badgePeriodique(false), 400));
+  setInterval(() => badgePeriodique(true), 60000);
+  (function attendreConnexion(n) { if (!badgePeriodique(true) && n < 150) setTimeout(() => attendreConnexion(n + 1), 2000); })(0);
 
   // ----- Formulaire de création / modification -------------------------------
   let equipementsCache = null;
@@ -57,8 +116,8 @@
     return equipementsCache;
   }
   /** <select> des équipements regroupés par secteur (optgroup). */
-  function selectEquipements(equipements, valeur, existantId) {
-    const sel = el('select', { id: 'f_equipementId' });
+  function selectEquipements(equipements, valeur, libelleActuel) {
+    const sel = el('select', { id: 'f_equipementId', style: { flex: '1', minWidth: '0' } });
     sel.appendChild(el('option', { value: '' }, '— Aucun équipement (demande générale) —'));
     const groupes = new Map();
     for (const e of equipements) { const k = e.secteurId == null ? 0 : Number(e.secteurId); if (!groupes.has(k)) groupes.set(k, []); groupes.get(k).push(e); }
@@ -71,9 +130,25 @@
     }
     if (valeur != null && valeur !== '') {
       sel.value = String(valeur);
-      if (sel.value !== String(valeur)) { sel.appendChild(el('option', { value: String(valeur) }, existantId ? 'Équipement actuel (#' + valeur + ')' : 'Équipement #' + valeur)); sel.value = String(valeur); }
+      if (sel.value !== String(valeur)) { sel.appendChild(el('option', { value: String(valeur) }, libelleActuel || 'Équipement #' + valeur)); sel.value = String(valeur); }
     }
     return sel;
+  }
+  /** Filtre les options du select (texte saisi) ; retourne la première option visible. */
+  function filtrerOptions(sel, texte) {
+    const t = String(texte || '').trim().toLowerCase();
+    let premier = null; let n = 0;
+    sel.querySelectorAll('optgroup').forEach((og) => {
+      let visibles = 0;
+      const groupeOk = !!t && String(og.label || '').toLowerCase().includes(t);
+      og.querySelectorAll('option').forEach((o) => {
+        const ok = !t || groupeOk || o.textContent.toLowerCase().includes(t);
+        o.hidden = !ok;
+        if (ok) { visibles++; if (!premier) premier = o; }
+      });
+      og.hidden = !visibles; n += visibles;
+    });
+    return { premier, n };
   }
 
   async function ouvrirFormulaire(existant, opts = {}, apres) {
@@ -81,25 +156,54 @@
     const creation = !existant;
     const equipements = await chargerEquipements();
     const eqInitial = existant ? existant.equipementId : (opts.equipementId || null);
-    const selEq = selectEquipements(equipements, eqInitial, existant ? existant.id : null);
-    if (!creation && existant.statut !== S.soumise) { selEq.disabled = true; selEq.title = 'L\'équipement ne peut plus être modifié après validation'; }
+    const libelleActuel = existant && existant.equipementId ? `${existant.equipementNom || 'Équipement #' + existant.equipementId}${existant.equipementNumero ? ' (' + existant.equipementNumero + ')' : ''}` : null;
+    const selEq = selectEquipements(equipements, eqInitial, libelleActuel);
+    const verrouEq = !creation && existant.statut !== ST().soumise;
+    if (verrouEq) { selEq.disabled = true; selEq.title = 'L\'équipement ne peut plus être modifié après validation'; }
+    const rechercheEq = el('input', { type: 'search', placeholder: 'Filtrer…', title: 'Filtrer les équipements (nom, numéro, secteur)', disabled: verrouEq || equipements.length < 8, style: { width: '160px', flexShrink: '0' } });
+    rechercheEq.addEventListener('input', () => {
+      const { premier } = filtrerOptions(selEq, rechercheEq.value);
+      const courant = selEq.selectedOptions[0];
+      if (premier && (!courant || courant.hidden || !courant.value)) { selEq.value = premier.value; majInfo(); }
+    });
+    rechercheEq.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); selEq.focus(); } });
     const infoEq = el('div', { class: 'aide' });
+    const doublons = el('div');
     let formRef = null;
+    let jeton = 0;
+    /** Demandes encore ouvertes sur l'équipement choisi (prévention des doublons). */
+    async function verifierDoublons(equipementId) {
+      const j = ++jeton;
+      ui.vider(doublons);
+      if (!equipementId) return;
+      let rows = [];
+      try { rows = await api.get('/api/demandes', { equipementId, ouvertes: '1' }); } catch (e) { return; }
+      if (j !== jeton) return;
+      rows = rows.filter((x) => !existant || x.id !== existant.id);
+      if (!rows.length) return;
+      doublons.appendChild(ui.alerte(frag(
+        el('strong', null, `${rows.length} demande${rows.length > 1 ? 's' : ''} déjà ouverte${rows.length > 1 ? 's' : ''} sur cet équipement : `),
+        rows.slice(0, 4).flatMap((x, i) => [i ? ', ' : null, el('a', { href: '#/demandes/' + x.id, target: '_blank', title: ui.libelle('statutsDemande', x.statut) }, `${x.numero} « ${x.titre} »`)]),
+        rows.length > 4 ? ` et ${rows.length - 4} autre(s)` : null,
+        el('div', { class: 'texte-petit' }, 'Vérifiez qu\'il ne s\'agit pas du même problème avant de soumettre ; vous pouvez plutôt ajouter un commentaire à la demande existante.')), 'alerte'));
+    }
     const majInfo = () => {
       const e = equipements.find((x) => String(x.id) === selEq.value);
       ui.vider(infoEq);
-      if (e) infoEq.append(frag(e.secteurChemin || e.secteurNom ? `Secteur : ${e.secteurChemin || e.secteurNom}` : 'Équipement sans secteur', e.localisation ? ` · ${e.localisation}` : '', e.etatCode ? frag(' · ', ui.badgeListe('etatsEquipement', e.etatCode)) : null));
+      if (e) infoEq.append(frag(e.secteurChemin || e.secteurNom ? `Secteur : ${e.secteurChemin || e.secteurNom}` : 'Équipement sans secteur', e.localisation ? ` · ${e.localisation}` : '', e.etatCode ? frag(' · ', ui.badgeListe('etatsEquipement', e.etatCode)) : null, e.criticiteCode ? frag(' ', ui.badgeListe('criticites', e.criticiteCode, { contour: true })) : null));
+      else if (selEq.value && libelleActuel) infoEq.textContent = 'Équipement actuel de la demande (inactif ou hors de votre portée).';
       else if (!equipements.length) infoEq.textContent = 'Aucun équipement disponible : la demande sera rattachée à un secteur.';
       else infoEq.textContent = 'Choisissez l\'équipement concerné ; le secteur de la demande en est déduit.';
       const champSecteur = formRef && formRef.champ('secteurId');
-      if (champSecteur) champSecteur.classList.toggle('masque', !!e);
+      if (champSecteur) champSecteur.classList.toggle('masque', !!selEq.value);
+      if (!verrouEq) verifierDoublons(selEq.value ? Number(selEq.value) : null);
     };
     selEq.addEventListener('change', majInfo);
     const priorites = GMAO.liste('priorites');
     const aidePriorite = priorites.filter((p) => p.delaiHeures).map((p) => `${p.label} : ${p.delaiHeures} h`).join(' · ');
     const champs = [
       { nom: 'titre', label: 'Titre de la demande', type: 'texte', requis: true, pleineLargeur: true, placeholder: 'ex. Fuite d\'huile sur la presse hydraulique', maxLength: 200 },
-      { type: 'html', label: 'Équipement concerné', rendu: (f) => { formRef = f; setTimeout(majInfo, 0); return frag(selEq, infoEq); } },
+      { type: 'html', label: 'Équipement concerné', rendu: (f) => { formRef = f; setTimeout(majInfo, 0); return frag(el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, rechercheEq, selEq), infoEq, doublons); } },
       { nom: 'secteurId', label: 'Secteur (si aucun équipement)', type: 'select', options: ui.optionsSecteurs({ vide: '— Aucun —' }), aide: 'Utilisé pour la portée et le choix des valideurs' },
       { nom: 'typeCode', label: 'Type d\'intervention', type: 'select', requis: true, options: ui.optionsListe('typesIntervention', { vide: false }) },
       { nom: 'prioriteCode', label: 'Priorité', type: 'select', requis: true, options: ui.optionsListe('priorites', { vide: false }), aide: aidePriorite ? 'Délais de traitement — ' + aidePriorite : '' },
@@ -128,7 +232,7 @@
         if (creation && v.pieceJointe && v.pieceJointe.contenu) body.pieceJointes = [v.pieceJointe];
         const res = creation ? await api.post('/api/demandes', body) : await api.put('/api/demandes/' + existant.id, body);
         if (res.avertissement) toast(res.avertissement, 'alerte', 8000);
-        toast(creation ? `Demande ${res.numero} ${res.statut === S.soumise ? 'soumise' : 'créée'}${res.otCree ? ' — ordre de travail ' + res.otCree.numero + ' généré' : ''}` : 'Demande enregistrée', 'succes');
+        toast(creation ? `Demande ${res.numero} enregistrée (${ui.libelle('statutsDemande', res.statut)})${res.otCree ? ' — ordre de travail ' + res.otCree.numero + ' généré' : ''}` : 'Demande enregistrée', 'succes');
         rafraichirBadge();
         if (apres) apres(res);
       },
@@ -174,7 +278,7 @@
   async function cloturerDemande(d, apres) {
     ui.formModal({
       titre: `Clôturer la demande ${d.numero}`, taille: 'petite', colonnes: 1, submitLabel: 'Clôturer',
-      avant: d.otId && d.otStatut && !['termine', 'annule'].includes(d.otStatut) ? ui.alerte('Un ordre de travail est encore ouvert pour cette demande.', 'alerte') : null,
+      avant: d.otId && d.otStatut && !otFinal(d.otStatut) ? ui.alerte(`L'ordre de travail ${d.otNumero || (d.ot && d.ot.numero) || ''} est encore ouvert (${ui.libelle('statutsOT', d.otStatut)}) : la clôture de la demande ne le clôture pas.`, 'alerte') : null,
       champs: [{ nom: 'commentaire', label: 'Commentaire de clôture (facultatif)', type: 'texte_long', lignes: 3 }],
       onSubmit: async (v) => {
         const r = await api.post(`/api/demandes/${d.id}/cloturer`, { commentaire: v.commentaire });
@@ -186,7 +290,7 @@
   async function reouvrirDemande(d, apres) {
     ui.formModal({
       titre: `Réouvrir la demande ${d.numero}`, taille: 'petite', colonnes: 1, submitLabel: 'Réouvrir',
-      avant: ui.alerte(d.statut === S.refusee ? 'La demande repassera au statut « soumise » et sera de nouveau proposée aux valideurs.' : 'La demande reprendra son statut précédent (validée ou convertie).', 'info'),
+      avant: ui.alerte(d.statut === ST().refusee ? `La demande repassera au statut « ${ui.libelle('statutsDemande', ST().soumise)} » et sera de nouveau proposée aux valideurs.` : `La demande reprendra son statut précédent (« ${ui.libelle('statutsDemande', ST().validee)} » ou « ${ui.libelle('statutsDemande', ST().convertie)} » si un ordre de travail est lié).`, 'info'),
       champs: [{ nom: 'commentaire', label: 'Motif de la réouverture (facultatif)', type: 'texte_long', lignes: 3 }],
       onSubmit: async (v) => {
         const r = await api.post(`/api/demandes/${d.id}/reouvrir`, { commentaire: v.commentaire });
@@ -240,11 +344,16 @@
   function rendreChronologie(d) {
     const etapes = (d.historique || []).slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
     if (!etapes.length) return ui.vide('Aucune étape enregistrée', 'horloge');
-    const couleurs = { creation: '#6b7280', validation: '#2563eb', refus: '#dc2626', conversion: '#f59e0b', cloture: '#16a34a', reouverture: '#8b5cf6', modification: '#9ca3af', ot_annule: '#dc2626' };
-    return el('ul', { class: 'chronologie' }, etapes.map((h) => el('li', null,
-      el('div', { class: 'inline' }, ui.pastille(couleurs[h.action] || '#2563eb'), el('span', { class: 'texte-gras' }, h.libelle || h.action), h.statut ? ui.badgeListe('statutsDemande', h.statut) : null),
-      el('div', { class: 'chrono-date' }, `${ui.formatDateHeure(h.date)} · ${h.userNom || 'Système'}`),
-      h.commentaire ? el('div', { class: 'texte-2', style: { whiteSpace: 'pre-wrap', marginTop: '2px' } }, h.commentaire) : null)));
+    const couleurPoint = (h) => (h.action === 'modification' ? '#9ca3af' : h.statut ? ui.couleur('statutsDemande', h.statut) : '#6b7280');
+    const changeStatut = (h) => h.statut && h.action !== 'modification';
+    return el('ul', { class: 'chronologie' }, etapes.map((h) => {
+      const li = el('li', null,
+        el('div', { class: 'inline', style: { flexWrap: 'wrap' } }, el('span', { class: 'texte-gras' }, h.libelle || h.action), changeStatut(h) ? ui.badgeListe('statutsDemande', h.statut) : null),
+        el('div', { class: 'chrono-date' }, `${ui.formatDateHeure(h.date)} · ${h.userNom || 'Système'}`),
+        h.commentaire ? el('div', { class: 'texte-2', style: { whiteSpace: 'pre-wrap', marginTop: '2px' } }, h.commentaire) : null);
+      li.style.setProperty('--primaire', couleurPoint(h)); // couleur du point (.chronologie li::before)
+      return li;
+    }));
   }
 
   function rendreCommentaires(d, cont, recharger) {
@@ -311,22 +420,22 @@
       sousTitre: el('span', { class: 'inline', style: { flexWrap: 'wrap' } }, ui.badgeListe('statutsDemande', d.statut), ui.badgeListe('priorites', d.prioriteCode), ui.badgeListe('typesIntervention', d.typeCode), badgeArret(d), el('span', null, `Demandée par ${d.demandeurNom || '—'} ${ui.relatif(d.dateDemande)}`)),
     }));
     if (d.enRetard) container.appendChild(ui.alerte(`Délai de traitement dépassé : échéance ${ui.formatDateHeure(d.echeance)} (priorité ${ui.libelle('priorites', d.prioriteCode)}).`, 'alerte'));
-    if (d.statut === S.refusee && d.motifRefus) container.appendChild(ui.alerte(frag(el('strong', null, 'Demande refusée'), ` par ${d.validateurNom || '—'} le ${ui.formatDateHeure(d.dateValidation)} : `, d.motifRefus), 'alerte'));
-    if (d.statut === S.soumise && (d.valideurs || []).length) container.appendChild(ui.alerte(el('span', { class: 'inline' }, ico('horloge', 16), el('span', null, 'En attente de validation par : ', el('strong', null, d.valideurs.map((u) => u.nomComplet).join(', ')))), 'info'));
-    if (d.statut === S.soumise && !(d.valideurs || []).length && wf().validationDemandes !== false) container.appendChild(ui.alerte('Aucun valideur habilité n\'a été trouvé pour cette demande (vérifiez les droits et les secteurs des valideurs, ou l\'option « valider par le supérieur uniquement »).', 'alerte'));
+    if (d.statut === ST().refusee && d.motifRefus) container.appendChild(ui.alerte(frag(el('strong', null, 'Demande refusée'), ` par ${d.validateurNom || '—'} le ${ui.formatDateHeure(d.dateValidation)} : `, d.motifRefus), 'alerte'));
+    if (d.statut === ST().soumise && (d.valideurs || []).length) container.appendChild(ui.alerte(el('span', { class: 'inline' }, ico('horloge', 16), el('span', null, 'En attente de validation par : ', el('strong', null, d.valideurs.map((u) => u.nomComplet).join(', ')))), 'info'));
+    if (d.statut === ST().soumise && !(d.valideurs || []).length && wf().validationDemandes !== false) container.appendChild(ui.alerte('Aucun valideur habilité n\'a été trouvé pour cette demande (vérifiez les droits et les secteurs des valideurs, ou l\'option « valider par le supérieur uniquement »).', 'alerte'));
 
     const details = ui.details([
       { label: 'Statut', valeur: ui.badgeListe('statutsDemande', d.statut) }, { label: 'Priorité', valeur: frag(ui.badgeListe('priorites', d.prioriteCode), d.echeance && !d.final ? el('span', { class: 'texte-2 texte-petit ml' }, 'échéance ' + ui.formatDateHeure(d.echeance)) : null) },
-      { label: 'Type', valeur: ui.badgeListe('typesIntervention', d.typeCode) }, { label: 'Arrêt de production', valeur: d.arretProduction ? el('span', { class: 'texte-danger texte-gras' }, 'Oui') : 'Non' },
+      { label: 'Type', valeur: badgeSouple('typesIntervention', d.typeCode) }, { label: 'Arrêt de production', valeur: d.arretProduction ? el('span', { class: 'texte-danger texte-gras' }, 'Oui') : 'Non' },
       { label: 'Équipement', valeur: d.equipement ? frag(el('a', { href: '#/equipements/' + d.equipement.id }, `${d.equipement.nom}`), el('span', { class: 'texte-2' }, ` (${d.equipement.numero || '#' + d.equipement.id})`), d.equipement.etatCode ? frag(' ', ui.badgeListe('etatsEquipement', d.equipement.etatCode)) : null) : '—' },
       { label: 'Secteur', valeur: d.secteurChemin || '—' },
-      { label: 'Demandeur', valeur: d.demandeur ? frag(ui.avatar(d.demandeur.nomComplet, 22), ' ', d.demandeur.nomComplet, d.demandeur.fonction ? el('span', { class: 'texte-2' }, ` · ${d.demandeur.fonction}`) : null) : d.demandeurNom },
+      { label: 'Demandeur', valeur: d.demandeur ? el('span', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, ui.avatar(d.demandeur.nomComplet, 26), el('span', null, el('div', null, d.demandeur.nomComplet), d.demandeur.fonction ? el('div', { class: 'texte-2 texte-petit' }, d.demandeur.fonction) : null)) : d.demandeurNom },
       { label: 'Date de la demande', valeur: ui.formatDateHeure(d.dateDemande) },
       { label: 'Validateur', valeur: d.validateur ? d.validateur.nomComplet : '—' }, { label: 'Date de validation', valeur: ui.formatDateHeure(d.dateValidation) || '—' },
       { label: 'Ordre de travail', valeur: d.ot ? frag(lienOt(d), ' ', ui.badgeListe('statutsOT', d.ot.statut), d.ot.technicienId ? el('span', { class: 'texte-2' }, ` · ${ui.nomUser(d.ot.technicienId)}`) : null) : '—' },
       { label: 'Date de clôture', valeur: ui.formatDateHeure(d.dateCloture) || '—' },
       d.motifRefus ? { label: 'Motif du refus', valeur: d.motifRefus } : null,
-      { label: 'Créée le', valeur: `${ui.formatDateHeure(d.createdAt)} par ${ui.nomUser(d.createdBy)}` },
+      d.createdBy != null && d.createdBy !== d.demandeurId ? { label: 'Saisie par', valeur: `${ui.nomUser(d.createdBy)} le ${ui.formatDateHeure(d.createdAt)}` } : null,
       ...ui.champsPersoAffichage(ENTITE, d),
     ], { colonnes: 2 });
 
@@ -358,7 +467,7 @@
     let onglets = null;
     const setBadgeOnglet = (cle, n) => { if (!onglets) return; onglets.setBadge(cle, n); const b = onglets.el.querySelector(`.onglets button[data-cle="${cle}"] .badge`); if (b) b.classList.toggle('masque', !n); };
     const colonnes = [
-      { cle: 'numero', label: 'Numéro', rendu: (d) => el('div', null, el('div', { class: 'cellule-principale' }, d.numero), el('div', { class: 'cellule-secondaire' }, ui.formatDate(d.dateDemande))), valeurTri: (d) => d.numero, largeur: '130px' },
+      { cle: 'numero', label: 'Numéro', rendu: (d) => el('div', { style: { whiteSpace: 'nowrap' } }, el('div', { class: 'cellule-principale' }, d.numero), el('div', { class: 'cellule-secondaire' }, ui.formatDate(d.dateDemande))), valeurTri: (d) => d.numero, largeur: '130px' },
       { cle: 'titre', label: 'Titre', rendu: (d) => el('div', null, el('div', { class: 'cellule-principale' }, d.titre), el('div', { class: 'cellule-secondaire inline' }, ui.libelle('typesIntervention', d.typeCode), badgeArret(d), d.nbCommentaires ? el('span', { class: 'inline', style: { gap: '3px' }, title: `${d.nbCommentaires} commentaire(s)` }, ico('commentaire', 12), String(d.nbCommentaires)) : null, d.nbPieceJointes ? el('span', { class: 'inline', style: { gap: '3px' }, title: `${d.nbPieceJointes} pièce(s) jointe(s)` }, ico('piece_jointe', 12), String(d.nbPieceJointes)) : null)), valeurTri: (d) => String(d.titre).toLowerCase() },
       { cle: 'equipementNom', label: 'Équipement', rendu: lienEquipement, valeurTri: (d) => (d.equipementNom || '').toLowerCase() },
       { cle: 'prioriteCode', label: 'Priorité', liste: 'priorites', aligner: 'centre', rendu: (d) => frag(ui.badgeListe('priorites', d.prioriteCode), d.enRetard ? el('div', { class: 'texte-danger texte-petit', title: 'Échéance ' + ui.formatDateHeure(d.echeance) }, 'en retard') : null), valeurTri: (d) => { const it = ui.itemListe('priorites', d.prioriteCode); return it ? -(it.ordre || 0) : 0; } },
@@ -378,7 +487,7 @@
         { icone: 'voir', titre: 'Ouvrir la fiche', onClic: (d) => GMAO.navigate('#/demandes/' + d.id) },
         { icone: 'check', titre: 'Valider', classe: 'texte-ok', visible: (d) => d.peutValider, onClic: (d) => validerDemande(d, rafraichir) },
         { icone: 'fermer', titre: 'Refuser', classe: 'texte-danger', visible: (d) => d.peutValider, onClic: (d) => refuserDemande(d, rafraichir) },
-        { icone: 'modifier', titre: 'Modifier', visible: (d) => !d.final && ((d.statut === S.soumise && (d.demandeurId === moi || d.createdBy === moi)) || can('modifier')), onClic: (d) => ouvrirFormulaire(d, {}, rafraichir) },
+        { icone: 'modifier', titre: 'Modifier', visible: (d) => !d.final && ((d.statut === ST().soumise && (d.demandeurId === moi || d.createdBy === moi)) || can('modifier')), onClic: (d) => ouvrirFormulaire(d, {}, rafraichir) },
         { icone: 'supprimer', titre: 'Supprimer', classe: 'texte-danger', visible: (d) => can('supprimer') && !d.otId, onClic: (d) => supprimerDemande(d, rafraichir) },
       ],
     });
@@ -391,9 +500,9 @@
       else if (onglet === 'cloturees') rows = rows.filter((d) => finaux.has(d.statut));
       if (filtres.prioriteCode) rows = rows.filter((d) => d.prioriteCode === filtres.prioriteCode);
       if (filtres.statut) rows = rows.filter((d) => d.statut === filtres.statut);
-      if (filtres.secteurId) rows = rows.filter((d) => String(d.secteurId) === filtres.secteurId);
-      if (filtres.du) rows = rows.filter((d) => String(d.dateDemande || '').slice(0, 10) >= filtres.du);
-      if (filtres.au) rows = rows.filter((d) => String(d.dateDemande || '').slice(0, 10) <= filtres.au);
+      if (filtres.secteurId) { const ids = secteurEtDescendants(filtres.secteurId); rows = rows.filter((d) => d.secteurId != null && ids.has(Number(d.secteurId))); }
+      if (filtres.du) rows = rows.filter((d) => ui.dateISO(d.dateDemande) >= filtres.du);
+      if (filtres.au) rows = rows.filter((d) => ui.dateISO(d.dateDemande) <= filtres.au);
       if (filtres.arret) rows = rows.filter((d) => d.arretProduction);
       tableau.maj(rows);
       setBadgeOnglet('aValider', demandes.filter((d) => d.peutValider).length);
@@ -415,7 +524,12 @@
       ui.vider(kpis);
       if (!compteurs) return;
       const aller = (cle) => () => onglets.activer(cle);
-      kpis.appendChild(ui.kpi({ label: 'À valider', valeur: compteurs.aValider, icone: 'check', couleur: compteurs.aValider ? '#f59e0b' : '#16a34a', detail: can('valider') ? 'demandes en attente de votre validation' : 'demandes en attente de validation', onClic: can('valider') ? aller('aValider') : aller('toutes') }));
+      if (can('valider')) kpis.appendChild(ui.kpi({ label: 'À valider', valeur: compteurs.aValider, icone: 'check', couleur: compteurs.aValider ? '#f59e0b' : '#16a34a', detail: 'demandes en attente de votre validation', onClic: aller('aValider') }));
+      else {
+        const codeSoumise = (compteurs.statuts && compteurs.statuts.soumise) || ST().soumise;
+        const enAttente = (compteurs.parStatut || {})[codeSoumise] || 0;
+        kpis.appendChild(ui.kpi({ label: 'En attente de validation', valeur: enAttente, icone: 'check', couleur: enAttente ? '#f59e0b' : '#16a34a', detail: 'demandes pas encore traitées', onClic: () => { filtres.statut = codeSoumise; selStatut.value = codeSoumise; onglets.activer('toutes'); } }));
+      }
       kpis.appendChild(ui.kpi({ label: 'En cours', valeur: compteurs.ouvertes, icone: 'horloge', couleur: '#2563eb', detail: compteurs.enRetard ? `${compteurs.enRetard} en retard` : 'aucune en retard', onClic: aller('enCours') }));
       kpis.appendChild(ui.kpi({ label: 'Arrêts de production', valeur: compteurs.arretProduction, icone: 'alerte', couleur: compteurs.arretProduction ? '#dc2626' : '#6b7280', detail: 'demandes ouvertes avec arrêt', onClic: () => { filtres.arret = true; cbArret.checked = true; onglets.activer('enCours'); } }));
       kpis.appendChild(ui.kpi({ label: 'Mes demandes', valeur: compteurs.mesOuvertes, icone: 'utilisateur', couleur: '#8b5cf6', detail: `${compteurs.mesDemandes} au total`, onClic: aller('mes') }));
@@ -439,7 +553,7 @@
       { cle: 'mes', label: 'Mes demandes', icone: 'utilisateur', rendu: rendreOnglet('mes') },
       { cle: 'enCours', label: 'En cours', icone: 'horloge', rendu: rendreOnglet('enCours') },
       { cle: 'cloturees', label: 'Clôturées', icone: 'dossier', rendu: rendreOnglet('cloturees') },
-    ].filter(Boolean), { actif: query.onglet || 'toutes' });
+    ].filter(Boolean), { hash: true });
 
     function exporter() {
       const q = new URLSearchParams();

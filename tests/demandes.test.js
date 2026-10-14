@@ -164,7 +164,7 @@ describe('Demandes d\'intervention', () => {
     assert.ok(!(await admin.ok('GET', '/api/demandes?recherche=zzzz')).length);
     assert.ok((await admin.ok('GET', '/api/demandes?statut=soumise&prioriteCode=urgente&secteurId=' + PROD + '&equipementId=' + presse.id)).some((d) => d.id === di1.id));
     assert.ok(!(await admin.ok('GET', '/api/demandes?statut=cloturee')).some((d) => d.id === di1.id));
-    const auj = new Date().toISOString().slice(0, 10);
+    const n = new Date(); const auj = `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
     assert.ok((await admin.ok('GET', `/api/demandes?du=${auj}&au=${auj}`)).some((d) => d.id === di1.id));
     assert.ok(!(await admin.ok('GET', '/api/demandes?au=2000-01-01')).length);
   });
@@ -240,7 +240,13 @@ describe('Demandes d\'intervention', () => {
 
   test('validerParSuperieurUniquement : seul le N+1 du demandeur (ou un administrateur) valide', async () => {
     config({ validerParSuperieurUniquement: true });
+    const avantChef = notifsDe(uChefProd.id).length;
+    const avantResp = notifsDe(uResp.id).length;
+    const avantAdmin = notifsDe(1).length;
     const d = await demandeur.ok('POST', '/api/demandes', { titre: 'Validation hiérarchique', equipementId: presse.id });
+    assert.equal(notifsDe(uChefProd.id).length, avantChef + 1, 'le N+1 est notifié');
+    assert.equal(notifsDe(uResp.id).length, avantResp, 'le responsable (non N+1) n\'est pas notifié');
+    assert.equal(notifsDe(1).length, avantAdmin, 'l\'administrateur n\'est pas notifié lorsque le N+1 peut valider');
     assert.ok(d.valideurs.some((u) => u.id === uChefProd.id) && !d.valideurs.some((u) => u.id === uResp.id), 'seul le N+1 est valideur');
     assert.equal((await resp.post('/api/demandes/' + d.id + '/valider')).status, 403, 'responsable (portée tous) mais pas N+1');
     assert.ok(!(await resp.ok('GET', '/api/demandes?aValider=1')).some((x) => x.id === d.id));
@@ -259,6 +265,9 @@ describe('Demandes d\'intervention', () => {
     assert.equal(d.statut, 'convertie');
     assert.ok(d.otId);
     assert.ok(d.otCree && d.otCree.id === d.otId);
+    assert.equal(d.validateurId, null, 'validation automatique : aucun validateur nominatif');
+    assert.ok(d.dateValidation);
+    assert.ok(d.historique.some((h) => h.action === 'validation' && h.userId === null && h.userNom === 'Système'));
     assert.equal(notifsDe(uChefProd.id).length, avantChef, 'pas de notification de validation');
     config({ validationDemandes: true });
   });
@@ -403,6 +412,80 @@ describe('Demandes d\'intervention', () => {
     const d = srv.db.get('demandes', di1.id);
     assert.equal(s.lieeA({ id: d.otId, demandeId: null }).id, di1.id);
     assert.equal(s.STATUTS.convertie, 'convertie');
+  });
+
+  test('création au nom d\'un autre : le demandeur désigné est notifié ; modification et suppression par un tiers aussi', async () => {
+    const avant = notifsDe(uDemandeur.id).length;
+    const d = await chefProd.ok('POST', '/api/demandes', { titre: 'Saisie pour l\'opérateur', equipementId: presse.id, demandeurId: uDemandeur.id });
+    assert.equal(d.demandeurId, uDemandeur.id);
+    assert.equal(d.createdBy, uChefProd.id);
+    assert.ok(d.historique[0].commentaire.includes('Saisie par'));
+    assert.equal(notifsDe(uDemandeur.id).length, avant + 1, 'notification « saisie en votre nom »');
+    assert.ok((await demandeur.ok('GET', '/api/demandes?mesDemandes=1')).some((x) => x.id === d.id), 'visible dans « mes demandes » du demandeur désigné');
+    await chefProd.ok('PUT', '/api/demandes/' + d.id, { prioriteCode: 'haute' });
+    assert.equal(notifsDe(uDemandeur.id).length, avant + 2, 'notification de modification');
+    await admin.ok('DELETE', '/api/demandes/' + d.id);
+    assert.equal(notifsDe(uDemandeur.id).length, avant + 3, 'notification de suppression');
+  });
+
+  test('hiérarchie : le N+1 voit et valide la demande de son subordonné même hors de ses secteurs', async () => {
+    const profils = await admin.ok('GET', '/api/profils');
+    const u = await admin.ok('POST', '/api/utilisateurs', { login: 'operateur2', nom: 'Opérateur', prenom: 'Inès', profilId: profils.find((x) => x.nom === 'Demandeur').id, secteurIds: [PROD], password: 'oper1234', doitChangerMdp: false, managerId: uChefLog.id });
+    const op2 = srv.client(); await op2.login('operateur2', 'oper1234');
+    const avant = notifsDe(uChefLog.id).length;
+    const d = await op2.ok('POST', '/api/demandes', { titre: 'Capteur de présence défaillant', equipementId: presse.id });
+    assert.equal(d.secteurId, PROD);
+    assert.ok(d.valideurs.some((x) => x.id === uChefLog.id), 'le N+1 (secteur LOG) figure parmi les valideurs');
+    assert.equal(notifsDe(uChefLog.id).length, avant + 1, 'le N+1 est notifié');
+    assert.equal((await chefLog.get('/api/demandes/' + d.id)).status, 200, 'le N+1 voit la demande de son subordonné');
+    assert.ok((await chefLog.ok('GET', '/api/demandes?aValider=1')).some((x) => x.id === d.id));
+    assert.equal((await chefLog.ok('GET', '/api/demandes-compteurs')).aValider >= 1, true);
+    const v = await chefLog.ok('POST', '/api/demandes/' + d.id + '/valider');
+    assert.equal(v.statut, 'convertie');
+    assert.equal(v.validateurId, uChefLog.id);
+    assert.equal((await chefLog.get('/api/demandes/' + di1.id)).status, 404, 'les autres demandes PROD restent hors portée');
+  });
+
+  test('statuts configurables : codes renommés résolus depuis la liste statutsDemande', async () => {
+    const mod = require('../server/modules/demandes');
+    const cfg = srv.db.getConfig();
+    const origine = JSON.parse(JSON.stringify(cfg.listes.statutsDemande));
+    const liste = [
+      { code: 'nouvelle', label: 'Nouvelle', couleur: '#6b7280', ordre: 1, final: false },
+      { code: 'acceptee', label: 'Acceptée', couleur: '#2563eb', ordre: 2, final: false },
+      { code: 'rejetee', label: 'Rejetée', couleur: '#dc2626', ordre: 3, final: true },
+      { code: 'en_traitement', label: 'En traitement', couleur: '#f59e0b', ordre: 4, final: false },
+      { code: 'terminee', label: 'Terminée', couleur: '#16a34a', ordre: 5, final: true },
+    ];
+    assert.deepEqual(srv.ctx.services.demandes.resoudreStatuts(liste), { soumise: 'nouvelle', validee: 'acceptee', refusee: 'rejetee', convertie: 'en_traitement', cloturee: 'terminee' });
+    assert.deepEqual(srv.ctx.services.demandes.resoudreStatuts([]), { soumise: 'soumise', validee: 'validee', refusee: 'refusee', convertie: 'convertie', cloturee: 'cloturee' }, 'liste absente : codes par défaut');
+    // Libellés seuls modifiés : les codes par défaut restent utilisés
+    assert.equal(srv.ctx.services.demandes.resoudreStatuts(origine.map((s) => Object.assign({}, s, { label: 'X ' + s.label }))).validee, 'validee');
+    cfg.listes.statutsDemande = liste;
+    srv.db.setConfig(cfg);
+    try {
+      const d = await demandeur.ok('POST', '/api/demandes', { titre: 'Circuit avec statuts renommés', equipementId: presse.id });
+      assert.equal(d.statut, 'nouvelle', 'statut initial résolu dans la liste');
+      assert.equal((await admin.ok('GET', '/api/demandes-compteurs')).statuts.convertie, 'en_traitement');
+      assert.ok((await chefProd.ok('GET', '/api/demandes?aValider=1')).some((x) => x.id === d.id));
+      const v = await chefProd.ok('POST', '/api/demandes/' + d.id + '/valider');
+      assert.equal(v.statut, 'en_traitement', 'validation + OT automatique → étape « convertie » renommée');
+      srv.ctx.emit('ot:termine', { ot: srv.db.get('ot', v.otId) });
+      assert.equal(srv.db.get('demandes', d.id).statut, 'terminee', 'clôture automatique → étape « cloturee » renommée');
+      const r = await demandeur.ok('POST', '/api/demandes', { titre: 'Refus avec statuts renommés', equipementId: presse.id });
+      const refus = await chefProd.ok('POST', '/api/demandes/' + r.id + '/refuser', { motif: 'Hors périmètre' });
+      assert.equal(refus.statut, 'rejetee');
+      assert.equal(refus.final, true);
+      const csv = await admin.get('/api/demandes-export?statut=rejetee');
+      assert.ok(String(csv.body).includes('Rejetée'), 'libellé du statut dans l\'export');
+      assert.equal(srv.ctx.services.demandes.STATUTS.soumise, 'nouvelle');
+    } finally {
+      const c2 = srv.db.getConfig();
+      c2.listes.statutsDemande = origine;
+      srv.db.setConfig(c2);
+    }
+    assert.equal(srv.ctx.services.demandes.STATUTS.soumise, 'soumise', 'retour aux codes par défaut');
+    assert.ok(mod.seedDemo, 'module exporté');
   });
 
   test('seedDemo : 7 demandes réalistes, idempotent', async () => {
