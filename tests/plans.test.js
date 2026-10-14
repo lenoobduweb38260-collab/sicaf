@@ -201,8 +201,8 @@ describe('Plans 3D', () => {
     assert.equal(img.status, 200);
     assert.equal(img.headers.get('content-type'), 'image/png');
     // fond sans image renvoyée : image conservée, paramètres modifiés
-    const m = await admin.ok('PUT', '/api/plans/' + p.id, { version: 1, fond: { echelle: 0.1, x: 10, y: 10, opacite: 0.8 } });
-    assert.equal(m.fond.echelle, 0.1);
+    const m = await admin.ok('PUT', '/api/plans/' + p.id, { version: 1, fond: { echelle: 0.00012345, x: 10, y: 10, opacite: 0.8 } });
+    assert.equal(m.fond.echelle, 0.00012345, 'précision de l\'échelle conservée');
     assert.equal(m.fond.taille, p.fond.taille);
     const sans = await admin.ok('PUT', '/api/plans/' + p.id, { version: 2, fond: null });
     assert.equal(sans.fond, null);

@@ -181,7 +181,7 @@
       .p3d-carte-pied { display: flex; align-items: center; gap: 4px; border-top: 1px solid var(--bordure); padding: 6px 8px; }
       .p3d-carte-pied .espace { flex: 1; }
       .p3d-fiche { display: flex; flex-direction: column; height: calc(100vh - var(--entete-hauteur) - 44px); min-height: 520px; background: var(--surface); border: 1px solid var(--bordure); border-radius: var(--rayon); box-shadow: var(--ombre); overflow: hidden; }
-      .p3d-fiche:fullscreen { height: 100vh; border-radius: 0; border: 0; }
+      .p3d-fiche.p3d-plein-ecran { position: fixed; inset: 0; z-index: 90; height: auto; min-height: 0; border-radius: 0; border: 0; }
       .p3d-barre { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-bottom: 1px solid var(--bordure); flex-wrap: wrap; background: var(--surface); position: relative; z-index: 6; }
       .p3d-barre select { width: auto; padding: 5px 8px; font-size: 13px; }
       .p3d-barre .espace { flex: 1; }
@@ -191,7 +191,7 @@
       .p3d-titre { display: flex; flex-direction: column; min-width: 0; margin: 0 6px 0 2px; }
       .p3d-titre .t { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
       .p3d-titre .s { font-size: 12px; color: var(--texte-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
-      .p3d-modif { color: var(--alerte); font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
+      .p3d-point { width: 9px; height: 9px; border-radius: 50%; background: var(--alerte); box-shadow: 0 0 0 2px var(--surface); margin-left: 2px; }
       .p3d-corps { flex: 1; display: flex; min-height: 0; position: relative; }
       .p3d-outils { width: 50px; flex-shrink: 0; border-right: 1px solid var(--bordure); display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 0; background: var(--surface-2); overflow-y: auto; }
       .p3d-outil { width: 38px; height: 36px; display: flex; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--texte-2); cursor: pointer; flex-shrink: 0; }
@@ -620,7 +620,7 @@
       this.appliquerFond();
       this.synchroniser();
       // Vue initiale : vue enregistrée, sinon cadrage du plan
-      if (this.vue) this.moteur.definirCamera({ x: this.vue.x, y: this.vue.y, z: this.vue.z || 0, distance: this.vue.distance, azimut: this.vue.azimut, elevation: this.vue.elevation, dessus: !!this.vue.dessus || this.moteur.mode === '2d' }, false);
+      if (this.vue) this.moteur.definirCamera({ x: this.vue.x, y: this.vue.y, z: this.vue.z || 0, distance: this.vue.distance, azimut: this.moteur.mode === '2d' ? 0 : this.vue.azimut, elevation: this.vue.elevation, dessus: !!this.vue.dessus || this.moteur.mode === '2d' }, false);
       else this.moteur.recentrer(false);
       this.majBoutonsVue();
       this.rendrePanneau();
@@ -752,10 +752,10 @@
         z.appendChild(ui.bouton('Éditer le plan', { icone: 'modifier', classe: 'btn-primaire', onClic: () => this.basculerMode('edition') }));
         return;
       }
-      this.indicModif = el('span', { class: 'p3d-modif' + (this.modifie ? '' : ' masque') }, '● Non enregistré');
-      z.appendChild(this.indicModif);
       z.appendChild(ui.bouton('Terminer', { titre: 'Revenir en consultation', onClic: () => this.basculerMode('consultation') }));
       this.btnEnregistrer = ui.bouton('Enregistrer', { icone: 'sauvegarde', classe: 'btn-primaire', titre: 'Enregistrer le plan (Ctrl+S)', onClic: () => this.enregistrer() });
+      this.indicModif = el('span', { class: 'p3d-point' + (this.modifie ? '' : ' masque'), title: 'Modifications non enregistrées', 'aria-label': 'Modifications non enregistrées' });
+      this.btnEnregistrer.appendChild(this.indicModif);
       z.appendChild(this.btnEnregistrer);
     }
     ouvrirMenu(ancre) {
@@ -821,8 +821,17 @@
         });
         return;
       }
-      if (mode === 'edition' && this.mode !== 'edition') this.niveauConsultation = this.niveau;
-      if (mode === 'consultation' && this.mode === 'edition' && this.niveauConsultation != null) this.niveau = this.niveauConsultation;
+      if (mode === 'edition' && this.mode !== 'edition') {
+        this.niveauConsultation = this.niveau;
+        // l'édition se fait de préférence en vue de dessus (orthographique, nord en haut)
+        this.cameraConsultation = this.moteur.camera.dessus ? null : this.moteur.camera;
+        if (this.cameraConsultation) this.moteur.definirCamera({ dessus: true, elevation: 89, azimut: 0 }, 500);
+      }
+      if (mode === 'consultation' && this.mode === 'edition') {
+        if (this.niveauConsultation != null) this.niveau = this.niveauConsultation;
+        if (this.cameraConsultation && this.moteur.camera.dessus && this.moteur.mode !== '2d') this.moteur.definirCamera(Object.assign({}, this.cameraConsultation, { x: this.moteur.camera.x, y: this.moteur.camera.y }), 500);
+        this.cameraConsultation = null;
+      }
       this.mode = mode;
       this.annulerTrace();
       this.outil = 'selection';
@@ -837,6 +846,7 @@
       this.moteur.redimensionner();
       this.synchroniser();
       this.rendrePanneau();
+      this.majBoutonsVue();
       this.majStatut();
       if (mode === 'edition') toast('Mode édition : choisissez un outil à gauche. Pensez à enregistrer.', 'info');
     }
@@ -847,9 +857,29 @@
       this.majBoutonsVue();
       this.majStatut();
     }
+    /**
+     * Plein écran : le document passe en plein écran et la fiche occupe toute la fenêtre (position fixe),
+     * ce qui laisse visibles les fenêtres modales et les notifications. Sans API plein écran, la fiche
+     * occupe simplement toute la fenêtre.
+     */
     basculerPleinEcran() {
-      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-      else if (this.racine.requestFullscreen) this.racine.requestFullscreen().catch((e) => toast('Plein écran indisponible : ' + e.message, 'alerte'));
+      const actif = this.racine.classList.contains('p3d-plein-ecran');
+      if (actif) {
+        this.racine.classList.remove('p3d-plein-ecran');
+        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      } else {
+        this.racine.classList.add('p3d-plein-ecran');
+        const de = document.documentElement;
+        if (de.requestFullscreen && !document.fullscreenElement) de.requestFullscreen().catch(() => { /* fenêtre agrandie seulement */ });
+      }
+      this.majBoutonPlein();
+      setTimeout(() => this.moteur.redimensionner(), 60);
+    }
+    majBoutonPlein() {
+      const actif = this.racine.classList.contains('p3d-plein-ecran');
+      ui.vider(this.btnPlein); this.btnPlein.appendChild(ic(actif ? 'quitterPleinEcran' : 'pleinEcran'));
+      this.btnPlein.title = actif ? 'Quitter le plein écran (Échap)' : 'Plein écran';
+      this.btnPlein.classList.toggle('actif', actif);
     }
     choisirOutil(cle) {
       if (!this.edition) return;
@@ -946,9 +976,9 @@
           const nom = (info && info.nom) || o.nom || (o.type === 'installation' ? cat.label : '');
           const montrer = o.type === 'machine' || !SANS_ETIQUETTE.has(o.categorie) || this.selection.includes(o.id);
           const classe = 'machine' + (info && info.alerte === 'urgent' ? ' alerte-urgent' : (info && info.alerte === 'en_cours' && this.couleurMode === 'ot' ? ' alerte-en_cours' : ''));
-          const et = montrer ? lab(nom, classe, o.type === 'machine' ? 6 : 4, info ? { pastille: this.couleurMode !== 'origine' ? coul : null } : null) : null;
+          const et = montrer ? lab(nom, classe, (o.type === 'machine' ? 6 : 4) + (info && info.alerte === 'urgent' ? 3 : 0), Object.assign({ pixelsMin: 16, toujours: !!(info && info.alerte === 'urgent') }, info ? { pastille: this.couleurMode !== 'origine' ? coul : null } : {})) : null;
           if (estSegment(o)) return [Object.assign({}, base, { forme: 'segment', x: o.x, y: o.y, x2: o.x2, y2: o.y2, epaisseur: o.epaisseur || 0.15, y0: alt + (o.z || 0), hauteur: Math.max(0.03, o.epaisseur || 0.15), couleur: coul, opacite: op(1), aretes: false, etiquette: et })];
-          const d = Object.assign({}, base, { forme: o.forme === 'cylindre' ? 'cylindre' : 'boite', x: o.x, y: o.y, largeur: o.largeur, profondeur: o.profondeur, hauteur: Math.max(0.05, o.hauteur || 1), rotation: o.rotation || 0, y0: alt + (o.z || 0), couleur: coul, opacite: op(o.categorie === 'rack' ? 0.92 : 1), aretes: true, etiquette: et });
+          const d = Object.assign({}, base, { forme: o.forme === 'cylindre' ? 'cylindre' : 'boite', x: o.x, y: o.y, largeur: o.largeur, profondeur: o.profondeur, hauteur: Math.max(0.05, o.hauteur || 1), rotation: o.rotation || 0, y0: alt + (o.z || 0), couleur: coul, opacite: op(1), aretes: true, etiquette: et });
           if (o.categorie === 'rack' && !fantome) {
             // lisses horizontales du rack
             const out = [d];
@@ -1042,7 +1072,7 @@
     }
     surSurvol(id, p) {
       const o = id ? this.objet(id) : null;
-      if (!o || !p || this.drag) { this.infobulle.classList.add('masque'); return; }
+      if (!o || !p || this.drag || this.trace || (this.edition && this.outil !== 'selection')) { this.infobulle.classList.add('masque'); return; }
       const info = o.equipementId != null ? this.infos.get(Number(o.equipementId)) : null;
       ui.vider(this.infobulle);
       this.infobulle.appendChild(el('div', { class: 't' }, (info && info.nom) || o.nom || o.texte || libType(o)));
@@ -1282,6 +1312,7 @@
       this.majStatut(`${pts.length} sommet(s) — double-clic ou Entrée pour fermer`);
     }
     majApercuTrace(inf) {
+      if (this.calibrage) return; // les repères de calibrage restent affichés
       const t = this.trace;
       this._infoTrace = null;
       const alt = this.niveauDe(this.niveauActifId()).altitude;
@@ -2092,8 +2123,9 @@
             toast(`Attention : ${e.updatedByNom || 'un autre utilisateur'} a enregistré une version plus récente de ce plan.`, 'alerte', 8000);
           }
         }
-        this.synchroniser();
-        this.rendrePanneau();
+        // pas de reconstruction pendant un glisser / tracé, ni de panneau rafraîchi pendant une saisie
+        if (!this.drag && !this.trace) this.synchroniser();
+        if (!this.panneau.contains(document.activeElement)) this.rendrePanneau();
         if (manuel === true) toast('État des équipements actualisé', 'succes', 1500);
       } catch (err) { if (manuel === true) erreur(err); }
     }
@@ -2116,7 +2148,7 @@
       const avantFermeture = (ev) => { if (this.modifie) { ev.preventDefault(); ev.returnValue = ''; } };
       window.addEventListener('beforeunload', avantFermeture);
       this.nettoyages.push(() => window.removeEventListener('beforeunload', avantFermeture));
-      const plein = () => { const actif = document.fullscreenElement === this.racine; ui.vider(this.btnPlein); this.btnPlein.appendChild(ic(actif ? 'quitterPleinEcran' : 'pleinEcran')); this.btnPlein.title = actif ? 'Quitter le plein écran' : 'Plein écran'; setTimeout(() => this.moteur.redimensionner(), 60); };
+      const plein = () => { if (!document.fullscreenElement && this.racine.classList.contains('p3d-plein-ecran')) { this.racine.classList.remove('p3d-plein-ecran'); this.majBoutonPlein(); } setTimeout(() => this.moteur.redimensionner(), 60); };
       document.addEventListener('fullscreenchange', plein);
       this.nettoyages.push(() => document.removeEventListener('fullscreenchange', plein));
       // thème clair / sombre
@@ -2146,6 +2178,7 @@
         if (this.trace || this.calibrage) this.terminerTrace(false);
         else if (this.selection.length) this.selectionner([]);
         else if (this.edition && this.outil !== 'selection') this.choisirOutil('selection');
+        else if (this.racine.classList.contains('p3d-plein-ecran')) this.basculerPleinEcran();
         else traite = false;
       } else if (k === 'f' || k === 'F') { if (this.selection.length) this.moteur.cadrer(this.selection); else this.moteur.recentrer(true); }
       else if (!this.edition) traite = false;
@@ -2175,7 +2208,7 @@
       if (this.modifie && this.edition) brouillons.set(this.plan.id, { version: this.version, objets: this.objets, niveaux: this.niveaux, fond: this.fond, fondModifie: this.fondModifie, dimensions: this.dimensions, proprietes: this.proprietes, historique: this.historique, indexHisto: this.indexHisto, nb: this.indexHisto || 1 });
       for (const f of this.nettoyages) { try { f(); } catch (e) { /* ignore */ } }
       this.nettoyages = [];
-      if (document.fullscreenElement === this.racine) document.exitFullscreen().catch(() => {});
+      if (this.racine.classList.contains('p3d-plein-ecran') && document.fullscreenElement) document.exitFullscreen().catch(() => {});
       if (this.moteur) this.moteur.detruire();
       if (GMAO._plan3d === this) GMAO._plan3d = null;
     }

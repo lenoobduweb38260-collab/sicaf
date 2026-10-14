@@ -405,6 +405,8 @@
       this.pickSale = true;
       this.curseurBase = 'default';
       this.stats = { objets: 0, sommets: 0, appels: 0 };
+      this.compte = { opaque: 0, transp: 0, lignes: 0, grille: 0, decor: 0, apercu: 0, apercuLig: 0 };
+      this.plagesOpaques = []; this.plagesTransp = []; this.plagesLignes = [];
       this.mode = 'webgl';
       this.raisonRepli = '';
 
@@ -807,8 +809,23 @@
       const dessus = this.cam.dessus || this.mode === '2d';
       const demi = Math.max(ly / 2, lx / 2 / aspect) * (dessus ? 1.12 : 1.05);
       let distance = demi / Math.tan(FOV / 2);
-      if (!dessus) distance = Math.max(distance, Math.hypot(lx, ly) * 0.75);
       const cible = Object.assign({ x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2, z: b.minZ || 0, distance: Math.max(3, distance) }, extra || {});
+      if (!dessus) {
+        // ajustement exact : on recule jusqu'à ce que les coins (au sol et en hauteur) tiennent dans l'écran
+        const sauve = this.cam;
+        const coins = [];
+        for (const x of [b.minX, b.maxX]) for (const y of [b.minY, b.maxY]) for (const z of [b.minZ || 0, b.maxZ || 0]) coins.push([x, y, z]);
+        let d = Math.max(3, distance * 0.8);
+        for (let i = 0; i < 40; i++) {
+          this.cam = this._normaliserCam(Object.assign({}, sauve, cible, { distance: d, dessus: false }));
+          this._matrices();
+          const ok = coins.every(([x, y, z]) => { const c = mat4.transformer(this.vp, x, z, y, 1); if (c[3] <= 0) return false; return Math.abs(c[0] / c[3]) < 0.9 && Math.abs(c[1] / c[3]) < 0.86; });
+          if (ok) break;
+          d *= 1.1;
+        }
+        this.cam = sauve; this._matrices();
+        cible.distance = d;
+      }
       this.definirCamera(cible, animer ? 700 : false);
     }
     /** Anime la caméra vers un objet (et le fait clignoter si demandé). */
@@ -997,7 +1014,8 @@
         gl.depthMask(false);
         const o = this.oeil;
         const d2 = (p) => { const c = p.centre; return (c[0] - o[0]) ** 2 + (c[1] - o[1]) ** 2 + (c[2] - o[2]) ** 2; };
-        const plages = this.plagesTransp.slice().sort((a, b) => d2(b) - d2(a));
+        // au-delà de 160 objets transparents, un seul appel de dessin (ordre de construction) pour rester fluide
+        const plages = this.plagesTransp.length > 160 && !(this.decal && this.decal.nums.size) ? [{ first: 0, count: this.compte.transp, num: -1 }] : this.plagesTransp.slice().sort((a, b) => d2(b) - d2(a));
         for (const p of plages) {
           const decale = this.decal && this.decal.nums.has(p.num);
           if (decale) gl.uniformMatrix4fv(tri.u.uModele, false, this.decal.matrice);
@@ -1209,7 +1227,13 @@
           const fs = Math.round(px) + 'px';
           if (el.style.fontSize !== fs) { el.style.fontSize = fs; el._taille = null; }
         }
-        let visible = c.pr.visible && affichees < 400;
+        let visible = c.pr.visible && affichees < 160;
+        if (visible && c.et.pixelsMin && !c.sel && c.e.num !== this.survolNum && !c.et.toujours) {
+          // étiquette masquée si l'objet est trop petit à l'écran (vue éloignée d'un grand plan)
+          const b = c.e.g.boite, t = Math.max(b.maxX - b.minX, b.maxY - b.minY, 0.3);
+          const q = this.projeter((b.minX + b.maxX) / 2 + t, (b.minY + b.maxY) / 2, b.maxZ);
+          if (Math.hypot(q.x - c.pr.x, q.y - c.pr.y) < c.et.pixelsMin) visible = false;
+        }
         if (visible) {
           if (!el._taille) {
             // mesure fiable même si l'étiquette était masquée à l'image précédente
@@ -1404,13 +1428,22 @@
       g.drawImage(src, 0, 0);
       const dpr = src.width / Math.max(1, this.cssW);
       g.save(); g.scale(dpr, dpr);
+      g.lineJoin = 'round'; g.miterLimit = 2; g.textBaseline = 'middle';
       for (const e of this._etiquettesVisibles()) {
-        const sol = /zone|texte-sol|batiment/.test(e.classe);
-        g.font = `600 ${e.taille}px "Segoe UI", Arial, sans-serif`;
-        if (!sol) { g.fillStyle = /selectionnee/.test(e.classe) ? '#2563eb' : 'rgba(255,255,255,0.92)'; g.strokeStyle = 'rgba(0,0,0,0.25)'; g.beginPath(); if (g.roundRect) g.roundRect(e.x, e.y, e.w, e.h, 8); else g.rect(e.x, e.y, e.w, e.h); g.fill(); g.stroke(); }
-        g.fillStyle = /selectionnee/.test(e.classe) ? '#fff' : '#111827';
-        if (sol) { g.lineWidth = 3; g.strokeStyle = 'rgba(255,255,255,0.85)'; g.strokeText(e.texte || '', e.x + (sol ? 0 : 7), e.y + e.h * 0.75); }
-        g.fillText(e.texte || '', e.x + (sol ? 0 : 7), e.y + e.h * 0.75);
+        const sel = /selectionnee/.test(e.classe);
+        const sol = /zone|texte-sol|batiment/.test(e.classe) && !sel;
+        const maj = /zone/.test(e.classe);
+        const texte = maj ? String(e.texte || '').toUpperCase() : String(e.texte || '');
+        g.font = `${sol ? 700 : 600} ${e.taille}px "Segoe UI", Arial, sans-serif`;
+        if (!sol) {
+          g.fillStyle = sel ? '#2563eb' : 'rgba(255,255,255,0.94)'; g.strokeStyle = sel ? '#2563eb' : 'rgba(0,0,0,0.22)'; g.lineWidth = 1;
+          g.beginPath(); if (g.roundRect) g.roundRect(e.x + 0.5, e.y + 0.5, e.w, e.h, 9); else g.rect(e.x, e.y, e.w, e.h); g.fill(); g.stroke();
+          g.fillStyle = sel ? '#ffffff' : '#111827';
+          g.fillText(texte, e.x + 7, e.y + e.h / 2 + 0.5);
+        } else {
+          g.lineWidth = 3.5; g.strokeStyle = 'rgba(255,255,255,0.9)'; g.fillStyle = '#111827';
+          g.strokeText(texte, e.x, e.y + e.h / 2); g.fillText(texte, e.x, e.y + e.h / 2);
+        }
       }
       if (options.titre) {
         g.fillStyle = 'rgba(17,24,39,0.78)'; g.fillRect(0, 0, this.cssW, options.sousTitre ? 44 : 30);

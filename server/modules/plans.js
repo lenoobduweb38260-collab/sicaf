@@ -270,7 +270,7 @@ function register(ctx) {
 
   // ----- Validation -------------------------------------------------------------------------
   function erreur(prefixe, msg) { return new HttpError(400, prefixe ? `${prefixe} : ${msg}` : msg); }
-  function nombre(v, min, max, libelle, defaut, prefixe) {
+  function nombre(v, min, max, libelle, defaut, prefixe, decimales) {
     if (v === undefined || v === null || v === '') {
       if (defaut === undefined) throw erreur(prefixe, `${libelle} est obligatoire`);
       return defaut;
@@ -279,7 +279,7 @@ function register(ctx) {
     const n = Number(v);
     if (!Number.isFinite(n)) throw erreur(prefixe, `${libelle} doit être un nombre`);
     if (n < min || n > max) throw erreur(prefixe, `${libelle} hors limites (${min} à ${max})`);
-    return arrondi(n);
+    return arrondi(n, decimales == null ? 3 : decimales);
   }
   function texte(v, max, libelle, prefixe, obligatoire) {
     if (v != null && typeof v === 'object') throw erreur(prefixe, `${libelle} invalide`);
@@ -349,7 +349,7 @@ function register(ctx) {
     const niveauId = v.niveauId == null || v.niveauId === '' ? niveaux[0].id : String(v.niveauId);
     if (!niveaux.some((n) => n.id === niveauId)) throw erreur(pre, 'niveau inconnu');
     return Object.assign(img, {
-      echelle: nombre(v.echelle, 0.00001, 1000, 'L\'échelle (m/pixel)', undefined, pre),
+      echelle: nombre(v.echelle, 0.00001, 1000, 'L\'échelle (m/pixel)', undefined, pre, 8),
       x: nombre(v.x, -BORNE, BORNE, 'La position x', 0, pre),
       y: nombre(v.y, -BORNE, BORNE, 'La position y', 0, pre),
       rotation: normRotation(nombre(v.rotation, -3600, 3600, 'La rotation', 0, pre)),
