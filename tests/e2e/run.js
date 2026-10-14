@@ -109,9 +109,18 @@ async function main() {
     await page.fill('#f_login', 'spetit'); await page.fill('#f_password', 'demo'); await page.click('button[type=submit]');
     await page.waitForSelector('.sidebar-nav .nav-item');
     const navRestreinte = await page.$$eval('.sidebar-nav .nav-item', (a) => a.map((x) => x.dataset.module));
-    etape('Menu restreint pour un demandeur', !navRestreinte.includes('utilisateurs') && !navRestreinte.includes('configuration'), navRestreinte.join(', '));
+    const attendus = ['dashboard', 'demandes', 'equipements'];
+    const interdits = ['ot', 'preventif', 'planning', 'stock', 'fournisseurs', 'rapports', 'utilisateurs', 'profils', 'configuration', 'audit'];
+    etape('Menu restreint pour un demandeur', attendus.every((m) => navRestreinte.includes(m)) && !interdits.some((m) => navRestreinte.includes(m)), navRestreinte.join(', '));
     await page.goto(base + '/#/configuration'); await page.waitForTimeout(400);
     etape('Accès refusé à la configuration pour un demandeur', (await page.textContent('.vue')).includes('pas accès'));
+    await page.goto(base + '/#/ot'); await page.waitForTimeout(400);
+    etape('Accès refusé aux ordres de travail pour un demandeur', (await page.textContent('.vue')).includes('pas accès'));
+    await page.goto(base + '/#/demandes'); await page.waitForSelector('.vue[data-module="demandes"] table.tableau');
+    etape('Le demandeur peut signaler une panne', !!(await page.$('.vue .page-actions .btn-primaire')));
+    await page.goto(base + '/#/dashboard'); await page.waitForFunction(() => document.querySelector('.vue[data-module="dashboard"]') && !document.querySelector('.vue > .chargement'));
+    await page.waitForTimeout(300);
+    etape('Tableau de bord du demandeur sans erreur', !(await page.$('.vue .alerte-danger')));
     await capture('demandeur');
   } catch (e) {
     etape('Exception', false, e.message);

@@ -360,6 +360,8 @@ function register(ctx) {
         equipementId: id, numero: e ? e.numero || '' : '', nom: e ? e.nom : `Équipement #${id}`, secteurId: e && e.secteurId != null ? e.secteurId : null,
         etatCode: e ? e.etatCode || null : null, criticiteCode: e ? e.criticiteCode || null : null,
         nbOt: v.nbOt, nbCorrectifs: v.nbCorrectifs, ouverts: v.ouverts, heures: arrondi(v.heures), cout: arrondi(v.cout),
+        // La fiche n'est ouvrable que si l'équipement est dans la portée (un intervenant peut voir l'OT sans voir l'équipement)
+        accessible: !!(e && perms.can(req.perms, 'equipements', 'voir') && equipementVisible(req, e)),
       };
     }).sort((a, b) => b.nbOt - a.nbOt || b.nbCorrectifs - a.nbCorrectifs || b.heures - a.heures || parTexte(a.nom, b.nom)).slice(0, TOP_EQUIPEMENTS);
 
@@ -617,9 +619,19 @@ const MESSAGE_DEMO = 'Bienvenue sur la GMAO SICAF. Rappel sécurité : toute int
 /**
  * Le tableau de bord ne possède pas de collection : ses données de démonstration proviennent des
  * autres modules. On renseigne seulement un message d'accueil s'il est vide (idempotent).
+ *
+ * Chargé avant les modules Demandes et OT (ordre alphabétique des fichiers), il déclenche d'abord, sur
+ * une base sans OT, le chargement de l'historique (module Rapports, idempotent), qui charge lui-même les
+ * référentiels, les 12 mois d'interventions archivées puis les demandes et OT courants : la numérotation
+ * des OT et des DI suit ainsi l'ordre chronologique, et les plans préventifs (chargés ensuite) retrouvent
+ * leur historique. Le module OT applique la même règle s'il est sollicité en premier (ex. par les Achats).
  */
 function seedDemo(ctx) {
   const { db } = ctx;
+  const historique = (ctx.modules || []).find((m) => m.fichier === 'rapports.js');
+  if (historique && typeof historique.seedDemo === 'function' && db.count('ot') === 0) {
+    try { historique.seedDemo(ctx); } catch (e) { ctx.log('Tableau de bord : chargement de l\'historique en échec', e.message); }
+  }
   const cfg = db.getConfig();
   cfg.general = cfg.general || {};
   if (texte(cfg.general.messageAccueil).trim()) return 'message d\'accueil déjà défini';

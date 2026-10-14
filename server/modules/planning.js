@@ -268,6 +268,12 @@ function register(ctx) {
   function libelleType(refs, code) { const t = refs.types.get(code); return t ? t.label : (code || ''); }
 
   /** Élément de planning pour un OT. */
+  /** Fiche équipement ouvrable par l'utilisateur (droit et portée) ; un intervenant peut voir l'OT sans voir l'équipement. */
+  function equipementAccessible(req, e) {
+    if (!e || !req || !req.perms || !perms.can(req.perms, 'equipements', 'voir')) return false;
+    const sEq = ctx.services.equipements;
+    try { return sEq && typeof sEq.visible === 'function' ? !!sEq.visible(req, e) : ctx.canSee(req, e); } catch (err) { return false; }
+  }
   function itemOt(o, refs, d, jour, req) {
     const e = o.equipementId != null ? refs.equipements.get(Number(o.equipementId)) : null;
     const s = o.secteurId != null ? refs.secteurs.get(Number(o.secteurId)) : null;
@@ -279,6 +285,7 @@ function register(ctx) {
       typeCode: o.typeCode || null, typeLibelle: libelleType(refs, o.typeCode), couleur: couleurType(refs, o.typeCode),
       prioriteCode: o.prioriteCode || null,
       equipementId: o.equipementId == null ? null : o.equipementId, equipementNom: e ? e.nom : '', equipementNumero: e ? e.numero || '' : '',
+      equipementAccessible: equipementAccessible(req, e),
       secteurId: o.secteurId == null ? null : o.secteurId, secteurNom: s ? s.nom : '',
       technicienId: o.technicienId == null ? null : Number(o.technicienId), technicienNom: nomDe(refs, o.technicienId),
       techniciens: (o.techniciens || []).map(Number), techniciensNoms: (o.techniciens || []).map((id) => nomDe(refs, id)).filter(Boolean),

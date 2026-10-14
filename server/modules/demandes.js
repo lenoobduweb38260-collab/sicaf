@@ -195,12 +195,22 @@ function register(ctx) {
     while (cur && !vus.has(cur.id)) { parts.unshift(cur.nom); vus.add(cur.id); cur = cur.parentId != null ? db.get('secteurs', cur.parentId) : null; }
     return parts.join(' › ');
   }
-  /** OT lié : par `otId`, sinon par `demandeId` côté OT (lien persisté à la volée). */
-  function otLie(d) {
+  /** Un OT est-il annulé (statut final de la liste `statutsOT` correspondant à une annulation) ? */
+  function otAnnule(o) {
+    const s = o ? ctx.liste('statutsOT').find((x) => x.code === o.statut) : null;
+    return !!(s && s.final && (s.code === 'annule' || /annul/i.test(s.label || '')));
+  }
+  /**
+   * OT lié à la demande : par `otId`, sinon par `demandeId` côté OT (lien persisté à la volée). Un OT annulé n'est pas rattaché (la demande
+   * redevient « validée » et peut être reconvertie) ; `inclureAnnules` le retourne tout de même (ex. pour
+   * interdire la suppression d'une demande encore référencée).
+   */
+  function otLie(d, { inclureAnnules = false } = {}) {
     let ot = d.otId != null ? db.get('ot', d.otId) : null;
     if (!ot) {
-      ot = db.findOne('ot', (o) => Number(o.demandeId) === d.id);
+      ot = db.findOne('ot', (o) => Number(o.demandeId) === d.id && !otAnnule(o));
       if (ot && d.otId == null) db.update(ENTITE, d.id, { otId: ot.id });
+      if (!ot && inclureAnnules) ot = db.findOne('ot', (o) => Number(o.demandeId) === d.id);
     }
     return ot;
   }
@@ -252,7 +262,7 @@ function register(ctx) {
     const final = finaux.has(d.statut);
     return Object.assign(reste, {
       otId: ot ? ot.id : (d.otId == null ? null : d.otId),
-      equipementNom: e ? e.nom : '', equipementNumero: e ? e.numero : '',
+      equipementNom: e ? e.nom : '', equipementNumero: e ? e.numero : '', equipementVisible: e ? equipementVisible(req, e) : false,
       secteurNom: d.secteurId != null ? ((db.get('secteurs', d.secteurId) || {}).nom || '') : '',
       secteurChemin: cheminSecteur(d.secteurId),
       demandeurNom: ctx.nomUser(d.demandeurId), validateurNom: ctx.nomUser(d.validateurId),
@@ -537,7 +547,7 @@ function register(ctx) {
 
   router.delete('/api/demandes/:id', async (req) => {
     const existant = getVisible(req, req.params.id);
-    const ot = otLie(existant);
+    const ot = otLie(existant, { inclureAnnules: true });
     if (ot) throw new HttpError(400, `Impossible de supprimer la demande ${existant.numero} : elle est liée à l'ordre de travail ${ot.numero || ot.id}`);
     db.remove(ENTITE, existant.id);
     ctx.audit(req, 'suppression', ENTITE, existant.id, `Demande ${existant.numero} : ${existant.titre}`);
@@ -790,15 +800,26 @@ function seedDemo(ctx) {
   const texteNote = 'RELEVÉ CONTRÔLE QUALITÉ — Étuve UF 110\r\nConsigne 105 °C — lecture sonde étalon 103,2 °C (écart -1,8 °C, tolérance ±1 °C).\r\nDernier étalonnage : il y a 14 mois.\r\n';
   const note = { nom: 'releve-etuve.txt', type: 'text/plain', taille: Buffer.byteLength(texteNote), contenu: 'data:text/plain;base64,' + Buffer.from(texteNote).toString('base64'), date: ilYa(2), userId: userId('mdupont'), description: 'Relevé de contrôle' };
 
-  const mk = (o) => {
+  // Les demandes sont insérées dans l'ordre chronologique (numérotation croissante avec la date de demande)
+  const aInserer = [];
+  const mk = (o) => { aInserer.push(o); };
+  const inserer = (o) => {
     const e = o.equipement ? equipement(o.equipement) : null;
     const secteurRepli = o.secteurCode ? secteur(o.secteurCode) : null;
     delete o.equipement; delete o.secteurCode;
-    return db.insert(ENTITE, Object.assign({
+    const d = db.insert(ENTITE, Object.assign({
       numero: numeroUnique(), description: '', equipementId: e ? e.id : null, secteurId: e ? (e.secteurId == null ? null : e.secteurId) : (o.secteurId == null ? secteurRepli : o.secteurId),
       prioriteCode: 'normale', typeCode: 'correctif', statut: ST.soumise, validateurId: null, dateValidation: null, motifRefus: '', otId: null, dateCloture: null,
       arretProduction: false, commentaires: [], pieceJointes: [], historique: [], champs: {}, createdBy: admin ? admin.id : null,
     }, o));
+    // Horodatages cohérents avec l'historique (création à la date de la demande)
+    const brut = (db.data.collections[ENTITE] || []).find((x) => x.id === d.id);
+    if (brut && o.dateDemande) {
+      const dates = [o.dateDemande].concat((o.historique || []).map((h) => h.date), (o.commentaires || []).map((c) => c.date)).filter(Boolean).sort();
+      brut.createdAt = o.dateDemande;
+      brut.updatedAt = dates[dates.length - 1];
+    }
+    return d;
   };
 
   // 1. Convertie en OT (validée par le chef de secteur) avec photo et échange
@@ -830,8 +851,8 @@ function seedDemo(ctx) {
   mk({
     titre: 'Remplacement trimestriel des filtres F7 de la CTA', equipement: 'CTA atelier conditionnement', secteurCode: 'SG', prioriteCode: 'basse', typeCode: 'preventif', statut: ST.soumise,
     description: 'Les filtres F7 de la centrale de traitement d\'air n\'ont pas été remplacés ce trimestre : perte de charge affichée à 280 Pa (seuil 250 Pa).',
-    demandeurId: userId('jbernard'), createdBy: userId('jbernard'), dateDemande: ilYa(26),
-    historique: [etape(26, 'jbernard', 'creation', ST.soumise)],
+    demandeurId: userId('kleroy'), createdBy: userId('kleroy'), dateDemande: ilYa(26),
+    historique: [etape(26, 'kleroy', 'creation', ST.soumise)],
   });
   // 5. Clôturée après intervention
   mk({
@@ -856,8 +877,10 @@ function seedDemo(ctx) {
     demandeurId: userId('mdupont'), createdBy: userId('mdupont'), dateDemande: ilYa(2), pieceJointes: [note],
     historique: [etape(2, 'mdupont', 'creation', ST.soumise)],
   });
+  aInserer.sort((a, b) => String(a.dateDemande || '').localeCompare(String(b.dateDemande || ''))).forEach(inserer);
+  db.touch();
   const n = relier();
-  return '7 demandes d\'intervention' + (n ? ` (${n} lien(s) OT)` : '');
+  return `${aInserer.length} demandes d'intervention` + (n ? ` (${n} lien(s) OT)` : '');
 }
 
 module.exports = { nom, register, seedDemo };

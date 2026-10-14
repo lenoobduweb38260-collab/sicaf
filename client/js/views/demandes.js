@@ -66,6 +66,8 @@
     const id = d.otId || (d.ot && d.ot.id);
     const numero = d.otNumero || (d.ot && d.ot.numero);
     if (!id) return el('span', { class: 'texte-2' }, '—');
+    // Sans accès au module OT (ex. demandeur) : numéro affiché sans lien
+    if (!GMAO.can('ot', 'voir')) return el('span', { class: 'inline', title: 'Ordre de travail' }, ico('ot'), numero || ('OT #' + id));
     return el('a', { href: '#/ot/' + id, class: 'inline', title: 'Ouvrir l\'ordre de travail', onclick: (ev) => ev.stopPropagation() }, ico('ot'), numero || ('OT #' + id));
   }
   function lienEquipement(d) {
@@ -73,7 +75,13 @@
     const nomEq = d.equipementNom || (d.equipement && d.equipement.nom);
     const numero = d.equipementNumero || (d.equipement && d.equipement.numero);
     if (!id) return el('span', { class: 'texte-2' }, d.secteurChemin ? 'Sans équipement · ' + d.secteurChemin : 'Sans équipement');
-    return el('a', { href: '#/equipements/' + id, title: 'Ouvrir la fiche équipement', onclick: (ev) => ev.stopPropagation() }, el('div', { class: 'cellule-principale' }, nomEq || ('#' + id)), el('div', { class: 'cellule-secondaire' }, [numero, d.secteurChemin].filter(Boolean).join(' · ')));
+    const contenu = [el('div', { class: 'cellule-principale' }, nomEq || ('#' + id)), el('div', { class: 'cellule-secondaire' }, [numero, d.secteurChemin].filter(Boolean).join(' · '))];
+    // Équipement hors de la portée de l'utilisateur (ou module non accessible) : pas de lien vers une fiche introuvable
+    if (!equipementOuvrable(d)) return el('div', null, contenu);
+    return el('a', { href: '#/equipements/' + id, title: 'Ouvrir la fiche équipement', onclick: (ev) => ev.stopPropagation() }, contenu);
+  }
+  function equipementOuvrable(d) {
+    return GMAO.can('equipements', 'voir') && d.equipementVisible !== false;
   }
   /** Identifiants d'un secteur et de ses sous-secteurs (filtre « secteur » de la liste). */
   function secteurEtDescendants(id) {
@@ -427,7 +435,7 @@
     const details = ui.details([
       { label: 'Statut', valeur: ui.badgeListe('statutsDemande', d.statut) }, { label: 'Priorité', valeur: frag(ui.badgeListe('priorites', d.prioriteCode), d.echeance && !d.final ? el('span', { class: 'texte-2 texte-petit ml' }, 'échéance ' + ui.formatDateHeure(d.echeance)) : null) },
       { label: 'Type', valeur: badgeSouple('typesIntervention', d.typeCode) }, { label: 'Arrêt de production', valeur: d.arretProduction ? el('span', { class: 'texte-danger texte-gras' }, 'Oui') : 'Non' },
-      { label: 'Équipement', valeur: d.equipement ? frag(el('a', { href: '#/equipements/' + d.equipement.id }, `${d.equipement.nom}`), el('span', { class: 'texte-2' }, ` (${d.equipement.numero || '#' + d.equipement.id})`), d.equipement.etatCode ? frag(' ', ui.badgeListe('etatsEquipement', d.equipement.etatCode)) : null) : '—' },
+      { label: 'Équipement', valeur: d.equipement ? frag(equipementOuvrable(d) ? el('a', { href: '#/equipements/' + d.equipement.id }, `${d.equipement.nom}`) : el('span', null, `${d.equipement.nom}`), el('span', { class: 'texte-2' }, ` (${d.equipement.numero || '#' + d.equipement.id})`), d.equipement.etatCode ? frag(' ', ui.badgeListe('etatsEquipement', d.equipement.etatCode)) : null) : '—' },
       { label: 'Secteur', valeur: d.secteurChemin || '—' },
       { label: 'Demandeur', valeur: d.demandeur ? el('span', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, ui.avatar(d.demandeur.nomComplet, 26), el('span', null, el('div', null, d.demandeur.nomComplet), d.demandeur.fonction ? el('div', { class: 'texte-2 texte-petit' }, d.demandeur.fonction) : null)) : d.demandeurNom },
       { label: 'Date de la demande', valeur: ui.formatDateHeure(d.dateDemande) },

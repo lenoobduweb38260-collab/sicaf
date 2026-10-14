@@ -121,8 +121,13 @@ function register(ctx) {
     const finauxOt = statutsOtFinaux();
     const finauxDi = statutsDemandeFinaux();
     const parDate = (a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
-    const ot = db.list('ot', (o) => Number(o.equipementId) === e.id).sort(parDate);
-    const demandes = db.list('demandes', (d) => Number(d.equipementId) === e.id).sort(parDate);
+    // Données des autres modules : seulement avec le droit de consultation correspondant et dans la portée
+    const peut = (module) => !!(req && req.perms && perms.can(req.perms, module, 'voir'));
+    const visibles = (module, rows) => (peut(module) ? (req ? ctx.scope(req, rows) : rows) : []);
+    const ot = visibles('ot', db.list('ot', (o) => Number(o.equipementId) === e.id)).sort(parDate);
+    // Demandes : même règle que le module Demandes (portée, et le N+1 voit celles de ses subordonnés directs)
+    const estN1 = (d) => { const u = d.demandeurId != null ? db.get('users', d.demandeurId) : null; return !!(u && req && req.user && Number(u.managerId) === req.user.id); };
+    const demandes = (peut('demandes') ? db.list('demandes', (d) => Number(d.equipementId) === e.id && (!req || ctx.canSee(req, d) || estN1(d))) : []).sort(parDate);
     const base = resume(e, new Map([[e.id, ot.filter((o) => !finauxOt.has(o.statut)).length]]));
     const parent = e.parentId != null ? db.get(ENTITE, e.parentId) : null;
     const fournisseur = e.fournisseurId != null ? db.get('fournisseurs', e.fournisseurId) : null;
@@ -139,8 +144,8 @@ function register(ctx) {
       demandes: demandes.slice(0, 10).map((d) => ({ id: d.id, numero: d.numero, titre: d.titre, statut: d.statut, prioriteCode: d.prioriteCode, typeCode: d.typeCode, demandeurId: d.demandeurId, dateDemande: d.dateDemande || d.createdAt, otId: d.otId, arretProduction: !!d.arretProduction })),
       nbDemandesTotal: demandes.length,
       nbDemandesOuvertes: demandes.filter((d) => !finauxDi.has(d.statut)).length,
-      plansPreventifs: db.list('plansPreventifs', (p) => Number(p.equipementId) === e.id).sort(triNom).map((p) => ({ id: p.id, numero: p.numero, nom: p.nom, typeCode: p.typeCode, periodicite: p.periodicite, prochaineEcheance: p.prochaineEcheance, derniereExecution: p.derniereExecution, technicienId: p.technicienId, dureeEstimee: p.dureeEstimee, actif: p.actif !== false })),
-      articlesCompatibles: db.list('articles', (a) => (a.equipementIds || []).map(Number).includes(e.id)).sort((a, b) => String(a.designation || '').localeCompare(String(b.designation || ''), 'fr')).map((a) => ({ id: a.id, code: a.code, designation: a.designation, categorieCode: a.categorieCode, uniteCode: a.uniteCode, quantite: a.quantite, seuilMin: a.seuilMin, emplacement: a.emplacement, prixUnitaire: a.prixUnitaire, actif: a.actif !== false })),
+      plansPreventifs: visibles('preventif', db.list('plansPreventifs', (p) => Number(p.equipementId) === e.id)).sort(triNom).map((p) => ({ id: p.id, numero: p.numero, nom: p.nom, typeCode: p.typeCode, periodicite: p.periodicite, prochaineEcheance: p.prochaineEcheance, derniereExecution: p.derniereExecution, technicienId: p.technicienId, dureeEstimee: p.dureeEstimee, actif: p.actif !== false })),
+      articlesCompatibles: visibles('stock', db.list('articles', (a) => (a.equipementIds || []).map(Number).includes(e.id))).sort((a, b) => String(a.designation || '').localeCompare(String(b.designation || ''), 'fr')).map((a) => ({ id: a.id, code: a.code, designation: a.designation, categorieCode: a.categorieCode, uniteCode: a.uniteCode, quantite: a.quantite, seuilMin: a.seuilMin, emplacement: a.emplacement, prixUnitaire: a.prixUnitaire, actif: a.actif !== false })),
       documents: (e.documents || []).map(resumeDoc),
       compteurReleves: (e.compteurReleves || []).slice().sort((a, b) => String(b.date).localeCompare(String(a.date))).map((r) => Object.assign({}, r, { userNom: ctx.nomUser(r.userId) })),
       historiqueEtats: (e.historiqueEtats || []).slice().sort((a, b) => String(b.date).localeCompare(String(a.date))).map((h) => Object.assign({}, h, { userNom: ctx.nomUser(h.userId) })),

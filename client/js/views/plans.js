@@ -1028,6 +1028,12 @@
     majLegende() {
       const l = this.legende;
       ui.vider(l);
+      const { titre, items } = this.itemsLegende();
+      l.appendChild(el('div', { class: 'lt' }, titre));
+      if (!items.length) l.appendChild(el('div', { class: 'texte-2' }, 'Couleurs définies sur le plan'));
+      for (const [c, t] of items) l.appendChild(el('div', { class: 'li' }, el('span', { class: 'p3d-pastille', style: { background: c } }), t));
+    }
+    itemsLegende() {
       let items = [];
       let titre = '';
       switch (this.couleurMode) {
@@ -1045,9 +1051,7 @@
         default: titre = 'Couleurs d\'origine'; items = [];
       }
       if (this.couleurMode !== 'origine') items.push([NEUTRE, 'Machine non liée']);
-      l.appendChild(el('div', { class: 'lt' }, titre));
-      if (!items.length) l.appendChild(el('div', { class: 'texte-2' }, 'Couleurs définies sur le plan'));
-      for (const [c, t] of items) l.appendChild(el('div', { class: 'li' }, el('span', { class: 'p3d-pastille', style: { background: c } }), t));
+      return { titre, items };
     }
     majStatut(info) {
       const s = this.statut;
@@ -2091,6 +2095,24 @@
     capturer() {
       try {
         const c = this.moteur.capture({ titre: this.proprietes.nom, sousTitre: `${this.plan.numero} · ${ui.cheminSecteur(this.proprietes.secteurId) || ''} · ${ui.formatDateHeure(new Date())}` });
+        // légende du mode de couleur (coin inférieur gauche)
+        const { titre, items } = this.itemsLegende();
+        if (items.length) {
+          const g = c.getContext('2d');
+          const k = c.width / Math.max(1, this.moteur.cssW || c.width);
+          g.save(); g.scale(k, k);
+          const h = 26 + items.length * 18, w = 190, x = 10, y = (c.height / k) - h - 10;
+          g.fillStyle = 'rgba(255,255,255,0.94)'; g.strokeStyle = 'rgba(0,0,0,0.18)';
+          g.beginPath(); if (g.roundRect) g.roundRect(x, y, w, h, 8); else g.rect(x, y, w, h); g.fill(); g.stroke();
+          g.fillStyle = '#4b5563'; g.font = '700 10.5px "Segoe UI", Arial, sans-serif'; g.textBaseline = 'middle';
+          g.fillText(titre.toUpperCase(), x + 10, y + 13);
+          items.forEach(([coul, t], i) => {
+            const yy = y + 30 + i * 18;
+            g.fillStyle = coul; g.beginPath(); g.arc(x + 15, yy, 5, 0, Math.PI * 2); g.fill();
+            g.fillStyle = '#111827'; g.font = '12px "Segoe UI", Arial, sans-serif'; g.fillText(t, x + 27, yy);
+          });
+          g.restore();
+        }
         telechargerCanvas(c, `plan-${this.plan.numero}-${ui.dateISO(new Date())}.png`);
         toast('Capture enregistrée', 'succes', 1800);
       } catch (e) { erreur(e); }

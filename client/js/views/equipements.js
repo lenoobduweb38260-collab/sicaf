@@ -52,7 +52,12 @@
   /** Icône SVG dimensionnée (hors contexte .btn / .arbre, le SVG n'a pas de taille par défaut). */
   function iconeDim(nom, taille, couleur) { const ic = icone(nom); Object.assign(ic.style, { width: taille + 'px', height: taille + 'px', flexShrink: 0, color: couleur || 'currentColor' }); return ic; }
   /** Lien vers une autre vue, utilisable dans une ligne de tableau cliquable. */
-  function lienVue(href, label) { return el('a', { href, onclick: (ev) => ev.stopPropagation() }, label); }
+  /** Lien vers une autre vue ; simple texte si le module cible n'est pas accessible à l'utilisateur. */
+  function lienVue(href, label) {
+    const cible = (String(href).match(/^#\/([^/?]+)/) || [])[1];
+    if (cible && typeof GMAO.moduleVisible === 'function' && !GMAO.moduleVisible(cible)) return el('span', null, label);
+    return el('a', { href, onclick: (ev) => ev.stopPropagation() }, label);
+  }
   function libelleEq(e) { return `${e.numero || ''} · ${e.nom || ''}`.replace(/^ · /, ''); }
 
   // ----- Formulaire de création / modification --------------------------
@@ -495,7 +500,7 @@
   function rendreInterventions(e) {
     const cont = el('div');
     const ot = e.derniersOt || [];
-    cont.appendChild(ui.carte(`Ordres de travail (${e.nbOtTotal || 0}${e.nbOtOuverts ? `, dont ${e.nbOtOuverts} ouvert(s)` : ''})`,
+    if (GMAO.can('ot', 'voir')) cont.appendChild(ui.carte(`Ordres de travail (${e.nbOtTotal || 0}${e.nbOtOuverts ? `, dont ${e.nbOtOuverts} ouvert(s)` : ''})`,
       ot.length ? frag(ui.table({
         compact: true, recherche: false, pagination: false, lignes: ot, onClic: (o) => GMAO.navigate('#/ot/' + o.id),
         colonnes: [
@@ -515,7 +520,7 @@
         GMAO.can('ot', 'creer') ? ui.bouton('Nouvel OT', { icone: 'plus', classe: 'btn-sm btn-primaire', onClic: () => GMAO.navigate(`#/ot?nouveau=1&equipementId=${e.id}`) }) : null) }));
 
     const demandes = e.demandes || [];
-    cont.appendChild(ui.carte(`Demandes d'intervention (${e.nbDemandesTotal || 0}${e.nbDemandesOuvertes ? `, dont ${e.nbDemandesOuvertes} en cours` : ''})`,
+    if (GMAO.can('demandes', 'voir')) cont.appendChild(ui.carte(`Demandes d'intervention (${e.nbDemandesTotal || 0}${e.nbDemandesOuvertes ? `, dont ${e.nbDemandesOuvertes} en cours` : ''})`,
       demandes.length ? ui.table({
         compact: true, recherche: false, pagination: false, lignes: demandes, onClic: (d) => GMAO.navigate('#/demandes/' + d.id),
         colonnes: [
@@ -684,16 +689,17 @@
       can('supprimer') ? ui.bouton('Supprimer', { icone: 'supprimer', classe: 'btn-sm btn-danger', onClic: () => supprimer(e, (r) => (r.desactive ? recharger() : GMAO.navigate('#/equipements'))) }) : null));
 
     if (e.actif === false) zone.appendChild(ui.alerte('Cet équipement est désactivé (archivé) : il est conservé pour l\'historique mais n\'apparaît plus dans les listes par défaut.', 'alerte'));
-    if (e.nbOtOuverts) zone.appendChild(ui.alerte(frag(`${e.nbOtOuverts} ordre(s) de travail ouvert(s) sur cet équipement. `, lienVue('#/ot?equipementId=' + e.id, 'Voir les interventions')), 'info'));
+    if (e.nbOtOuverts && GMAO.can('ot', 'voir')) zone.appendChild(ui.alerte(frag(`${e.nbOtOuverts} ordre(s) de travail ouvert(s) sur cet équipement. `, lienVue('#/ot?equipementId=' + e.id, 'Voir les interventions')), 'info'));
 
+    // Onglets des autres modules : affichés seulement avec le droit de consultation correspondant
     zone.appendChild(ui.onglets([
       { cle: 'infos', label: 'Informations', icone: 'info', rendu: () => rendreInfos(e) },
-      { cle: 'interventions', label: 'Interventions', icone: 'ot', badge: (e.nbOtOuverts || 0) || null, rendu: () => rendreInterventions(e) },
-      { cle: 'preventif', label: 'Préventif', icone: 'preventif', badge: (e.plansPreventifs || []).length || null, rendu: () => rendrePreventif(e) },
+      GMAO.can('ot', 'voir') || GMAO.can('demandes', 'voir') ? { cle: 'interventions', label: 'Interventions', icone: 'ot', badge: (e.nbOtOuverts || 0) || null, rendu: () => rendreInterventions(e) } : null,
+      GMAO.can('preventif', 'voir') ? { cle: 'preventif', label: 'Préventif', icone: 'preventif', badge: (e.plansPreventifs || []).length || null, rendu: () => rendrePreventif(e) } : null,
       { cle: 'documents', label: 'Documents', icone: 'piece_jointe', badge: (e.documents || []).length || null, rendu: () => rendreDocuments(e, recharger) },
-      { cle: 'pieces', label: 'Pièces compatibles', icone: 'piece', badge: (e.articlesCompatibles || []).length || null, rendu: () => rendrePieces(e) },
+      GMAO.can('stock', 'voir') ? { cle: 'pieces', label: 'Pièces compatibles', icone: 'piece', badge: (e.articlesCompatibles || []).length || null, rendu: () => rendrePieces(e) } : null,
       { cle: 'compteur', label: 'Compteur', icone: 'horloge', rendu: () => rendreCompteur(e, recharger) },
-    ], { hash: true }).el);
+    ].filter(Boolean), { hash: true }).el);
   }
 
   // ----- Vue --------------------------------------------------------------

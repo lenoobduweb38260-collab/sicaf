@@ -117,7 +117,9 @@
   // ----- Cellules de liste ------------------------------------------------------------------
   function lienEquipement(o) {
     if (!o.equipementId) return el('span', { class: 'texte-2' }, o.secteurChemin ? 'Sans équipement · ' + o.secteurChemin : 'Sans équipement');
-    return el('a', { href: '#/equipements/' + o.equipementId, title: o.secteurChemin ? 'Secteur : ' + o.secteurChemin : 'Ouvrir la fiche équipement', onclick: (ev) => ev.stopPropagation(), style: { display: 'block', minWidth: '140px' } },
+    // Fiche équipement hors de la portée de l'utilisateur (intervenant d'un autre secteur) : pas de lien
+    const ouvrable = o.equipementAccessible !== false && GMAO.can('equipements', 'voir');
+    return el(ouvrable ? 'a' : 'div', { href: ouvrable ? '#/equipements/' + o.equipementId : null, title: o.secteurChemin ? 'Secteur : ' + o.secteurChemin : (ouvrable ? 'Ouvrir la fiche équipement' : ''), onclick: ouvrable ? (ev) => ev.stopPropagation() : null, style: { display: 'block', minWidth: '140px' } },
       el('div', { class: 'cellule-principale' }, o.equipementNom || ('#' + o.equipementId)),
       el('div', { class: 'cellule-secondaire' }, [o.equipementNumero, o.secteurNom].filter(Boolean).join(' · ')));
   }
@@ -462,7 +464,7 @@
       st.estFinal(o.statut) && o.rapport ? ui.carte('Compte rendu', el('div', { style: { whiteSpace: 'pre-wrap' } }, o.rapport)) : null);
     const droite = el('div', null,
       e ? ui.carte('Équipement', frag(
-        el('div', { class: 'inline', style: { marginBottom: '8px', flexWrap: 'wrap' } }, ico('equipements', 18), el('a', { href: '#/equipements/' + e.id, class: 'texte-gras' }, e.nom), el('span', { class: 'texte-2' }, e.numero), e.etatCode ? ui.badgeListe('etatsEquipement', e.etatCode) : null, e.criticiteCode ? ui.badgeListe('criticites', e.criticiteCode, { contour: true }) : null, e.actif === false ? ui.badge('Inactif', '#6b7280') : null),
+        el('div', { class: 'inline', style: { marginBottom: '8px', flexWrap: 'wrap' } }, ico('equipements', 18), e.accessible !== false && GMAO.can('equipements', 'voir') ? el('a', { href: '#/equipements/' + e.id, class: 'texte-gras' }, e.nom) : el('span', { class: 'texte-gras' }, e.nom), el('span', { class: 'texte-2' }, e.numero), e.etatCode ? ui.badgeListe('etatsEquipement', e.etatCode) : null, e.criticiteCode ? ui.badgeListe('criticites', e.criticiteCode, { contour: true }) : null, e.actif === false ? ui.badge('Inactif', '#6b7280') : null),
         ui.details([
           e.chemin ? { label: 'Emplacement', valeur: e.chemin } : null,
           { label: 'Localisation', valeur: e.localisation || '—' },
@@ -640,22 +642,24 @@
       return ui.carte('Compte rendu', cont);
     }
     const f = ui.form({ colonnes: 2, champs: [
-      { nom: 'rapport', label: 'Compte rendu (brouillon)', type: 'texte_long', lignes: 5, placeholder: 'Constat, travaux réalisés, essais… (obligatoire pour clôturer)' },
-      { nom: 'causeCode', label: 'Cause', type: 'select', options: ui.optionsListe('causesPanne', { vide: '— Non renseignée —' }) },
-      o.equipement ? { nom: 'compteurReleve', label: `Relevé du compteur${o.equipement.compteur && o.equipement.compteur.unite ? ' (' + o.equipement.compteur.unite + ')' : ''}`, type: 'nombre', min: 0 } : null,
-      { nom: 'coutExterne', label: 'Coût externe (€)', type: 'nombre', min: 0, step: 0.01 },
-    ], valeurs: { rapport: o.rapport || '', causeCode: o.causeCode || '', compteurReleve: o.compteurReleve, coutExterne: o.coutExterne || 0 } });
+      { nom: 'brouillonRapport', label: 'Compte rendu (brouillon)', type: 'texte_long', lignes: 5, placeholder: 'Constat, travaux réalisés, essais… (obligatoire pour clôturer)' },
+      { nom: 'brouillonCause', label: 'Cause', type: 'select', options: ui.optionsListe('causesPanne', { vide: '— Non renseignée —' }) },
+      o.equipement ? { nom: 'brouillonCompteur', label: `Relevé du compteur${o.equipement.compteur && o.equipement.compteur.unite ? ' (' + o.equipement.compteur.unite + ')' : ''}`, type: 'nombre', min: 0 } : null,
+      { nom: 'brouillonCoutExterne', label: 'Coût externe (€)', type: 'nombre', min: 0, step: 0.01 },
+    ], valeurs: { brouillonRapport: o.rapport || '', brouillonCause: o.causeCode || '', brouillonCompteur: o.compteurReleve, brouillonCoutExterne: o.coutExterne || 0 } });
+    // Lecture du brouillon sous les noms attendus par l'API
+    const lireBrouillon = () => { const x = f.valeurs(); return { rapport: x.brouillonRapport, causeCode: x.brouillonCause, compteurReleve: x.brouillonCompteur, coutExterne: x.brouillonCoutExterne }; };
     cont.appendChild(f.el);
     const btnEnr = el('button', { type: 'button', class: 'btn btn-sm', onclick: async () => {
       if (!f.valider()) return;
-      const v = f.valeurs();
+      const v = lireBrouillon();
       const body = { rapport: v.rapport, causeCode: v.causeCode || null, coutExterne: v.coutExterne == null ? 0 : v.coutExterne };
       if (o.equipement) body.compteurReleve = v.compteurReleve == null || v.compteurReleve === '' ? null : v.compteurReleve;
       btnEnr.disabled = true;
       try { maj(await api.put(`/api/ot/${o.id}`, body)); toast('Compte rendu enregistré', 'succes'); } catch (e) { erreur(e); btnEnr.disabled = false; }
     } }, icone('sauvegarde'), 'Enregistrer');
     cont.appendChild(el('div', { class: 'mt', style: FLEX({ justifyContent: 'flex-end' }) }, btnEnr,
-      a.cloturer ? el('button', { type: 'button', class: 'btn btn-sm btn-ok', onclick: () => cloturerOt(Object.assign({}, o, { rapport: f.valeurs().rapport || o.rapport, causeCode: f.valeurs().causeCode || o.causeCode }), maj) }, icone('check'), 'Clôturer l\'OT') : null));
+      a.cloturer ? el('button', { type: 'button', class: 'btn btn-sm btn-ok', onclick: () => cloturerOt(Object.assign({}, o, { rapport: lireBrouillon().rapport || o.rapport, causeCode: lireBrouillon().causeCode || o.causeCode }), maj) }, icone('check'), 'Clôturer l\'OT') : null));
     return ui.carte('Compte rendu', cont);
   }
 

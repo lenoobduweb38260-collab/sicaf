@@ -1042,7 +1042,7 @@ function definitionsArchives() {
     { eq: 'Groupe froid industriel', j: 128, hd: '08:10', dem: 3, dur: 5.5, type: 'correctif', prio: 'haute', titre: 'Remplacement du moteur du ventilateur n°3 du condenseur', cause: 'casse', tech: 'kleroy', crea: 'kleroy', temps: [['kleroy', 5.5]],
       desc: 'Ventilateur n°3 bloqué, bruit de frottement puis disjonction.', pieces: [[null, 'Moteur de ventilateur EC Ø 800 mm', 1, 640]],
       rapport: 'Roulements du moteur grippés, bobinage brûlé. Moteur EC remplacé, câblage et sens de rotation contrôlés. Intensité nominale 2,1 A.' },
-    { eq: 'CTA atelier conditionnement', j: 214, hd: '07:30', dem: 1.5, dur: 2, type: 'correctif', prio: 'haute', titre: 'Courroie du ventilateur de soufflage cassée sur la CTA', cause: 'casse', tech: 'kleroy', crea: 'pmartin', di: { par: 'spetit', valid: 0.8 },
+    { eq: 'CTA atelier conditionnement', j: 214, hd: '07:30', dem: 1.5, dur: 2, type: 'correctif', prio: 'haute', titre: 'Courroie du ventilateur de soufflage cassée sur la CTA', cause: 'casse', tech: 'kleroy', crea: 'mdupont', di: { par: 'kleroy', valid: 0.8 },
       desc: 'Plus de soufflage dans l\'atelier conditionnement, température en hausse.', pieces: [[null, 'Courroie trapézoïdale SPA 1250', 2, 18.6]],
       rapport: 'Courroies SPA du ventilateur de soufflage remplacées (jeu de 2), tension réglée, alignement des poulies contrôlé. Débit d\'air nominal rétabli.' },
     // Ligne 1 — conditionnement
@@ -1216,7 +1216,35 @@ function insererArchives(ctx) {
   const colOt = db.data.collections.ot || (db.data.collections.ot = []);
   const colDi = db.data.collections.demandes || (db.data.collections.demandes = []);
   let nbOt = 0; let nbDi = 0;
+
+  // Demandes refusées (hors périmètre de la maintenance), insérées à leur place chronologique
+  const refus = [
+    { jours: 300, eq: 'Ligne de conditionnement L1', par: 'spetit', titre: 'Peindre le garde-corps de la passerelle de la ligne 1', prio: 'basse', type: 'amelioration', motif: 'Travaux de peinture hors périmètre maintenance : à demander aux services généraux (contrat de prestation peinture).' },
+    { jours: 185, eq: 'Transpalette électrique', par: 'jbernard', titre: 'Ajouter une prise 230 V au quai 3 pour charger le transpalette', prio: 'normale', type: 'amelioration', motif: 'Prise de charge déjà disponible au quai 2 ; une installation au quai 3 nécessite une étude électrique (projet travaux neufs).' },
+  ];
+  function insererRefus(r) {
+    const eq = equipements.get(r.eq);
+    if (!eq) return;
+    const demandeur = userId(r.par);
+    const uDem = demandeur != null ? db.get('users', demandeur) : null;
+    const valideur = uDem && uDem.managerId != null && db.get('users', uDem.managerId) ? Number(uDem.managerId) : userId('pmartin');
+    const dateDemande = instant(r.jours, '10:00');
+    const dateValidation = instant(r.jours, '10:00', 26);
+    const di = db.insert('demandes', {
+      numero: numero('di', 'demandes', gabaritDi, dateDemande), titre: r.titre, description: '', equipementId: eq.id, secteurId: eq.secteurId == null ? null : eq.secteurId,
+      prioriteCode: code('priorites', r.prio), typeCode: code('typesIntervention', r.type), statut: sd('refusee'), demandeurId: demandeur, dateDemande,
+      validateurId: valideur, dateValidation, motifRefus: r.motif, otId: null, dateCloture: null, arretProduction: false,
+      commentaires: [], pieceJointes: [], champs: {}, createdBy: demandeur, origine: 'reprise',
+      historique: [etapeDi(dateDemande, demandeur, 'creation', 'Demande soumise', sd('soumise'), 'Historique repris de l\'ancienne GMAO'), etapeDi(dateValidation, valideur, 'refus', 'Demande refusée', sd('refusee'), r.motif)],
+    });
+    const brutDi = colDi.find((x) => x.id === di.id);
+    if (brutDi) { brutDi.createdAt = dateDemande; brutDi.updatedAt = dateValidation; }
+    nbDi++;
+  }
+  const refusRestants = refus.map((r) => Object.assign({ date: instant(r.jours, '10:00') }, r)).sort((a, b) => a.date.localeCompare(b.date));
+
   for (const d of defs) {
+    while (refusRestants.length && refusRestants[0].date < d.creation) insererRefus(refusRestants.shift());
     const eq = equipements.get(d.eq);
     if (!eq) continue;
     const annule = !!d.annule;
@@ -1257,7 +1285,9 @@ function insererArchives(ctx) {
     // Demande d'intervention à l'origine de la panne (circuit complet : soumise → validée → convertie → clôturée)
     if (d.di && !annule) {
       const demandeur = userId(d.di.par);
-      const valideur = userId(d.di.par === 'pmartin' ? 'mdupont' : 'pmartin');
+      // Valideur : le supérieur hiérarchique (N+1) du demandeur, à défaut le chef de secteur
+      const uDem = demandeur != null ? db.get('users', demandeur) : null;
+      const valideur = uDem && uDem.managerId != null && db.get('users', uDem.managerId) ? Number(uDem.managerId) : userId(d.di.par === 'pmartin' ? 'mdupont' : 'pmartin');
       const dateDemande = new Date(Date.parse(d.creation) - Math.round(d.di.valid * 3600000)).toISOString();
       const di = db.insert('demandes', {
         numero: numero('di', 'demandes', gabaritDi, dateDemande), titre: d.titre, description: d.desc || '', equipementId: eq.id, secteurId: eq.secteurId == null ? null : eq.secteurId,
@@ -1280,29 +1310,7 @@ function insererArchives(ctx) {
     }
   }
 
-  // Demandes refusées (hors périmètre de la maintenance)
-  const refus = [
-    { jours: 300, eq: 'Ligne de conditionnement L1', par: 'spetit', titre: 'Peindre le garde-corps de la passerelle de la ligne 1', prio: 'basse', type: 'amelioration', motif: 'Travaux de peinture hors périmètre maintenance : à demander aux services généraux (contrat de prestation peinture).' },
-    { jours: 185, eq: 'Transpalette électrique', par: 'jbernard', titre: 'Ajouter une prise 230 V au quai 3 pour charger le transpalette', prio: 'normale', type: 'amelioration', motif: 'Prise de charge déjà disponible au quai 2 ; une installation au quai 3 nécessite une étude électrique (projet travaux neufs).' },
-  ];
-  for (const r of refus) {
-    const eq = equipements.get(r.eq);
-    if (!eq) continue;
-    const demandeur = userId(r.par);
-    const valideur = userId('pmartin');
-    const dateDemande = instant(r.jours, '10:00');
-    const dateValidation = instant(r.jours, '10:00', 26);
-    const di = db.insert('demandes', {
-      numero: numero('di', 'demandes', gabaritDi, dateDemande), titre: r.titre, description: '', equipementId: eq.id, secteurId: eq.secteurId == null ? null : eq.secteurId,
-      prioriteCode: code('priorites', r.prio), typeCode: code('typesIntervention', r.type), statut: sd('refusee'), demandeurId: demandeur, dateDemande,
-      validateurId: valideur, dateValidation, motifRefus: r.motif, otId: null, dateCloture: null, arretProduction: false,
-      commentaires: [], pieceJointes: [], champs: {}, createdBy: demandeur, origine: 'reprise',
-      historique: [etapeDi(dateDemande, demandeur, 'creation', 'Demande soumise', sd('soumise'), 'Historique repris de l\'ancienne GMAO'), etapeDi(dateValidation, valideur, 'refus', 'Demande refusée', sd('refusee'), r.motif)],
-    });
-    const brutDi = colDi.find((x) => x.id === di.id);
-    if (brutDi) { brutDi.createdAt = dateDemande; brutDi.updatedAt = dateValidation; }
-    nbDi++;
-  }
+  while (refusRestants.length) insererRefus(refusRestants.shift());
   db.touch();
   return `${nbOt} ordres de travail archivés (12 mois d'historique repris de l'ancienne GMAO), ${nbDi} demandes archivées`;
 }

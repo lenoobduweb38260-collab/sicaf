@@ -553,6 +553,7 @@
       const src = fond.image || fond.url;
       if (ancien && ancien.source === src && ancien.image && ancien.image.complete) { this.fond.image = ancien.image; this.fond.source = src; this.demanderRendu(); return; }
       this.fond.source = src;
+      if (ancien && ancien.image) this.fond.image = ancien.image; // l'ancienne image reste affichée pendant le chargement
       const img = typeof src === 'string' ? new Image() : src;
       const pret = () => {
         if (!this.fond || this.fond.source !== src) return;

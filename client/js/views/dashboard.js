@@ -299,9 +299,9 @@
     const top = d.graphiques.topEquipements90j || [];
     if (!top.length) return carte('Équipements les plus sollicités (90 j)', vide('Aucune intervention sur un équipement ces 90 derniers jours.', 'equipements'), { icone: 'equipements' });
     const max = Math.max(1, ...top.map((x) => x.nbOt));
-    const lienEq = voir('equipements');
-    return carte('Équipements les plus sollicités (90 j)', el('div', null, top.map((x, i) => el(lienEq ? 'a' : 'div', {
-      href: lienEq ? '#/equipements/' + x.equipementId : null, class: lienEq ? 'notif-item' : null,
+    const lienEq = (x) => voir('equipements') && x.accessible !== false;
+    return carte('Équipements les plus sollicités (90 j)', el('div', null, top.map((x, i) => el(lienEq(x) ? 'a' : 'div', {
+      href: lienEq(x) ? '#/equipements/' + x.equipementId : null, class: lienEq(x) ? 'notif-item' : null,
       style: { display: 'flex', alignItems: 'center', gap: '10px', padding: '7px 6px', borderRadius: '6px', color: 'inherit', textDecoration: 'none' },
     },
     el('span', { style: { width: '24px', height: '24px', borderRadius: '50%', background: i === 0 ? 'var(--primaire)' : 'var(--fond-2)', color: i === 0 ? '#fff' : 'var(--texte)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: '700', fontSize: '12px', flexShrink: '0' } }, String(i + 1)),

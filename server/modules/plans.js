@@ -30,6 +30,8 @@
  * Événements émis  : 'plan:cree' ({ plan }), 'plan:modifie' ({ plan, ancien }), 'plan:supprime' ({ plan })
  * Événements écoutés : 'equipement:supprime' (retire les liens vers l'équipement supprimé)
  */
+const crypto = require('crypto');
+
 const nom = 'Plans 3D';
 const ENTITE = 'plans';
 
@@ -195,7 +197,7 @@ function register(ctx) {
   }
 
   // ----- Représentations ------------------------------------------------------------------
-  function urlFond(plan) { return plan.fond && plan.fond.image ? `/api/plans/${plan.id}/fond?v=${plan.version || 1}` : null; }
+  function urlFond(plan) { return plan.fond && plan.fond.image ? `/api/plans/${plan.id}/fond?v=${plan.fond.hash || plan.version || 1}` : null; }
   function fondPublic(plan) {
     if (!plan.fond) return null;
     const { image, ...reste } = plan.fond;
@@ -331,7 +333,7 @@ function register(ctx) {
     const jpeg = debut[0] === 0xff && debut[1] === 0xd8 && debut[2] === 0xff;
     const type = m[1] === 'png' ? 'image/png' : 'image/jpeg';
     if ((type === 'image/png' && !png) || (type === 'image/jpeg' && !jpeg)) throw new HttpError(400, 'Fond de plan : le contenu ne correspond pas à une image PNG ou JPEG');
-    return { image: `data:${type};base64,${b64}`, type, taille };
+    return { image: `data:${type};base64,${b64}`, type, taille, hash: crypto.createHash('sha1').update(b64).digest('hex').slice(0, 16) };
   }
   function validerFond(v, existant, niveaux) {
     if (v === undefined) {
@@ -343,7 +345,7 @@ function register(ctx) {
     if (typeof v !== 'object') throw new HttpError(400, 'Fond de plan invalide');
     let img;
     if (v.image != null && v.image !== '') img = validerImage(v.image);
-    else if (existant && existant.image) img = { image: existant.image, type: existant.type, taille: existant.taille };
+    else if (existant && existant.image) img = { image: existant.image, type: existant.type, taille: existant.taille, hash: existant.hash || crypto.createHash('sha1').update(existant.image).digest('hex').slice(0, 16) };
     else throw new HttpError(400, 'Fond de plan : image manquante');
     const pre = 'Fond de plan';
     const niveauId = v.niveauId == null || v.niveauId === '' ? niveaux[0].id : String(v.niveauId);
@@ -922,9 +924,9 @@ function seedDemo(ctx) {
     f.machine('Groupe froid industriel', 'Groupe froid industriel', 40, 41, 4, 2.2, 2.4, { niveauId: 'toiture', couleur: '#0e7490' });
     f.machine('CTA atelier conditionnement', 'CTA atelier conditionnement', 22, 11, 4.5, 2, 2, { niveauId: 'toiture', couleur: '#0e7490' });
     // Textes
-    f.texteObj('Bâtiment A – Production', 40, 5.5, 1.6);
+    f.texteObj('Entrée du personnel', 36, 50.5, 1);
     f.texteObj('Quais d\'expédition', 60, 53.5, 1.2);
-    f.texteObj('Bâtiment utilités', 80, 5.5, 1.2);
+    f.texteObj('Cour de service', 80, 27, 1);
     f.texteObj('Parking', 81, 43, 1.5);
 
     const plan = db.insert(ENTITE, {

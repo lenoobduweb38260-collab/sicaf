@@ -336,7 +336,9 @@ function register(ctx) {
   function verifierDebutFin(debut, fin) {
     if (!debut || !fin) return;
     const dateSeule = RE_DATE.test(String(debut)) || RE_DATE.test(String(fin));
-    const ko = dateSeule ? jourDe(fin) < jourDe(debut) : horodatage(fin) < horodatage(debut);
+    // Comparaison à la minute près : les champs date-heure de l'interface sont saisis à la minute,
+    // alors que le démarrage est horodaté à la seconde (démarrage et clôture dans la même minute).
+    const ko = dateSeule ? jourDe(fin) < jourDe(debut) : Math.floor(horodatage(fin) / 60000) < Math.floor(horodatage(debut) / 60000);
     if (ko) throw new HttpError(400, 'La date de fin doit être postérieure à la date de début');
   }
 
@@ -405,6 +407,26 @@ function register(ctx) {
   function estImage(type) { return /^image\/(png|jpe?g|gif|webp|bmp|svg\+xml)$/i.test(type || ''); }
   function resumeDoc(d, i) { return { index: i, nom: d.nom, type: d.type, taille: d.taille, date: d.date, userId: d.userId, userNom: ctx.nomUser(d.userId), description: d.description || '', estImage: estImage(d.type) }; }
 
+  /**
+   * Fiches équipement ouvrables par l'utilisateur (droit equipements.voir et portée) : un intervenant peut
+   * voir un OT sur un équipement hors de ses secteurs sans pouvoir ouvrir la fiche de l'équipement.
+   */
+  function equipementsAccessibles(req) {
+    const cache = new Map();
+    const voirEq = !!(req && req.perms && perms.can(req.perms, 'equipements', 'voir'));
+    return (id) => {
+      if (id == null || !voirEq) return false;
+      const k = Number(id);
+      if (!cache.has(k)) {
+        const e = db.get('equipements', k);
+        const sEq = ctx.services.equipements;
+        let ok = false;
+        if (e) { try { ok = sEq && typeof sEq.visible === 'function' ? !!sEq.visible(req, e) : ctx.canSee(req, e); } catch (err) { ok = false; } }
+        cache.set(k, ok);
+      }
+      return cache.get(k);
+    };
+  }
   /** Vue allégée pour les listes (sans contenu des documents). */
   function resume(o, refs) {
     refs = refs || references();
@@ -482,6 +504,7 @@ function register(ctx) {
         id: e.id, numero: e.numero || '', nom: e.nom, secteurId: e.secteurId == null ? null : e.secteurId, localisation: e.localisation || '',
         etatCode: e.etatCode || null, criticiteCode: e.criticiteCode || null, typeCode: e.typeCode || null, marque: e.marque || '', modele: e.modele || '',
         compteur: e.compteur || null, parentId: e.parentId == null ? null : e.parentId, actif: e.actif !== false, chemin: cheminEq,
+        accessible: equipementsAccessibles(req)(e.id),
       } : null,
       demande: d ? { id: d.id, numero: d.numero || '', titre: d.titre || '', statut: d.statut || null, demandeurId: d.demandeurId == null ? null : d.demandeurId, demandeurNom: nomDe(refs, d.demandeurId), dateDemande: d.dateDemande || d.createdAt || null, arretProduction: !!d.arretProduction, prioriteCode: d.prioriteCode || null } : null,
       plan: p ? { id: p.id, numero: p.numero || '', nom: p.nom || '', periodicite: p.periodicite || null, prochaineEcheance: p.prochaineEcheance == null ? null : p.prochaineEcheance, derniereExecution: p.derniereExecution == null ? null : p.derniereExecution } : null,
@@ -685,7 +708,8 @@ function register(ctx) {
   // ----- Routes : consultation -------------------------------------------------
   router.get('/api/ot', async (req) => {
     const refs = references();
-    return filtrer(req).map((o) => resume(o, refs));
+    const accessible = equipementsAccessibles(req);
+    return filtrer(req).map((o) => Object.assign(resume(o, refs), { equipementAccessible: accessible(o.equipementId) }));
   }, { perm: [ENTITE, 'voir'] });
 
   router.get('/api/ot-compteurs', async (req) => {
@@ -918,18 +942,36 @@ function register(ctx) {
     const coutExterne = b.coutExterne === undefined ? (Number(o.coutExterne) || 0) : (nombre(b.coutExterne, 'Le coût externe', { min: 0, max: 1e9 }) || 0);
     let fournisseurId = o.fournisseurId == null ? null : o.fournisseurId;
     if (b.fournisseurId !== undefined) { fournisseurId = idRef(b.fournisseurId, 'Prestataire'); if (fournisseurId != null && !db.get('fournisseurs', fournisseurId)) throw new HttpError(400, 'Prestataire (fournisseur) introuvable'); }
-    const dateFin = lireDate(b.dateFin, 'La date de fin') || maintenant();
+    let dateFin = lireDate(b.dateFin, 'La date de fin') || maintenant();
     const tFin = horodatage(dateFin);
     if (tFin > Date.now() + 5 * 60000 && !(RE_DATE.test(dateFin) && dateFin <= dateLocale())) throw new HttpError(400, 'La date de fin ne peut pas être dans le futur');
     const dateDebut = b.dateDebut !== undefined ? lireDate(b.dateDebut, 'La date de début') : (o.dateDebut || null);
     verifierDebutFin(dateDebut, dateFin);
+    // Fin saisie à la minute, dans la même minute que le démarrage : la fin ne précède jamais le début
+    if (dateDebut && !RE_DATE.test(String(dateDebut)) && !RE_DATE.test(String(dateFin)) && horodatage(dateFin) < horodatage(dateDebut)) dateFin = dateDebut;
     const avertissements = [];
     // Relevé de compteur de l'équipement (avant la clôture : une valeur refusée n'altère pas l'OT)
     if (compteurReleve != null && o.equipementId != null) {
+      // Cohérence avec l'historique de l'équipement (et le préventif sur compteur) : un relevé ne peut pas
+      // être inférieur au dernier relevé connu à la date de fin de l'intervention.
+      const eqC = db.get('equipements', o.equipementId);
+      const tReleve = Math.min(tFin, Date.now());
+      if (eqC && eqC.compteur && eqC.compteur.valeur != null) {
+        const anterieurs = (eqC.compteurReleves || []).filter((r) => r && r.valeur != null && Number.isFinite(Date.parse(r.date)) && Date.parse(r.date) <= tReleve)
+          .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+        const reference = anterieurs.length ? Number(anterieurs[anterieurs.length - 1].valeur)
+          : ((eqC.compteurReleves || []).length || tReleve < Date.now() - 86400000 ? null : Number(eqC.compteur.valeur));
+        if (reference != null && Number.isFinite(reference) && compteurReleve < reference) {
+          const unite = eqC.compteur.unite || '';
+          throw new HttpError(400, `Le relevé de compteur (${compteurReleve} ${unite}) est inférieur au dernier relevé de l'équipement « ${eqC.nom} » (${reference} ${unite}) : vérifiez la saisie (un remplacement de compteur s'enregistre depuis la fiche de l'équipement)`.replace(/\s+\)/g, ')'));
+        }
+      }
       const sEq = ctx.services.equipements;
       if (sEq && typeof sEq.releverCompteur === 'function') {
         try {
-          sEq.releverCompteur(o.equipementId, compteurReleve, { user: req.user, socket: req.socket }, { otId: o.id, commentaire: `Relevé à la clôture de l'OT ${o.numero}` });
+          const optionsReleve = { otId: o.id, commentaire: `Relevé à la clôture de l'OT ${o.numero}` };
+          if (tReleve < Date.now() - 3600000) optionsReleve.date = new Date(tReleve).toISOString(); // intervention antérieure : relevé historisé à sa date
+          sEq.releverCompteur(o.equipementId, compteurReleve, { user: req.user, socket: req.socket }, optionsReleve);
         } catch (e) {
           if (e && e.status === 400) throw e;
           avertissements.push(`Relevé de compteur non reporté sur l'équipement : ${e.message}`);
@@ -1236,6 +1278,13 @@ function seedDemo(ctx) {
   if (db.findOne(ENTITE, (o) => o.titre === TEMOIN)) return 'déjà présents';
   seedEnCours = true;
   try {
+    // Historique repris de l'ancienne GMAO (module Rapports) d'abord, sur une base sans OT : les OT et
+    // demandes courants sont ainsi numérotés après les archives (numérotation chronologique), quel que
+    // soit le module qui déclenche le chargement en premier.
+    const historique = (ctx.modules || []).find((m) => m.fichier === 'rapports.js');
+    if (historique && typeof historique.seedDemo === 'function' && db.count(ENTITE) === 0) {
+      try { historique.seedDemo(ctx); } catch (e) { ctx.log('OT : chargement de l\'historique en échec', e.message); }
+    }
     // Dépendances (idempotentes) : utilisateurs, équipements, demandes, stock
     for (const m of ctx.modules || []) {
       if (/^(utilisateurs|equipements|demandes|stock)\.js$/.test(m.fichier || '') && typeof m.seedDemo === 'function') {

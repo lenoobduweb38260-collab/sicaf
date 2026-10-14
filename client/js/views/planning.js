@@ -715,7 +715,7 @@
           { label: 'Échéance', valeur: frag(majuscule(libelleJour(e.date)), e.estimee ? el('span', { class: 'texte-2' }, ' (estimée d\'après le compteur)') : null, !e.projection && jours != null ? el('span', { class: jours < 0 ? 'texte-danger texte-gras' : 'texte-2' }, jours < 0 ? ` — dépassée de ${pluriel(-jours, 'jour')}` : (jours === 0 ? ' — aujourd\'hui' : ` — dans ${pluriel(jours, 'jour')}`)) : null) },
           { label: 'Périodicité', valeur: e.periodiciteLibelle || '—' },
           e.valeurCompteur != null ? { label: 'Seuil du compteur', valeur: `${ui.formatNombre(e.valeurCompteur)} ${e.uniteCompteur || ''}`.trim() } : null,
-          { label: 'Équipement', valeur: e.equipementId != null && GMAO.can('equipements', 'voir') ? el('a', { href: '#/equipements/' + e.equipementId }, [e.equipementNumero, e.equipementNom].filter(Boolean).join(' — ')) : (e.equipementNom || '—') },
+          { label: 'Équipement', valeur: e.equipementId != null && GMAO.can('equipements', 'voir') && e.equipementAccessible !== false ? el('a', { href: '#/equipements/' + e.equipementId }, [e.equipementNumero, e.equipementNom].filter(Boolean).join(' — ')) : (e.equipementNom || '—') },
           { label: 'Secteur', valeur: e.secteurId != null ? ui.cheminSecteur(e.secteurId) : '—' },
           { label: 'Technicien', valeur: e.technicienNom || 'Non désigné' },
           { label: 'Durée estimée', valeur: e.dureeEstimee ? ui.formatDuree(e.dureeEstimee) : '—' },
