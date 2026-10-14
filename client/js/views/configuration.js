@@ -1,7 +1,7 @@
 /**
  * Vue Configuration : société, paramètres généraux, modules (activation / libellés / ordre),
  * options d'affichage des profils & utilisateurs (tri par secteur), secteurs, listes de valeurs,
- * champs personnalisés, numérotation, sauvegardes / export / import, données de démonstration, système.
+ * champs personnalisés, numérotation, secteurs & sites. (Base de données et réseau : vue systeme.js.)
  */
 (function () {
   'use strict';
@@ -290,71 +290,11 @@
     return ui.carte('Numérotation automatique', frag(el('p', { class: 'texte-2 texte-petit' }, 'Gabarits disponibles : {annee} (2026), {aa} (26), {mois} (01), {num:4} (compteur sur 4 chiffres, réinitialisé chaque année si {annee} est présent). Exemple : OT-{annee}-{num:4} → OT-2026-0001.'), f.el, el('div', { class: 'mt texte-droite' }, btn)));
   }
 
-  // ----- Onglet Sauvegardes -------------------------------------------------
-  function ongletSauvegardes(cont) {
-    async function rendre() {
-      ui.vider(cont);
-      let infos = { sauvegardes: [], dossier: '' };
-      try { infos = await api.get('/api/sauvegardes'); } catch (e) { erreur(e); }
-      const tableau = ui.table({ colonnes: [{ cle: 'nom', label: 'Fichier' }, { cle: 'date', label: 'Date', type: 'datetime' }, { cle: 'taille', label: 'Taille', rendu: (s) => ui.formatNombre(s.taille / 1024, 0) + ' Ko', aligner: 'droite' }], lignes: infos.sauvegardes, recherche: false, pagination: false, vide: 'Aucune sauvegarde (une sauvegarde quotidienne est créée automatiquement au démarrage)',
-        actions: [{ icone: 'rafraichir', titre: 'Restaurer cette sauvegarde', visible: () => peutModifier(), onClic: async (s) => {
-          if (!(await ui.confirm({ titre: 'Restaurer', message: `Remplacer toutes les données actuelles par la sauvegarde « ${s.nom} » ? Une copie de l'état actuel sera faite avant.`, okLabel: 'Restaurer', danger: true }))) return;
-          try { await api.post('/api/sauvegardes/restaurer', { nom: s.nom }); toast('Sauvegarde restaurée', 'succes'); await GMAO.refresh(false); rendre(); } catch (e) { erreur(e); }
-        } }] });
-      const inputImport = el('input', { type: 'file', accept: '.json,application/json', class: 'masque' });
-      inputImport.addEventListener('change', async () => {
-        const f = inputImport.files && inputImport.files[0]; if (!f) return;
-        try {
-          const txt = await ui.lireFichier(f, true);
-          const data = JSON.parse(txt);
-          if (!(await ui.confirm({ titre: 'Importer', message: 'Remplacer TOUTES les données actuelles par le contenu de ce fichier ? Une sauvegarde sera faite avant. Vous devrez vous reconnecter.', okLabel: 'Importer', danger: true }))) return;
-          await api.post('/api/import', data);
-          toast('Import terminé, reconnectez-vous', 'succes');
-          setTimeout(() => location.reload(), 800);
-        } catch (e) { erreur(e); } finally { inputImport.value = ''; }
-      });
-      cont.appendChild(ui.carte('Sauvegardes', frag(
-        el('p', { class: 'texte-2 texte-petit' }, `Dossier : ${infos.dossier || '—'}. Copiez ce dossier sur un autre support pour une sauvegarde externe.`),
-        el('div', { class: 'barre-outils' },
-          peutModifier() ? ui.bouton('Créer une sauvegarde maintenant', { icone: 'sauvegarde', classe: 'btn-primaire', onClic: async () => { try { await api.post('/api/sauvegardes'); toast('Sauvegarde créée', 'succes'); rendre(); } catch (e) { erreur(e); } } }) : null,
-          peutModifier() ? ui.bouton('Exporter toutes les données (JSON)', { icone: 'export', onClic: () => api.telecharger('/api/export').catch(erreur) }) : null,
-          peutModifier() ? ui.bouton('Importer un fichier d\'export', { icone: 'import', onClic: () => inputImport.click() }) : null, inputImport),
-        tableau.el)));
-      // Sauvegardes avancées (destinations multiples, autres sites) fournies par client/js/lib/sauvegardes-ui.js
-      if (typeof GMAO.rendreSauvegardesAvancees === 'function') {
-        const zone = el('div');
-        cont.appendChild(zone);
-        try { GMAO.rendreSauvegardesAvancees(zone); } catch (e) { zone.appendChild(ui.alerte('Sauvegardes avancées indisponibles : ' + e.message, 'danger')); }
-      }
-      cont.appendChild(ui.carte('Données de démonstration', frag(
-        el('p', { class: 'texte-2 texte-petit' }, 'Ajoute des utilisateurs (mot de passe « demo »), secteurs, équipements, interventions, articles et fournisseurs d\'exemple pour découvrir l\'application. Les données existantes sont conservées.'),
-        peutModifier() ? ui.bouton('Charger les données de démonstration', { icone: 'lecture', onClic: async () => {
-          if (!(await ui.confirm({ titre: 'Données de démonstration', message: 'Charger les données d\'exemple dans la base actuelle ?', okLabel: 'Charger' }))) return;
-          try { const r = await api.post('/api/demo'); await GMAO.refresh(false); ui.modal({ titre: 'Données de démonstration', taille: 'petite', contenu: el('ul', null, r.map((x) => el('li', null, `${x.module} : ${x.ok ? (x.details || 'ok') : 'erreur — ' + x.erreur}`))), boutons: [{ label: 'Fermer' }] }); } catch (e) { erreur(e); }
-        } }) : null)));
-    }
-    rendre();
-  }
-
-  // ----- Onglet Système -----------------------------------------------------
-  function ongletSysteme(cont) {
-    cont.appendChild(ui.chargement());
-    api.get('/api/systeme').then((s) => {
-      ui.vider(cont);
-      cont.appendChild(ui.carte('Informations système', ui.details([
-        { label: 'Version GMAO', valeur: s.version }, { label: 'Node.js', valeur: s.node }, { label: 'Plateforme', valeur: s.plateforme },
-        { label: 'Dossier des données', valeur: el('code', null, s.dossierDonnees) }, { label: 'Fichier de données', valeur: el('code', null, s.fichierDonnees) }, { label: 'Taille', valeur: ui.formatNombre(s.taille / 1024, 0) + ' Ko' },
-        { label: 'Démarré le', valeur: ui.formatDateHeure(s.demarrage) }, { label: 'Modules serveur', valeur: (s.modulesServeur || []).join(', ') },
-      ], { colonnes: 2 })));
-      cont.appendChild(ui.carte('Contenu de la base', el('div', { class: 'tableau-conteneur' }, el('table', { class: 'tableau tableau-compact' }, el('thead', null, el('tr', null, el('th', null, 'Collection'), el('th', { class: 'num' }, 'Éléments'))), el('tbody', null, s.collections.map((c) => el('tr', null, el('td', null, c.nom), el('td', { class: 'num' }, String(c.nombre)))))))));
-    }).catch((e) => { ui.vider(cont); cont.appendChild(ui.alerte(e.message, 'danger')); });
-  }
-
   GMAO.registerView('configuration', {
     titre: 'Configuration', icone: 'configuration',
     async rendu(container) {
       config = await api.get('/api/configuration');
-      container.appendChild(ui.pageEntete({ titre: GMAO.moduleLabel('configuration'), icone: 'configuration', sousTitre: 'Tout est modifiable : société, modules, listes, champs, secteurs, numérotation, sauvegardes.' }));
+      container.appendChild(ui.pageEntete({ titre: GMAO.moduleLabel('configuration'), icone: 'configuration', sousTitre: 'Tout est modifiable : société, modules, listes, champs, secteurs, numérotation. Base de données, sauvegardes et réseau : écran « Système & informatique ».' }));
       if (!peutModifier()) container.appendChild(ui.alerte('Vous consultez la configuration en lecture seule.', 'info'));
       container.appendChild(ui.onglets([
         { cle: 'general', label: 'Général', icone: 'configuration', rendu: () => ongletGeneral() },
@@ -364,8 +304,6 @@
         { cle: 'listes', label: 'Listes de valeurs', icone: 'filtre', rendu: () => ongletListes() },
         { cle: 'champs', label: 'Champs personnalisés', icone: 'modifier', rendu: () => ongletChamps() },
         { cle: 'numerotation', label: 'Numérotation', icone: 'ot', rendu: () => ongletNumerotation() },
-        { cle: 'sauvegardes', label: 'Sauvegardes & données', icone: 'sauvegarde', rendu: (c) => { ongletSauvegardes(c); } },
-        { cle: 'systeme', label: 'Système', icone: 'info', rendu: (c) => { ongletSysteme(c); } },
       ], { hash: true }).el);
     },
   });

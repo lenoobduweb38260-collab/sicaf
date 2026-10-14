@@ -4,7 +4,7 @@ Application de **Gestion de Maintenance Assistée par Ordinateur** pour Windows 
 entièrement personnalisable, avec **comptes internes**, **profils hiérarchiques** (chaque profil voit
 plus ou moins de choses, ajustable utilisateur par utilisateur) et **secteurs**.
 
-- Aucune dépendance à installer en dehors de Node.js (ou rien du tout avec l'exécutable).
+- Application Windows autonome : un seul installateur `.exe`, aucun prérequis (Node.js intégré), aucune fenêtre de commandes, mises à jour automatiques.
 - Vos données restent sur votre poste (fichier JSON, sauvegardes automatiques).
 - Utilisable seul sur un PC, ou partagé sur le réseau local de l'entreprise.
 
@@ -23,41 +23,56 @@ plus ou moins de choses, ajustable utilisateur par utilisateur) et **secteurs**.
 | **Rapports & historique** | MTTR, MTBF, respect des délais, taux de préventif, coûts par secteur / équipement / mois, charge des techniciens, historique complet, fiche de vie d'un équipement, exports CSV |
 | **Utilisateurs** | Comptes internes, hiérarchie (supérieur N+1, organigramme), rattachement aux secteurs, droits individuels |
 | **Profils & droits** | Matrice module × action, niveau hiérarchique, portée des données, tri / regroupement par secteur |
-| **Configuration** | Société et logo, modules (activer / renommer / ordonner), listes de valeurs, champs personnalisés, numérotation, secteurs, sauvegardes, import / export, données de démonstration |
+| **Configuration** | Société et logo, modules (activer / renommer / ordonner), listes de valeurs, champs personnalisés, numérotation, sites et secteurs |
+| **Système & informatique** | (Pôle informatique) base de données, sauvegardes multi-sites, import / export, réseau, postes connectés, mises à jour |
 | **Journal d'audit** | Qui a fait quoi, quand (filtres, export) |
 
 ## Installation sous Windows 10/11
 
-### Option 1 — exécutable (recommandé)
+GMAO SICAF est une **application Windows à part entière** : elle s'ouvre dans sa propre fenêtre,
+sans navigateur ni barre d'adresse. **Aucun prérequis** (le moteur Node.js est intégré à l'exécutable)
+et **aucune fenêtre de commandes**.
 
-1. Allez dans l'onglet **Actions** du dépôt GitHub (ou **Releases** si une version a été publiée) et
-   téléchargez l'artefact `GMAO-SICAF-windows` : il contient l'installateur `GMAO-SICAF-<version>-x64.exe`
-   et une version portable.
-2. Lancez l'installateur (ou l'exécutable portable). Un raccourci « GMAO SICAF » est créé sur le bureau.
-3. Les données sont stockées dans `%APPDATA%\GMAO SICAF\data` (menu *Fichier › Ouvrir le dossier des données*).
+1. Téléchargez **`GMAO-SICAF-Setup-<version>.exe`** depuis la page
+   [Releases](https://github.com/lenoobduweb38260-collab/sicaf/releases/latest) du dépôt (ou l'artefact de
+   l'onglet *Actions*). Une version **portable** (`GMAO-SICAF-Portable-<version>.exe`, sans installation)
+   est aussi fournie.
+2. Lancez l'installateur : raccourcis « GMAO SICAF » sur le bureau et dans le menu Démarrer. Pas besoin
+   d'être administrateur du poste.
+3. Au premier lancement, l'assistant demande comment ce poste utilise la GMAO :
+   - **Ce poste héberge la GMAO** : la base de données est sur ce PC (dossier
+     `%APPDATA%\GMAO SICAF\data` ou un dossier choisi). Cochez *Partager la GMAO avec les autres postes*
+     sur le PC « serveur » de l'usine ; l'assistant affiche l'adresse à utiliser sur les autres postes
+     (autorisez l'application dans le pare-feu Windows quand il le demande).
+   - **Se connecter à la GMAO d'un autre poste** : saisissez l'adresse du poste serveur
+     (ex. `http://srv-gmao:8585`). Chaque poste client installe la même application.
+   - Le **code du pôle informatique** est défini à ce moment : il protège ensuite ces paramètres
+     (mode, réseau, port, dossier des données, mises à jour). Les utilisateurs ne peuvent pas les modifier.
+4. L'application se place dans la **zone de notification** (à côté de l'horloge) : sur le poste serveur
+   partagé, fermer la fenêtre ne coupe pas la GMAO des autres postes. Option *Démarrer avec Windows*.
 
-> L'exécutable est construit automatiquement par GitHub Actions (`.github/workflows/build-windows.yml`) à
-> chaque mise à jour de la branche principale et à chaque tag `vX.Y.Z`.
+### Mises à jour automatiques
 
-### Option 2 — avec Node.js (aucune installation de dépendances)
+L'application vérifie au démarrage puis toutes les 6 heures si une nouvelle version est publiée, la
+télécharge, vérifie son empreinte (SHA-256), l'installe en silence et redémarre. Les données ne sont jamais
+touchées par une mise à jour. À chaque évolution du code sur la branche principale, GitHub Actions
+(`.github/workflows/build-windows.yml`) construit et publie automatiquement la nouvelle version
+(`v1.0.<n>`). Pour un réseau sans accès Internet, le pôle informatique peut choisir comme source un dossier
+réseau (ex. `\\NAS\gmao\mises-a-jour`, contenant `latest.json` et l'installateur).
 
-1. Installez [Node.js LTS](https://nodejs.org) (une seule fois).
-2. Téléchargez ou clonez ce dépôt dans un dossier, par exemple `C:\GMAO`.
-3. Double-cliquez sur **`Lancer-GMAO.bat`** : le serveur démarre et l'application s'ouvre dans une fenêtre
-   Microsoft Edge dédiée (mode application, sans barre d'adresse). Laissez la fenêtre noire ouverte pendant
-   l'utilisation.
-4. Les données sont dans le dossier `data\` à côté de l'application (`data\gmao.json` + `data\backups\`).
+### Pôle informatique
 
-Pour partager la GMAO avec d'autres postes du réseau local, utilisez **`Lancer-GMAO-reseau.bat`** sur le
-poste « serveur » : les autres postes ouvrent `http://<ip-du-poste>:8585/` dans Edge ou Chrome (autorisez le
-port 8585 dans le pare-feu Windows si besoin). Chaque personne se connecte avec son propre compte.
-
-Options en ligne de commande : `node server\index.js --port 8585 --host 0.0.0.0 --data D:\GMAO\data --open`.
+Le profil **Pôle informatique** (et l'administrateur) est le seul à pouvoir :
+- créer, modifier et supprimer les comptes et les profils ;
+- accéder à l'écran **Système & informatique** : base de données, sauvegardes (locales, multi-destinations,
+  autres sites), export / import / restauration, réseau, postes connectés (déconnexion à distance),
+  autorisation éventuelle de l'accès par navigateur web (désactivé par défaut), informations système ;
+- modifier les paramètres de connexion des postes (code du pôle informatique).
 
 ### Première connexion
 
 Compte initial : **admin / admin**. Le changement de mot de passe est demandé immédiatement.
-Dans *Configuration › Sauvegardes & données*, le bouton **Charger les données de démonstration** ajoute des
+Dans *Système & informatique › Base de données & sauvegardes*, le bouton **Charger les données de démonstration** ajoute des
 utilisateurs (mot de passe `demo` : `mdupont` responsable, `pmartin` chef de secteur, `jbernard` et `kleroy`
 techniciens, `spetit` demandeuse), équipements, interventions, articles et fournisseurs pour découvrir
 l'application.
@@ -99,13 +114,14 @@ framework : voir [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Base : un fichier JSON (`data/gmao.json`), écrit de manière atomique.
 - Une sauvegarde quotidienne est créée automatiquement au démarrage dans `data/backups/` (30 conservées), plus
   des sauvegardes manuelles et une avant chaque import / restauration.
-- Export / import complet au format JSON depuis *Configuration › Sauvegardes & données*.
+- Export / import complet au format JSON depuis *Système & informatique › Base de données & sauvegardes*.
 - Pour déplacer la GMAO sur un autre PC : copiez le dossier `data`.
 
 ## Pour les développeurs
 
 ```bash
-npm start            # démarre le serveur et ouvre le navigateur (http://127.0.0.1:8585)
+npm start            # (développement) serveur Node.js + navigateur sur http://127.0.0.1:8585
+                     # lanceurs Windows de développement : scripts/dev/*.bat (nécessitent Node.js)
 npm test             # tests API (node:test, serveur en mémoire)
 node tests/e2e/run.js   # parcours d'interface avec Playwright (Chromium)
 npm install && npm run dist   # construit l'installateur Windows avec Electron (nécessite Internet)

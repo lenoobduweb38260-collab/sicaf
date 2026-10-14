@@ -108,7 +108,7 @@ function register(ctx) {
         };
       }
       // Les modules d'administration ne peuvent pas être désactivés (sinon plus de configuration possible)
-      for (const k of ['configuration', 'profils', 'utilisateurs']) cfg.modules[k].actif = true;
+      for (const k of ['configuration', 'profils', 'utilisateurs', 'systeme']) if (cfg.modules[k]) cfg.modules[k].actif = true;
     }
     if (b.profils) {
       cfg.profils = Object.assign({}, cfg.profils, {
@@ -136,7 +136,7 @@ function register(ctx) {
     // Sections simples des modules (étiquettes, inventaire, achats, RH, plans, sauvegardes) :
     // seules les clés connues sont acceptées, avec le même type que la valeur par défaut.
     const defaut = configParDefaut();
-    for (const section of ['etiquettes', 'inventaire', 'achats', 'rh', 'plans', 'sauvegardes']) {
+    for (const section of ['etiquettes', 'inventaire', 'achats', 'rh', 'plans', 'sauvegardes']) { // « reseau » : module systeme uniquement
       if (b[section] && typeof b[section] === 'object') cfg[section] = fusionTypee(cfg[section], b[section], defaut[section], section === 'sauvegardes' ? SECRETS_SAUVEGARDE : []);
     }
     if (b.listes) {
@@ -177,25 +177,25 @@ function register(ctx) {
   }, { perm: ['configuration', 'modifier'] });
 
   // ----- Sauvegardes ------------------------------------------------------
-  router.get('/api/sauvegardes', async () => ({ dossier: db.backupDir, sauvegardes: db.listBackups() }), { perm: ['configuration', 'voir'] });
+  router.get('/api/sauvegardes', async () => ({ dossier: db.backupDir, sauvegardes: db.listBackups() }), { perm: ['systeme', 'voir'] });
   router.post('/api/sauvegardes', async (req) => {
     const f = db.backupNow('manuel');
     ctx.audit(req, 'sauvegarde', 'configuration', null, f || 'mémoire');
     return { ok: true, fichier: f, sauvegardes: db.listBackups() };
-  }, { perm: ['configuration', 'modifier'] });
+  }, { perm: ['systeme', 'modifier'] });
   router.post('/api/sauvegardes/restaurer', async (req) => {
     const nomFichier = req.body && req.body.nom;
     if (!nomFichier) throw new HttpError(400, 'Nom de sauvegarde manquant');
     db.restoreBackup(nomFichier);
     ctx.audit(req, 'restauration', 'configuration', null, nomFichier);
     return { ok: true };
-  }, { perm: ['configuration', 'modifier'] });
+  }, { perm: ['systeme', 'modifier'] });
 
   router.get('/api/export', async (req, res) => {
     const data = db.exportAll();
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="gmao-export-${new Date().toISOString().slice(0, 10)}.json"` });
     res.end(JSON.stringify(data, null, 1));
-  }, { perm: ['configuration', 'modifier'] });
+  }, { perm: ['systeme', 'modifier'] });
 
   router.post('/api/import', async (req) => {
     const data = req.body;
@@ -205,14 +205,14 @@ function register(ctx) {
     ctx.audit(req, 'import', 'configuration', null, Object.keys(data.collections).join(', '));
     ctx.sessions.map.clear();
     return { ok: true };
-  }, { perm: ['configuration', 'modifier'] });
+  }, { perm: ['systeme', 'modifier'] });
 
   /** Données de démonstration (tous les modules). */
   router.post('/api/demo', async (req) => {
     const rapport = seedDemoTous(ctx);
     ctx.audit(req, 'demo', 'configuration', null, rapport.map((r) => `${r.module}: ${r.ok ? (r.details || 'ok') : 'ERREUR ' + r.erreur}`).join(' | '));
     return rapport;
-  }, { perm: ['configuration', 'modifier'] });
+  }, { perm: ['systeme', 'modifier'] });
 
   /** Informations système. */
   router.get('/api/systeme', async () => ({
@@ -225,7 +225,7 @@ function register(ctx) {
     collections: db.collections().map((c) => ({ nom: c, nombre: db.count(c) })),
     modulesServeur: (ctx.modules || []).map((m) => m.nom),
     demarrage: DEMARRAGE,
-  }), { perm: ['configuration', 'voir'] });
+  }), { perm: ['systeme', 'voir'] });
 }
 
 const DEMARRAGE = new Date().toISOString();

@@ -6,7 +6,7 @@ rem  Microsoft Edge en mode "application" (sans barre d'adresse).
 rem  Pre-requis : Node.js (https://nodejs.org, version LTS).
 rem =====================================================================
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0\..\.."
 chcp 65001 >nul
 
 where node >nul 2>nul

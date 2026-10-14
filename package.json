@@ -2,7 +2,7 @@
   "name": "gmao-sicaf",
   "productName": "GMAO SICAF",
   "version": "1.0.0",
-  "description": "GMAO (Gestion de Maintenance Assistée par Ordinateur) complète et personnalisable pour Windows 10/11, avec comptes internes, profils hiérarchiques et secteurs.",
+  "description": "GMAO (Gestion de Maintenance Assistée par Ordinateur) complète et personnalisable pour Windows 10/11 : multi-site, comptes internes, profils hiérarchiques, plans 3D, inventaire par code-barres, RH, achats et factures.",
   "main": "electron/main.js",
   "private": true,
   "license": "MIT",
@@ -15,8 +15,9 @@
     "test": "node --test \"tests/**/*.test.js\"",
     "test:e2e": "node tests/e2e/run.js",
     "electron": "electron .",
-    "dist": "electron-builder --win",
-    "dist:portable": "electron-builder --win portable"
+    "dist": "electron-builder --win --publish never",
+    "dist:portable": "electron-builder --win portable --publish never",
+    "manifeste": "node scripts/manifeste-maj.js dist"
   },
   "devDependencies": {
     "electron": "^33.2.0",
@@ -25,28 +26,62 @@
   "build": {
     "appId": "fr.sicaf.gmao",
     "productName": "GMAO SICAF",
+    "copyright": "SICAF",
     "directories": {
-      "output": "dist"
+      "output": "dist",
+      "buildResources": "electron"
     },
     "files": [
       "electron/**/*",
       "server/**/*",
       "client/**/*",
-      "package.json"
+      "package.json",
+      "!**/*.test.js",
+      "!**/*.md"
     ],
+    "asar": true,
     "win": {
       "target": [
-        "nsis",
-        "portable"
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
-      "artifactName": "GMAO-SICAF-${version}-${arch}.${ext}"
+      "icon": "electron/icon.png",
+      "artifactName": "GMAO-SICAF-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
       "shortcutName": "GMAO SICAF",
-      "language": "1036"
-    }
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": [
+        "fr_FR"
+      ],
+      "language": "1036",
+      "artifactName": "GMAO-SICAF-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "GMAO-SICAF-Portable-${version}.${ext}"
+    },
+    "publish": null
+  },
+  "author": "SICAF",
+  "homepage": "https://github.com/lenoobduweb38260-collab/sicaf",
+  "gmao": {
+    "depotMisesAJour": "lenoobduweb38260-collab/sicaf"
   }
 }

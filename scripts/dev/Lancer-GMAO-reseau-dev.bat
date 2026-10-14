@@ -6,7 +6,7 @@ rem  reseau : http://<ip-de-ce-poste>:8585/  (ouvrir dans Edge ou Chrome).
 rem  Pensez a autoriser le port dans le pare-feu Windows si necessaire.
 rem =====================================================================
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0\..\.."
 chcp 65001 >nul
 where node >nul 2>nul
 if errorlevel 1 (

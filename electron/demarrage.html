@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+  <title>GMAO SICAF — Paramètres de connexion</title>
+  <style>
+    :root { --primaire: #2563eb; --fond: #0f172a; --carte: #ffffff; --texte: #111827; --texte2: #6b7280; --bordure: #e5e7eb; --ok: #16a34a; --danger: #dc2626; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; font-size: 14px; color: var(--texte); background: linear-gradient(135deg, #2563eb 0%, #0f172a 100%); min-height: 100vh; display: flex; align-items: flex-start; justify-content: center; padding: 28px 16px; }
+    .boite { background: var(--carte); border-radius: 14px; box-shadow: 0 20px 50px rgba(0,0,0,.35); width: 100%; max-width: 780px; padding: 26px 30px; }
+    h1 { font-size: 22px; margin: 0 0 4px; color: var(--primaire); }
+    .sous { color: var(--texte2); margin-bottom: 18px; }
+    .erreur { background: #fee2e2; color: #7f1d1d; border: 1px solid #fca5a5; border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; }
+    .info { background: #dbeafe; color: #1e3a8a; border: 1px solid #93c5fd; border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 13px; }
+    .choix { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+    .option { border: 2px solid var(--bordure); border-radius: 12px; padding: 14px 16px; cursor: pointer; transition: border-color .1s, background .1s; }
+    .option:hover { border-color: #93c5fd; }
+    .option.actif { border-color: var(--primaire); background: #eff6ff; }
+    .option h2 { font-size: 15px; margin: 0 0 6px; display: flex; gap: 8px; align-items: center; }
+    .option p { margin: 0; color: var(--texte2); font-size: 13px; }
+    .bloc { border: 1px solid var(--bordure); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+    .bloc h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--texte2); margin: 0 0 10px; }
+    label.ligne { display: flex; align-items: center; gap: 8px; margin: 8px 0; cursor: pointer; }
+    .champ { margin: 8px 0; }
+    .champ label { display: block; font-size: 12.5px; font-weight: 600; color: var(--texte2); margin-bottom: 4px; }
+    input[type=text], input[type=number], input[type=password] { width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px; font: inherit; }
+    input:focus { outline: none; border-color: var(--primaire); box-shadow: 0 0 0 3px #dbeafe; }
+    .rangee { display: flex; gap: 8px; align-items: center; }
+    .rangee input { flex: 1; }
+    button { font: inherit; padding: 8px 16px; border-radius: 6px; border: 1px solid #d1d5db; background: #fff; cursor: pointer; }
+    button:hover { background: #f3f4f6; }
+    button.primaire { background: var(--primaire); border-color: var(--primaire); color: #fff; font-weight: 600; }
+    button.primaire:hover { background: #1d4ed8; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .pied { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+    .resultat { font-size: 13px; margin-top: 6px; }
+    .resultat.ok { color: var(--ok); } .resultat.ko { color: var(--danger); }
+    .masque { display: none !important; }
+    code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+    .petit { font-size: 12px; color: var(--texte2); }
+    @media (max-width: 700px) { .choix { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="boite">
+    <h1>GMAO SICAF</h1>
+    <div class="sous" id="sous-titre">Bienvenue ! Choisissez comment ce poste utilise la GMAO. Vous pourrez modifier ce choix à tout moment (icône de la zone de notification › Paramètres de connexion).</div>
+    <div id="erreur" class="erreur masque"></div>
+    <div id="bloc-reessayer" class="pied masque" style="margin-top:0;margin-bottom:14px"><span class="petit">Vérifiez que le poste serveur est allumé et connecté au réseau.</span><button type="button" class="primaire" id="btn-reessayer">Réessayer</button></div>
+
+    <div id="verrou" class="bloc masque">
+      <h3>🔒 Paramètres protégés</h3>
+      <p class="petit" style="margin-top:0">Les paramètres de connexion, de base de données et de réseau de ce poste sont réservés au pôle informatique.</p>
+      <div class="champ"><label for="code">Code du pôle informatique</label><div class="rangee"><input type="password" id="code" autocomplete="off"><button type="button" class="primaire" id="btn-deverrouiller">Déverrouiller</button></div><div id="resultat-code" class="resultat ko"></div></div>
+    </div>
+
+    <div id="formulaire">
+    <div class="choix">
+      <div class="option" id="opt-serveur" tabindex="0">
+        <h2>🖥️ Ce poste héberge la GMAO</h2>
+        <p>La base de données est sur ce PC. Idéal pour un poste seul, ou pour le PC « serveur » de l'usine auquel les autres postes se connectent.</p>
+      </div>
+      <div class="option" id="opt-client" tabindex="0">
+        <h2>🔌 Se connecter à la GMAO d'un autre poste</h2>
+        <p>La GMAO est déjà installée sur le PC serveur de l'usine : ce poste s'y connecte (plusieurs postes, mêmes données).</p>
+      </div>
+    </div>
+
+    <div id="bloc-serveur" class="bloc masque">
+      <h3>Hébergement sur ce poste</h3>
+      <label class="ligne"><input type="checkbox" id="partage"> Partager la GMAO avec les autres postes du réseau</label>
+      <div id="infos-partage" class="info masque"></div>
+      <div class="champ"><label for="port">Port réseau</label><input type="number" id="port" min="1" max="65535" value="8585" style="max-width:140px"></div>
+      <div class="champ">
+        <label for="dossier">Dossier des données</label>
+        <div class="rangee"><input type="text" id="dossier" placeholder="Dossier par défaut"><button type="button" id="btn-dossier">Parcourir…</button></div>
+        <div class="petit" id="dossier-defaut"></div>
+      </div>
+    </div>
+
+    <div id="bloc-client" class="bloc masque">
+      <h3>Connexion au poste serveur</h3>
+      <div class="champ">
+        <label for="url">Adresse du serveur GMAO</label>
+        <div class="rangee"><input type="text" id="url" placeholder="ex. http://srv-gmao:8585 ou http://192.168.1.20:8585"><button type="button" id="btn-tester">Tester</button></div>
+        <div id="resultat-test" class="resultat"></div>
+        <div class="petit">Cette adresse est affichée sur le poste serveur (icône de la zone de notification › « Accès réseau »).</div>
+      </div>
+    </div>
+
+    <div class="bloc">
+      <h3>Options</h3>
+      <label class="ligne"><input type="checkbox" id="windows"> Démarrer la GMAO avec Windows (dans la zone de notification)</label>
+      <label class="ligne"><input type="checkbox" id="arriere-plan"> Garder la GMAO active en arrière-plan quand la fenêtre est fermée</label>
+      <label class="ligne"><input type="checkbox" id="maj"> Installer automatiquement les nouvelles versions de l'application</label>
+      <div class="pied" style="margin-top:6px"><span class="petit" id="version"></span><button type="button" id="btn-maj">Rechercher une mise à jour maintenant</button></div>
+    </div>
+
+    <div class="bloc">
+      <h3>Code du pôle informatique</h3>
+      <p class="petit" style="margin-top:0" id="aide-code">Ce code protège les paramètres de ce poste (mode, réseau, dossier des données, mises à jour). Il sera demandé pour toute modification ultérieure.</p>
+      <div class="choix" style="margin-bottom:0">
+        <div class="champ"><label for="code1" id="lbl-code1">Code (6 caractères minimum)</label><input type="password" id="code1" autocomplete="new-password"></div>
+        <div class="champ"><label for="code2">Confirmation</label><input type="password" id="code2" autocomplete="new-password"></div>
+      </div>
+    </div>
+    </div>
+
+    <div class="pied">
+      <button type="button" id="btn-quitter">Quitter</button>
+      <button type="button" class="primaire" id="btn-valider">Démarrer la GMAO</button>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    'use strict';
+    const $ = (id) => document.getElementById(id);
+    const B = window.gmaoBureau;
+    let mode = 'serveur';
+    let infos = {};
+
+    function choisir(m) {
+      mode = m;
+      $('opt-serveur').classList.toggle('actif', m === 'serveur');
+      $('opt-client').classList.toggle('actif', m === 'client');
+      $('bloc-serveur').classList.toggle('masque', m !== 'serveur');
+      $('bloc-client').classList.toggle('masque', m !== 'client');
+      majInfosPartage();
+    }
+    function majInfosPartage() {
+      const zone = $('infos-partage');
+      if (mode !== 'serveur' || !$('partage').checked) { zone.classList.add('masque'); return; }
+      const port = $('port').value || 8585;
+      const adr = (infos.adresses || []).map((a) => `<code>http://${a.adresse}:${port}/</code>`).join(' ou ');
+      zone.innerHTML = `Les autres postes se connecteront avec l'adresse ${adr || `<code>http://${infos.nomPoste || 'ce-poste'}:${port}/</code>`} (ou <code>http://${infos.nomPoste || 'ce-poste'}:${port}/</code>). Au premier démarrage, Windows peut demander d'autoriser l'application dans le pare-feu : cochez « Réseaux privés » puis « Autoriser ».`;
+      zone.classList.remove('masque');
+    }
+    function erreur(msg) { const e = $('erreur'); e.textContent = msg || ''; e.classList.toggle('masque', !msg); }
+
+    $('opt-serveur').addEventListener('click', () => choisir('serveur'));
+    $('opt-client').addEventListener('click', () => choisir('client'));
+    ['opt-serveur', 'opt-client'].forEach((id) => $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choisir(id === 'opt-client' ? 'client' : 'serveur'); } }));
+    $('partage').addEventListener('change', majInfosPartage);
+    $('port').addEventListener('input', majInfosPartage);
+    $('btn-dossier').addEventListener('click', async () => { const d = await B.choisirDossier(); if (d) $('dossier').value = d; });
+    $('btn-tester').addEventListener('click', async () => {
+      const r = $('resultat-test'); r.className = 'resultat'; r.textContent = 'Test en cours…';
+      const t = await B.testerServeur($('url').value);
+      r.className = 'resultat ' + (t.ok ? 'ok' : 'ko');
+      r.textContent = t.ok ? `✔ Serveur GMAO trouvé${t.societe ? ' : ' + t.societe : ''}${t.version ? ' (version ' + t.version + ')' : ''}` : '✘ ' + t.message;
+      if (t.ok) $('url').value = t.url;
+    });
+    $('url').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btn-tester').click(); });
+    $('btn-maj').addEventListener('click', () => B.verifierMisesAJour());
+    $('btn-quitter').addEventListener('click', () => B.quitter());
+    $('btn-reessayer').addEventListener('click', () => B.reessayer());
+    $('btn-deverrouiller').addEventListener('click', deverrouiller);
+    $('code').addEventListener('keydown', (e) => { if (e.key === 'Enter') deverrouiller(); });
+    async function deverrouiller() {
+      const r = await B.deverrouiller($('code').value);
+      if (!r.ok) { $('resultat-code').textContent = '✘ ' + (r.message || 'Code incorrect'); $('code').select(); return; }
+      $('code').value = '';
+      await charger();
+    }
+    $('btn-valider').addEventListener('click', async () => {
+      erreur('');
+      const btn = $('btn-valider'); btn.disabled = true; btn.textContent = 'Démarrage…';
+      try {
+        const port = Number($('port').value);
+        if (mode === 'serveur' && !(Number.isInteger(port) && port > 0 && port < 65536)) throw new Error('Port invalide (1 à 65535)');
+        if (mode === 'client' && !$('url').value.trim()) throw new Error('Saisissez l\'adresse du serveur GMAO');
+        const c1 = $('code1').value, c2 = $('code2').value;
+        if (!codeDefini && !c1) throw new Error('Définissez le code du pôle informatique');
+        if (c1 && c1.length < 6) throw new Error('Le code du pôle informatique doit contenir au moins 6 caractères');
+        if (c1 !== c2) throw new Error('Les deux codes saisis sont différents');
+        const r = await B.enregistrer({
+          mode,
+          serveur: { port, partageReseau: $('partage').checked, dossierDonnees: $('dossier').value.trim() },
+          client: { url: $('url').value.trim() },
+          demarrerAvecWindows: $('windows').checked,
+          reduireDansZoneNotification: $('arriere-plan').checked,
+          misesAJour: { automatique: $('maj').checked },
+          nouveauCodeInformatique: c1 || undefined,
+        });
+        if (!r || !r.ok) throw new Error((r && r.message) || 'Enregistrement impossible');
+      } catch (e) {
+        erreur(e.message || String(e));
+        btn.disabled = false; btn.textContent = 'Démarrer la GMAO';
+      }
+    });
+
+    let codeDefini = false;
+    async function charger() {
+      const [p, i] = await Promise.all([B.parametres(), B.infos()]);
+      infos = i || {};
+      codeDefini = !!p.codeInformatiqueDefini;
+      $('verrou').classList.toggle('masque', !p.verrouille);
+      $('formulaire').classList.toggle('masque', !!p.verrouille);
+      $('btn-valider').classList.toggle('masque', !!p.verrouille);
+      if (p.verrouille) { $('code').focus(); return; }
+      if (codeDefini) { $('lbl-code1').textContent = 'Nouveau code (laisser vide pour conserver le code actuel)'; $('aide-code').textContent = 'Le code actuel reste valable si vous laissez ces champs vides.'; }
+      if (p.configure) { $('sous-titre').textContent = 'Paramètres de connexion de ce poste. Un changement de mode, de port ou de dossier redémarre l\'application.'; $('btn-valider').textContent = 'Enregistrer'; }
+      $('partage').checked = !!p.serveur.partageReseau;
+      $('port').value = p.serveur.port;
+      $('dossier').value = p.serveur.dossierDonnees || '';
+      $('dossier-defaut').textContent = 'Par défaut : ' + (infos.dossierDonneesDefaut || '');
+      $('url').value = p.client.url || '';
+      $('windows').checked = !!p.demarrerAvecWindows;
+      $('arriere-plan').checked = !!p.reduireDansZoneNotification;
+      $('maj').checked = !!p.misesAJour.automatique;
+      $('version').textContent = `Version installée : ${infos.version || ''}${infos.portable ? ' (portable)' : ''}`;
+      choisir(p.mode || 'serveur');
+    }
+
+    (async function init() {
+      if (!B) { erreur('Cette page doit être ouverte depuis l\'application GMAO SICAF.'); return; }
+      const q = new URLSearchParams(location.search);
+      if (q.get('erreur')) { erreur(q.get('erreur')); $('bloc-reessayer').classList.remove('masque'); }
+      await charger();
+    })().catch((e) => erreur(e.message || String(e)));
+  })();
+  </script>
+</body>
+</html>

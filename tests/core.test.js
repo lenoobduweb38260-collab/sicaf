@@ -26,7 +26,7 @@ describe('Noyau : authentification, profils, utilisateurs, hiérarchie, configur
     const me = await admin.ok('GET', '/api/auth/me');
     assert.equal(me.user.login, 'admin');
     assert.equal(me.permissions.estAdmin, true);
-    assert.equal(me.modules.length, 17);
+    assert.equal(me.modules.length, 18);
     assert.ok(me.references.secteurs.length >= 5);
     assert.ok(me.references.profils.length >= 5);
     assert.ok(me.config.listes.statutsOT.length > 0);

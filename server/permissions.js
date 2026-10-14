@@ -40,6 +40,7 @@ const MODULES = [
   { key: 'utilisateurs', label: 'Utilisateurs', icon: 'utilisateurs', ordre: 100, actions: ['voir', 'creer', 'modifier', 'supprimer'], description: 'Comptes internes et hiérarchie' },
   { key: 'profils', label: 'Profils & droits', icon: 'profils', ordre: 110, actions: ['voir', 'creer', 'modifier', 'supprimer'], description: 'Profils, matrice des droits, secteurs' },
   { key: 'configuration', label: 'Configuration', icon: 'configuration', ordre: 120, actions: ['voir', 'modifier'], description: 'Paramètres, listes de valeurs, champs personnalisés, sauvegardes' },
+  { key: 'systeme', label: 'Système & informatique', icon: 'serveur', ordre: 125, actions: ['voir', 'modifier'], description: 'Base de données, sauvegardes, réseau, postes connectés, mises à jour (réservé au pôle informatique)' },
   { key: 'audit', label: "Journal d'audit", icon: 'audit', ordre: 130, actions: ['voir', 'exporter'], description: 'Traçabilité des actions' },
 ];
 

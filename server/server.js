@@ -69,6 +69,8 @@ function createApp(options = {}) {
 
   const ctx = {
     db, router, sessions, perms, auth, HttpError, log, dataDir,
+    /** Vrai quand le serveur tourne dans l'application de bureau (accès navigateur contrôlé). */
+    bureau: !!options.bureau,
     clientDir: CLIENT_DIR,
     version: require('../package.json').version,
     /** Services publiés par les modules (ex. ctx.services.stock.sortir), consultés au moment des requêtes. */
@@ -273,8 +275,24 @@ function createApp(options = {}) {
     fs.createReadStream(file).pipe(res);
   }
 
+  /** Application de bureau : accès réservé à l'application GMAO SICAF (pas de navigateur web), sauf autorisation du pôle informatique. */
+  const MARQUEUR_BUREAU = /GMAO-SICAF-Bureau\//;
+  function accesNavigateurRefuse(req, url) {
+    if (!options.bureau) return false;
+    if (url.pathname.startsWith('/api/replication/')) return false; // sauvegardes reçues d'un autre site
+    if (MARQUEUR_BUREAU.test(String(req.headers['user-agent'] || ''))) return false;
+    const reseau = db.getConfig().reseau || {};
+    return !reseau.accesNavigateur;
+  }
+  const PAGE_APPLICATION = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>GMAO SICAF</title><style>body{font-family:Segoe UI,Arial,sans-serif;background:#0f172a;color:#e5e7eb;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}div{max-width:520px;background:#1e293b;padding:28px 32px;border-radius:12px}h1{color:#60a5fa;margin-top:0}</style></head><body><div><h1>GMAO SICAF</h1><p>La GMAO s'utilise avec l'<strong>application GMAO SICAF</strong> installée sur votre poste (mode « Se connecter à la GMAO d'un autre poste »).</p><p>L'accès par un navigateur web est désactivé. Contactez le pôle informatique.</p></div></body></html>`;
+
   function handler(req, res) {
     const url = new URL(req.url, 'http://localhost');
+    if (accesNavigateurRefuse(req, url)) {
+      if (url.pathname.startsWith('/api/')) return sendJson(res, 403, { erreur: 'Accès réservé à l\'application GMAO SICAF (accès par navigateur désactivé par le pôle informatique)' });
+      res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(PAGE_APPLICATION);
+    }
     if (url.pathname.startsWith('/api/')) {
       handleApi(req, res, url).catch((err) => {
         if (res.writableEnded) return;
@@ -349,7 +367,7 @@ function registerCoreRoutes(ctx) {
     }
     if (user.actif === false) throw new HttpError(403, 'Ce compte est désactivé');
     sessions.succes(cle);
-    const token = sessions.create(user.id, { ua: req.headers['user-agent'] });
+    const token = sessions.create(user.id, { ua: String(req.headers['user-agent'] || '').slice(0, 300), ip: req.socket.remoteAddress || '' });
     db.update('users', user.id, { derniereConnexion: new Date().toISOString() });
     res.setHeader('Set-Cookie', `gmao_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(auth.SESSION_DUREE_MS / 1000)}`);
     req.user = db.get('users', user.id);

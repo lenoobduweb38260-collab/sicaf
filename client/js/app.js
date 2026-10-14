@@ -15,7 +15,7 @@
     exploitation: { label: 'Exploitation', modules: ['dashboard', 'equipements', 'plans', 'demandes', 'ot', 'preventif', 'planning'] },
     magasin: { label: 'Magasin & achats', modules: ['stock', 'inventaire', 'fournisseurs', 'achats'] },
     pilotage: { label: 'Pilotage', modules: ['rapports', 'rh'] },
-    administration: { label: 'Administration', modules: ['utilisateurs', 'profils', 'configuration', 'audit'] },
+    administration: { label: 'Administration', modules: ['utilisateurs', 'profils', 'configuration', 'systeme', 'audit'] },
   };
 
   const GMAO = window.GMAO = {
@@ -315,6 +315,8 @@
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); afficherMonCompte(); } }, icone('utilisateur'), 'Mon compte'),
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.ouvrirChangementMdp(false); } }, icone('cle'), 'Changer mon mot de passe'),
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.setTheme(theme === 'sombre' ? 'clair' : 'sombre'); } }, icone(theme === 'sombre' ? 'soleil' : 'lune'), theme === 'sombre' ? 'Thème clair' : 'Thème sombre'),
+      typeof GMAO.ouvrirMonDossierRH === 'function' ? el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.ouvrirMonDossierRH(); } }, icone('rh'), 'Mon dossier RH') : null,
+      window.gmaoBureau ? el('button', { class: 'menu-item', onclick: () => { fermerMenus(); window.gmaoBureau.verifierMisesAJour(); } }, icone('rafraichir'), 'Rechercher les mises à jour') : null,
       el('div', { class: 'menu-sep' }),
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.deconnexion(); } }, icone('deconnexion'), 'Se déconnecter'));
     document.querySelector('.entete-utilisateur').parentNode.appendChild(menu);

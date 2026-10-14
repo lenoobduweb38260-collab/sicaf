@@ -32,6 +32,7 @@ function configParDefaut() {
     achats: { tauxTVA: 20, seuilValidationHT: 1000, delaiPaiementJours: 30, entreeStockAReception: true, alerteEcheanceJours: 7 },
     rh: { alerteJoursAvantEcheance: 60, afficherAbsencesPlanning: true, heuresHebdo: 35 },
     plans: { grilleM: 0.5, uniteAffichage: 'm', couleurParDefaut: 'etat', afficherEtiquettes: true },
+    reseau: { accesNavigateur: false },
     sauvegardes: {
       automatique: true, frequenceHeures: 24, heure: '22:00', conserverLocal: 30, compresser: true, chiffrer: false,
       destinations: [], cleReception: '', accepterReception: false,
@@ -214,8 +215,12 @@ function profilsParDefaut() {
   return [
     { nom: 'Administrateur', description: 'Accès complet à toute l\'application', niveau: 1, estAdmin: true, portee: 'tous', couleur: '#dc2626', permissions: vide(), systeme: true },
     {
+      nom: 'Pôle informatique', description: 'Gère les comptes, les profils, la base de données, les sauvegardes, le réseau et les mises à jour', niveau: 1, estAdmin: false, portee: 'tous', couleur: '#0f766e', systeme: true,
+      permissions: set(vide(), Object.assign(TOUT(['utilisateurs', 'profils', 'configuration', 'systeme', 'audit']), { dashboard: ['voir'] })),
+    },
+    {
       nom: 'Responsable maintenance', description: 'Pilote la maintenance : valide, affecte, clôture, gère le stock et le préventif', niveau: 2, estAdmin: false, portee: 'tous', couleur: '#2563eb', systeme: true,
-      permissions: set(vide(), Object.assign(TOUT(['dashboard', 'equipements', 'plans', 'demandes', 'ot', 'preventif', 'planning', 'stock', 'inventaire', 'fournisseurs', 'rapports']), { achats: ['voir', 'creer', 'modifier', 'valider', 'exporter'], rh: ['voir', 'creer', 'modifier', 'valider', 'exporter'], utilisateurs: ['voir', 'creer', 'modifier'], profils: ['voir'], audit: ['voir', 'exporter'], configuration: ['voir'] })),
+      permissions: set(vide(), Object.assign(TOUT(['dashboard', 'equipements', 'plans', 'demandes', 'ot', 'preventif', 'planning', 'stock', 'inventaire', 'fournisseurs', 'rapports']), { achats: ['voir', 'creer', 'modifier', 'valider', 'exporter'], rh: ['voir', 'creer', 'modifier', 'valider', 'exporter'], utilisateurs: ['voir'], profils: ['voir'], audit: ['voir', 'exporter'], configuration: ['voir'] })),
     },
     {
       nom: 'Chef de secteur', description: 'Valide les demandes et suit les interventions de son secteur', niveau: 3, estAdmin: false, portee: 'secteurs', couleur: '#8b5cf6', systeme: true,
@@ -258,6 +263,11 @@ function secteursParDefaut() {
  */
 function migrerProfilsSysteme(db) {
   const defauts = new Map(profilsParDefaut().map((p) => [p.nom, p]));
+  // Bases antérieures : création du profil « Pôle informatique » si personne ne gère le système
+  const it = defauts.get('Pôle informatique');
+  if (it && !db.findOne('profils', (p) => p.nom === it.nom) && !db.findOne('profils', (p) => !p.estAdmin && p.permissions && p.permissions.systeme && p.permissions.systeme.modifier)) {
+    db.insert('profils', Object.assign({ secteurId: null, actif: true }, it));
+  }
   for (const p of db.list('profils', (x) => x.systeme && !x.estAdmin)) {
     const def = defauts.get(p.nom);
     if (!def) continue;

@@ -150,7 +150,10 @@
       try { history.replaceState(null, '', '#/planning?' + q.toString()); } catch (e) { /* ignore */ }
     }
     function naviguer(sens) {
-      etat.date = sens === 0 ? ui.aujourdhui() : (etat.vue === 'mois' ? ajouterMois(etat.date, sens) : ajouterJours(etat.date, 7 * sens));
+      const auj = ui.aujourdhui();
+      etat.date = sens === 0 ? auj : (etat.vue === 'mois' ? ajouterMois(etat.date, sens) : ajouterJours(etat.date, 7 * sens));
+      // Retour sur le mois courant : on se place sur aujourd'hui (la vue Semaine suivante reste pertinente)
+      if (etat.vue === 'mois' && etat.date.slice(0, 7) === auj.slice(0, 7)) etat.date = auj;
       charger();
     }
 
@@ -570,7 +573,7 @@
       if (!etat.panneau || !donnees) return;
       const modif = peutModifier();
       const grille = lateral ? {} : { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(250px, 1fr))', gap: '0 10px' };
-      const liste = el('div', { style: Object.assign({ minHeight: '60px', borderRadius: '6px', padding: '2px' }, grille) });
+      const liste = el('div', { class: 'planning-non-planifies', style: Object.assign({ minHeight: '60px', borderRadius: '6px', padding: '2px' }, grille) });
       const terme = etat.rechercheNP.trim().toLowerCase();
       const np = donnees.nonPlanifies.filter((o) => !terme || [o.numero, o.titre, o.equipementNom, o.technicienNom, o.secteurNom].some((v) => String(v || '').toLowerCase().includes(terme)));
       np.forEach((o) => liste.appendChild(carteOt(o, { glissable: modif && o.deplacable, priorite: true })));
@@ -838,7 +841,8 @@
       if (!container.isConnected) { document.removeEventListener('keydown', surTouche); return; }
       if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey || document.querySelector('.modal-fond')) return;
       const t = ev.target;
-      if (t && (/^(input|select|textarea|button)$/i.test(t.tagName || '') || t.isContentEditable)) return;
+      // Les boutons n'exploitent pas les flèches : la navigation reste active après un clic sur ◀ / ▶
+      if (t && (/^(input|select|textarea)$/i.test(t.tagName || '') || t.isContentEditable)) return;
       if (ev.key === 'ArrowLeft') { ev.preventDefault(); naviguer(-1); } else if (ev.key === 'ArrowRight') { ev.preventDefault(); naviguer(1); }
     }
     document.addEventListener('keydown', surTouche);

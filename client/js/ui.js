@@ -70,6 +70,7 @@
     glisser: '<circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/>',
     haut: '<path d="M18 15l-6-6-6 6"/>',
     bas: '<path d="M6 9l6 6 6-6"/>',
+    serveur: '<rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/>',
     codebarre: '<path d="M3 5v14M6 5v14M8 5v14M11 5v14M14 5v14M16 5v14M19 5v14M21 5v14"/>',
     plan3d: '<path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 22V12M21 7l-9 5-9-5"/>',
     site: '<path d="M2 21h20M4 21V10l6-4v15M10 21V4l10 5v12M14 9v.01M14 13v.01M14 17v.01M17 11v.01M17 15v.01M7 13v.01M7 17v.01"/>',

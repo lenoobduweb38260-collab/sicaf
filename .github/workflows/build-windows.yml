@@ -1,27 +1,42 @@
-name: Construire l'application Windows
+name: Application Windows (.exe)
 
-# Produit l'installateur et la version portable (.exe) de la GMAO avec Electron.
-# - À chaque push sur main : les .exe sont disponibles dans l'onglet « Actions » (artefacts).
-# - À chaque tag vX.Y.Z : une « Release » GitHub est créée avec les .exe attachés.
+# Construit l'application de bureau GMAO SICAF pour Windows 10/11 (Electron : Node.js intégré,
+# aucune installation préalable, aucune fenêtre de commandes) :
+#   - GMAO-SICAF-Setup-<version>.exe     installateur (mises à jour automatiques)
+#   - GMAO-SICAF-Portable-<version>.exe  version portable (clé USB, sans installation)
+#   - latest.json                        manifeste de mise à jour (version + empreinte SHA-256)
+#
+# Chaque push sur la branche par défaut publie une nouvelle version (Release GitHub « v1.0.<n> ») :
+# les postes équipés de l'application la détectent et l'installent automatiquement.
+# Les autres branches produisent les .exe en artefacts (onglet Actions) sans les publier.
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
     tags: ['v*']
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   tests:
+    name: Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Tests API
+      - name: Tests API et application de bureau
         run: npm test
 
   windows:
+    name: Installateur Windows
     needs: tests
     runs-on: windows-latest
     steps:
@@ -29,25 +44,56 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Installer Electron et electron-builder
+
+      - name: Numéro de version
+        shell: bash
+        run: |
+          BASE=$(node -p "require('./package.json').version.split('.').slice(0,2).join('.')")
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="$BASE.${GITHUB_RUN_NUMBER}"
+          fi
+          npm pkg set version="$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Version : $VERSION"
+
+      - name: Installation d'Electron et d'electron-builder
         run: npm install --no-audit --no-fund
-      - name: Construire l'installateur et la version portable
-        run: npm run dist
+
+      - name: Construction de l'installateur et de la version portable
+        run: npx electron-builder --win --publish never
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publier les exécutables (artefacts)
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Notes de version
+        shell: bash
+        run: git log -1 --pretty=format:"%s%n%n%b" > notes.txt
+
+      - name: Manifeste de mise à jour (latest.json)
+        shell: bash
+        run: node scripts/manifeste-maj.js dist "$VERSION" notes.txt
+
+      - name: Artefacts (.exe)
         uses: actions/upload-artifact@v4
         with:
-          name: GMAO-SICAF-windows
+          name: GMAO-SICAF-${{ env.VERSION }}
           path: |
-            dist/*.exe
-            dist/*.blockmap
+            dist/GMAO-SICAF-Setup-*.exe
+            dist/GMAO-SICAF-Portable-*.exe
+            dist/latest.json
           if-no-files-found: error
-      - name: Créer la release (sur tag)
-        if: startsWith(github.ref, 'refs/tags/v')
+
+      - name: Publication de la version (mises à jour automatiques)
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.exe
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: v${{ env.VERSION }}
+          name: GMAO SICAF ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          body_path: notes.txt
+          make_latest: true
+          files: |
+            dist/GMAO-SICAF-Setup-*.exe
+            dist/GMAO-SICAF-Portable-*.exe
+            dist/latest.json
