@@ -416,7 +416,15 @@ function createApp(options = {}) {
     serveStatic(req, res, url);
   }
 
-  const server = http.createServer(handler);
+  // HTTPS (réseau partagé) : options.tls = { key, cert } (PEM) ; sinon HTTP (poste local uniquement)
+  const server = options.tls
+    ? require('https').createServer({ key: options.tls.key, cert: options.tls.cert, minVersion: 'TLSv1.2' }, (req, res) => {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+      handler(req, res);
+    })
+    : http.createServer(handler);
+  server.headersTimeout = 30000;   // protection contre les connexions lentes
+  server.requestTimeout = 10 * 60 * 1000;
 
   return {
     db, ctx, router, sessions, server, handler,

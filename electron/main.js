@@ -452,6 +452,12 @@ function enregistrerIpc() {
   gerer('bureau:quitter', () => quitterApplication());
 }
 
+// ----- Durcissement : aucune vue intégrée (webview) ni navigation hors de l'application -------
+app.on('web-contents-created', (ev, contents) => {
+  contents.on('will-attach-webview', (e) => e.preventDefault());
+  contents.on('will-navigate', (e, u) => { if (!origineAutorisee(u) && u !== 'about:blank') e.preventDefault(); });
+});
+
 // ----- Cycle de vie ---------------------------------------------------------------------------
 app.whenReady().then(() => {
   if (!VERROU) return; // une autre instance est déjà ouverte : elle a été mise au premier plan

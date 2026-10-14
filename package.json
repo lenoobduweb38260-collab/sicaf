@@ -77,7 +77,15 @@
     "portable": {
       "artifactName": "GMAO-SICAF-Portable-${version}.${ext}"
     },
-    "publish": null
+    "publish": null,
+    "electronFuses": {
+      "runAsNode": false,
+      "enableCookieEncryption": true,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    }
   },
   "author": "SICAF",
   "homepage": "https://github.com/lenoobduweb38260-collab/sicaf",
