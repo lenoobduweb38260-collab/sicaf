@@ -14,6 +14,7 @@ const { URL } = require('url');
 const { Db } = require('./db');
 const { Router, HttpError } = require('./router');
 const auth = require('./auth');
+const totp = require('./totp');
 const perms = require('./permissions');
 const { seed } = require('./seed');
 const { loadModules } = require('./modules');
@@ -238,7 +239,9 @@ function createApp(options = {}) {
    * Journal d'activité → notification des rôles responsables (config.journal) : les événements
    * semblables (même action, même entité) sont regroupés dans une notification non lue de moins de 15 min.
    */
-  const LIBELLES_ACTION = { creation: 'Création', suppression: 'Suppression', modification: 'Modification', desactivation: 'Désactivation', restauration: 'Restauration', import: 'Import de données', reinitialisation_mdp: 'Réinitialisation de mot de passe', validation: 'Validation', cloture: 'Clôture' };
+  const LIBELLES_ACTION = { creation: 'Création', suppression: 'Suppression', modification: 'Modification', desactivation: 'Désactivation', restauration: 'Restauration', import: 'Import de données', reinitialisation_mdp: 'Réinitialisation de mot de passe', validation: 'Validation', cloture: 'Clôture',
+    activation_double_auth: 'Activation de la double authentification', desactivation_double_auth: 'Désactivation de la double authentification',
+    reinitialisation_double_auth: 'Réinitialisation de la double authentification', codes_secours: 'Nouveaux codes de secours', echec_double_auth: 'Code de vérification incorrect' };
   const LIBELLES_ENTITE = { users: 'Utilisateurs', profils: 'Profils', secteurs: 'Secteurs', configuration: 'Configuration', equipements: 'Équipements', demandes: 'Demandes', ot: 'Ordres de travail', plansPreventifs: 'Préventif', articles: 'Stock', fournisseurs: 'Fournisseurs', plans: 'Plans 3D', inventaires: 'Inventaires', commandes: 'Commandes', factures: 'Factures', personnel: 'Personnel', visites: 'Audits & visites' };
   function notifierJournal(req, action, entite, entiteId, details) {
     const j = db.getConfig().journal || {};
@@ -276,8 +279,8 @@ function createApp(options = {}) {
   registerCoreRoutes(ctx);
   loadModules(ctx);
 
-  // Nettoyage périodique des sessions
-  const sweeper = setInterval(() => sessions.sweep(), 10 * 60 * 1000);
+  // Nettoyage périodique des sessions et des connexions en deux étapes inachevées
+  const sweeper = setInterval(() => { sessions.sweep(); ctx.deuxFacteurs.purger(); }, 10 * 60 * 1000);
   if (sweeper.unref) sweeper.unref();
 
   async function handleApi(req, res, url) {
@@ -324,6 +327,11 @@ function createApp(options = {}) {
     }
 
     if (!route.opts.public && !req.user) throw new HttpError(401, 'Authentification requise');
+    // Double authentification obligatoire pour ce compte mais pas encore activée : seules les routes
+    // d'authentification (profil, mot de passe, enrôlement) restent accessibles.
+    if (req.user && !route.opts.public && !url.pathname.startsWith('/api/auth/') && ctx.deuxFacteurs.enrolementRequis(req.user, req.perms)) {
+      throw new HttpError(403, 'La double authentification est obligatoire pour votre compte : activez-la pour continuer.', { deuxFacteursRequis: true });
+    }
     if (route.opts.perm) ctx.requirePerm(req, route.opts.perm[0], route.opts.perm[1]);
 
     const result = await route.handler(req, res, ctx);
@@ -445,9 +453,133 @@ function createApp(options = {}) {
   };
 }
 
-/** Routes d'authentification, d'amorçage et de profil personnel. */
+/** Modes de la double authentification (config.securite.deuxFacteurs). */
+const MODES_DEUX_FACTEURS = ['facultatif', 'obligatoire_sensibles', 'obligatoire_tous'];
+/** Modules dont le droit « Modifier » rend un compte sensible (en plus des administrateurs). */
+const MODULES_SENSIBLES = ['systeme', 'utilisateurs', 'profils', 'configuration'];
+const JETON_DEUX_FACTEURS_MS = 5 * 60 * 1000;        // validité d'une connexion en attente du code
+const ESSAIS_PAR_JETON = 5;                          // codes incorrects tolérés avant de redemander le mot de passe
+const JETONS_PAR_COMPTE = 3;                         // connexions en attente simultanées pour un même compte
+const PREPARATION_DEUX_FACTEURS_MS = 30 * 60 * 1000; // délai pour terminer un enrôlement commencé
+
+/**
+ * Double authentification (TOTP) : politique, clés chiffrées au repos, connexions en attente du code,
+ * vérification des codes (application ou code de secours) avec anti-rejeu. Exposé dans ctx.deuxFacteurs.
+ */
+function installerDeuxFacteurs(ctx) {
+  const { db, perms: droits, log } = ctx;
+  const coffre = new totp.Coffre({ dossier: db.inMemory ? null : db.dataDir, enMemoire: db.inMemory });
+  const attentes = new Map(); // jeton → { userId, login, mdp, ip, ua, expire, essais }
+  /** Empreinte courte du mot de passe enregistré : un changement de mot de passe invalide les connexions en attente. */
+  const empreinteMdp = (user) => crypto.createHash('sha256').update(String(user.passwordHash || '')).digest('hex').slice(0, 32);
+
+  const df = {
+    MODES: MODES_DEUX_FACTEURS,
+    /** Horloge (millisecondes) utilisée pour les codes et les délais. */
+    maintenant: () => Date.now(),
+
+    mode() {
+      const m = ((db.data.config || {}).securite || {}).deuxFacteurs;
+      return MODES_DEUX_FACTEURS.includes(m) ? m : 'facultatif';
+    },
+    actif(user) { return !!(user && user.deuxFacteurs && user.deuxFacteurs.actif); },
+    /** Compte sensible : administrateur, ou droit « Modifier » sur le système, les utilisateurs, les profils ou la configuration. */
+    sensible(user, p) {
+      const d = p || droits.effectivePermissions(db, user, null, db.getConfig());
+      return !!d.estAdmin || MODULES_SENSIBLES.some((m) => droits.can(d, m, 'modifier'));
+    },
+    /** La configuration impose-t-elle la double authentification à ce compte ? */
+    exige(user, p) {
+      const mode = df.mode();
+      if (!user || mode === 'facultatif') return false;
+      return mode === 'obligatoire_tous' || df.sensible(user, p);
+    },
+    enrolementRequis(user, p) { return !!user && !df.actif(user) && df.exige(user, p); },
+    /** État transmis au poste (aucun secret). */
+    etat(user, p) {
+      if (!user) return null;
+      return Object.assign(auth.resumeDeuxFacteurs(user), { mode: df.mode(), exige: df.exige(user, p), enrolementRequis: df.enrolementRequis(user, p) });
+    },
+
+    chiffrer: (texte) => coffre.chiffrer(texte),
+    dechiffrer: (chiffre) => coffre.dechiffrer(chiffre),
+
+    // ----- Connexions en attente du code (après un mot de passe correct) -----
+    creerJeton(user, poste) {
+      df.purger();
+      const miens = Array.from(attentes.entries()).filter(([, a]) => a.userId === user.id).sort((a, b) => a[1].expire - b[1].expire);
+      while (miens.length >= JETONS_PAR_COMPTE) attentes.delete(miens.shift()[0]);
+      const jeton = crypto.randomBytes(32).toString('hex');
+      attentes.set(jeton, { userId: user.id, login: user.login, mdp: empreinteMdp(user), ip: poste.ip, ua: poste.ua, expire: df.maintenant() + JETON_DEUX_FACTEURS_MS, essais: 0 });
+      return jeton;
+    },
+    /**
+     * Connexion en attente du jeton et son compte, ou null : jeton inconnu ou expiré, présenté depuis un autre
+     * poste, compte supprimé, désactivé, renommé, dont le mot de passe ou la double authentification a changé.
+     */
+    lireJeton(jeton, poste) {
+      if (typeof jeton !== 'string' || !/^[0-9a-f]{64}$/.test(jeton)) return null;
+      const a = attentes.get(jeton);
+      if (!a) return null;
+      const user = db.get('users', a.userId);
+      const valide = a.expire > df.maintenant() && a.ip === poste.ip && a.ua === poste.ua
+        && !!user && user.actif !== false && df.actif(user) && user.login === a.login && empreinteMdp(user) === a.mdp;
+      if (!valide) { attentes.delete(jeton); return null; }
+      return { attente: a, user };
+    },
+    supprimerJeton(jeton) { attentes.delete(jeton); },
+    /** Annule les connexions en attente d'un compte (mot de passe changé, double authentification réinitialisée…). */
+    annulerAttentes(userId) { for (const [j, a] of attentes) if (a.userId === Number(userId)) attentes.delete(j); },
+    purger() { const t = df.maintenant(); for (const [j, a] of attentes) if (a.expire <= t) attentes.delete(j); },
+
+    /**
+     * Vérifie un code de l'application (TOTP) ou un code de secours et consigne son utilisation :
+     * pas mémorisé (un code déjà utilisé est refusé) ou code de secours consommé.
+     * @returns {Promise<null|{type:'application'}|{type:'secours', restants:number}>}
+     */
+    async verifierCode(userId, code) {
+      const saisi = (typeof code === 'string' || typeof code === 'number') ? String(code).trim().slice(0, 40) : '';
+      const user = db.get('users', userId);
+      if (!user || !df.actif(user)) return null;
+      const d = user.deuxFacteurs;
+      if (totp.normaliserCode(saisi)) {
+        let secret = null;
+        try { secret = d.secret ? coffre.dechiffrer(d.secret) : null; } catch (e) {
+          log('Double authentification : clé du compte n°' + user.id + ' indéchiffrable (base provenant d\'un autre serveur ?)');
+        }
+        if (!secret) return null;
+        const pas = totp.verifier(secret, saisi, { instant: df.maintenant(), dernierPas: d.dernierPas });
+        if (pas === null) return null;
+        db.update('users', user.id, { deuxFacteurs: Object.assign({}, d, { dernierPas: pas, derniereUtilisation: new Date().toISOString() }) });
+        return { type: 'application' };
+      }
+      if (totp.normaliserCodeSecours(saisi)) {
+        const empreinte = await totp.trouverCodeSecours(saisi, user.codesSecours);
+        if (!empreinte) return null;
+        // Relecture après le calcul : un même code de secours ne peut pas être consommé deux fois
+        const actuel = db.get('users', user.id);
+        const restants = actuel && df.actif(actuel) && Array.isArray(actuel.codesSecours) ? actuel.codesSecours : [];
+        if (!restants.includes(empreinte)) return null;
+        db.update('users', user.id, { codesSecours: restants.filter((e) => e !== empreinte) });
+        return { type: 'secours', restants: restants.length - 1 };
+      }
+      return null;
+    },
+
+    /** Nouveaux codes de secours : `codes` en clair (affichés une seule fois) et `empreintes` (stockées). */
+    async nouveauxCodesSecours() {
+      const codes = totp.genererCodesSecours();
+      const empreintes = await Promise.all(codes.map((c) => totp.empreinteCodeSecours(c)));
+      return { codes, empreintes };
+    },
+  };
+  return df;
+}
+
+/** Routes d'authentification (connexion en une ou deux étapes, double authentification), d'amorçage et de profil personnel. */
 function registerCoreRoutes(ctx) {
   const { router, db, sessions, HttpError } = ctx;
+  const deuxFacteurs = ctx.deuxFacteurs = installerDeuxFacteurs(ctx);
 
   function bootstrap(req) {
     const config = db.getConfig();
@@ -461,6 +593,7 @@ function registerCoreRoutes(ctx) {
     return {
       user: auth.cleanUser(req.user),
       permissions: req.perms,
+      deuxFacteurs: deuxFacteurs.etat(req.user, req.perms),
       config,
       modules,
       catalogue: { modules: perms.MODULES, actions: perms.ACTIONS, portees: perms.PORTEES, modesSite: perms.MODES_SITE },
@@ -471,11 +604,36 @@ function registerCoreRoutes(ctx) {
   }
 
   /** Prévient le pôle informatique (droit Système › Modifier) d'un blocage de compte. */
-  function notifierBlocage(login, ip) {
+  function notifierBlocage(login, ip, options = {}) {
     if ((db.getConfig().securite || {}).notifierBlocages === false) return;
     const ids = ctx.usersAvecDroit('systeme', 'modifier').map((u) => u.id);
-    ctx.notify(ids, { titre: 'Compte temporairement bloqué', message: `Trop de mots de passe incorrects pour l'identifiant « ${String(login).slice(0, 60)} » depuis ${ip || 'un poste inconnu'}. Accès bloqué 10 minutes.`, lien: '#/audit?action=echec_connexion', type: 'alerte' });
+    const motif = options.motif || 'Trop de mots de passe incorrects';
+    ctx.notify(ids, { titre: 'Compte temporairement bloqué', message: `${motif} pour l'identifiant « ${String(login).slice(0, 60)} » depuis ${ip || 'un poste inconnu'}. Accès bloqué 10 minutes.`, lien: '#/audit?action=' + (options.action || 'echec_connexion'), type: 'alerte' });
   }
+
+  /** Poste à l'origine de la requête : une connexion en attente du code reste liée à ce poste. */
+  function posteDe(req) {
+    return { ip: String(req.socket.remoteAddress || ''), ua: String(req.headers['user-agent'] || '').slice(0, 300) };
+  }
+
+  /** Ouvre la session (cookie), journalise la connexion et renvoie l'amorçage. */
+  function ouvrirSession(req, res, user, details = {}) {
+    const poste = posteDe(req);
+    const token = sessions.create(user.id, { ua: poste.ua, ip: poste.ip, deuxFacteurs: !!details.deuxFacteurs });
+    db.update('users', user.id, { derniereConnexion: new Date().toISOString() });
+    const securise = req.socket.encrypted ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `gmao_session=${token}; Path=/; HttpOnly; SameSite=Strict${securise}; Max-Age=${Math.floor(sessions.dureeMaxMs() / 1000)}`);
+    req.user = db.get('users', user.id);
+    req.profil = db.get('profils', req.user.profilId);
+    req.perms = perms.effectivePermissions(db, req.user, req.profil, db.getConfig());
+    perms.appliquerSiteCourant(db, req.perms, req.headers['x-gmao-site']);
+    ctx.audit(req, 'connexion', 'users', user.id, details.texte || '');
+    return bootstrap(req);
+  }
+
+  const cleCode = (userId) => 'deux-facteurs|' + userId;        // codes incorrects à la connexion
+  const cleConfirmation = (userId) => 'confirmation|' + userId; // confirmations (mot de passe, code) en session
+  const minutes = (s) => Math.ceil(s / 60);
 
   router.post('/api/auth/login', async (req, res) => {
     const b = req.body || {};
@@ -486,7 +644,7 @@ function registerCoreRoutes(ctx) {
     const clePoste = ip + '|' + login.toLowerCase();
     const cleCompte = 'compte|' + login.toLowerCase();
     const bloc = Math.max(sessions.blocage(clePoste), sessions.blocage(cleCompte));
-    if (bloc > 0) throw new HttpError(429, `Trop de tentatives. Réessayez dans ${Math.ceil(bloc / 60)} min`);
+    if (bloc > 0) throw new HttpError(429, `Trop de tentatives. Réessayez dans ${minutes(bloc)} min`);
     const user = login ? db.findOne('users', (u) => String(u.login).toLowerCase() === login.toLowerCase()) : null;
     // Vérification exécutée même si le compte n'existe pas (temps de réponse identique)
     const ok = auth.verifyPassword(password, user ? user.passwordHash : 'scrypt$00$00') && !!user;
@@ -503,23 +661,60 @@ function registerCoreRoutes(ctx) {
     if (user.actif === false) throw new HttpError(403, 'Ce compte est désactivé');
     sessions.succes(clePoste);
     sessions.succes(cleCompte);
-    const token = sessions.create(user.id, { ua: String(req.headers['user-agent'] || '').slice(0, 300), ip });
-    db.update('users', user.id, { derniereConnexion: new Date().toISOString() });
-    const securise = req.socket.encrypted ? '; Secure' : '';
-    res.setHeader('Set-Cookie', `gmao_session=${token}; Path=/; HttpOnly; SameSite=Strict${securise}; Max-Age=${Math.floor(sessions.dureeMaxMs() / 1000)}`);
-    req.user = db.get('users', user.id);
-    req.profil = db.get('profils', req.user.profilId);
-    req.perms = perms.effectivePermissions(db, req.user, req.profil, db.getConfig());
-    perms.appliquerSiteCourant(db, req.perms, req.headers['x-gmao-site']);
-    ctx.audit(req, 'connexion', 'users', user.id, '');
-    return bootstrap(req);
-  }, { public: true });
+    if (deuxFacteurs.actif(user)) {
+      // Mot de passe correct : la session ne sera ouverte qu'après la saisie du code de vérification
+      const blocCode = sessions.blocage(cleCode(user.id));
+      if (blocCode > 0) throw new HttpError(429, `Trop de codes de vérification incorrects. Réessayez dans ${minutes(blocCode)} min`);
+      const jeton = deuxFacteurs.creerJeton(user, posteDe(req));
+      return { deuxFacteurs: true, jeton, expireDans: JETON_DEUX_FACTEURS_MS / 1000 };
+    }
+    return ouvrirSession(req, res, user);
+  }, { public: true, maxBody: 16 * 1024 });
+
+  /** Deuxième étape de la connexion : code de l'application d'authentification ou code de secours. */
+  router.post('/api/auth/login/code', async (req, res) => {
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    const poste = posteDe(req);
+    const recommencer = (message, status = 401) => new HttpError(status, message || 'Délai dépassé ou demande invalide : saisissez de nouveau votre identifiant et votre mot de passe', { recommencer: true });
+    const lu = deuxFacteurs.lireJeton(b.jeton, poste);
+    if (!lu) throw recommencer();
+    const { attente, user } = lu;
+    const cle = cleCode(user.id);
+    const bloc = sessions.blocage(cle);
+    if (bloc > 0) { deuxFacteurs.supprimerJeton(b.jeton); throw recommencer(`Trop de codes de vérification incorrects. Réessayez dans ${minutes(bloc)} min`, 429); }
+    if (attente.essais >= ESSAIS_PAR_JETON) { deuxFacteurs.supprimerJeton(b.jeton); throw recommencer('Trop de codes incorrects : saisissez de nouveau votre mot de passe'); }
+    attente.essais += 1; // essai décompté avant la vérification (requêtes simultanées)
+    const resultat = await deuxFacteurs.verifierCode(user.id, b.code);
+    if (!resultat) {
+      const bloque = sessions.echec(cle);
+      ctx.audit({ socket: req.socket }, 'echec_double_auth', 'users', user.id, `Code de vérification incorrect pour « ${user.login} »`);
+      if (bloque) {
+        deuxFacteurs.annulerAttentes(user.id);
+        ctx.audit({ socket: req.socket }, 'blocage', 'users', user.id, `Blocage après des codes de vérification incorrects : « ${user.login} »`);
+        notifierBlocage(user.login, poste.ip, { motif: 'Mot de passe correct mais trop de codes de vérification incorrects', action: 'echec_double_auth' });
+        ctx.notify(user.id, { titre: 'Tentatives de connexion suspectes', message: 'Votre mot de passe a été saisi correctement, suivi de plusieurs codes de vérification incorrects. Si vous n\'êtes pas à l\'origine de ces tentatives, changez immédiatement votre mot de passe et prévenez le pôle informatique.', lien: '', type: 'alerte' });
+        throw recommencer('Trop de codes de vérification incorrects : compte bloqué 10 minutes', 429);
+      }
+      const restants = ESSAIS_PAR_JETON - attente.essais;
+      if (restants <= 0) { deuxFacteurs.supprimerJeton(b.jeton); throw recommencer('Trop de codes incorrects : saisissez de nouveau votre mot de passe'); }
+      throw new HttpError(401, `Code incorrect ou déjà utilisé (${restants} essai${restants > 1 ? 's' : ''} restant${restants > 1 ? 's' : ''})`, { essaisRestants: restants });
+    }
+    deuxFacteurs.supprimerJeton(b.jeton);
+    sessions.succes(cle);
+    const secours = resultat.type === 'secours';
+    const out = ouvrirSession(req, res, user, { deuxFacteurs: true, texte: secours ? `Double authentification par code de secours (${resultat.restants} restant(s))` : 'Double authentification par application' });
+    if (secours) {
+      out.connexion = { codeSecours: true, codesSecoursRestants: resultat.restants };
+      ctx.notify(user.id, { titre: 'Code de secours utilisé', message: `Un code de secours a été utilisé pour vous connecter. Il vous en reste ${resultat.restants}.${resultat.restants <= 2 ? ' Générez de nouveaux codes depuis le menu de votre compte › Double authentification.' : ''}`, lien: '', type: resultat.restants <= 2 ? 'alerte' : 'info' });
+    }
+    return out;
+  }, { public: true, maxBody: 16 * 1024 });
 
   router.post('/api/auth/logout', async (req, res) => {
     if (req.session) sessions.destroy(req.session.token);
     res.setHeader('Set-Cookie', 'gmao_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');
     return { ok: true };
-  }, { public: true });
+  }, { public: true, maxBody: 16 * 1024 });
 
   router.get('/api/auth/me', async (req) => bootstrap(req));
 
@@ -532,25 +727,137 @@ function registerCoreRoutes(ctx) {
     return { societe: { nom: soc.nom, slogan: soc.slogan, logo: soc.logo }, general: { theme: (c.general || {}).theme, couleurPrincipale: (c.general || {}).couleurPrincipale, messageAccueil: (c.general || {}).messageAccueil }, version: ctx.version, premierDemarrage };
   }, { public: true });
 
+  // ----- Confirmations des opérations sensibles (mot de passe actuel, code de vérification) -----
+  function echecConfirmation(req, details) {
+    const bloque = sessions.echec(cleConfirmation(req.user.id));
+    ctx.audit(req, 'echec_confirmation', 'users', req.user.id, details);
+    if (bloque) ctx.audit(req, 'blocage', 'users', req.user.id, 'Blocage après des confirmations incorrectes');
+  }
+  function verifierBlocageConfirmation(req) {
+    const bloc = sessions.blocage(cleConfirmation(req.user.id));
+    if (bloc > 0) throw new HttpError(429, `Trop d'essais incorrects. Réessayez dans ${minutes(bloc)} min`);
+  }
+  function confirmerMotDePasse(req, motDePasse, message) {
+    verifierBlocageConfirmation(req);
+    const ok = typeof motDePasse === 'string' && motDePasse.length <= 500 && auth.verifyPassword(motDePasse, req.user.passwordHash);
+    if (!ok) {
+      echecConfirmation(req, 'Mot de passe actuel incorrect');
+      throw new HttpError(400, message || 'Mot de passe incorrect');
+    }
+  }
+  async function confirmerCode(req, code) {
+    verifierBlocageConfirmation(req);
+    const r = await deuxFacteurs.verifierCode(req.user.id, code);
+    if (!r) {
+      echecConfirmation(req, 'Code de vérification incorrect');
+      throw new HttpError(400, 'Code de vérification incorrect ou déjà utilisé');
+    }
+    return r;
+  }
+
   /** Changement de son propre mot de passe. */
   router.post('/api/auth/mot-de-passe', async (req) => {
-    const { ancien, nouveau } = req.body || {};
-    if (!req.user.doitChangerMdp && !auth.verifyPassword(ancien, req.user.passwordHash)) throw new HttpError(400, 'Ancien mot de passe incorrect');
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    const { ancien, nouveau } = b;
+    if (!req.user.doitChangerMdp) confirmerMotDePasse(req, ancien, 'Ancien mot de passe incorrect');
     const err = auth.validerMotDePasse(nouveau, db.getConfig(), { login: req.user.login });
     if (err) throw new HttpError(400, err);
     if (auth.verifyPassword(nouveau, req.user.passwordHash)) throw new HttpError(400, 'Le nouveau mot de passe doit être différent de l\'ancien');
     db.update('users', req.user.id, { passwordHash: auth.hashPassword(nouveau), doitChangerMdp: false, dateMdp: new Date().toISOString() });
     sessions.destroyUserSauf(req.user.id, req.session.token); // les autres postes connectés sont déconnectés
+    deuxFacteurs.annulerAttentes(req.user.id);
     ctx.audit(req, 'changement_mdp', 'users', req.user.id, '');
     return { ok: true };
-  });
+  }, { maxBody: 16 * 1024 });
 
-  /** Préférences personnelles (thème, etc.). */
+  // ----- Double authentification : enrôlement par l'utilisateur lui-même -----
+
+  /** Étape 1 : nouvelle clé en attente (après confirmation du mot de passe) ; renvoyée une seule fois pour le QR code. */
+  router.post('/api/auth/2fa/preparer', async (req) => {
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    if (deuxFacteurs.actif(req.user)) throw new HttpError(400, 'La double authentification est déjà active sur votre compte');
+    confirmerMotDePasse(req, b.motDePasse);
+    const secret = totp.genererSecret();
+    const d = Object.assign({}, req.user.deuxFacteurs || {}, { actif: false, secretEnAttente: deuxFacteurs.chiffrer(secret), prepareLe: new Date(deuxFacteurs.maintenant()).toISOString() });
+    db.update('users', req.user.id, { deuxFacteurs: d });
+    return {
+      secret, cleManuelle: totp.grouperSecret(secret), uri: totp.uriOtpauth(req.user.login, secret),
+      emetteur: totp.EMETTEUR, compte: req.user.login, algorithme: 'SHA1', chiffres: totp.CHIFFRES, periode: totp.PAS_SECONDES,
+    };
+  }, { maxBody: 16 * 1024 });
+
+  /** Étape 2 : confirmation par un premier code ; les 10 codes de secours sont renvoyés une seule fois. */
+  router.post('/api/auth/2fa/activer', async (req) => {
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    if (deuxFacteurs.actif(req.user)) throw new HttpError(400, 'La double authentification est déjà active sur votre compte');
+    const d = req.user.deuxFacteurs || {};
+    if (!d.secretEnAttente) throw new HttpError(400, 'Aucune activation en cours : recommencez la procédure');
+    const prepare = Date.parse(d.prepareLe || '');
+    if (!Number.isFinite(prepare) || deuxFacteurs.maintenant() - prepare > PREPARATION_DEUX_FACTEURS_MS) throw new HttpError(400, 'La procédure d\'activation a expiré : recommencez');
+    verifierBlocageConfirmation(req);
+    let secret;
+    try { secret = deuxFacteurs.dechiffrer(d.secretEnAttente); } catch (e) { throw new HttpError(400, 'Activation impossible : recommencez la procédure'); }
+    const pas = typeof b.code === 'string' || typeof b.code === 'number' ? totp.verifier(secret, String(b.code), { instant: deuxFacteurs.maintenant() }) : null;
+    if (pas === null) {
+      echecConfirmation(req, 'Code incorrect lors de l\'activation de la double authentification');
+      throw new HttpError(400, 'Code incorrect : vérifiez que l\'heure de votre téléphone est exacte et saisissez le code affiché');
+    }
+    const secours = await deuxFacteurs.nouveauxCodesSecours();
+    // Relecture après le calcul : la procédure ne doit pas avoir changé entre-temps
+    const actuel = db.get('users', req.user.id);
+    if (!actuel || deuxFacteurs.actif(actuel) || (actuel.deuxFacteurs || {}).secretEnAttente !== d.secretEnAttente) throw new HttpError(409, 'La procédure d\'activation a changé entre-temps : recommencez');
+    db.update('users', req.user.id, {
+      deuxFacteurs: { actif: true, secret: d.secretEnAttente, activeLe: new Date().toISOString(), dernierPas: pas },
+      codesSecours: secours.empreintes,
+    });
+    sessions.succes(cleConfirmation(req.user.id));
+    sessions.destroyUserSauf(req.user.id, req.session.token); // les autres postes devront se reconnecter avec un code
+    deuxFacteurs.annulerAttentes(req.user.id);
+    ctx.audit(req, 'activation_double_auth', 'users', req.user.id, 'Double authentification activée');
+    return { ok: true, codesSecours: secours.codes };
+  }, { maxBody: 16 * 1024 });
+
+  /** Désactivation par l'utilisateur : mot de passe et code (application ou code de secours) exigés. */
+  router.post('/api/auth/2fa/desactiver', async (req) => {
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    if (!deuxFacteurs.actif(req.user)) throw new HttpError(400, 'La double authentification n\'est pas active sur votre compte');
+    confirmerMotDePasse(req, b.motDePasse);
+    await confirmerCode(req, b.code);
+    db.update('users', req.user.id, { deuxFacteurs: { actif: false, desactiveLe: new Date().toISOString() }, codesSecours: [] });
+    deuxFacteurs.annulerAttentes(req.user.id);
+    ctx.audit(req, 'desactivation_double_auth', 'users', req.user.id, 'Double authentification désactivée par l\'utilisateur');
+    const u = db.get('users', req.user.id);
+    return { ok: true, exige: deuxFacteurs.exige(u, req.perms) };
+  }, { maxBody: 16 * 1024 });
+
+  /** Nouveaux codes de secours (les anciens deviennent invalides) : mot de passe et code exigés. */
+  router.post('/api/auth/2fa/codes-secours', async (req) => {
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    if (!deuxFacteurs.actif(req.user)) throw new HttpError(400, 'La double authentification n\'est pas active sur votre compte');
+    confirmerMotDePasse(req, b.motDePasse);
+    await confirmerCode(req, b.code);
+    const secours = await deuxFacteurs.nouveauxCodesSecours();
+    db.update('users', req.user.id, { codesSecours: secours.empreintes });
+    ctx.audit(req, 'codes_secours', 'users', req.user.id, 'Nouveaux codes de secours générés');
+    return { ok: true, codesSecours: secours.codes };
+  }, { maxBody: 16 * 1024 });
+
+  /** Préférences personnelles (thème, etc.) : clés simples, valeurs scalaires courtes uniquement. */
   router.put('/api/auth/preferences', async (req) => {
-    const prefs = Object.assign({}, req.user.preferences || {}, req.body || {});
+    const b = req.body && typeof req.body === 'object' && !Array.isArray(req.body) && !Buffer.isBuffer(req.body) ? req.body : {};
+    const prefs = Object.assign({}, req.user.preferences || {});
+    for (const [k, v] of Object.entries(b)) {
+      if (!/^[a-zA-Z]\w{0,40}$/.test(k)) continue;
+      if (k === 'theme') {
+        if (!['clair', 'sombre', 'auto'].includes(v)) throw new HttpError(400, 'Thème inconnu');
+        prefs.theme = v;
+      } else if (v === null) delete prefs[k];
+      else if (typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.length <= 200)) prefs[k] = v;
+    }
+    if (Object.keys(prefs).length > 50) throw new HttpError(400, 'Trop de préférences enregistrées');
     db.update('users', req.user.id, { preferences: prefs });
     return prefs;
-  });
+  }, { maxBody: 64 * 1024 });
 
   /** Notifications de l'utilisateur courant. */
   router.get('/api/notifications', async (req) => {

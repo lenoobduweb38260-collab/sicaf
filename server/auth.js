@@ -137,11 +137,27 @@ class Sessions {
   succes(cle) { this.tentatives.delete(cle); }
 }
 
-/** Retire les informations sensibles avant envoi au client. */
+/**
+ * Retire les informations sensibles avant envoi au client : empreinte du mot de passe, clé de double
+ * authentification (active ou en attente) et empreintes des codes de secours. Seul un résumé de l'état
+ * de la double authentification est conservé.
+ */
 function cleanUser(u) {
   if (!u) return null;
-  const { passwordHash, ...rest } = u;
+  const { passwordHash, deuxFacteurs, codesSecours, ...rest } = u;
+  rest.deuxFacteurs = resumeDeuxFacteurs(u);
   return rest;
+}
+
+/** État de la double authentification, sans aucun secret. */
+function resumeDeuxFacteurs(u) {
+  const d = (u && u.deuxFacteurs) || {};
+  const actif = !!d.actif;
+  return {
+    actif,
+    activeLe: actif ? d.activeLe || null : null,
+    codesSecoursRestants: actif && Array.isArray(u.codesSecours) ? u.codesSecours.length : 0,
+  };
 }
 
 function parseCookies(header) {
@@ -157,4 +173,4 @@ function parseCookies(header) {
   return out;
 }
 
-module.exports = { hashPassword, verifyPassword, validerMotDePasse, genererMotDePasse, Sessions, cleanUser, parseCookies, SESSION_DUREE_MS, MAX_TENTATIVES };
+module.exports = { hashPassword, verifyPassword, validerMotDePasse, genererMotDePasse, Sessions, cleanUser, resumeDeuxFacteurs, parseCookies, SESSION_DUREE_MS, MAX_TENTATIVES, BLOCAGE_MS };

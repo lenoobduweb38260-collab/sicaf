@@ -83,6 +83,11 @@
       { nom: 'securite.interdireIdentifiant', label: 'Refuser un mot de passe contenant l\'identifiant', type: 'booleen' },
       { nom: 'securite.forcerChangementMdpInitial', label: 'Forcer le changement du mot de passe initial', type: 'booleen' },
       { nom: 'securite.notifierBlocages', label: 'Prévenir le pôle informatique quand un compte est bloqué (mots de passe erronés)', type: 'booleen' },
+      { nom: 'securite.deuxFacteurs', label: 'Double authentification (code d\'une application sur téléphone)', type: 'select', pleineLargeur: true, options: [
+        { value: 'facultatif', label: 'Facultative : chaque utilisateur peut l\'activer depuis le menu de son compte' },
+        { value: 'obligatoire_sensibles', label: 'Obligatoire pour les comptes sensibles (administrateurs, gestion du système, des utilisateurs, des profils ou de la configuration)' },
+        { value: 'obligatoire_tous', label: 'Obligatoire pour tous les utilisateurs' },
+      ], aide: 'Applications compatibles : Microsoft Authenticator, Google Authenticator, FreeOTP. Un compte concerné qui ne l\'a pas encore activée doit le faire dès sa connexion, avant tout autre écran. En cas de perte du téléphone, le pôle informatique réinitialise la double authentification depuis la fiche de l\'utilisateur.' },
       { type: 'separateur', label: 'Circuit de travail (workflow)' },
       { nom: 'workflow.validationDemandes', label: 'Les demandes d\'intervention doivent être validées avant de devenir des OT', type: 'booleen', sansDecalage: true },
       { nom: 'workflow.validerParSuperieurUniquement', label: 'Seul le supérieur hiérarchique du demandeur (ou un admin) peut valider sa demande', type: 'booleen', sansDecalage: true },
@@ -100,6 +105,7 @@
       'securite.longueurMinMdp': c.securite.longueurMinMdp, 'securite.forcerChangementMdpInitial': c.securite.forcerChangementMdpInitial,
       'securite.inactiviteMinutes': c.securite.inactiviteMinutes, 'securite.dureeSessionHeures': c.securite.dureeSessionHeures, 'securite.complexite': c.securite.complexite,
       'securite.refuserCourants': c.securite.refuserCourants, 'securite.interdireIdentifiant': c.securite.interdireIdentifiant, 'securite.notifierBlocages': c.securite.notifierBlocages,
+      'securite.deuxFacteurs': c.securite.deuxFacteurs || 'facultatif',
       'workflow.validationDemandes': c.workflow.validationDemandes, 'workflow.validerParSuperieurUniquement': c.workflow.validerParSuperieurUniquement, 'workflow.otAutoDepuisDemande': c.workflow.otAutoDepuisDemande, 'workflow.cloturerDemandeAvecOt': c.workflow.cloturerDemandeAvecOt, 'workflow.notifierValidateurs': c.workflow.notifierValidateurs, 'workflow.autoriserTechnicienCloture': c.workflow.autoriserTechnicienCloture, 'workflow.stockNegatif': c.workflow.stockNegatif,
       'preventif.genererAuto': c.preventif.genererAuto, 'preventif.horizonJours': c.preventif.horizonJours,
     } });
@@ -108,6 +114,13 @@
       const v = f.valeurs();
       const d = {};
       for (const [k, val] of Object.entries(v)) { const [a, b] = k.split('.'); d[a] = d[a] || {}; d[a][b] = val == null ? '' : val; }
+      // Double authentification rendue obligatoire alors que son propre compte n'est pas enrôlé : prévenir
+      const mode2fa = d.securite.deuxFacteurs;
+      const etat2fa = GMAO.deuxFacteurs || {};
+      if (mode2fa !== (c.securite.deuxFacteurs || 'facultatif') && mode2fa !== 'facultatif' && !etat2fa.actif && (mode2fa === 'obligatoire_tous' || GMAO.compteSensible())) {
+        const ok = await ui.confirm({ titre: 'Double authentification obligatoire', message: 'Votre propre compte est concerné et la double authentification n\'y est pas encore activée : vous devrez l\'activer immédiatement après l\'enregistrement (munissez-vous de votre téléphone). Continuer ?', okLabel: 'Enregistrer et activer' });
+        if (!ok) return;
+      }
       if (await enregistrer(d)) GMAO.rendre();
     } });
     return ui.carte(null, frag(f.el, el('div', { class: 'mt texte-droite' }, btn)));

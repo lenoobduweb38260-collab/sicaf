@@ -10,6 +10,8 @@ const { seedDemo: seedDemoTous } = require('./index');
 const nom = 'Configuration';
 
 const TYPES_CHAMPS = ['texte', 'texte_long', 'nombre', 'date', 'liste', 'booleen'];
+/** Modes de la double authentification (securite.deuxFacteurs). */
+const MODES_DEUX_FACTEURS = ['facultatif', 'obligatoire_sensibles', 'obligatoire_tous'];
 
 function register(ctx) {
   const { router, db, HttpError, perms } = ctx;
@@ -89,6 +91,7 @@ function register(ctx) {
     if (b.securite) {
       const bs = b.securite;
       const bool = (k) => (bs[k] === undefined ? cfg.securite[k] : !!bs[k]);
+      if (bs.deuxFacteurs !== undefined && !MODES_DEUX_FACTEURS.includes(bs.deuxFacteurs)) throw new HttpError(400, 'Mode de double authentification invalide (facultatif, obligatoire_sensibles ou obligatoire_tous)');
       cfg.securite = Object.assign({}, cfg.securite, {
         longueurMinMdp: Math.min(64, Math.max(8, Number(bs.longueurMinMdp) || cfg.securite.longueurMinMdp)),
         complexite: bool('complexite'),
@@ -98,6 +101,7 @@ function register(ctx) {
         notifierBlocages: bool('notifierBlocages'),
         inactiviteMinutes: Math.min(24 * 60, Math.max(5, Number(bs.inactiviteMinutes) || cfg.securite.inactiviteMinutes || 60)),
         dureeSessionHeures: Math.min(72, Math.max(1, Number(bs.dureeSessionHeures) || cfg.securite.dureeSessionHeures || 12)),
+        deuxFacteurs: bs.deuxFacteurs !== undefined ? bs.deuxFacteurs : (MODES_DEUX_FACTEURS.includes(cfg.securite.deuxFacteurs) ? cfg.securite.deuxFacteurs : 'facultatif'),
       });
     }
     if (b.numerotation) {

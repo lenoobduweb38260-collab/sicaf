@@ -21,7 +21,11 @@ function configParDefaut() {
       heuresParJour: 8,
       tauxHoraire: 45,
     },
-    securite: { longueurMinMdp: 10, complexite: true, refuserCourants: true, interdireIdentifiant: true, forcerChangementMdpInitial: true, dureeSessionHeures: 12, inactiviteMinutes: 60, notifierBlocages: true },
+    securite: {
+      longueurMinMdp: 10, complexite: true, refuserCourants: true, interdireIdentifiant: true, forcerChangementMdpInitial: true, dureeSessionHeures: 12, inactiviteMinutes: 60, notifierBlocages: true,
+      // Double authentification : 'facultatif' | 'obligatoire_sensibles' (administrateurs, gestion du système, des utilisateurs, des profils, de la configuration) | 'obligatoire_tous'
+      deuxFacteurs: 'facultatif',
+    },
     numerotation: { ot: 'OT-{annee}-{num:4}', di: 'DI-{annee}-{num:4}', eq: 'EQ-{num:4}', art: 'ART-{num:4}', pp: 'PP-{num:3}', inv: 'INV-{annee}-{num:3}', vis: 'VIS-{annee}-{num:3}', cmd: 'CMD-{annee}-{num:4}', fac: 'FAC-{annee}-{num:4}', pl: 'PL-{num:3}', mat: 'MAT-{num:4}' },
     etiquettes: {
       format: 'a4-3x7', symbologie: 'code128', hauteurCodeMm: 12, decalage: 0,

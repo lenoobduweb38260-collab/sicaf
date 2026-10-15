@@ -6,12 +6,18 @@
  * Deux modes :
  *  - « serveur » : ce PC héberge la base de données et le serveur GMAO (intégré à l'application) ;
  *    avec le partage réseau, les autres postes s'y connectent.
- *  - « client »  : ce PC se connecte au serveur GMAO d'un autre poste (adresse http://serveur:8585).
+ *  - « client »  : ce PC se connecte au serveur GMAO d'un autre poste (adresse https://serveur:8585).
+ *    L'empreinte du certificat du serveur, confirmée par le pôle informatique à la première
+ *    connexion chiffrée, est enregistrée ici : toute empreinte différente bloque ensuite la connexion.
+ *
+ * Le fichier contient l'empreinte (scrypt) du code du pôle informatique : il est écrit avec des
+ * droits restreints à l'utilisateur courant.
  *
  * Module sans dépendance à Electron : testable avec node:test.
  */
 const fs = require('fs');
 const path = require('path');
+const { normaliserEmpreinte } = require('../server/tls');
 
 const DEFAUTS = {
   configure: false,            // l'assistant de premier lancement a-t-il été validé ?
@@ -23,7 +29,9 @@ const DEFAUTS = {
     dossierDonnees: '',        // vide = dossier par défaut (%APPDATA%\GMAO SICAF\data)
   },
   client: {
-    url: '',                   // ex. http://srv-gmao:8585/
+    url: '',                   // ex. https://srv-gmao:8585/
+    empreinte: '',             // empreinte SHA-256 du certificat du serveur confirmée (« AB:CD:… »)
+    empreinteCle: '',          // empreinte SHA-256 de sa clé publique (certificat renouvelé par le même serveur)
   },
   demarrerAvecWindows: false,
   reduireDansZoneNotification: true, // fermer la fenêtre garde l'application active (serveur partagé)
@@ -73,6 +81,8 @@ function normaliser(p) {
   out.serveur.dossierDonnees = typeof s.dossierDonnees === 'string' ? s.dossierDonnees.trim().slice(0, 500) : '';
   const c = src.client || {};
   out.client.url = normaliserUrl(c.url);
+  out.client.empreinte = normaliserEmpreinte(c.empreinte);
+  out.client.empreinteCle = normaliserEmpreinte(c.empreinteCle);
   out.demarrerAvecWindows = !!src.demarrerAvecWindows;
   out.reduireDansZoneNotification = src.reduireDansZoneNotification === undefined ? d.reduireDansZoneNotification : !!src.reduireDansZoneNotification;
   const m = src.misesAJour || {};
@@ -113,8 +123,9 @@ class Parametres {
     }));
     fs.mkdirSync(path.dirname(this.fichier), { recursive: true });
     const tmp = this.fichier + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(this.valeurs, null, 2), 'utf8');
+    fs.writeFileSync(tmp, JSON.stringify(this.valeurs, null, 2), { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmp, this.fichier);
+    try { fs.chmodSync(this.fichier, 0o600); } catch (e) { /* système de fichiers sans droits POSIX */ }
     return this.valeurs;
   }
 }

@@ -4,12 +4,18 @@ name: Application Windows (.exe)
 # aucune installation préalable, aucune fenêtre de commandes) :
 #   - GMAO-SICAF-Setup-<version>.exe     installateur (mises à jour automatiques)
 #   - GMAO-SICAF-Portable-<version>.exe  version portable (clé USB, sans installation)
-#   - latest.json                        manifeste de mise à jour (version + empreinte SHA-256)
+#   - latest.json                        manifeste de mise à jour (version, empreinte SHA-256, signature Ed25519)
 #
 # Chaque push sur la branche par défaut publie une nouvelle version (Release GitHub « v1.0.<n> ») :
 # les postes équipés de l'application la détectent et l'installent automatiquement.
 # Les autres branches, et les commits marqués [wip], produisent les .exe en artefacts (onglet Actions)
 # sans les publier.
+#
+# Secrets facultatifs (Settings › Secrets and variables › Actions), voir docs/MISES-A-JOUR.md :
+#   - MAJ_CLE_PRIVEE    clé privée Ed25519 de signature du manifeste (scripts/generer-cle-maj.js) ;
+#   - CSC_LINK          certificat de signature de code Windows (.pfx encodé en base64) ;
+#   - CSC_KEY_PASSWORD  mot de passe de ce certificat.
+# Ils ne sont utilisés que pour les versions publiées, et chacun uniquement par l'étape qui en a besoin.
 
 on:
   push:
@@ -17,8 +23,9 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Droits minimaux par défaut ; seul le job de construction peut créer une Release.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: windows-${{ github.ref }}
@@ -30,6 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -40,8 +49,16 @@ jobs:
     name: Installateur Windows
     needs: tests
     runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      # « oui » pour une version à publier : branche par défaut (hors commit [wip]) ou étiquette v*
+      PUBLICATION: ${{ ((github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && !contains(github.event.head_commit.message, '[wip]')) || startsWith(github.ref, 'refs/tags/v')) && 'oui' || 'non' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Le jeton n'est pas conservé dans .git/config : les scripts d'installation npm ne peuvent pas s'en servir
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -62,17 +79,82 @@ jobs:
       - name: Installation d'Electron et d'electron-builder
         run: npm install --no-audit --no-fund
 
+      # Placée après l'installation des paquets npm : leurs scripts d'installation ne voient jamais le certificat.
+      - name: Certificat de signature de code (Authenticode)
+        if: env.PUBLICATION == 'oui'
+        shell: bash
+        env:
+          CERTIFICAT_BASE64: ${{ secrets.CSC_LINK }}
+          CERTIFICAT_MOT_DE_PASSE: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          if [ -z "$CERTIFICAT_BASE64" ]; then
+            echo "Secret CSC_LINK absent : les exécutables ne seront pas signés (Authenticode)."
+            exit 0
+          fi
+          PFX="$(cygpath -u "$RUNNER_TEMP")/certificat-signature.pfx"
+          # Base64 brut ou produit par « certutil -encode » (lignes BEGIN / END ignorées)
+          if ! printf '%s' "$CERTIFICAT_BASE64" | sed '/-----/d' | tr -d ' \r\n\t' | base64 -d > "$PFX" 2>/dev/null || [ ! -s "$PFX" ]; then
+            rm -f "$PFX"
+            echo "::error title=Signature de code::Le secret CSC_LINK ne contient pas un certificat .pfx encodé en base64."
+            exit 1
+          fi
+          # electron-builder lit CSC_LINK et CSC_KEY_PASSWORD dans l'environnement
+          echo "CSC_LINK=$(cygpath -w "$PFX")" >> "$GITHUB_ENV"
+          if [ -n "$CERTIFICAT_MOT_DE_PASSE" ]; then
+            DELIMITEUR="FIN_$(node -p "require('crypto').randomBytes(16).toString('hex')")"
+            {
+              echo "CSC_KEY_PASSWORD<<$DELIMITEUR"
+              printf '%s\n' "$CERTIFICAT_MOT_DE_PASSE"
+              echo "$DELIMITEUR"
+            } >> "$GITHUB_ENV"
+          fi
+          echo "SIGNATURE_CODE=oui" >> "$GITHUB_ENV"
+          echo "Signature de code activée."
+
       - name: Construction de l'installateur et de la version portable
         run: npx electron-builder --win --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
-      - name: Notes de version
+      - name: Suppression du certificat de signature de code
+        if: always() && env.PUBLICATION == 'oui'
         shell: bash
-        run: git log -1 --pretty=format:"%s%n%n%b" > notes.txt
+        run: |
+          rm -f "$(cygpath -u "$RUNNER_TEMP")/certificat-signature.pfx"
+          # Variables vidées : les étapes suivantes (dont les actions de publication) n'y ont plus accès
+          echo "CSC_LINK=" >> "$GITHUB_ENV"
+          echo "CSC_KEY_PASSWORD=" >> "$GITHUB_ENV"
+
+      - name: Contrôle de la signature Authenticode
+        if: env.SIGNATURE_CODE == 'oui'
+        shell: pwsh
+        run: |
+          $lignes = @('### Signature de code (Authenticode)', '', '| Fichier | État | Signataire |', '|---|---|---|')
+          $echec = $false
+          foreach ($f in Get-ChildItem dist -Filter 'GMAO-SICAF-*.exe' | Where-Object { $_.Extension -eq '.exe' }) {
+            $s = Get-AuthenticodeSignature -FilePath $f.FullName
+            $signataire = if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { '-' }
+            $lignes += "| $($f.Name) | $($s.Status) | $signataire |"
+            if ($s.Status -eq 'NotSigned' -or $s.Status -eq 'HashMismatch') { $echec = $true }
+          }
+          $lignes | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          $lignes | Write-Output
+          if ($echec) { Write-Output '::error title=Signature de code::Un exécutable n''est pas signé alors que le certificat est configuré.'; exit 1 }
+
+      - name: Notes de version
+        # Message du commit, sans les lignes de mention ajoutées par git ou les outils de développement
+        # (Co-Authored-By:, Signed-off-by:, Reviewed-by:, identifiants de session…).
+        shell: bash
+        run: |
+          git log -1 --pretty=format:"%s%n%n%b" \
+            | grep -viE '^[[:space:]]*[a-z0-9]+(-[a-z0-9]+)*-(by|session):' > notes.txt || true
 
       - name: Manifeste de mise à jour (latest.json)
+        # Signé (Ed25519) avec le secret MAJ_CLE_PRIVEE pour une version publiée. Sans ce secret, le manifeste
+        # n'est pas signé (avertissement) : les postes dont la clé publique est configurée le refuseront.
         shell: bash
+        env:
+          MAJ_CLE_PRIVEE: ${{ env.PUBLICATION == 'oui' && secrets.MAJ_CLE_PRIVEE || '' }}
         run: node scripts/manifeste-maj.js dist "$VERSION" notes.txt
 
       - name: Artefacts (.exe)
@@ -86,8 +168,12 @@ jobs:
           if-no-files-found: error
 
       - name: Publication de la version (mises à jour automatiques)
+        id: publication
         # Pas de publication pour un travail en cours (message de commit contenant [wip])
-        if: (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && !contains(github.event.head_commit.message, '[wip]')) || startsWith(github.ref, 'refs/tags/v')
+        if: env.PUBLICATION == 'oui'
+        # GitHub refuse de créer l'étiquette lorsque le commit modifie lui-même un fichier de .github/workflows
+        # (le jeton du workflow n'a pas ce droit) : l'échec n'interrompt pas le job et il est signalé ci-dessous.
+        continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
@@ -99,3 +185,25 @@ jobs:
             dist/GMAO-SICAF-Setup-*.exe
             dist/GMAO-SICAF-Portable-*.exe
             dist/latest.json
+
+      - name: Avertissement (version non publiée)
+        if: steps.publication.outcome == 'failure'
+        shell: bash
+        env:
+          FICHIERS_COMMIT: ${{ join(github.event.head_commit.added, ' ') }} ${{ join(github.event.head_commit.modified, ' ') }} ${{ join(github.event.head_commit.removed, ' ') }}
+        run: |
+          {
+            echo "### Attention : version $VERSION non publiée"
+            echo
+            echo "GitHub a refusé de créer l'étiquette \`v$VERSION\` ou la Release : les postes ne recevront pas cette version."
+            echo "Cause habituelle : le commit modifie lui-même un fichier de \`.github/workflows\`, ce que le jeton du"
+            echo "workflow (GITHUB_TOKEN) n'a pas le droit de publier."
+            case " $FICHIERS_COMMIT " in
+              *".github/workflows/"*) echo; echo "C'est le cas ici : ce commit modifie un fichier de workflow." ;;
+            esac
+            echo
+            echo "Les exécutables et latest.json restent disponibles dans les artefacts de cette exécution."
+            echo "Pour publier : poussez un commit suivant qui ne modifie pas les workflows, ou créez l'étiquette depuis"
+            echo "un poste autorisé : \`git tag v$VERSION $GITHUB_SHA\` puis \`git push origin v$VERSION\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=Version non publiée::GitHub a refusé la publication de v$VERSION (voir le résumé du job). Les .exe sont dans les artefacts."

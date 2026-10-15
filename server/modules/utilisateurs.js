@@ -1,14 +1,47 @@
 'use strict';
 /**
  * Module Utilisateurs : comptes internes, hiérarchie (supérieur, niveau de profil),
- * rattachement aux secteurs, surcharges individuelles de droits.
+ * rattachement aux secteurs, surcharges individuelles de droits, état et réinitialisation
+ * de la double authentification.
  */
 const nom = 'Utilisateurs';
 
 function register(ctx) {
   const { router, db, HttpError, auth, perms } = ctx;
 
-  const clean = (u) => auth.cleanUser(u);
+  /** Fiche sans secret (mot de passe, clé et codes de double authentification), avec l'état de la double authentification. */
+  const clean = (u) => {
+    const c = auth.cleanUser(u);
+    if (c && ctx.deuxFacteurs) c.deuxFacteurs = Object.assign(c.deuxFacteurs, { exige: ctx.deuxFacteurs.exige(u) });
+    return c;
+  };
+
+  /**
+   * Portée : un utilisateur est visible s'il s'agit de soi, s'il n'est rattaché à aucun secteur ou s'il partage
+   * un secteur accessible (en modification, les sites en lecture seule sont exclus) ; le site choisi dans
+   * l'en-tête filtre en plus.
+   */
+  function visible(req, u, ecriture) {
+    if (!u) return false;
+    if (u.id === req.user.id) return true;
+    const ids = (u.secteurIds || []).map(Number);
+    if (req.perms.portee !== 'tous') {
+      const accessibles = new Set(ecriture ? req.perms.secteurIds : req.perms.secteurIds.concat(req.perms.secteurIdsLecture || []));
+      if (ids.length && !ids.some((s) => accessibles.has(s))) return false;
+    }
+    if (req.perms.siteFiltre) {
+      const site = new Set(req.perms.siteFiltre);
+      if (ids.length && !ids.some((x) => site.has(x)) && !(u.siteAcces || []).some((a) => site.has(Number(a.siteId)))) return false;
+    }
+    return true;
+  }
+
+  /** Utilisateur visible ou 404. */
+  function getVisible(req, id, ecriture) {
+    const u = db.get('users', id);
+    if (!u || !visible(req, u, ecriture)) throw new HttpError(404, 'Utilisateur introuvable');
+    return u;
+  }
 
   function validerUser(req, body, existant) {
     const out = {};
@@ -103,22 +136,10 @@ function register(ctx) {
   }
 
   // Liste (triable par secteur côté client ; on fournit tout ce qu'il faut)
-  router.get('/api/utilisateurs', async (req) => {
-    let rows = db.list('users');
-    if (req.perms.portee !== 'tous') {
-      const visibles = new Set(req.perms.secteurIds.concat(req.perms.secteurIdsLecture || []));
-      rows = rows.filter((u) => u.id === req.user.id || (u.secteurIds || []).length === 0 || (u.secteurIds || []).some((s) => visibles.has(Number(s))));
-    }
-    if (req.perms.siteFiltre) {
-      const site = new Set(req.perms.siteFiltre);
-      rows = rows.filter((u) => u.id === req.user.id || !(u.secteurIds || []).length || u.secteurIds.some((x) => site.has(Number(x))) || (u.siteAcces || []).some((a) => site.has(Number(a.siteId))));
-    }
-    return rows.map(clean);
-  }, { perm: ['utilisateurs', 'voir'] });
+  router.get('/api/utilisateurs', async (req) => db.list('users').filter((u) => visible(req, u, false)).map(clean), { perm: ['utilisateurs', 'voir'] });
 
   router.get('/api/utilisateurs/:id', async (req) => {
-    const u = db.get('users', req.params.id);
-    if (!u) throw new HttpError(404, 'Utilisateur introuvable');
+    const u = getVisible(req, req.params.id, false);
     const profil = db.get('profils', u.profilId);
     return Object.assign(clean(u), {
       permissionsEffectives: perms.effectivePermissions(db, u, profil, db.getConfig()),
@@ -144,8 +165,7 @@ function register(ctx) {
   }, { perm: ['utilisateurs', 'creer'] });
 
   router.put('/api/utilisateurs/:id', async (req) => {
-    const existant = db.get('users', req.params.id);
-    if (!existant) throw new HttpError(404, 'Utilisateur introuvable');
+    const existant = getVisible(req, req.params.id, true);
     const profilExistant = db.get('profils', existant.profilId);
     if (existant.id !== req.user.id && !perms.canManageUser(req.perms, profilExistant)) throw new HttpError(403, 'Vous ne pouvez pas modifier un utilisateur de niveau hiérarchique supérieur ou égal au vôtre');
     const body = req.body || {};
@@ -161,16 +181,16 @@ function register(ctx) {
       data.passwordHash = auth.hashPassword(body.password);
       data.doitChangerMdp = body.doitChangerMdp === undefined ? true : !!body.doitChangerMdp;
       if (existant.id !== req.user.id) ctx.sessions.destroyUser(existant.id);
+      if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(existant.id);
     }
     const u = db.update('users', existant.id, data);
-    if (u.actif === false) ctx.sessions.destroyUser(u.id);
+    if (u.actif === false) { ctx.sessions.destroyUser(u.id); if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(u.id); }
     ctx.audit(req, 'modification', 'users', u.id, `Utilisateur ${u.login}`);
     return clean(u);
   }, { perm: ['utilisateurs', 'modifier'] });
 
   router.delete('/api/utilisateurs/:id', async (req) => {
-    const existant = db.get('users', req.params.id);
-    if (!existant) throw new HttpError(404, 'Utilisateur introuvable');
+    const existant = getVisible(req, req.params.id, true);
     if (existant.id === req.user.id) throw new HttpError(400, 'Vous ne pouvez pas supprimer votre propre compte');
     if (!perms.canManageUser(req.perms, db.get('profils', existant.profilId))) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
     verifierDernierAdmin(existant, { actif: false });
@@ -179,33 +199,59 @@ function register(ctx) {
     if (reference) {
       db.update('users', existant.id, { actif: false, supprime: true });
       ctx.sessions.destroyUser(existant.id);
+      if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(existant.id);
       ctx.audit(req, 'desactivation', 'users', existant.id, `Utilisateur ${existant.login} (référencé, désactivé)`);
       return { ok: true, desactive: true };
     }
     db.remove('users', existant.id);
     for (const u of db.list('users', (x) => x.managerId === existant.id)) db.update('users', u.id, { managerId: null });
     ctx.sessions.destroyUser(existant.id);
+    if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(existant.id);
     ctx.audit(req, 'suppression', 'users', existant.id, `Utilisateur ${existant.login}`);
     return { ok: true };
   }, { perm: ['utilisateurs', 'supprimer'] });
 
   /** Réinitialisation du mot de passe par un gestionnaire. */
   router.post('/api/utilisateurs/:id/reinitialiser-mdp', async (req) => {
-    const existant = db.get('users', req.params.id);
-    if (!existant) throw new HttpError(404, 'Utilisateur introuvable');
+    const existant = getVisible(req, req.params.id, true);
     if (!perms.canManageUser(req.perms, db.get('profils', existant.profilId))) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
     const pwd = req.body && req.body.password ? String(req.body.password) : auth.genererMotDePasse();
     const err = auth.validerMotDePasse(pwd, db.getConfig(), { login: existant.login });
     if (err) throw new HttpError(400, err);
     db.update('users', existant.id, { passwordHash: auth.hashPassword(pwd), doitChangerMdp: true });
     ctx.sessions.destroyUser(existant.id);
+    if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(existant.id);
     ctx.audit(req, 'reinitialisation_mdp', 'users', existant.id, `Utilisateur ${existant.login}`);
     return { ok: true, motDePasse: pwd };
   }, { perm: ['utilisateurs', 'modifier'] });
 
+  /**
+   * Réinitialisation de la double authentification d'un utilisateur (téléphone perdu ou remplacé) par le
+   * pôle informatique : clé et codes de secours supprimés, sessions fermées ; l'utilisateur la configurera
+   * de nouveau (immédiatement à sa prochaine connexion si elle lui est imposée).
+   */
+  router.post('/api/utilisateurs/:id/2fa/reinitialiser', async (req) => {
+    const existant = getVisible(req, req.params.id, true);
+    if (existant.id === req.user.id) throw new HttpError(400, 'Pour votre propre compte, utilisez « Double authentification » dans le menu de votre compte');
+    if (!perms.canManageUser(req.perms, db.get('profils', existant.profilId))) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
+    const avant = existant.deuxFacteurs || {};
+    if (!avant.actif && !avant.secretEnAttente) throw new HttpError(400, 'La double authentification n\'est pas configurée pour cet utilisateur');
+    db.update('users', existant.id, { deuxFacteurs: { actif: false, reinitialiseLe: new Date().toISOString(), reinitialisePar: req.user.id }, codesSecours: [] });
+    ctx.sessions.destroyUser(existant.id);
+    if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(existant.id);
+    const exige = !!(ctx.deuxFacteurs && ctx.deuxFacteurs.exige(db.get('users', existant.id)));
+    ctx.audit(req, 'reinitialisation_double_auth', 'users', existant.id, `Utilisateur ${existant.login}${avant.actif ? '' : ' (activation en cours annulée)'}`);
+    ctx.notify(existant.id, {
+      titre: 'Double authentification réinitialisée',
+      message: `${ctx.nomUser(req.user.id)} a réinitialisé votre double authentification. ${exige ? 'Elle est obligatoire pour votre compte : vous la configurerez de nouveau à votre prochaine connexion.' : 'Vous pouvez la configurer de nouveau depuis le menu de votre compte › Double authentification.'}`,
+      lien: '', type: 'alerte',
+    });
+    return { ok: true, exige };
+  }, { perm: ['utilisateurs', 'modifier'] });
+
   /** Organigramme hiérarchique (arbre supérieur → subordonnés). */
   router.get('/api/utilisateurs-organigramme', async (req) => {
-    const users = db.list('users', (u) => u.actif !== false).map(clean);
+    const users = db.list('users', (u) => u.actif !== false && visible(req, u, false)).map(clean);
     const byId = new Map(users.map((u) => [u.id, Object.assign(u, { enfants: [] })]));
     const racines = [];
     for (const u of users) {

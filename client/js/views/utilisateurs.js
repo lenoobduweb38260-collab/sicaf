@@ -1,6 +1,7 @@
 /**
  * Vue Utilisateurs : comptes internes, hiérarchie (supérieur, niveau), secteurs,
- * surcharges individuelles de droits (« voit plus ou moins » que son profil).
+ * surcharges individuelles de droits (« voit plus ou moins » que son profil),
+ * état et réinitialisation de la double authentification.
  */
 (function () {
   'use strict';
@@ -16,6 +17,36 @@
   function peutModifier(u) {
     const p = ui.profil(u.profilId);
     return GMAO.can('utilisateurs', 'modifier') && (GMAO.estAdmin() || u.id === GMAO.user.id || !p || (!p.estAdmin && p.niveau > GMAO.perms.niveau));
+  }
+
+  /** Réinitialisation de la double authentification d'un autre compte (pôle informatique). */
+  function peutReinitialiserDeuxFacteurs(u) {
+    return GMAO.can('utilisateurs', 'modifier') && u.id !== GMAO.user.id && peutModifier(u) && !!(u.deuxFacteurs && u.deuxFacteurs.actif);
+  }
+
+  /** Badge d'état de la double authentification. */
+  function badgeDeuxFacteurs(u, detaille) {
+    const d = u.deuxFacteurs || {};
+    if (d.actif) {
+      return frag(ui.badge('Activée', '#16a34a', { titre: d.activeLe ? 'Depuis le ' + ui.formatDate(d.activeLe) : '' }),
+        detaille && d.activeLe ? el('span', { class: 'texte-2 texte-petit' }, ` depuis le ${ui.formatDate(d.activeLe)} · ${d.codesSecoursRestants} code(s) de secours restant(s)`) : null);
+    }
+    if (d.exige) return ui.badge('À activer (obligatoire)', '#f59e0b');
+    return detaille ? ui.badge('Désactivée', '#6b7280') : el('span', { class: 'texte-2' }, '—');
+  }
+
+  async function reinitialiserDeuxFacteurs(u, apres) {
+    const ok = await ui.confirm({
+      titre: 'Réinitialiser la double authentification',
+      message: `Réinitialiser la double authentification de ${nomComplet(u)} (téléphone perdu ou remplacé) ? Sa clé et ses codes de secours seront supprimés et ses sessions fermées. ${u.deuxFacteurs && u.deuxFacteurs.exige ? 'Elle lui étant imposée, il devra la configurer de nouveau à sa prochaine connexion.' : 'Il pourra la configurer de nouveau depuis le menu de son compte.'}`,
+      okLabel: 'Réinitialiser', danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.post(`/api/utilisateurs/${u.id}/2fa/reinitialiser`);
+      toast(`Double authentification de ${nomComplet(u)} réinitialisée`, 'succes');
+      if (apres) apres();
+    } catch (e) { erreur(e); }
   }
 
   let rafraichir = () => {};
@@ -130,6 +161,7 @@
             { label: 'Supérieur hiérarchique', valeur: u.managerId != null ? el('a', { href: '#', onclick: (ev) => { ev.preventDefault(); m.fermer(); afficherFiche(u.managerId); } }, ui.nomUser(u.managerId)) : '—' },
             { label: 'Subordonnés', valeur: (u.subordonnes || []).length ? u.subordonnes.map((s) => nomComplet(s)).join(', ') : '—' },
             { label: 'Dernière connexion', valeur: ui.formatDateHeure(u.derniereConnexion) }, { label: 'Créé le', valeur: ui.formatDateHeure(u.createdAt) },
+            { label: 'Double authentification', valeur: badgeDeuxFacteurs(u, true) },
             ...ui.champsPersoAffichage('utilisateurs', u),
           ], { colonnes: 2 }),
         ) },
@@ -139,6 +171,8 @@
         ) },
       ]).el,
       boutons: [
+        peutReinitialiserDeuxFacteurs(u) ? { label: 'Réinitialiser la double authentification', icone: 'profils', gauche: true, onClic: () => { m.fermer(); reinitialiserDeuxFacteurs(u, () => rafraichir()); } } : null,
+        u.id === GMAO.user.id ? { label: 'Ma double authentification', icone: 'profils', gauche: true, onClic: () => { m.fermer(); GMAO.ouvrirDoubleAuthentification(); } } : null,
         peutModifier(u) ? { label: 'Modifier', icone: 'modifier', classe: 'btn-primaire', onClic: () => { m.fermer(); ouvrirFormulaire(u, () => rafraichir()); } } : null,
         { label: 'Fermer' },
       ],
@@ -194,6 +228,7 @@
         { cle: 'secteurIds', label: 'Secteurs', rendu: (u) => (u.secteurIds || []).length ? el('div', null, u.secteurIds.map((s) => ui.secteur(s)).filter(Boolean).flatMap((s, i) => [i ? ' ' : null, ui.badge(s.nom, s.couleur, { contour: true })])) : el('span', { class: 'texte-2' }, 'Tous'), valeurTri: (u) => { const s = premierSecteur(u); return s ? (s.ordre || 0) : 999; } },
         cfg.afficherSuperieur !== false ? { cle: 'managerId', label: 'Supérieur', type: 'user' } : null,
         { cle: 'derniereConnexion', label: 'Dernière connexion', rendu: (u) => (u.derniereConnexion ? el('span', { title: ui.formatDateHeure(u.derniereConnexion) }, ui.relatif(u.derniereConnexion)) : el('span', { class: 'texte-2' }, 'jamais')), valeurTri: (u) => u.derniereConnexion || '' },
+        { cle: 'deuxFacteurs', label: 'Double auth.', rendu: (u) => badgeDeuxFacteurs(u, false), valeurTri: (u) => (u.deuxFacteurs && u.deuxFacteurs.actif ? 0 : (u.deuxFacteurs && u.deuxFacteurs.exige ? 1 : 2)), aligner: 'centre' },
         { cle: 'actif', label: 'Statut', rendu: (u) => (u.actif === false ? ui.badge('Désactivé', '#dc2626') : ui.badge('Actif', '#16a34a')), aligner: 'centre' },
       ].filter(Boolean);
 
@@ -205,6 +240,7 @@
         actions: [
           { icone: 'modifier', titre: 'Modifier', visible: peutModifier, onClic: (u) => ouvrirFormulaire(u, rafraichir) },
           { icone: 'cle', titre: 'Réinitialiser le mot de passe', visible: (u) => peutModifier(u) && u.id !== GMAO.user.id, onClic: reinitialiserMdp },
+          { icone: 'profils', titre: 'Réinitialiser la double authentification', visible: peutReinitialiserDeuxFacteurs, onClic: (u) => reinitialiserDeuxFacteurs(u, rafraichir) },
           { icone: 'supprimer', titre: 'Supprimer', classe: 'texte-danger', visible: (u) => GMAO.can('utilisateurs', 'supprimer') && u.id !== GMAO.user.id && peutModifier(u), onClic: supprimer },
         ],
       });

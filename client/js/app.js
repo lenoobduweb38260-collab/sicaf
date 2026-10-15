@@ -1,5 +1,6 @@
 /**
- * Noyau de l'application cliente : amorçage, connexion, navigation, droits, thème.
+ * Noyau de l'application cliente : amorçage, connexion (en deux étapes si la double authentification
+ * est active), navigation, droits, thème, enrôlement de la double authentification.
  *
  * Les vues s'enregistrent avec :
  *   GMAO.registerView('ot', { titre: 'Ordres de travail', rendu(container, { params, query }) { ... } });
@@ -21,6 +22,8 @@
 
   const GMAO = window.GMAO = {
     user: null, perms: null, config: {}, modules: [], refs: { users: [], secteurs: [], profils: [] }, catalogue: { modules: [], actions: {}, portees: {} }, version: '',
+    /** État de la double authentification du compte : { actif, activeLe, codesSecoursRestants, mode, exige, enrolementRequis }. */
+    deuxFacteurs: null,
     vues: {}, route: { module: null, params: [], query: {} },
     _badges: {}, _vueCourante: null,
 
@@ -58,6 +61,7 @@
       construireNavigation();
       appliquerTheme();
       if (rerendre) this.rendre();
+      if (GMAO.deuxFacteursRequis()) imposerEnrolement();
     },
     async refreshRefs() { return this.refresh(false); },
 
@@ -72,7 +76,8 @@
       afficherConnexion();
     },
 
-    ouvrirChangementMdp(force) {
+    /** Changement du mot de passe ; `apres` est appelé une fois le nouveau mot de passe enregistré. */
+    ouvrirChangementMdp(force, apres) {
       const f = ui.form({ colonnes: 1, champs: [
         force ? null : { nom: 'ancien', label: 'Mot de passe actuel', type: 'mdp', requis: true },
         { nom: 'nouveau', label: 'Nouveau mot de passe', type: 'mdp', requis: true, aide: (() => { const sc = GMAO.config.securite || {}; return `Au moins ${sc.longueurMinMdp || 10} caractères${sc.complexite !== false ? ', en mélangeant minuscules, majuscules, chiffres ou caractères spéciaux' : ''}.`; })() },
@@ -80,6 +85,7 @@
       ] });
       const m = ui.modal({
         titre: force ? 'Définissez votre mot de passe' : 'Changer mon mot de passe', taille: 'petite', fermable: !force,
+        onFermer: () => modalesImposees.delete(m),
         contenu: frag(force ? ui.alerte('Pour sécuriser votre compte, vous devez choisir un nouveau mot de passe avant de continuer.', 'info') : null, f.el),
         boutons: [force ? null : { label: 'Annuler' }, { label: 'Enregistrer', classe: 'btn-primaire', onClic: async () => {
           if (!f.valider()) return false;
@@ -87,8 +93,10 @@
           await api.post('/api/auth/mot-de-passe', { ancien: v.ancien, nouveau: v.nouveau });
           GMAO.user.doitChangerMdp = false;
           toast('Mot de passe modifié', 'succes');
+          if (apres) setTimeout(apres, 0);
         } }],
       });
+      if (force) modalesImposees.add(m);
       f.el.addEventListener('submit', (ev) => { ev.preventDefault(); m.pied.querySelector('.btn-primaire').click(); });
     },
 
@@ -116,6 +124,14 @@
       const vue = GMAO.vues[module];
       ui.fermerModales();
       ui.vider(contenu);
+      if (GMAO.deuxFacteursRequis()) {
+        // Double authentification imposée et pas encore activée : aucun écran avant l'enrôlement
+        const titre = app.querySelector('.entete-titre');
+        if (titre) titre.textContent = 'Double authentification';
+        contenu.appendChild(el('div', { class: 'vue' }, ui.vide('La double authentification est obligatoire pour votre compte : activez-la pour accéder à la GMAO.', 'cle'),
+          el('div', { class: 'texte-centre' }, ui.bouton('Activer la double authentification', { classe: 'btn-primaire', icone: 'cle', onClic: () => imposerEnrolement() }))));
+        return;
+      }
       document.querySelectorAll('.nav-item').forEach((a) => a.classList.toggle('actif', a.dataset.module === module));
       const titreEl = app.querySelector('.entete-titre');
       if (!vue || !GMAO.moduleVisible(module)) {
@@ -133,7 +149,11 @@
         if (r && typeof r.then === 'function') {
           conteneur.appendChild(ui.chargement());
           r.then((n) => { if (GMAO._vueCourante !== module || !conteneur.isConnected) return; const ch = conteneur.querySelector(':scope > .chargement'); if (ch) ch.remove(); if (n instanceof Node) conteneur.appendChild(n); })
-            .catch((e) => { const ch = conteneur.querySelector(':scope > .chargement'); if (ch) ch.remove(); conteneur.appendChild(ui.alerte('Erreur : ' + (e.message || e), 'danger')); console.error(e); });
+            .catch((e) => {
+              const ch = conteneur.querySelector(':scope > .chargement'); if (ch) ch.remove();
+              if (e && e.details && e.details.deuxFacteursRequis) { GMAO.refresh(true).catch(() => {}); return; } // obligation activée entre-temps
+              conteneur.appendChild(ui.alerte('Erreur : ' + (e.message || e), 'danger')); console.error(e);
+            });
         } else if (r instanceof Node) conteneur.appendChild(r);
       } catch (e) {
         conteneur.appendChild(ui.alerte('Erreur d\'affichage : ' + (e.message || e), 'danger'));
@@ -151,6 +171,7 @@
     GMAO.catalogue = data.catalogue || GMAO.catalogue;
     GMAO.refs = data.references || GMAO.refs;
     GMAO.version = data.version || '';
+    GMAO.deuxFacteurs = data.deuxFacteurs || null;
   }
 
   function hexToRgb(hex) {
@@ -188,14 +209,17 @@
   }
 
   // ----- Page de connexion -----------------------------------------------
-  async function afficherConnexion() {
+  /** Page de connexion ; `message` : erreur à afficher d'emblée (ex. délai de saisie du code dépassé). */
+  async function afficherConnexion(message) {
     const app = document.getElementById('app');
+    fermerModalesImposees();
     let infos = { societe: {}, general: {} };
     try { infos = await api.get('/api/auth/infos'); } catch (e) { /* serveur injoignable */ }
     GMAO.config = { societe: infos.societe, general: infos.general };
     appliquerTheme();
     ui.vider(app);
-    const err = el('div', { class: 'connexion-erreur masque' });
+    const err = el('div', { class: 'connexion-erreur' + (message ? '' : ' masque') }, message || '');
+    const zone = el('div');
     const f = ui.form({ colonnes: 1, champs: [
       { nom: 'login', label: 'Identifiant', type: 'texte', requis: true, placeholder: 'ex. admin' },
       { nom: 'password', label: 'Mot de passe', type: 'mdp', requis: true },
@@ -208,6 +232,7 @@
       btn.disabled = true; err.classList.add('masque');
       try {
         const data = await api.post('/api/auth/login', f.valeurs(), { silent401: true });
+        if (data && data.deuxFacteurs === true && data.jeton) { etapeCode(zone, err, data.jeton); return; }
         await demarrer(data);
       } catch (e) {
         err.textContent = e.message; err.classList.remove('masque');
@@ -217,9 +242,82 @@
     app.appendChild(el('div', { class: 'connexion' }, el('div', { class: 'connexion-carte' },
       el('div', { class: 'connexion-logo' }, soc.logo ? el('img', { src: soc.logo, alt: soc.nom }) : el('div', { class: 'connexion-titre' }, soc.nom || 'GMAO'), el('div', { class: 'connexion-sous-titre' }, soc.slogan || 'Gestion de Maintenance Assistée par Ordinateur')),
       (infos.general || {}).messageAccueil ? el('div', { class: 'connexion-accueil' }, infos.general.messageAccueil) : null,
-      err, f.el,
+      err, zone,
       el('div', { class: 'connexion-pied' }, `GMAO ${infos.version ? 'v' + infos.version : ''}${infos.premierDemarrage ? ' · Première connexion : admin / admin (mot de passe à changer immédiatement)' : ''}`))));
+    zone.appendChild(f.el);
     setTimeout(() => { const i = f.el.querySelector('input'); if (i) i.focus(); }, 50);
+  }
+
+  /** Champ de saisie d'un code de vérification (6 chiffres) ou, en mode secours, d'un code de secours. */
+  function champCode(id, onComplet) {
+    const input = el('input', { type: 'text', id, name: 'code', spellcheck: 'false', autocapitalize: 'off', style: { fontFamily: 'Consolas, "Courier New", monospace', fontSize: '22px', textAlign: 'center' } });
+    input.definirMode = (secours) => {
+      input.dataset.mode = secours ? 'secours' : 'application';
+      input.value = '';
+      input.setAttribute('inputmode', secours ? 'text' : 'numeric');
+      input.setAttribute('autocomplete', secours ? 'off' : 'one-time-code');
+      input.setAttribute('maxlength', secours ? '11' : '6');
+      input.setAttribute('placeholder', secours ? 'xxxxx-xxxxx' : '000000');
+      if (secours) input.removeAttribute('pattern'); else input.setAttribute('pattern', '[0-9]*');
+      input.style.letterSpacing = secours ? '2px' : '8px';
+    };
+    input.definirMode(false);
+    input.addEventListener('input', () => {
+      if (input.dataset.mode === 'secours') return;
+      const v = input.value.replace(/\D/g, '').slice(0, 6);
+      if (v !== input.value) input.value = v;
+      if (v.length === 6 && onComplet) onComplet(v);
+    });
+    return input;
+  }
+
+  /** Seconde étape de la connexion : code de l'application d'authentification ou code de secours. */
+  function etapeCode(zone, err, jeton) {
+    ui.vider(zone);
+    err.classList.add('masque');
+    let secours = false;
+    let envoi = false;
+    const input = champCode('f_code', () => soumettre());
+    const label = el('label', { for: 'f_code' }, 'Code de vérification');
+    const aide = el('div', { class: 'aide' });
+    const btn = el('button', { class: 'btn btn-primaire', type: 'submit' }, 'Valider');
+    const lienSecours = el('button', { type: 'button', class: 'btn btn-lien btn-sm', style: { width: 'auto' } });
+    const lienRetour = el('button', { type: 'button', class: 'btn btn-lien btn-sm', style: { width: 'auto' }, onclick: () => afficherConnexion() }, 'Changer d\'identifiant');
+    const majMode = () => {
+      input.definirMode(secours);
+      label.textContent = secours ? 'Code de secours' : 'Code de vérification';
+      aide.textContent = secours
+        ? 'Saisissez l\'un de vos codes de secours (10 caractères). Chaque code ne peut servir qu\'une seule fois.'
+        : 'Code à 6 chiffres affiché par votre application d\'authentification (Microsoft Authenticator, Google Authenticator, FreeOTP…).';
+      lienSecours.textContent = secours ? 'Utiliser le code de l\'application' : 'Utiliser un code de secours';
+      input.focus();
+    };
+    lienSecours.addEventListener('click', () => { secours = !secours; majMode(); });
+    async function soumettre() {
+      if (envoi) return;
+      const code = input.value.trim();
+      if (!code) { input.focus(); return; }
+      envoi = true; btn.disabled = true; err.classList.add('masque');
+      try {
+        const data = await api.post('/api/auth/login/code', { jeton, code }, { silent401: true });
+        await demarrer(data);
+        const cnx = data.connexion || {};
+        if (cnx.codeSecours) toast(`Connexion avec un code de secours : il vous en reste ${cnx.codesSecoursRestants}.${cnx.codesSecoursRestants <= 2 ? ' Générez-en de nouveaux (menu de votre compte › Double authentification).' : ''}`, cnx.codesSecoursRestants <= 2 ? 'alerte' : 'info', 9000);
+      } catch (e) {
+        if (e && e.details && e.details.recommencer) { afficherConnexion(e.message); return; }
+        err.textContent = e.message; err.classList.remove('masque');
+        input.value = ''; input.focus();
+      } finally { envoi = false; btn.disabled = false; }
+    }
+    const form = el('form', { class: 'formulaire colonnes-1', novalidate: true },
+      el('div', { class: 'champ pleine-largeur' }, label, input, aide),
+      el('div', { class: 'champ pleine-largeur' }, btn),
+      el('div', { style: { display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '6px' } }, lienSecours, lienRetour));
+    form.addEventListener('submit', (ev) => { ev.preventDefault(); soumettre(); });
+    zone.appendChild(el('div', { class: 'inline texte-gras', style: { fontSize: '16px', marginBottom: '6px' } }, icone('cle'), 'Vérification en deux étapes'));
+    zone.appendChild(el('p', { class: 'texte-2 texte-petit', style: { marginTop: '0' } }, 'Mot de passe correct. Ouvrez votre application d\'authentification et saisissez le code affiché pour « GMAO SICAF ».'));
+    zone.appendChild(form);
+    majMode();
   }
 
   // ----- Application connectée ------------------------------------------
@@ -246,7 +344,10 @@
     construireNavigation();
     document.addEventListener('click', fermerMenus);
     GMAO.rendre();
-    if (GMAO.user.doitChangerMdp && (GMAO.config.securite || {}).forcerChangementMdpInitial !== false) GMAO.ouvrirChangementMdp(true);
+    // Écrans imposés : nouveau mot de passe, puis enrôlement de la double authentification si elle est obligatoire
+    const suite = () => { if (GMAO.deuxFacteursRequis()) imposerEnrolement(); };
+    if (GMAO.user.doitChangerMdp && (GMAO.config.securite || {}).forcerChangementMdpInitial !== false) GMAO.ouvrirChangementMdp(true, suite);
+    else suite();
     majNotifications();
     if (GMAO._notifTimer) clearInterval(GMAO._notifTimer);
     GMAO._notifTimer = setInterval(majNotifications, 60000);
@@ -315,6 +416,8 @@
       el('div', { class: 'menu-sep' }),
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); afficherMonCompte(); } }, icone('utilisateur'), 'Mon compte'),
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.ouvrirChangementMdp(false); } }, icone('cle'), 'Changer mon mot de passe'),
+      el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.ouvrirDoubleAuthentification(); } }, icone('profils'), 'Double authentification',
+        el('span', { class: 'texte-2 texte-petit', style: { marginLeft: 'auto' } }, GMAO.deuxFacteurs && GMAO.deuxFacteurs.actif ? 'activée' : 'désactivée')),
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.setTheme(theme === 'sombre' ? 'clair' : 'sombre'); } }, icone(theme === 'sombre' ? 'soleil' : 'lune'), theme === 'sombre' ? 'Thème clair' : 'Thème sombre'),
       typeof GMAO.ouvrirMonDossierRH === 'function' ? el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.ouvrirMonDossierRH(); } }, icone('rh'), 'Mon dossier RH') : null,
       window.gmaoBureau ? el('button', { class: 'menu-item', onclick: () => { fermerMenus(); window.gmaoBureau.verifierMisesAJour(); } }, icone('rafraichir'), 'Rechercher les mises à jour') : null,
@@ -338,10 +441,226 @@
         { label: 'Secteurs', valeur: (u.secteurIds || []).length ? u.secteurIds.map((s) => ui.nomSecteur(s)).join(', ') : 'Tous' },
         { label: 'Supérieur hiérarchique', valeur: u.managerId != null ? ui.nomUser(u.managerId) : '—' },
         { label: 'Dernière connexion', valeur: ui.formatDateHeure(u.derniereConnexion) },
+        { label: 'Double authentification', valeur: frag(badgeDeuxFacteurs(GMAO.deuxFacteurs), ' ', el('button', { type: 'button', class: 'btn btn-lien btn-sm', onclick: () => GMAO.ouvrirDoubleAuthentification() }, 'Gérer')) },
       ], { colonnes: 2 }),
       el('h3', { class: 'mt' }, 'Mes droits'),
       el('div', { class: 'tableau-conteneur' }, el('table', { class: 'tableau tableau-compact' }, el('thead', null, el('tr', null, el('th', null, 'Module'), el('th', null, 'Actions autorisées'))), el('tbody', null, mods)))
     ), boutons: [{ label: 'Fermer' }] });
+  }
+
+  // ----- Double authentification -------------------------------------------
+  const MODULES_SENSIBLES = ['systeme', 'utilisateurs', 'profils', 'configuration'];
+  /** Enrôlement imposé (obligation configurée et double authentification non activée). */
+  GMAO.deuxFacteursRequis = () => !!(GMAO.user && GMAO.deuxFacteurs && GMAO.deuxFacteurs.enrolementRequis);
+  /** Compte concerné par l'obligation « comptes sensibles » (même règle que le serveur). */
+  GMAO.compteSensible = () => GMAO.estAdmin() || MODULES_SENSIBLES.some((m) => GMAO.can(m, 'modifier'));
+  /** Gestion de sa propre double authentification (activation, codes de secours, désactivation). */
+  GMAO.ouvrirDoubleAuthentification = () => {
+    if (GMAO.deuxFacteursRequis()) return imposerEnrolement();
+    if (GMAO.deuxFacteurs && GMAO.deuxFacteurs.actif) return afficherEtatDeuxFacteurs();
+    return enrolerDeuxFacteurs(false).then((active) => { if (active) GMAO.refresh(false).catch(erreur); });
+  };
+
+  function badgeDeuxFacteurs(etat) {
+    if (etat && etat.actif) return frag(ui.badge('Activée', '#16a34a'), etat.activeLe ? el('span', { class: 'texte-2 texte-petit' }, ` depuis le ${ui.formatDate(etat.activeLe)}`) : null);
+    if (etat && etat.exige) return ui.badge('Obligatoire, à activer', '#f59e0b');
+    return ui.badge('Désactivée', '#6b7280');
+  }
+
+  let enrolementEnCours = false;
+  function imposerEnrolement() {
+    if (enrolementEnCours) return;
+    enrolementEnCours = true;
+    enrolerDeuxFacteurs(true).then((issue) => {
+      enrolementEnCours = false;
+      if (issue === 'deconnexion' || !GMAO.user) return;
+      GMAO.refresh(true).catch(erreur);
+    });
+  }
+
+  /** Fenêtres imposées (mot de passe initial, enrôlement) : fermées lorsque la session se termine. */
+  const modalesImposees = new Set();
+  function fermerModalesImposees() { modalesImposees.forEach((m) => m.fermer()); modalesImposees.clear(); }
+
+  /** Champ de mot de passe ou de code dans un petit formulaire (Entrée = bouton principal de la modale). */
+  function formulaireConfirmation(m, avecCode) {
+    const f = ui.form({ colonnes: 1, champs: [
+      { nom: 'motDePasse', label: 'Mot de passe actuel', type: 'mdp', requis: true },
+      avecCode ? { nom: 'code', label: 'Code de l\'application ou code de secours', type: 'texte', requis: true, placeholder: '000000' } : null,
+    ] });
+    const mdp = f.controles.motDePasse.input;
+    mdp.setAttribute('autocomplete', 'current-password');
+    if (avecCode) {
+      const c = f.controles.code.input;
+      c.setAttribute('autocomplete', 'one-time-code');
+      c.setAttribute('maxlength', '11');
+      c.setAttribute('spellcheck', 'false');
+    }
+    f.el.addEventListener('submit', (ev) => { ev.preventDefault(); const b = m.pied.querySelector('.btn-primaire, .btn-danger'); if (b) b.click(); });
+    return f;
+  }
+
+  /** Liste des codes de secours avec impression, téléchargement et copie. */
+  function blocCodesSecours(codes) {
+    const login = GMAO.user ? GMAO.user.login : '';
+    const texte = ['GMAO SICAF — codes de secours de la double authentification', `Compte : ${login}`, `Générés le ${ui.formatDateHeure(new Date())}`, '',
+      ...codes.map((c, i) => `${String(i + 1).padStart(2, ' ')}. ${c}`), '', 'Chaque code ne peut être utilisé qu\'une seule fois.', 'Conservez cette liste en lieu sûr, à l\'écart de votre téléphone.'].join('\r\n');
+    const grille = el('ol', { style: { columns: '2', columnGap: '28px', fontFamily: 'Consolas, "Courier New", monospace', fontSize: '16px', margin: '10px 0', paddingLeft: '28px' } },
+      codes.map((c) => el('li', { style: { margin: '4px 0', userSelect: 'all' } }, c)));
+    const imprimer = () => {
+      const html = `<p>Compte : <strong>${ui.esc(login)}</strong></p><p>Chaque code ne peut être utilisé qu'une seule fois, à la place du code de l'application d'authentification. Conservez cette feuille en lieu sûr, à l'écart de votre téléphone.</p>`
+        + `<ol style="font-family:Consolas,'Courier New',monospace;font-size:18px;line-height:1.9">${codes.map((c) => `<li>${ui.esc(c)}</li>`).join('')}</ol>`
+        + '<p><button type="button" data-imprimer>Imprimer</button></p>';
+      ui.imprimer('Codes de secours — double authentification', html);
+    };
+    const copier = async () => {
+      try { await navigator.clipboard.writeText(texte); toast('Codes copiés dans le presse-papiers', 'succes'); } catch (e) {
+        const sel = window.getSelection(); const r = document.createRange(); r.selectNodeContents(grille); sel.removeAllRanges(); sel.addRange(r);
+        toast('Copie automatique impossible : les codes sont sélectionnés, utilisez Ctrl+C', 'info');
+      }
+    };
+    return el('div', { class: 'codes-secours' },
+      grille,
+      el('div', { class: 'barre-outils' },
+        ui.bouton('Imprimer', { icone: 'imprimer', onClic: imprimer }),
+        ui.bouton('Télécharger (.txt)', { icone: 'export', onClic: () => ui.telecharger(`codes-secours-gmao-${login}.txt`, texte, 'text/plain;charset=utf-8') }),
+        ui.bouton('Copier', { icone: 'copier', onClic: copier })));
+  }
+
+  /**
+   * Enrôlement en trois étapes : confirmation du mot de passe, QR code (et clé à saisir manuellement)
+   * avec vérification d'un premier code, puis affichage des codes de secours.
+   * @param {boolean} force fenêtre impossible à fermer (double authentification obligatoire)
+   * @returns {Promise<boolean|'deconnexion'>} vrai si la double authentification a été activée
+   */
+  function enrolerDeuxFacteurs(force) {
+    return new Promise((resolve) => {
+      let active = false;
+      let deconnexion = false;
+      const m = ui.modal({ titre: 'Activer la double authentification', fermable: !force, contenu: el('div'), onFermer: () => { modalesImposees.delete(m); resolve(deconnexion ? 'deconnexion' : active); } });
+      if (force) modalesImposees.add(m);
+      const corps = (...enfants) => { ui.vider(m.corps); enfants.forEach((x) => { if (x) m.corps.appendChild(x); }); };
+      const quitter = force ? { label: 'Se déconnecter', icone: 'deconnexion', gauche: true, onClic: () => { deconnexion = true; setTimeout(() => GMAO.deconnexion(), 0); } } : { label: 'Annuler' };
+
+      function etapeMotDePasse() {
+        m.setTitre('Activer la double authentification');
+        const f = formulaireConfirmation(m, false);
+        corps(
+          force ? ui.alerte('La double authentification est obligatoire pour votre compte : activez-la pour accéder à la GMAO.', 'alerte') : null,
+          el('p', null, 'En plus de votre mot de passe, un code à 6 chiffres généré par une application de votre téléphone vous sera demandé à chaque connexion. Même si votre mot de passe était découvert, votre compte resterait protégé.'),
+          el('ol', { class: 'texte-petit' },
+            el('li', null, 'Installez sur votre téléphone une application d\'authentification : Microsoft Authenticator, Google Authenticator ou FreeOTP.'),
+            el('li', null, 'Confirmez votre mot de passe ci-dessous.'),
+            el('li', null, 'Scannez le QR code affiché (ou saisissez la clé), puis entrez le code proposé par l\'application.')),
+          f.el);
+        m.setBoutons([quitter, { label: 'Continuer', classe: 'btn-primaire', icone: 'fleche_droite', onClic: async () => {
+          if (!f.valider()) return false;
+          const p = await api.post('/api/auth/2fa/preparer', { motDePasse: f.valeurs().motDePasse });
+          etapeQrCode(p);
+          return false;
+        } }]);
+        setTimeout(() => f.controles.motDePasse.input.focus(), 30);
+      }
+
+      function etapeQrCode(p) {
+        m.setTitre('Scannez le QR code');
+        let qr = null;
+        try { qr = window.QRCode ? window.QRCode.element(p.uri, { taille: 216, titre: 'QR code d\'enrôlement GMAO SICAF' }) : null; } catch (e) { qr = null; }
+        const input = champCode('f_code_activation', () => { const b = m.pied.querySelector('.btn-primaire'); if (b && !b.disabled) b.click(); });
+        const form = el('form', { class: 'formulaire colonnes-1', novalidate: true },
+          el('div', { class: 'champ pleine-largeur' }, el('label', { for: 'f_code_activation' }, 'Code affiché par l\'application'), input));
+        form.addEventListener('submit', (ev) => { ev.preventDefault(); const b = m.pied.querySelector('.btn-primaire'); if (b) b.click(); });
+        corps(el('div', { class: 'grille grille-2', style: { alignItems: 'start', gap: '20px' } },
+          el('div', { class: 'texte-centre' },
+            qr ? el('div', { class: 'qr-enrolement', style: { display: 'inline-block', background: '#ffffff', padding: '8px', borderRadius: '8px', border: '1px solid var(--bordure)' } }, qr)
+              : ui.alerte('QR code indisponible : saisissez la clé manuellement.', 'info'),
+            el('div', { class: 'texte-2 texte-petit mt' }, `${p.emetteur} · ${p.compte}`)),
+          el('div', null,
+            el('p', { style: { marginTop: '0' } }, 'Dans l\'application, ajoutez un compte puis scannez ce QR code.'),
+            el('p', { class: 'texte-petit texte-2' }, 'Impossible de scanner ? Choisissez « Saisir une clé » (compte « basé sur le temps ») et recopiez :'),
+            el('div', { class: 'cle-manuelle', style: { fontFamily: 'Consolas, "Courier New", monospace', fontSize: '16px', letterSpacing: '1px', padding: '8px 10px', background: 'var(--fond)', border: '1px dashed var(--bordure-2)', borderRadius: '6px', userSelect: 'all', wordBreak: 'break-word' } }, p.cleManuelle),
+            el('div', { class: 'texte-petit texte-2 mt' }, `Nom du compte : ${p.emetteur} (${p.compte}) · ${p.chiffres} chiffres · toutes les ${p.periode} secondes`),
+            el('div', { class: 'mt' }, form))));
+        m.setBoutons([{ label: 'Retour', icone: 'fleche_gauche', onClic: () => { etapeMotDePasse(); return false; } }, { label: 'Activer', classe: 'btn-primaire', icone: 'check', onClic: async () => {
+          const code = input.value.trim();
+          if (!/^\d{6}$/.test(code)) { toast('Saisissez le code à 6 chiffres affiché par l\'application', 'alerte'); input.focus(); return false; }
+          try {
+            const r = await api.post('/api/auth/2fa/activer', { code });
+            active = true;
+            etapeCodesSecours(r.codesSecours);
+          } catch (e) { input.value = ''; input.focus(); throw e; }
+          return false;
+        } }]);
+        setTimeout(() => input.focus(), 30);
+      }
+
+      function etapeCodesSecours(codes) {
+        m.setTitre('Codes de secours');
+        const cb = el('input', { type: 'checkbox', id: 'f_codes_conserves' });
+        corps(
+          ui.alerte('La double authentification est activée. Les autres postes connectés avec votre compte ont été déconnectés.', 'ok'),
+          el('p', null, 'Si vous perdez votre téléphone, ces codes de secours vous permettront de vous connecter. Chacun ne fonctionne qu\'une seule fois. ', el('strong', null, 'Ils ne seront plus jamais affichés : imprimez-les ou enregistrez-les maintenant.')),
+          blocCodesSecours(codes),
+          el('label', { class: 'inline mt', for: 'f_codes_conserves' }, cb, 'J\'ai conservé mes codes de secours en lieu sûr'));
+        m.setBoutons([{ label: 'Terminer', classe: 'btn-primaire', icone: 'check', onClic: () => {
+          if (!cb.checked) { toast('Confirmez d\'abord que vous avez conservé vos codes de secours', 'alerte'); return false; }
+          toast('Double authentification activée', 'succes');
+          return true;
+        } }]);
+      }
+
+      etapeMotDePasse();
+    });
+  }
+
+  /** Double authentification active : état, nouveaux codes de secours, désactivation. */
+  function afficherEtatDeuxFacteurs() {
+    const etat = GMAO.deuxFacteurs || {};
+    const restants = etat.codesSecoursRestants || 0;
+    const m = ui.modal({ titre: 'Double authentification', contenu: frag(
+      ui.details([
+        { label: 'État', valeur: badgeDeuxFacteurs(etat) },
+        { label: 'Codes de secours restants', valeur: el('span', { class: restants <= 2 ? 'texte-danger texte-gras' : '' }, String(restants)) },
+        { label: 'Règle de l\'entreprise', valeur: etat.exige ? 'Obligatoire pour votre compte' : 'Facultative pour votre compte' },
+      ], { colonnes: 1 }),
+      restants <= 2 ? ui.alerte('Il vous reste peu de codes de secours : générez-en de nouveaux.', 'alerte') : null,
+      el('p', { class: 'texte-2 texte-petit mt' }, 'Nouveau téléphone ? Désactivez puis réactivez la double authentification pour scanner un nouveau QR code. En cas de perte du téléphone et des codes de secours, contactez le pôle informatique.')),
+    boutons: [
+      { label: 'Désactiver', classe: 'btn-danger', gauche: true, icone: 'fermer', onClic: () => { m.fermer(); desactiverDeuxFacteurs(); } },
+      { label: 'Nouveaux codes de secours', icone: 'rafraichir', onClic: () => { m.fermer(); regenererCodesSecours(); } },
+      { label: 'Fermer' },
+    ] });
+  }
+
+  function regenererCodesSecours() {
+    const m = ui.modal({ titre: 'Nouveaux codes de secours', contenu: el('div') });
+    const f = formulaireConfirmation(m, true);
+    m.corps.appendChild(frag(el('p', null, 'Les codes de secours actuels deviendront inutilisables. Confirmez votre identité :'), f.el));
+    m.setBoutons([{ label: 'Annuler' }, { label: 'Générer', classe: 'btn-primaire', onClic: async () => {
+      if (!f.valider()) return false;
+      const r = await api.post('/api/auth/2fa/codes-secours', f.valeurs());
+      ui.vider(m.corps);
+      m.corps.appendChild(frag(ui.alerte('Nouveaux codes générés : les anciens ne fonctionnent plus. Ils ne seront plus affichés.', 'ok'), blocCodesSecours(r.codesSecours)));
+      m.setBoutons([{ label: 'Fermer', classe: 'btn-primaire' }]);
+      GMAO.refresh(false).catch(() => {});
+      return false;
+    } }]);
+  }
+
+  function desactiverDeuxFacteurs() {
+    const etat = GMAO.deuxFacteurs || {};
+    const m = ui.modal({ titre: 'Désactiver la double authentification', contenu: el('div') });
+    const f = formulaireConfirmation(m, true);
+    m.corps.appendChild(frag(
+      etat.exige ? ui.alerte('La double authentification est obligatoire pour votre compte : vous devrez la réactiver immédiatement (par exemple avec votre nouveau téléphone).', 'alerte') : ui.alerte('Votre compte ne sera plus protégé que par votre mot de passe.', 'alerte'),
+      f.el));
+    m.setBoutons([{ label: 'Annuler' }, { label: 'Désactiver', classe: 'btn-danger', onClic: async () => {
+      if (!f.valider()) return false;
+      await api.post('/api/auth/2fa/desactiver', f.valeurs());
+      toast('Double authentification désactivée', 'succes');
+      await GMAO.refresh(false); // impose aussitôt un nouvel enrôlement si elle est obligatoire
+      return true;
+    } }]);
   }
 
   // ----- Notifications ----------------------------------------------------
@@ -354,7 +673,10 @@
       if (!btn) return;
       let c = btn.querySelector('.notif-compteur');
       if (notifs.nonLues) { if (!c) { c = el('span', { class: 'notif-compteur' }); btn.appendChild(c); } c.textContent = String(notifs.nonLues); } else if (c) c.remove();
-    } catch (e) { /* silencieux */ }
+    } catch (e) {
+      // Double authentification rendue obligatoire pendant la session : enrôlement imposé
+      if (e && e.details && e.details.deuxFacteursRequis && !GMAO.deuxFacteursRequis()) GMAO.refresh(true).catch(() => {});
+    }
   }
   function basculerNotifications() {
     const existant = document.querySelector('.notif-panneau');

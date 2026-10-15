@@ -4,20 +4,24 @@
  *
  * - Aucun prérequis : le moteur Node.js est intégré à l'exécutable, aucune fenêtre CMD.
  * - Mode « serveur » : le serveur GMAO tourne DANS l'application (données dans
- *   %APPDATA%\GMAO SICAF\data ou un dossier choisi) ; avec le partage réseau, les autres
- *   postes s'y connectent (application en mode client ou navigateur).
- * - Mode « client » : l'application ouvre la GMAO hébergée sur un autre poste.
+ *   %APPDATA%\GMAO SICAF\data ou un dossier choisi). Avec le partage réseau, il fonctionne en
+ *   HTTPS avec un certificat généré sur ce poste (dossier des données › tls) ; la fenêtre locale
+ *   n'accepte que ce certificat et les autres postes s'y connectent par empreinte confirmée.
+ * - Mode « client » : l'application ouvre la GMAO hébergée sur un autre poste. À la première
+ *   connexion chiffrée, le pôle informatique confirme l'empreinte du certificat du serveur ;
+ *   ensuite, tout autre certificat bloque la connexion (protection contre l'usurpation du serveur).
  * - Icône dans la zone de notification, démarrage avec Windows, instance unique.
  * - Mises à jour automatiques (GitHub Releases, dossier réseau ou adresse web) : l'installateur
  *   est téléchargé, vérifié (SHA-256) puis installé en silence, et l'application redémarre.
  */
-const { app, BrowserWindow, Menu, Tray, shell, dialog, ipcMain, nativeImage, Notification, net } = require('electron');
+const { app, BrowserWindow, Menu, Tray, shell, dialog, ipcMain, nativeImage, Notification, net, session, clipboard } = require('electron');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
-const { Parametres } = require('./parametres');
+const { Parametres, normaliserUrl } = require('./parametres');
 const { creerGestionnaire } = require('./miseajour');
 const { hashPassword, verifyPassword } = require('../server/auth');
+const tlsGmao = require('../server/tls');
 
 const NOM = 'GMAO SICAF';
 const ICONE = path.join(__dirname, 'icon.png');
@@ -27,9 +31,20 @@ const PKG = (() => { try { return require('../package.json'); } catch (e) { retu
 const DEPOT_DEFAUT = (PKG.gmao && PKG.gmao.depotMisesAJour) || '';
 const PORTABLE = !!process.env.PORTABLE_EXECUTABLE_FILE;
 const DEMARRAGE_CACHE = process.argv.includes('--cache');
+const LONGUEUR_MIN_CODE = 8;
+const MESSAGE_USURPATION = 'Le serveur GMAO présente un certificat différent de celui confirmé par le pôle informatique. '
+  + 'La connexion est bloquée car il peut s\'agir d\'une usurpation du serveur. Ne saisissez aucun mot de passe et prévenez le pôle informatique.';
+const MESSAGE_DECLASSEMENT = 'Ce serveur répond sans chiffrement alors qu\'une connexion chiffrée a été confirmée pour ce poste. '
+  + 'La connexion est bloquée (possible usurpation du serveur). Prévenez le pôle informatique.';
+const MESSAGE_NON_CHIFFRE = 'Les mots de passe et les données circulent en clair sur le réseau. '
+  + 'Mettez à jour l\'application sur le poste serveur et activez le partage réseau pour bénéficier du chiffrement.';
 
 let parametres = null;
 let serveur = null;        // application GMAO intégrée (mode serveur)
+let ecoute = null;         // écoute réseau du serveur partagé (HTTPS + redirection des requêtes HTTP)
+let certificatLocal = null; // certificat du serveur intégré partagé { empreinte, empreinteCle, … }
+let epinglage = null;      // { hote, empreinte, empreinteCle } : seul certificat accepté pour ce nom d'hôte
+let dernierRefus = 0;      // horodatage du dernier certificat refusé (alerte affichée une seule fois)
 let urlApplication = '';   // adresse chargée dans la fenêtre principale
 let fenetre = null;        // fenêtre principale
 let fenetreAssistant = null;
@@ -39,6 +54,8 @@ let infoBulleMontree = false;
 let majEnCours = false;
 let minuterieMaj = null;
 let assistantDeverrouille = false; // code du pôle informatique saisi pour la fenêtre de paramètres ouverte
+let echecsCode = 0;
+let fileCode = Promise.resolve();
 
 // ----- Instance unique -----------------------------------------------------------------
 const VERROU = app.requestSingleInstanceLock();
@@ -49,6 +66,7 @@ app.setAppUserModelId('fr.sicaf.gmao');
 app.userAgentFallback = `${app.userAgentFallback || 'Mozilla/5.0'} GMAO-SICAF-Bureau/${app.getVersion()}`;
 
 function journal(...a) { try { console.log(new Date().toISOString(), ...a); } catch (e) { /* ignore */ } }
+const attendre = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function dossierDonnees() {
   const d = parametres.valeurs.serveur.dossierDonnees;
@@ -64,21 +82,66 @@ function adressesReseau() {
   return out;
 }
 
+function hoteDe(url) {
+  try { return new URL(url).hostname.replace(/^\[|\]$/g, '').toLowerCase(); } catch (e) { return ''; }
+}
+
+/** Même poste serveur (nom, port et chemin) pour deux adresses, quel que soit le protocole. */
+function memeServeur(a, b) {
+  try {
+    const x = new URL(a);
+    const y = new URL(b);
+    const port = (u) => u.port || (u.protocol === 'https:' ? '443' : '80');
+    return x.hostname.toLowerCase() === y.hostname.toLowerCase() && port(x) === port(y) && x.pathname === y.pathname;
+  } catch (e) { return false; }
+}
+
+function portEcoute() {
+  if (ecoute) return ecoute.adresse.port;
+  return serveur && serveur.server.address() ? serveur.server.address().port : parametres.valeurs.serveur.port;
+}
+
+function partageActif() {
+  return parametres.valeurs.mode === 'serveur' && parametres.valeurs.serveur.partageReseau;
+}
+
+/** Empreinte à afficher : certificat du serveur intégré, ou empreinte confirmée du serveur distant. */
+function empreinteAffichee() {
+  if (parametres.valeurs.mode === 'serveur') return certificatLocal ? certificatLocal.empreinte : '';
+  return epinglage ? epinglage.empreinte : '';
+}
+
 // ----- Serveur intégré -------------------------------------------------------------------
 async function demarrerServeur() {
   const { createApp } = require('../server/server');
   const p = parametres.valeurs.serveur;
-  const hote = p.partageReseau ? '0.0.0.0' : '127.0.0.1';
+  if (p.partageReseau) {
+    // Partage réseau : HTTPS obligatoire, certificat du poste créé ou renouvelé automatiquement
+    certificatLocal = tlsGmao.chargerOuCreer(dossierDonnees(), { log: journal });
+    serveur = createApp({ dataDir: dossierDonnees(), log: journal, bureau: true, tls: { key: certificatLocal.cle, cert: certificatLocal.certificat } });
+    try {
+      ecoute = await tlsGmao.ecouterMixte(serveur.server, p.port, '0.0.0.0');
+    } catch (e) {
+      try { await serveur.stop(); } catch (x) { /* ignore */ }
+      serveur = null;
+      if (e && e.code === 'EADDRINUSE') throw new Error(`Le port ${p.port} est déjà utilisé sur ce poste. Choisissez un autre port dans les paramètres de connexion.`);
+      throw e;
+    }
+    epinglage = { hote: '127.0.0.1', empreinte: certificatLocal.empreinte, empreinteCle: certificatLocal.empreinteCle };
+    urlApplication = `https://127.0.0.1:${ecoute.adresse.port}/`;
+    journal('Serveur GMAO démarré en HTTPS (partage réseau)', urlApplication, 'empreinte du certificat :', certificatLocal.empreinte, 'données :', dossierDonnees());
+    return urlApplication;
+  }
+  // Poste seul : écoute sur 127.0.0.1 uniquement, aucun trafic réseau à protéger
+  certificatLocal = null;
+  epinglage = null;
   serveur = createApp({ dataDir: dossierDonnees(), log: journal, bureau: true });
   let addr;
   try {
-    addr = await serveur.start(p.port, hote);
+    addr = await serveur.start(p.port, '127.0.0.1');
   } catch (e) {
-    if (e && e.code === 'EADDRINUSE' && !p.partageReseau) {
-      addr = await serveur.start(0, hote); // poste seul : n'importe quel port libre convient
-    } else if (e && e.code === 'EADDRINUSE') {
-      throw new Error(`Le port ${p.port} est déjà utilisé sur ce poste. Choisissez un autre port dans les paramètres de connexion.`);
-    } else throw e;
+    if (e && e.code === 'EADDRINUSE') addr = await serveur.start(0, '127.0.0.1'); // n'importe quel port libre convient
+    else throw e;
   }
   urlApplication = `http://127.0.0.1:${addr.port}/`;
   journal('Serveur GMAO démarré', urlApplication, 'données :', dossierDonnees());
@@ -86,36 +149,137 @@ async function demarrerServeur() {
 }
 
 async function arreterServeur() {
+  if (ecoute) {
+    try { await ecoute.fermer(); } catch (e) { /* ignore */ }
+    ecoute = null;
+  }
   if (!serveur) return;
   try { await serveur.stop(); } catch (e) { /* ignore */ }
   serveur = null;
 }
 
-/** Vérifie qu'un serveur GMAO répond à l'adresse donnée. */
-async function testerServeur(url) {
-  const { normaliserUrl } = require('./parametres');
+// ----- Connexion à un serveur distant (mode client) -------------------------------------------
+
+/** Épinglage enregistré pour cette adresse (empreintes vides si le serveur est différent). */
+function epinglageEnregistre(url) {
+  const c = parametres.valeurs.client;
+  return c.url && memeServeur(url, c.url) ? { empreinte: c.empreinte, empreinteCle: c.empreinteCle } : {};
+}
+
+/**
+ * Vérifie qu'un serveur GMAO répond à l'adresse donnée.
+ * - HTTPS : le certificat présenté doit correspondre à l'épinglage fourni ; sans épinglage, son
+ *   empreinte est renvoyée pour confirmation par le pôle informatique (confirmationRequise).
+ * - HTTP : accepté avec un avertissement (poste serveur d'une ancienne version), sauf si une
+ *   connexion chiffrée a déjà été confirmée pour ce serveur (déclassement refusé).
+ * - Un serveur qui redirige HTTP vers HTTPS (même poste) est automatiquement joint en HTTPS.
+ * @param {string} url
+ * @param {{ empreinte?: string, empreinteCle?: string }} [epingle]
+ */
+async function testerServeur(url, epingle) {
   const u = normaliserUrl(url);
-  if (!u) return { ok: false, message: 'Adresse invalide (exemple : http://srv-gmao:8585)' };
-  try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 6000);
-    const r = await net.fetch(new URL('api/auth/infos', u).toString(), { signal: ctrl.signal });
-    clearTimeout(t);
-    if (!r.ok) return { ok: false, message: `Le serveur a répondu ${r.status}` };
-    const infos = await r.json();
-    return { ok: true, url: u, societe: (infos.societe && infos.societe.nom) || '', version: infos.version || '' };
-  } catch (e) {
-    return { ok: false, message: 'Aucun serveur GMAO ne répond à cette adresse (poste éteint, pare-feu, adresse ou port incorrect).' };
+  if (!u) return { ok: false, message: 'Adresse invalide (exemple : srv-gmao:8585 ou https://192.168.1.20:8585)' };
+  const attendu = {
+    empreinte: tlsGmao.normaliserEmpreinte(epingle && epingle.empreinte),
+    empreinteCle: tlsGmao.normaliserEmpreinte(epingle && epingle.empreinteCle),
+  };
+  const epinglee = !!(attendu.empreinte || attendu.empreinteCle);
+  const options = Object.assign({ userAgent: app.userAgentFallback }, attendu);
+  let r = await tlsGmao.sonder(u, options);
+  if (!r.ok && u.startsWith('http:') && (r.erreur === 'redirection-https' || r.erreur === 'protocole')) {
+    r = await tlsGmao.sonder(r.redirectionHttps || u.replace(/^http:/, 'https:'), options);
   }
+  if (!r.ok) {
+    if (r.erreur === 'empreinte') {
+      return { ok: false, usurpation: true, chiffre: true, url: r.url || u.replace(/^http:/, 'https:'), empreinte: r.empreinte, empreinteCle: r.empreinteCle, attendue: attendu.empreinte, message: MESSAGE_USURPATION };
+    }
+    return { ok: false, message: r.message };
+  }
+  const base = { url: r.url, societe: String((r.infos.societe && r.infos.societe.nom) || '').slice(0, 120), version: String(r.infos.version || '').slice(0, 40) };
+  if (r.protocole === 'http') {
+    if (epinglee) return Object.assign({ ok: false, declassement: true, message: MESSAGE_DECLASSEMENT }, base);
+    return Object.assign({ ok: true, chiffre: false, avertissement: MESSAGE_NON_CHIFFRE }, base);
+  }
+  const certificat = { empreinte: r.empreinte, empreinteCle: r.empreinteCle };
+  if (!epinglee) {
+    return Object.assign({ ok: false, confirmationRequise: true, chiffre: true, message: 'Première connexion chiffrée à ce serveur : comparez l\'empreinte de son certificat avec celle affichée sur le poste serveur, puis confirmez-la.' }, base, certificat);
+  }
+  return Object.assign({ ok: true, chiffre: true, confirme: true, renouvele: !!r.parCle }, base, certificat);
+}
+
+/**
+ * Contrôle avant enregistrement du mode client : l'empreinte proposée par l'assistant n'est
+ * retenue que si le serveur la présente effectivement à cet instant.
+ */
+async function verifierConnexionClient(url, demande) {
+  const u = normaliserUrl(url);
+  if (!u) return { ok: false, message: 'Saisissez l\'adresse du serveur GMAO' };
+  let t = await testerServeur(u, epinglageEnregistre(u));
+  if (t.ok) return t;
+  if (t.usurpation && demande.remplacer) t = await testerServeur(u, {}); // certificat renouvelé : nouvelle confirmation
+  if (!t.confirmationRequise) return t;
+  const proposee = tlsGmao.normaliserEmpreinte(demande.empreinte);
+  if (!proposee) return Object.assign({}, t, { message: 'Confirmez l\'empreinte du certificat du serveur (comparez-la avec celle affichée sur le poste serveur) avant d\'enregistrer.' });
+  if (!tlsGmao.empreintesEgales(proposee, t.empreinte)) {
+    return { ok: false, message: 'L\'empreinte confirmée ne correspond pas à celle que présente maintenant le serveur : recommencez le test puis la vérification.' };
+  }
+  return Object.assign({}, t, { ok: true, confirme: true, nouvelleEmpreinte: true });
+}
+
+// ----- Vérification des certificats par Chromium (fenêtres de l'application) ---------------------
+
+/** Empreinte « sha256/base64 » fournie par Chromium → « AB:CD:… ». */
+function empreinteChromium(fp) {
+  const m = /^sha256\/([A-Za-z0-9+/=]+)$/.exec(String(fp || ''));
+  if (!m) return '';
+  const octets = Buffer.from(m[1], 'base64');
+  return octets.length === 32 ? octets.toString('hex').toUpperCase().match(/../g).join(':') : '';
+}
+
+/**
+ * Pour le nom d'hôte du serveur GMAO, seul le certificat épinglé est accepté (0 = accepté,
+ * -2 = refusé) ; pour les autres sites (mises à jour), la vérification standard s'applique (-3).
+ */
+function verifierCertificat(requete, rappel) {
+  const cible = epinglage;
+  const hote = String((requete && requete.hostname) || '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (!cible || !hote || hote !== cible.hote) { rappel(-3); return; }
+  const certificat = (requete && requete.certificate) || {};
+  let v = tlsGmao.verifierEpinglage(certificat.data || '', cible);
+  if (!v.empreinte) {
+    const fp = empreinteChromium(certificat.fingerprint);
+    v = { ok: !!fp && tlsGmao.empreintesEgales(fp, cible.empreinte), empreinte: fp };
+  }
+  if (v.ok) { rappel(0); return; }
+  rappel(-2);
+  signalerCertificatRefuse(hote, v.empreinte);
+}
+
+function signalerCertificatRefuse(hote, empreintePresentee) {
+  const maintenant = Date.now();
+  if (maintenant - dernierRefus < 30000) return;
+  dernierRefus = maintenant;
+  journal('Certificat refusé pour', hote, '— empreinte présentée :', empreintePresentee || 'inconnue');
+  setImmediate(() => afficherErreur(MESSAGE_USURPATION, 'securite'));
+}
+
+function installerVerificationCertificats() {
+  const ses = session && session.defaultSession;
+  if (ses && typeof ses.setCertificateVerifyProc === 'function') ses.setCertificateVerifyProc(verifierCertificat);
+  else journal('Vérification des certificats par empreinte indisponible');
 }
 
 // ----- Fenêtres --------------------------------------------------------------------------
-function origineAutorisee(url) {
+function estPageAssistant(url) {
   try {
     const u = new URL(url);
-    if (u.protocol === 'file:') return path.normalize(decodeURIComponent(u.pathname.replace(/^\/([a-zA-Z]:)/, '$1'))) === path.normalize(PAGE_DEMARRAGE);
-    return !!urlApplication && u.origin === new URL(urlApplication).origin;
+    return u.protocol === 'file:' && path.normalize(decodeURIComponent(u.pathname.replace(/^\/([a-zA-Z]:)/, '$1'))) === path.normalize(PAGE_DEMARRAGE);
   } catch (e) { return false; }
+}
+
+function origineAutorisee(url) {
+  if (estPageAssistant(url)) return true;
+  try { return !!urlApplication && new URL(url).origin === new URL(urlApplication).origin; } catch (e) { return false; }
 }
 
 function creerFenetrePrincipale(url) {
@@ -139,7 +303,10 @@ function creerFenetrePrincipale(url) {
   });
   fenetre.webContents.on('will-navigate', (ev, u) => { if (!origineAutorisee(u)) { ev.preventDefault(); if (/^https?:/i.test(u)) shell.openExternal(u); } });
   fenetre.webContents.on('did-fail-load', (ev, code, description, u, principal) => {
-    if (principal && code !== -3) afficherErreur(`Impossible d'ouvrir la GMAO (${description}).`);
+    if (!principal || code === -3) return;
+    if (Date.now() - dernierRefus < 30000) return; // alerte de sécurité déjà affichée
+    if (code <= -200 && code > -300) { afficherErreur(MESSAGE_USURPATION, 'securite'); return; } // erreurs de certificat
+    afficherErreur(`Impossible d'ouvrir la GMAO (${description}).`);
   });
   // La caméra (scan des codes-barres) est autorisée pour l'application elle-même uniquement
   fenetre.webContents.session.setPermissionRequestHandler((wc, permission, rappel, details) => {
@@ -167,17 +334,24 @@ function creerFenetrePrincipale(url) {
 
 /** En mode serveur partagé, fermer la fenêtre ne doit pas couper la GMAO des autres postes. */
 function garderEnArrierePlan() {
-  return parametres.valeurs.reduireDansZoneNotification && (parametres.valeurs.mode === 'serveur' && parametres.valeurs.serveur.partageReseau || DEMARRAGE_CACHE || parametres.valeurs.demarrerAvecWindows);
+  return parametres.valeurs.reduireDansZoneNotification && (partageActif() || DEMARRAGE_CACHE || parametres.valeurs.demarrerAvecWindows);
 }
 
-function ouvrirAssistant(erreur) {
+/**
+ * @param {string} [erreur]  message affiché en tête de l'assistant
+ * @param {'securite'} [type] alerte de sécurité (certificat refusé)
+ */
+function ouvrirAssistant(erreur, type) {
   if (fenetreAssistant) { fenetreAssistant.show(); fenetreAssistant.focus(); return; }
   assistantDeverrouille = !parametres.valeurs.codeInformatique; // premier lancement : pas encore de code
   fenetreAssistant = new BrowserWindow({
-    width: 860, height: 760, minWidth: 700, minHeight: 600, title: `${NOM} — Paramètres de connexion`, icon: ICONE, autoHideMenuBar: true, backgroundColor: '#0f172a',
+    width: 860, height: 780, minWidth: 700, minHeight: 600, title: `${NOM} — Paramètres de connexion`, icon: ICONE, autoHideMenuBar: true, backgroundColor: '#0f172a',
     webPreferences: { preload: PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
-  fenetreAssistant.loadFile(PAGE_DEMARRAGE, { query: erreur ? { erreur } : {} });
+  const query = {};
+  if (erreur) query.erreur = String(erreur).slice(0, 1000);
+  if (erreur && type === 'securite') query.alerte = 'securite';
+  fenetreAssistant.loadFile(PAGE_DEMARRAGE, { query });
   fenetreAssistant.webContents.setWindowOpenHandler(({ url: u }) => { if (/^https?:/i.test(u)) shell.openExternal(u); return { action: 'deny' }; });
   fenetreAssistant.on('closed', () => {
     fenetreAssistant = null;
@@ -186,9 +360,9 @@ function ouvrirAssistant(erreur) {
   });
 }
 
-function afficherErreur(message) {
+function afficherErreur(message, type) {
   if (fenetre) { fenetre.destroy(); fenetre = null; }
-  ouvrirAssistant(message);
+  ouvrirAssistant(message, type);
 }
 
 function afficher() {
@@ -198,14 +372,43 @@ function afficher() {
 }
 
 // ----- Démarrage selon le mode -------------------------------------------------------------
+async function connecterClient() {
+  const c = parametres.valeurs.client;
+  const t = await testerServeur(c.url, c);
+  if (!t.ok) {
+    if (t.usurpation || t.declassement) {
+      journal('Connexion au serveur bloquée :', c.url, t.usurpation ? `(empreinte présentée : ${t.empreinte})` : '(réponse non chiffrée)');
+      afficherErreur(t.message, 'securite');
+      return false;
+    }
+    if (t.confirmationRequise) {
+      afficherErreur(`Le serveur GMAO (${t.url}) utilise désormais une connexion chiffrée : le pôle informatique doit confirmer l'empreinte de son certificat (bouton « Tester » ci-dessous, puis « Enregistrer »).`);
+      return false;
+    }
+    afficherErreur(`Serveur GMAO injoignable à l'adresse ${c.url} : ${t.message}`);
+    return false;
+  }
+  if (t.chiffre) {
+    epinglage = { hote: hoteDe(t.url), empreinte: t.empreinte, empreinteCle: t.empreinteCle };
+    if (t.renouvele || t.url !== c.url || t.empreinte !== c.empreinte) {
+      // Certificat renouvelé par le même serveur (même clé) ou adresse passée en HTTPS
+      parametres.enregistrer({ client: { url: t.url, empreinte: t.empreinte, empreinteCle: t.empreinteCle } });
+      journal('Épinglage du serveur mis à jour', t.url, t.empreinte);
+    }
+  } else {
+    epinglage = null;
+    journal('Avertissement : connexion non chiffrée au serveur', t.url);
+  }
+  urlApplication = t.url;
+  return true;
+}
+
 async function lancer() {
   const p = parametres.valeurs;
   if (!p.configure) return ouvrirAssistant();
   try {
     if (p.mode === 'client') {
-      const t = await testerServeur(p.client.url);
-      if (!t.ok) return afficherErreur(`Serveur GMAO injoignable à l'adresse ${p.client.url} : ${t.message}`);
-      urlApplication = t.url;
+      if (!(await connecterClient())) return undefined;
     } else {
       await demarrerServeur();
     }
@@ -214,9 +417,10 @@ async function lancer() {
     appliquerDemarrageWindows();
     programmerMisesAJour();
   } catch (e) {
-    journal('Erreur au démarrage', e);
+    journal('Erreur au démarrage', e && e.message ? e.message : e);
     afficherErreur(e.message || String(e));
   }
+  return undefined;
 }
 
 async function redemarrer() {
@@ -227,7 +431,7 @@ async function redemarrer() {
 }
 
 async function quitterApplication() {
-  if (parametres.valeurs.mode === 'serveur' && parametres.valeurs.serveur.partageReseau) {
+  if (partageActif()) {
     const r = await dialog.showMessageBox(fenetre || undefined, { type: 'question', title: NOM, message: 'Arrêter la GMAO ?', detail: 'Ce poste héberge la GMAO pour le réseau : les autres postes ne pourront plus y accéder tant qu\'elle ne sera pas relancée.', buttons: ['Arrêter', 'Annuler'], defaultId: 1, cancelId: 1 });
     if (r.response !== 0) return;
   }
@@ -246,22 +450,39 @@ function appliquerDemarrageWindows() {
 }
 
 // ----- Zone de notification et menu ----------------------------------------------------------
+function adresseReseau() {
+  const a = adressesReseau()[0];
+  return a ? `https://${a.adresse}:${portEcoute()}/` : '';
+}
+
 function texteAcces() {
   const p = parametres.valeurs;
-  if (p.mode === 'client') return `Connecté à ${p.client.url}`;
+  if (p.mode === 'client') return `Connecté à ${p.client.url}${/^https:/.test(p.client.url) ? ' (connexion chiffrée)' : ' (connexion non chiffrée)'}`;
   if (!p.serveur.partageReseau) return 'Serveur local (ce poste uniquement)';
-  const port = serveur && serveur.server.address() ? serveur.server.address().port : p.serveur.port;
-  const a = adressesReseau()[0];
-  return a ? `Accès réseau : http://${a.adresse}:${port}/` : `Accès réseau sur le port ${port}`;
+  const a = adresseReseau();
+  return a ? `Accès réseau : ${a} (connexion chiffrée)` : `Accès réseau sur le port ${portEcoute()} (connexion chiffrée)`;
+}
+
+async function afficherEmpreinte() {
+  const fp = empreinteAffichee();
+  if (!fp) return;
+  const local = parametres.valeurs.mode === 'serveur';
+  const r = await dialog.showMessageBox(fenetre || undefined, {
+    type: 'info', title: `${NOM} — certificat du serveur`, message: 'Empreinte du certificat du serveur GMAO',
+    detail: `${fp}\n\n${local
+      ? 'Elle est demandée au pôle informatique lors de la première connexion de chaque poste client : les deux empreintes doivent être identiques caractère par caractère.'
+      : 'Empreinte confirmée pour ce poste : elle doit être identique à celle affichée sur le poste serveur.'}`,
+    buttons: ['Copier', 'Fermer'], defaultId: 1, cancelId: 1,
+  });
+  if (r.response === 0 && clipboard) clipboard.writeText(fp);
 }
 
 function menuModele() {
-  const p = parametres.valeurs;
-  const port = serveur && serveur.server.address() ? serveur.server.address().port : p.serveur.port;
   return [
     { label: 'Ouvrir la GMAO', click: () => afficher() },
     { label: texteAcces(), enabled: false },
-    p.mode === 'serveur' && p.serveur.partageReseau ? { label: 'Copier l\'adresse réseau', click: () => { const a = adressesReseau()[0]; if (a) require('electron').clipboard.writeText(`http://${a.adresse}:${port}/`); } } : null,
+    partageActif() ? { label: 'Copier l\'adresse réseau', click: () => { const a = adresseReseau(); if (a && clipboard) clipboard.writeText(a); } } : null,
+    empreinteAffichee() ? { label: 'Empreinte du certificat…', click: () => afficherEmpreinte() } : null,
     { type: 'separator' },
     { label: 'Paramètres de connexion (pôle informatique)…', click: () => ouvrirAssistant() },
     { label: 'Rechercher les mises à jour', click: () => verifierMisesAJour(true) },
@@ -292,7 +513,7 @@ function construireMenu() {
       { type: 'separator' },
       { label: 'Fermer la fenêtre', accelerator: 'Ctrl+W', click: () => fenetre && fenetre.close() },
       { label: 'Quitter', accelerator: 'Ctrl+Q', click: () => quitterApplication() },
-    ].filter(Boolean) },
+    ] },
     { label: 'Affichage', submenu: [
       { role: 'zoomIn', label: 'Zoom +' }, { role: 'zoomOut', label: 'Zoom -' }, { role: 'resetZoom', label: 'Zoom normal' },
       { type: 'separator' }, { role: 'togglefullscreen', label: 'Plein écran' },
@@ -300,8 +521,9 @@ function construireMenu() {
     ].filter(Boolean) },
     { label: 'Aide', submenu: [
       { label: 'Rechercher les mises à jour', click: () => verifierMisesAJour(true) },
-      { label: 'À propos', click: () => dialog.showMessageBox(fenetre || undefined, { type: 'info', title: 'À propos', message: NOM, detail: `Version ${app.getVersion()}\n${texteAcces()}${parametres.valeurs.mode === 'serveur' ? `\nDonnées : ${dossierDonnees()}` : ''}` }) },
-    ] },
+      empreinteAffichee() ? { label: 'Empreinte du certificat du serveur…', click: () => afficherEmpreinte() } : null,
+      { label: 'À propos', click: () => dialog.showMessageBox(fenetre || undefined, { type: 'info', title: 'À propos', message: NOM, detail: `Version ${app.getVersion()}\n${texteAcces()}${parametres.valeurs.mode === 'serveur' ? `\nDonnées : ${dossierDonnees()}` : ''}${empreinteAffichee() ? `\nEmpreinte du certificat : ${empreinteAffichee()}` : ''}` }) },
+    ].filter(Boolean) },
   ]));
 }
 
@@ -338,10 +560,9 @@ async function verifierMisesAJour(manuel) {
       return info;
     }
     if (!manuel && parametres.valeurs.misesAJour.ignorerVersion === info.version) return info;
-    const partage = parametres.valeurs.mode === 'serveur' && parametres.valeurs.serveur.partageReseau;
     const r = await dialog.showMessageBox(parent, {
       type: 'info', title: `${NOM} — mise à jour`, message: `Une nouvelle version est disponible : ${info.version}`,
-      detail: `Version installée : ${app.getVersion()}${info.notes ? `\n\nNouveautés :\n${info.notes.slice(0, 1500)}` : ''}${partage ? '\n\nCe poste héberge la GMAO pour le réseau : l\'accès sera interrompu une minute pendant l\'installation.' : ''}`,
+      detail: `Version installée : ${app.getVersion()}${info.notes ? `\n\nNouveautés :\n${info.notes.slice(0, 1500)}` : ''}${partageActif() ? '\n\nCe poste héberge la GMAO pour le réseau : l\'accès sera interrompu une minute pendant l\'installation.' : ''}`,
       buttons: PORTABLE ? ['Télécharger', 'Plus tard', 'Ignorer cette version'] : ['Installer maintenant', 'Plus tard', 'Ignorer cette version'], defaultId: 0, cancelId: 1,
     });
     if (r.response === 2) { parametres.enregistrer({ misesAJour: { ignorerVersion: info.version } }); return info; }
@@ -366,13 +587,15 @@ async function verifierMisesAJour(manuel) {
 }
 
 // ----- Pont avec les pages (preload.js) -----------------------------------------------------
-function expediteurAutorise(ev) {
-  const url = (ev.senderFrame && ev.senderFrame.url) || '';
-  return origineAutorisee(url);
-}
-function gerer(canal, fn) {
+
+/**
+ * Déclare un canal IPC. Par défaut, seul l'assistant de connexion (page locale) peut l'appeler ;
+ * `{ application: true }` l'ouvre aussi aux pages de la GMAO (serveur local ou distant).
+ */
+function gerer(canal, fn, { application = false } = {}) {
   ipcMain.handle(canal, async (ev, ...args) => {
-    if (!expediteurAutorise(ev)) throw new Error('Appel non autorisé');
+    const url = (ev && ev.senderFrame && ev.senderFrame.url) || '';
+    if (!(application ? origineAutorisee(url) : estPageAssistant(url))) throw new Error('Appel non autorisé');
     return fn(ev, ...args);
   });
 }
@@ -382,21 +605,39 @@ function exigerDeverrouillage() {
   if (parametres.valeurs.codeInformatique && !assistantDeverrouille) throw new Error('Code du pôle informatique requis');
 }
 
+/** Copie des données reçues d'une page, sans clés pouvant altérer les prototypes. */
+function donneesPage(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+  try {
+    return JSON.parse(JSON.stringify(v), (k, x) => (k === '__proto__' || k === 'constructor' || k === 'prototype' ? undefined : x));
+  } catch (e) { return {}; }
+}
+
 function enregistrerIpc() {
   gerer('bureau:etat-verrou', () => ({ codeDefini: !!parametres.valeurs.codeInformatique, deverrouille: assistantDeverrouille }));
-  gerer('bureau:deverrouiller', async (ev, code) => {
-    if (!parametres.valeurs.codeInformatique) { assistantDeverrouille = true; return { ok: true }; }
-    await new Promise((r) => setTimeout(r, 400)); // freine les essais successifs
-    assistantDeverrouille = verifyPassword(String(code || ''), parametres.valeurs.codeInformatique);
-    return { ok: assistantDeverrouille, message: assistantDeverrouille ? '' : 'Code incorrect' };
+  gerer('bureau:deverrouiller', (ev, code) => {
+    // Essais traités un par un, avec un délai croissant après plusieurs échecs (essais automatisés)
+    const essai = fileCode.then(async () => {
+      if (!parametres.valeurs.codeInformatique) { assistantDeverrouille = true; return { ok: true }; }
+      await attendre(400 + Math.min(30000, Math.max(0, echecsCode - 4) * 3000));
+      const ok = typeof code === 'string' && code.length > 0 && code.length <= 200 && verifyPassword(code, parametres.valeurs.codeInformatique);
+      assistantDeverrouille = ok;
+      echecsCode = ok ? 0 : echecsCode + 1;
+      if (!ok) journal(`Code du pôle informatique incorrect (${echecsCode} échec(s) consécutif(s))`);
+      return { ok, message: ok ? '' : 'Code incorrect' };
+    });
+    fileCode = essai.catch(() => {});
+    return essai;
   });
   gerer('bureau:reessayer', () => { if (fenetreAssistant) { const f = fenetreAssistant; fenetreAssistant = null; f.destroy(); } lancer(); return true; });
   gerer('bureau:infos', () => ({
     version: app.getVersion(), mode: parametres.valeurs.mode, url: urlApplication, portable: PORTABLE,
     dossierDonnees: parametres.valeurs.mode === 'serveur' ? dossierDonnees() : '', dossierDonneesDefaut: path.join(app.getPath('userData'), 'data'),
-    adresses: adressesReseau(), port: serveur && serveur.server.address() ? serveur.server.address().port : parametres.valeurs.serveur.port,
+    adresses: adressesReseau(), port: portEcoute(),
     nomPoste: os.hostname(), acces: texteAcces(),
-  }));
+    chiffrement: urlApplication ? (urlApplication.startsWith('https:') ? 'https' : 'http') : '',
+    empreinte: empreinteAffichee(),
+  }), { application: true });
   gerer('bureau:parametres', () => {
     const v = JSON.parse(JSON.stringify(parametres.valeurs));
     v.codeInformatiqueDefini = !!v.codeInformatique;
@@ -406,21 +647,26 @@ function enregistrerIpc() {
   });
   gerer('bureau:enregistrer', async (ev, nouvelles) => {
     exigerDeverrouillage();
+    const src = donneesPage(nouvelles);
     const avant = JSON.stringify([parametres.valeurs.mode, parametres.valeurs.serveur, parametres.valeurs.client]);
-    const n = Object.assign({}, nouvelles || {}, { configure: true });
+    const n = { configure: true };
+    for (const cle of ['mode', 'serveur', 'demarrerAvecWindows', 'reduireDansZoneNotification', 'misesAJour']) if (src[cle] !== undefined) n[cle] = src[cle];
     // Code du pôle informatique : obligatoire à la première configuration, modifiable ensuite
-    delete n.codeInformatique;
-    const nouveauCode = nouvelles && typeof nouvelles.nouveauCodeInformatique === 'string' ? nouvelles.nouveauCodeInformatique : '';
+    const nouveauCode = typeof src.nouveauCodeInformatique === 'string' ? src.nouveauCodeInformatique : '';
     if (nouveauCode) {
-      if (nouveauCode.length < 6) return { ok: false, message: 'Le code du pôle informatique doit contenir au moins 6 caractères' };
+      if (nouveauCode.length < LONGUEUR_MIN_CODE) return { ok: false, message: `Le code du pôle informatique doit contenir au moins ${LONGUEUR_MIN_CODE} caractères` };
+      if (nouveauCode.length > 200) return { ok: false, message: 'Le code du pôle informatique est trop long (200 caractères maximum)' };
       n.codeInformatique = hashPassword(nouveauCode);
     } else if (!parametres.valeurs.codeInformatique) {
       return { ok: false, message: 'Définissez le code du pôle informatique (il protège ces paramètres)' };
     }
     if (n.mode === 'client') {
-      const t = await testerServeur(n.client && n.client.url);
-      if (!t.ok) return { ok: false, message: t.message };
-      n.client = { url: t.url };
+      // L'adresse et l'empreinte ne sont retenues qu'après une connexion réussie au serveur
+      const c = src.client && typeof src.client === 'object' ? src.client : {};
+      const t = await verifierConnexionClient(c.url, { empreinte: c.empreinte, remplacer: c.remplacerEmpreinte === true });
+      if (!t.ok) return { ok: false, message: t.message, usurpation: !!t.usurpation, confirmationRequise: !!t.confirmationRequise, declassement: !!t.declassement, empreinte: t.empreinte || '' };
+      n.client = { url: t.url, empreinte: t.chiffre ? t.empreinte : '', empreinteCle: t.chiffre ? t.empreinteCle : '' };
+      if (t.nouvelleEmpreinte) journal('Empreinte du certificat du serveur confirmée par le pôle informatique :', t.url, t.empreinte);
     }
     const etaitConfigure = parametres.valeurs.configure;
     parametres.enregistrer(n);
@@ -439,14 +685,18 @@ function enregistrerIpc() {
     }
     return { ok: true, redemarrage: etaitConfigure && avant !== apres };
   });
-  gerer('bureau:tester-serveur', (ev, url) => testerServeur(url));
+  gerer('bureau:tester-serveur', (ev, url) => {
+    exigerDeverrouillage();
+    const u = normaliserUrl(typeof url === 'string' ? url.slice(0, 500) : '');
+    return testerServeur(u, epinglageEnregistre(u));
+  });
   gerer('bureau:choisir-dossier', async () => {
     exigerDeverrouillage();
     const r = await dialog.showOpenDialog(fenetreAssistant || fenetre || undefined, { title: 'Dossier des données de la GMAO', properties: ['openDirectory', 'createDirectory'] });
     return r.canceled ? '' : r.filePaths[0];
   });
-  gerer('bureau:verifier-maj', () => verifierMisesAJour(true));
-  gerer('bureau:ouvrir-parametres', () => { ouvrirAssistant(); return true; });
+  gerer('bureau:verifier-maj', () => verifierMisesAJour(true), { application: true });
+  gerer('bureau:ouvrir-parametres', () => { ouvrirAssistant(); return true; }, { application: true });
   gerer('bureau:ouvrir-dossier-donnees', () => { exigerDeverrouillage(); return parametres.valeurs.mode === 'serveur' ? shell.openPath(dossierDonnees()) : ''; });
   gerer('bureau:fermer-assistant', () => { if (fenetreAssistant) fenetreAssistant.close(); return true; });
   gerer('bureau:quitter', () => quitterApplication());
@@ -458,10 +708,17 @@ app.on('web-contents-created', (ev, contents) => {
   contents.on('will-navigate', (e, u) => { if (!origineAutorisee(u) && u !== 'about:blank') e.preventDefault(); });
 });
 
+// Certificat refusé par Chromium : jamais d'exception manuelle
+app.on('certificate-error', (ev, contents, url, erreur, certificat, rappel) => {
+  journal('Certificat refusé', hoteDe(url), erreur);
+  rappel(false);
+});
+
 // ----- Cycle de vie ---------------------------------------------------------------------------
 app.whenReady().then(() => {
   if (!VERROU) return; // une autre instance est déjà ouverte : elle a été mise au premier plan
   parametres = new Parametres(app.getPath('userData'));
+  installerVerificationCertificats();
   enregistrerIpc();
   lancer();
 });
@@ -474,4 +731,4 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => { quitter = true; });
 app.on('will-quit', () => { if (serveur) { try { serveur.db.saveNow(); } catch (e) { /* ignore */ } } });
 
-module.exports = { garderEnArrierePlan, adressesReseau };
+module.exports = { garderEnArrierePlan, adressesReseau, testerServeur, verifierCertificat };

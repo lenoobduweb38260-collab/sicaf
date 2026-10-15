@@ -12,9 +12,13 @@ const http = require('http');
 const crypto = require('crypto');
 const Module = require('module');
 
+const https = require('https');
 const { Parametres, normaliser, normaliserUrl } = require('../electron/parametres');
 const { creerGestionnaire, comparerVersions, validerManifeste, nomSur } = require('../electron/miseajour');
 const { manifeste } = require('../scripts/manifeste-maj');
+const tlsGmao = require('../server/tls');
+const { createApp } = require('../server/server');
+const { hashPassword } = require('../server/auth');
 
 const tmp = (p) => fs.mkdtempSync(path.join(os.tmpdir(), p));
 
@@ -50,6 +54,39 @@ describe('Paramètres du poste', () => {
     assert.equal(relu.demarrerAvecWindows, true);
     fs.writeFileSync(path.join(d, 'parametres.json'), '{ corrompu');
     assert.equal(new Parametres(d).valeurs.configure, false, 'fichier corrompu → valeurs par défaut');
+  });
+
+  test('empreinte du serveur épinglée : format validé, fichier à droits restreints', () => {
+    const fp = tlsGmao.genererCertificat({ nomPoste: 'srv' }).empreinte;
+    const p = normaliser({ mode: 'client', client: { url: 'https://srv:8585', empreinte: fp.toLowerCase(), empreinteCle: 'n\'importe quoi' } });
+    assert.equal(p.client.empreinte, fp, 'forme canonique');
+    assert.equal(p.client.empreinteCle, '', 'valeur invalide ignorée');
+    const d = tmp('gmao-param-');
+    new Parametres(d).enregistrer({ configure: true, codeInformatique: hashPassword('code-info-2026') });
+    if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(d, 'parametres.json')).mode & 0o777, 0o600);
+  });
+});
+
+describe('Assistant de connexion (demarrage.html)', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'electron', 'demarrage.html'), 'utf8');
+
+  test('politique de contenu : script autorisé par son empreinte uniquement', () => {
+    const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)];
+    assert.equal(scripts.length, 1);
+    const csp = /<meta http-equiv="Content-Security-Policy" content="([^"]+)"/.exec(html)[1];
+    const scriptSrc = csp.split(';').map((x) => x.trim()).find((x) => x.startsWith('script-src'));
+    const attendu = `'sha256-${crypto.createHash('sha256').update(scripts[0][1], 'utf8').digest('base64')}'`;
+    assert.equal(scriptSrc, `script-src ${attendu}`, 'empreinte CSP à recalculer après toute modification du script');
+    assert.match(csp, /default-src 'none'/);
+    assert.match(csp, /base-uri 'none'/);
+    assert.ok(!/unsafe-eval/.test(csp));
+  });
+
+  test('aucune insertion de HTML ni gestionnaire en ligne', () => {
+    assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(html));
+    assert.ok(!/\son[a-z]+\s*=/i.test(html.replace(/<script\b[\s\S]*?<\/script>/g, '')), 'aucun attribut onclick=…');
+    assert.ok(!/javascript:/i.test(html));
+    assert.ok(!/\beval\(|new Function/.test(html));
   });
 });
 
@@ -155,13 +192,13 @@ describe('electron/main.js avec un Electron simulé', () => {
   /** Construit un faux module « electron » qui enregistre les appels. */
   function fauxElectron(userData) {
     const ev = {};
-    const journal = { fenetres: [], urls: [], fichiers: [], trays: 0, menus: 0, loginItems: [], quit: 0 };
+    const journal = { fenetres: [], urls: [], fichiers: [], requetes: [], trays: 0, menus: 0, loginItems: [], quit: 0, verification: null, presse: [] };
     let pret;
     const whenReady = new Promise((r) => { pret = r; });
     class BrowserWindow {
       constructor(opts) { this.opts = opts; this.handlers = {}; journal.fenetres.push(this); this.webContents = { setWindowOpenHandler() {}, on() {}, session: { setPermissionRequestHandler() {} }, reload() {} }; }
       loadURL(u) { journal.urls.push(u); }
-      loadFile(f) { journal.fichiers.push(f); }
+      loadFile(f, o) { journal.fichiers.push(f); journal.requetes.push((o && o.query) || {}); }
       once(n, fn) { this.handlers[n] = fn; }
       on(n, fn) { this.handlers[n] = fn; }
       show() {} hide() {} focus() {} maximize() {} isMaximized() { return false; } isMinimized() { return false; } restore() {}
@@ -185,7 +222,8 @@ describe('electron/main.js avec un Electron simulé', () => {
       nativeImage: { createFromPath: () => ({ resize: () => ({}) }) },
       Notification: class { static isSupported() { return false; } show() {} },
       net: { fetch: (u, o) => fetch(u, o) },
-      clipboard: { writeText() {} },
+      clipboard: { writeText: (t) => journal.presse.push(t) },
+      session: { defaultSession: { setCertificateVerifyProc: (fn) => { journal.verification = fn; } } },
     };
     return { electron, journal, handlers, ev, demarrer: () => pret() };
   }
@@ -256,5 +294,242 @@ describe('electron/main.js avec un Electron simulé', () => {
     faux.demarrer();
     await attendre(() => faux.journal.fichiers.length === 1, 10000);
     assert.equal(faux.journal.urls.length, 0);
+  });
+
+  // ----- Chiffrement réseau (HTTPS) et épinglage du certificat ---------------------------------
+  const UA = 'Mozilla/5.0 GMAO-SICAF-Bureau/1.0.7';
+  const CODE = 'code-info-2026';
+  const cadreAssistant = { senderFrame: { url: 'file:///' + path.join(__dirname, '..', 'electron', 'demarrage.html').replace(/\\/g, '/').replace(/^\//, '') } };
+  const cadreApplication = (url) => ({ senderFrame: { url: url + '#/systeme' } });
+  /** Appelle la vérification de certificat installée par main.js, comme le ferait Chromium. */
+  const verifier = (faux, hostname, pem) => new Promise((r) => faux.journal.verification({ hostname, certificate: { data: pem }, verificationResult: 'net::ERR_CERT_AUTHORITY_INVALID', errorCode: -202 }, r));
+  const arreter = async (faux) => {
+    faux.ev['before-quit']();
+    faux.ev['window-all-closed']();
+    await attendre(() => faux.journal.quit > 0);
+    await new Promise((r) => setTimeout(r, 150));
+  };
+  /** Requête HTTPS envoyée seulement si le certificat présenté a l'empreinte attendue. */
+  function requeteEpinglee(url, empreinte, { method = 'GET', corps } = {}) {
+    return new Promise((resolve, reject) => {
+      const u = new URL(url);
+      const donnees = corps === undefined ? null : Buffer.from(JSON.stringify(corps));
+      const h = { 'user-agent': UA, 'x-requested-with': 'GMAO' };
+      if (donnees) { h['content-type'] = 'application/json'; h['content-length'] = donnees.length; }
+      const req = https.request({ host: u.hostname, port: u.port, path: u.pathname, method, headers: h, agent: false, rejectUnauthorized: false }, (res) => {
+        const m = [];
+        res.on('data', (c) => m.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, texte: Buffer.concat(m).toString('utf8') }));
+      });
+      req.on('socket', (sock) => sock.once('secureConnect', () => {
+        if (sock.getPeerCertificate().fingerprint256 !== empreinte) { req.destroy(new Error('Empreinte inattendue')); return; }
+        if (donnees) req.write(donnees);
+        req.end();
+      }));
+      req.on('error', reject);
+    });
+  }
+  /** Serveur GMAO distant en HTTPS (écoute mixte, comme l'application en mode serveur partagé). */
+  async function serveurDistant(cert) {
+    const srv = createApp({ inMemory: true, log: () => {}, tls: { key: cert.cle, cert: cert.certificat } });
+    const ecoute = await tlsGmao.ecouterMixte(srv.server, 0, '127.0.0.1');
+    return { port: ecoute.adresse.port, url: `https://127.0.0.1:${ecoute.adresse.port}/`, arreter: async () => { await ecoute.fermer(); await srv.stop(); } };
+  }
+  const lireParametres = (userData) => JSON.parse(fs.readFileSync(path.join(userData, 'parametres.json'), 'utf8'));
+
+  test('mode serveur partagé : HTTPS avec le certificat du poste, fenêtre limitée à ce certificat', async () => {
+    const userData = tmp('gmao-bureau-');
+    const port = 48000 + Math.floor(Math.random() * 1000);
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port, partageReseau: true } });
+    const faux = fauxElectron(userData);
+    chargerMain(faux);
+    faux.demarrer();
+    await attendre(() => faux.journal.urls.length === 1, 10000);
+    const url = faux.journal.urls[0];
+    assert.equal(url, `https://127.0.0.1:${port}/`, 'fenêtre locale en HTTPS');
+    const certPem = fs.readFileSync(path.join(userData, 'data', 'tls', 'certificat.pem'), 'utf8');
+    assert.ok(fs.existsSync(path.join(userData, 'data', 'tls', 'cle.pem')));
+    const fp = tlsGmao.empreinte(certPem);
+    const x509 = new crypto.X509Certificate(certPem);
+    assert.equal(x509.checkHost(os.hostname()) !== undefined, true, 'nom du poste dans le certificat');
+    assert.equal(x509.checkIP('127.0.0.1'), '127.0.0.1');
+
+    // Vérification Chromium : seul ce certificat est accepté pour 127.0.0.1, les autres sites gardent la vérification standard
+    assert.equal(typeof faux.journal.verification, 'function', 'vérification des certificats installée');
+    assert.equal(await verifier(faux, '127.0.0.1', certPem), 0);
+    const autre = tlsGmao.genererCertificat({ nomPoste: 'pirate' });
+    assert.equal(await verifier(faux, 'api.github.com', autre.certificat), -3);
+
+    // Connexion réelle : HTTPS, HSTS, cookie de session Secure
+    const infos = await requeteEpinglee(url + 'api/auth/infos', fp);
+    assert.equal(infos.status, 200);
+    assert.match(infos.headers['strict-transport-security'] || '', /max-age=/);
+    const login = await requeteEpinglee(url + 'api/auth/login', fp, { method: 'POST', corps: { login: 'admin', password: 'admin' } });
+    assert.equal(login.status, 200);
+    assert.match(String(login.headers['set-cookie']), /HttpOnly; SameSite=Strict; Secure/);
+    // Requête en clair sur le même port : redirection vers HTTPS, aucune donnée servie
+    const clair = await fetch(`http://127.0.0.1:${port}/api/auth/infos`, { redirect: 'manual', headers: { 'user-agent': UA } });
+    assert.equal(clair.status, 308);
+    assert.equal(clair.headers.get('location'), `https://127.0.0.1:${port}/api/auth/infos`);
+
+    // Informations pour l'assistant et la vue Système : empreinte à communiquer aux autres postes
+    const i = await faux.handlers['bureau:infos'](cadreApplication(url));
+    assert.equal(i.chiffrement, 'https');
+    assert.equal(i.empreinte, fp);
+    assert.equal(i.port, port);
+    assert.match(i.acces, /connexion chiffrée/);
+    // Canaux sensibles réservés à l'assistant de connexion (jamais aux pages de la GMAO)
+    for (const canal of ['bureau:enregistrer', 'bureau:tester-serveur', 'bureau:deverrouiller', 'bureau:parametres', 'bureau:quitter']) {
+      await assert.rejects(() => faux.handlers[canal](cadreApplication(url), {}), /non autorisé/, canal);
+    }
+    // Code du pôle informatique : essais simultanés traités un par un
+    const t0 = Date.now();
+    const essais = await Promise.all([faux.handlers['bureau:deverrouiller'](cadreAssistant, 'faux-1'), faux.handlers['bureau:deverrouiller'](cadreAssistant, 'faux-2')]);
+    assert.ok(essais.every((e) => !e.ok));
+    assert.ok(Date.now() - t0 >= 780, 'essais successifs freinés');
+
+    // Un autre certificat présenté pour 127.0.0.1 : refusé, alerte de sécurité dans l'assistant
+    assert.equal(await verifier(faux, '127.0.0.1', autre.certificat), -2);
+    await attendre(() => faux.journal.requetes.some((q) => q.alerte === 'securite'));
+    await arreter(faux);
+    await assert.rejects(() => requeteEpinglee(url + 'api/auth/infos', fp), 'serveur arrêté');
+  });
+
+  test('mode client : première connexion chiffrée confirmée par empreinte, puis certificat épinglé', async () => {
+    const cert = tlsGmao.genererCertificat({ nomPoste: 'srv-gmao' });
+    const pirate = tlsGmao.genererCertificat({ nomPoste: 'srv-gmao' });
+    const distant = await serveurDistant(cert);
+    try {
+      const userData = tmp('gmao-bureau-');
+      const faux = fauxElectron(userData);
+      chargerMain(faux);
+      faux.demarrer();
+      await attendre(() => faux.journal.fichiers.length === 1);
+      const enregistrer = (d) => faux.handlers['bureau:enregistrer'](cadreAssistant, Object.assign({ mode: 'client', nouveauCodeInformatique: CODE }, d));
+      // Adresse saisie sans protocole : le serveur redirige vers HTTPS, l'empreinte est à confirmer
+      const t = await faux.handlers['bureau:tester-serveur'](cadreAssistant, `127.0.0.1:${distant.port}`);
+      assert.equal(t.ok, false);
+      assert.equal(t.confirmationRequise, true);
+      assert.equal(t.url, distant.url);
+      assert.equal(t.empreinte, cert.empreinte);
+      assert.equal(typeof t.version, 'string');
+      // Enregistrement impossible sans confirmation, ou avec une autre empreinte
+      let r = await enregistrer({ client: { url: t.url } });
+      assert.equal(r.ok, false);
+      assert.equal(r.confirmationRequise, true);
+      r = await enregistrer({ client: { url: t.url, empreinte: pirate.empreinte } });
+      assert.equal(r.ok, false);
+      assert.match(r.message, /ne correspond pas/);
+      assert.ok(!fs.existsSync(path.join(userData, 'parametres.json')), 'rien n\'est enregistré');
+      // Empreinte confirmée par le pôle informatique : enregistrée, puis connexion
+      r = await enregistrer({ client: { url: t.url, empreinte: t.empreinte.toLowerCase() } });
+      assert.equal(r.ok, true);
+      const p = lireParametres(userData);
+      assert.equal(p.client.url, distant.url);
+      assert.equal(p.client.empreinte, cert.empreinte);
+      assert.equal(p.client.empreinteCle, cert.empreinteCle);
+      await attendre(() => faux.journal.urls.length === 1, 10000);
+      assert.equal(faux.journal.urls[0], distant.url);
+      assert.equal(await verifier(faux, '127.0.0.1', cert.certificat), 0, 'certificat confirmé accepté par la fenêtre');
+      assert.equal(await verifier(faux, 'github.com', pirate.certificat), -3);
+      // Nouveau test : empreinte reconnue sans nouvelle confirmation
+      const t2 = await faux.handlers['bureau:tester-serveur'](cadreAssistant, distant.url);
+      assert.equal(t2.ok, true);
+      assert.equal(t2.chiffre, true);
+      assert.equal(t2.confirme, true);
+      const i = await faux.handlers['bureau:infos'](cadreApplication(distant.url));
+      assert.equal(i.chiffrement, 'https');
+      assert.equal(i.empreinte, cert.empreinte);
+      assert.match(i.acces, /connexion chiffrée/);
+      // Certificat différent présenté en cours de session : refusé, alerte de sécurité
+      assert.equal(await verifier(faux, '127.0.0.1', pirate.certificat), -2);
+      await attendre(() => faux.journal.requetes.some((q) => q.alerte === 'securite'));
+      await arreter(faux);
+    } finally { await distant.arreter(); }
+  });
+
+  test('mode client : empreinte différente → connexion bloquée (possible usurpation), remplacement par le pôle informatique', async () => {
+    const cert = tlsGmao.genererCertificat({ nomPoste: 'srv-gmao' });
+    const ancien = tlsGmao.genererCertificat({ nomPoste: 'srv-gmao' });
+    const distant = await serveurDistant(cert);
+    try {
+      const userData = tmp('gmao-bureau-');
+      new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'client', client: { url: distant.url, empreinte: ancien.empreinte, empreinteCle: ancien.empreinteCle } });
+      const faux = fauxElectron(userData);
+      chargerMain(faux);
+      faux.demarrer();
+      await attendre(() => faux.journal.fichiers.length === 1, 10000);
+      assert.equal(faux.journal.urls.length, 0, 'aucune page chargée depuis ce serveur');
+      assert.equal(faux.journal.requetes[0].alerte, 'securite');
+      assert.match(faux.journal.requetes[0].erreur, /certificat différent.*usurpation/);
+      // Le pôle informatique constate l'écart puis, après vérification sur le poste serveur, remplace l'empreinte
+      await assert.rejects(() => faux.handlers['bureau:tester-serveur'](cadreAssistant, distant.url), /Code du pôle informatique requis/);
+      assert.equal((await faux.handlers['bureau:deverrouiller'](cadreAssistant, CODE)).ok, true);
+      const t = await faux.handlers['bureau:tester-serveur'](cadreAssistant, distant.url);
+      assert.equal(t.usurpation, true);
+      assert.equal(t.empreinte, cert.empreinte);
+      assert.equal(t.attendue, ancien.empreinte);
+      let r = await faux.handlers['bureau:enregistrer'](cadreAssistant, { mode: 'client', client: { url: distant.url, empreinte: t.empreinte } });
+      assert.equal(r.ok, false, 'remplacement explicite exigé');
+      assert.equal(r.usurpation, true);
+      assert.equal(lireParametres(userData).client.empreinte, ancien.empreinte);
+      r = await faux.handlers['bureau:enregistrer'](cadreAssistant, { mode: 'client', client: { url: distant.url, empreinte: t.empreinte, remplacerEmpreinte: true } });
+      assert.equal(r.ok, true);
+      assert.equal(lireParametres(userData).client.empreinte, cert.empreinte);
+      await attendre(() => faux.journal.urls.length === 1, 10000);
+      await arreter(faux);
+    } finally { await distant.arreter(); }
+  });
+
+  test('mode client : certificat renouvelé par le même serveur (même clé) → accepté, épinglage mis à jour', async () => {
+    const initial = tlsGmao.genererCertificat({ nomPoste: 'srv-gmao' });
+    const renouvele = tlsGmao.genererCertificat({ nomPoste: 'srv-gmao', cle: initial.cle, adresses: ['10.20.30.40'] });
+    const distant = await serveurDistant(renouvele);
+    try {
+      const userData = tmp('gmao-bureau-');
+      new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'client', client: { url: distant.url, empreinte: initial.empreinte, empreinteCle: initial.empreinteCle } });
+      const faux = fauxElectron(userData);
+      chargerMain(faux);
+      faux.demarrer();
+      await attendre(() => faux.journal.urls.length === 1, 10000);
+      assert.equal(lireParametres(userData).client.empreinte, renouvele.empreinte);
+      assert.equal(lireParametres(userData).client.empreinteCle, initial.empreinteCle);
+      assert.equal(await verifier(faux, '127.0.0.1', renouvele.certificat), 0);
+      await arreter(faux);
+    } finally { await distant.arreter(); }
+  });
+
+  test('mode client : serveur en clair accepté avec avertissement, refusé si une connexion chiffrée a été confirmée', async () => {
+    const ancienServeur = createApp({ inMemory: true, log: () => {} });
+    const port = (await ancienServeur.start(0)).port;
+    const url = `http://127.0.0.1:${port}/`;
+    try {
+      // Poste serveur d'une ancienne version : connexion possible, signalée comme non chiffrée
+      const u1 = tmp('gmao-bureau-');
+      new Parametres(u1).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'client', client: { url } });
+      const f1 = fauxElectron(u1);
+      chargerMain(f1);
+      f1.demarrer();
+      await attendre(() => f1.journal.urls.length === 1, 10000);
+      assert.equal(f1.journal.urls[0], url);
+      assert.equal((await f1.handlers['bureau:infos'](cadreApplication(url))).chiffrement, 'http');
+      assert.match((await f1.handlers['bureau:infos'](cadreApplication(url))).acces, /non chiffrée/);
+      assert.equal((await f1.handlers['bureau:deverrouiller'](cadreAssistant, CODE)).ok, true);
+      const t = await f1.handlers['bureau:tester-serveur'](cadreAssistant, url);
+      assert.equal(t.ok, true);
+      assert.equal(t.chiffre, false);
+      assert.match(t.avertissement, /circulent en clair/);
+      await arreter(f1);
+      // Même serveur alors qu'une empreinte avait été confirmée : déclassement refusé
+      const u2 = tmp('gmao-bureau-');
+      new Parametres(u2).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'client', client: { url, empreinte: tlsGmao.genererCertificat({ nomPoste: 'x' }).empreinte } });
+      const f2 = fauxElectron(u2);
+      chargerMain(f2);
+      f2.demarrer();
+      await attendre(() => f2.journal.fichiers.length === 1, 10000);
+      assert.equal(f2.journal.urls.length, 0);
+      assert.equal(f2.journal.requetes[0].alerte, 'securite');
+      assert.match(f2.journal.requetes[0].erreur, /sans chiffrement/);
+    } finally { await ancienServeur.stop(); }
   });
 });
