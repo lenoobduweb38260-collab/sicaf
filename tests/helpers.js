@@ -7,10 +7,11 @@ const { createApp } = require('../server/server');
 
 async function demarrer(options = {}) {
   const app = createApp(Object.assign({ inMemory: true, log: () => {} }, options));
-  // Environnement de test : mots de passe courts acceptés (la politique réelle est testée dans securite.test.js)
+  // Environnement de test : mots de passe courts acceptés et mot de passe initial (admin / admin) utilisable sans
+  // changement préalable (la politique réelle est testée dans securite.test.js et motdepasse.test.js)
   if (!options.politiqueReelle) {
     const cfg = app.db.getConfig();
-    cfg.securite = Object.assign({}, cfg.securite, { longueurMinMdp: 4, complexite: false, refuserCourants: false, interdireIdentifiant: false });
+    cfg.securite = Object.assign({}, cfg.securite, { longueurMinMdp: 4, complexite: false, refuserCourants: false, interdireIdentifiant: false, forcerChangementMdpInitial: false });
     app.db.setConfig(cfg);
   }
   const addr = await app.start(0);

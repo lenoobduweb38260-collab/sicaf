@@ -24,6 +24,8 @@
     user: null, perms: null, config: {}, modules: [], refs: { users: [], secteurs: [], profils: [] }, catalogue: { modules: [], actions: {}, portees: {} }, version: '',
     /** État de la double authentification du compte : { actif, activeLe, codesSecoursRestants, mode, exige, enrolementRequis }. */
     deuxFacteurs: null,
+    /** État du mot de passe : { doitChanger (changement imposé par le serveur), raison, dateMdp, expireLe, joursRestants, rappel }. */
+    motDePasse: null,
     vues: {}, route: { module: null, params: [], query: {} },
     _badges: {}, _vueCourante: null,
 
@@ -60,43 +62,91 @@
       appliquerBootstrap(data);
       construireNavigation();
       appliquerTheme();
+      majRappelMdp();
       if (rerendre) this.rendre();
-      if (GMAO.deuxFacteursRequis()) imposerEnrolement();
+      if (GMAO.changementMdpRequis()) imposerChangementMdp();
+      else if (GMAO.deuxFacteursRequis()) imposerEnrolement();
     },
     async refreshRefs() { return this.refresh(false); },
 
     onNonAuthentifie() {
-      if (GMAO.user) { GMAO.user = null; toast('Session expirée, veuillez vous reconnecter', 'alerte'); afficherConnexion(); }
+      if (GMAO.user) { GMAO.user = null; GMAO._badges = {}; toast('Session expirée, veuillez vous reconnecter', 'alerte'); afficherConnexion(); }
+    },
+
+    /**
+     * Réponse 403 « changement de mot de passe requis » (mot de passe expiré, réinitialisé…) : plus aucun écran
+     * n'est chargé et la fenêtre de changement est imposée (une seule fois, sans nouvel appel au serveur).
+     */
+    onChangementMdpRequis(details) {
+      if (!GMAO.user) return;
+      if (!GMAO.changementMdpRequis()) {
+        GMAO.motDePasse = Object.assign({}, GMAO.motDePasse || {}, { doitChanger: true, rappel: false, raison: (details && details.raison) || (GMAO.motDePasse && GMAO.motDePasse.raison) || null });
+        majRappelMdp();
+        GMAO.rendre();
+      }
+      imposerChangementMdp();
     },
 
     async deconnexion() {
       try { await api.post('/api/auth/logout'); } catch (e) { /* ignore */ }
       GMAO.user = null; GMAO.perms = null;
+      GMAO._badges = {}; // compteurs du menu propres à la session
       location.hash = '';
       afficherConnexion();
     },
 
-    /** Changement du mot de passe ; `apres` est appelé une fois le nouveau mot de passe enregistré. */
+    /**
+     * Changement du mot de passe : règles cochées pendant la saisie et robustesse ; `force` : changement imposé
+     * (raison affichée, fenêtre impossible à fermer sauf déconnexion) ; `apres` est appelé une fois le nouveau
+     * mot de passe enregistré.
+     */
     ouvrirChangementMdp(force, apres) {
+      const etat = GMAO.motDePasse || {};
+      const raison = etat.raison || 'initial';
+      const sc = GMAO.config.securite || {};
+      const messages = {
+        initial: 'Pour sécuriser votre compte, vous devez choisir un nouveau mot de passe personnel avant de continuer.',
+        reinitialise: 'Votre mot de passe a été réinitialisé par le pôle informatique : remplacez le mot de passe temporaire par un mot de passe personnel avant de continuer.',
+        expire: `Votre mot de passe a expiré${sc.expirationMdpJours ? ` (il doit être changé tous les ${sc.expirationMdpJours} jours)` : ''} : choisissez-en un nouveau pour continuer.`,
+        administrateur: 'Votre mot de passe a été défini par un administrateur : choisissez un nouveau mot de passe personnel avant de continuer.',
+      };
       const f = ui.form({ colonnes: 1, champs: [
         force ? null : { nom: 'ancien', label: 'Mot de passe actuel', type: 'mdp', requis: true },
-        { nom: 'nouveau', label: 'Nouveau mot de passe', type: 'mdp', requis: true, aide: (() => { const sc = GMAO.config.securite || {}; return `Au moins ${sc.longueurMinMdp || 10} caractères${sc.complexite !== false ? ', en mélangeant minuscules, majuscules, chiffres ou caractères spéciaux' : ''}.`; })() },
+        { nom: 'nouveau', label: 'Nouveau mot de passe', type: 'mdp', requis: true },
         { nom: 'confirmation', label: 'Confirmer le nouveau mot de passe', type: 'mdp', requis: true, valider: (v, vals) => (v !== vals.nouveau ? 'Les mots de passe ne correspondent pas' : '') },
       ] });
-      const m = ui.modal({
-        titre: force ? 'Définissez votre mot de passe' : 'Changer mon mot de passe', taille: 'petite', fermable: !force,
-        onFermer: () => modalesImposees.delete(m),
-        contenu: frag(force ? ui.alerte('Pour sécuriser votre compte, vous devez choisir un nouveau mot de passe avant de continuer.', 'info') : null, f.el),
-        boutons: [force ? null : { label: 'Annuler' }, { label: 'Enregistrer', classe: 'btn-primaire', onClic: async () => {
-          if (!f.valider()) return false;
-          const v = f.valeurs();
-          await api.post('/api/auth/mot-de-passe', { ancien: v.ancien, nouveau: v.nouveau });
-          GMAO.user.doitChangerMdp = false;
-          toast('Mot de passe modifié', 'succes');
-          if (apres) setTimeout(apres, 0);
-        } }],
+      if (!force) f.controles.ancien.input.setAttribute('autocomplete', 'current-password');
+      f.controles.nouveau.input.setAttribute('autocomplete', 'new-password');
+      f.controles.confirmation.input.setAttribute('autocomplete', 'new-password');
+      const regles = ui.reglesMdp(f.controles.nouveau.input, {
+        politique: { longueurMin: sc.longueurMinMdp, complexite: sc.complexite !== false, interdireIdentifiant: sc.interdireIdentifiant !== false, refuserCourants: sc.refuserCourants },
+        login: GMAO.user ? GMAO.user.login : '', confirmation: f.controles.confirmation.input, historique: Math.max(0, Number(sc.historiqueMdp) || 0),
       });
-      if (force) modalesImposees.add(m);
+      f.champ('nouveau').insertBefore(regles.el, f.champ('nouveau').querySelector('.erreur-champ'));
+      const echeance = !force && etat.expireLe
+        ? el('p', { class: 'texte-2 texte-petit' }, `Votre mot de passe actuel expire le ${ui.formatDate(etat.expireLe)}${etat.joursRestants != null ? ` (${etat.joursRestants <= 0 ? 'aujourd\'hui' : etat.joursRestants === 1 ? 'demain' : `dans ${etat.joursRestants} jours`})` : ''}.`)
+        : null;
+      const m = ui.modal({
+        titre: force ? (raison === 'expire' ? 'Mot de passe expiré' : 'Définissez votre mot de passe') : 'Changer mon mot de passe', taille: 'petite', fermable: !force, classe: 'modal-mdp',
+        onFermer: () => { modalesImposees.delete(m); if (modaleMdpImposee === m) modaleMdpImposee = null; },
+        contenu: frag(force ? ui.alerte(messages[raison] || messages.initial, raison === 'expire' ? 'alerte' : 'info') : echeance, f.el),
+        boutons: [
+          force ? { label: 'Se déconnecter', icone: 'deconnexion', gauche: true, onClic: () => { setTimeout(() => GMAO.deconnexion(), 0); } } : { label: 'Annuler' },
+          { label: 'Enregistrer', classe: 'btn-primaire', onClic: async () => {
+            if (!f.valider()) return false;
+            if (!regles.conforme()) { f.erreur('nouveau', 'Le nouveau mot de passe ne respecte pas toutes les règles indiquées'); f.controles.nouveau.input.focus(); return false; }
+            const v = f.valeurs();
+            await api.post('/api/auth/mot-de-passe', { ancien: v.ancien, nouveau: v.nouveau });
+            GMAO.user.doitChangerMdp = false;
+            if (GMAO.motDePasse) GMAO.motDePasse = Object.assign({}, GMAO.motDePasse, { doitChanger: false, raison: null, rappel: false });
+            majRappelMdp();
+            toast('Mot de passe modifié', 'succes');
+            if (apres) setTimeout(apres, 0);
+            else GMAO.refresh(false).catch(() => {}); // nouvelle échéance
+          } },
+        ],
+      });
+      if (force) { modalesImposees.add(m); modaleMdpImposee = m; }
       f.el.addEventListener('submit', (ev) => { ev.preventDefault(); m.pied.querySelector('.btn-primaire').click(); });
     },
 
@@ -124,6 +174,14 @@
       const vue = GMAO.vues[module];
       ui.fermerModales();
       ui.vider(contenu);
+      if (GMAO.changementMdpRequis()) {
+        // Changement de mot de passe imposé : aucun écran (ni appel au serveur) avant le nouveau mot de passe
+        const titre = app.querySelector('.entete-titre');
+        if (titre) titre.textContent = 'Changement de mot de passe';
+        contenu.appendChild(el('div', { class: 'vue' }, ui.vide('Vous devez choisir un nouveau mot de passe pour accéder à la GMAO.', 'cle'),
+          el('div', { class: 'texte-centre' }, ui.bouton('Changer mon mot de passe', { classe: 'btn-primaire', icone: 'cle', onClic: () => imposerChangementMdp() }))));
+        return;
+      }
       if (GMAO.deuxFacteursRequis()) {
         // Double authentification imposée et pas encore activée : aucun écran avant l'enrôlement
         const titre = app.querySelector('.entete-titre');
@@ -152,6 +210,7 @@
             .catch((e) => {
               const ch = conteneur.querySelector(':scope > .chargement'); if (ch) ch.remove();
               if (e && e.details && e.details.deuxFacteursRequis) { GMAO.refresh(true).catch(() => {}); return; } // obligation activée entre-temps
+              if (e && e.details && e.details.changementMdpRequis) return; // fenêtre de changement déjà imposée (api.js)
               conteneur.appendChild(ui.alerte('Erreur : ' + (e.message || e), 'danger')); console.error(e);
             });
         } else if (r instanceof Node) conteneur.appendChild(r);
@@ -172,6 +231,7 @@
     GMAO.refs = data.references || GMAO.refs;
     GMAO.version = data.version || '';
     GMAO.deuxFacteurs = data.deuxFacteurs || null;
+    GMAO.motDePasse = data.motDePasse || null;
   }
 
   function hexToRgb(hex) {
@@ -209,7 +269,12 @@
   }
 
   // ----- Page de connexion -----------------------------------------------
-  /** Page de connexion ; `message` : erreur à afficher d'emblée (ex. délai de saisie du code dépassé). */
+  /**
+   * Page de connexion ; `message` : erreur à afficher d'emblée (ex. délai de saisie du code dépassé).
+   * La même carte affiche, selon le lien choisi : la connexion, la demande de réinitialisation
+   * (« Mot de passe oublié ? ») et le nouveau mot de passe avec un code de réinitialisation ou un code
+   * de l'application d'authentification.
+   */
   async function afficherConnexion(message) {
     const app = document.getElementById('app');
     fermerModalesImposees();
@@ -218,34 +283,244 @@
     GMAO.config = { societe: infos.societe, general: infos.general };
     appliquerTheme();
     ui.vider(app);
-    const err = el('div', { class: 'connexion-erreur' + (message ? '' : ' masque') }, message || '');
+    const err = el('div', { class: 'connexion-erreur masque', role: 'alert' });
     const zone = el('div');
-    const f = ui.form({ colonnes: 1, champs: [
-      { nom: 'login', label: 'Identifiant', type: 'texte', requis: true, placeholder: 'ex. admin' },
-      { nom: 'password', label: 'Mot de passe', type: 'mdp', requis: true },
-    ] });
-    const btn = el('button', { class: 'btn btn-primaire', type: 'submit' }, 'Se connecter');
-    f.el.appendChild(el('div', { class: 'champ pleine-largeur' }, btn));
-    f.el.addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      if (!f.valider()) return;
-      btn.disabled = true; err.classList.add('masque');
-      try {
-        const data = await api.post('/api/auth/login', f.valeurs(), { silent401: true });
-        if (data && data.deuxFacteurs === true && data.jeton) { etapeCode(zone, err, data.jeton); return; }
-        await demarrer(data);
-      } catch (e) {
-        err.textContent = e.message; err.classList.remove('masque');
-      } finally { btn.disabled = false; }
-    });
     const soc = infos.societe || {};
     app.appendChild(el('div', { class: 'connexion' }, el('div', { class: 'connexion-carte' },
       el('div', { class: 'connexion-logo' }, soc.logo ? el('img', { src: soc.logo, alt: soc.nom }) : el('div', { class: 'connexion-titre' }, soc.nom || 'GMAO'), el('div', { class: 'connexion-sous-titre' }, soc.slogan || 'Gestion de Maintenance Assistée par Ordinateur')),
       (infos.general || {}).messageAccueil ? el('div', { class: 'connexion-accueil' }, infos.general.messageAccueil) : null,
       err, zone,
       el('div', { class: 'connexion-pied' }, `GMAO ${infos.version ? 'v' + infos.version : ''}${infos.premierDemarrage ? ' · Première connexion : admin / admin (mot de passe à changer immédiatement)' : ''}`))));
-    zone.appendChild(f.el);
-    setTimeout(() => { const i = f.el.querySelector('input'); if (i) i.focus(); }, 50);
+    const c = { zone, err, infos, login: '' };
+    vueConnexion(c);
+    if (message) erreurConnexion(c, message);
+  }
+
+  /** Message d'erreur de la carte de connexion (vide = masqué). */
+  function erreurConnexion(c, message) {
+    c.err.textContent = message || '';
+    c.err.classList.toggle('masque', !message);
+  }
+  /** Liens discrets sous un formulaire de la carte de connexion : [[libellé, action, classe?], …]. */
+  function liensConnexion(liens) {
+    return el('div', { class: 'connexion-liens' }, liens.filter(Boolean).map(([label, action, classe]) => el('button', { type: 'button', class: 'btn btn-lien btn-sm' + (classe ? ' ' + classe : ''), onclick: action }, label)));
+  }
+  /** Titre d'un panneau de la carte de connexion. */
+  function titrePanneau(ic, titre, texte) {
+    return frag(el('div', { class: 'connexion-panneau-titre' }, icone(ic), titre), texte ? el('p', { class: 'texte-2 texte-petit connexion-panneau-texte' }, texte) : null);
+  }
+  /** Mise au point différée d'un champ de la carte, sauf si la saisie a déjà commencé dans la carte. */
+  function mettreAuPoint(c, element) {
+    setTimeout(() => { if (element.isConnected && !c.zone.contains(document.activeElement)) element.focus(); }, 50);
+  }
+  /** Bouton d'envoi : désactivé, avec un libellé d'attente, pendant `action`. */
+  async function pendantEnvoi(btn, libelle, action) {
+    const initial = btn.textContent;
+    btn.disabled = true; btn.textContent = libelle;
+    try { return await action(); } finally { btn.disabled = false; btn.textContent = initial; }
+  }
+
+  /** Formulaire de connexion (identifiant, mot de passe) et liens « Mot de passe oublié ? », « J'ai un code ». */
+  function vueConnexion(c) {
+    ui.vider(c.zone);
+    erreurConnexion(c, '');
+    const f = ui.form({ colonnes: 1, champs: [
+      { nom: 'login', label: 'Identifiant', type: 'texte', requis: true, placeholder: 'ex. admin', valeur: c.login },
+      { nom: 'password', label: 'Mot de passe', type: 'mdp', requis: true },
+    ] });
+    const inLogin = f.controles.login.input;
+    inLogin.setAttribute('autocomplete', 'username');
+    f.controles.password.input.setAttribute('autocomplete', 'current-password');
+    const btn = el('button', { class: 'btn btn-primaire', type: 'submit' }, 'Se connecter');
+    f.el.appendChild(el('div', { class: 'champ pleine-largeur' }, btn));
+    let envoi = false;
+    f.el.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      if (envoi || !f.valider()) return;
+      envoi = true; erreurConnexion(c, '');
+      try {
+        await pendantEnvoi(btn, 'Connexion…', async () => {
+          const data = await api.post('/api/auth/login', f.valeurs(), { silent401: true });
+          if (data && data.deuxFacteurs === true && data.jeton) { etapeCode(c.zone, c.err, data.jeton); return; }
+          await demarrer(data);
+        });
+      } catch (e) {
+        erreurConnexion(c, e.message);
+      } finally { envoi = false; }
+    });
+    const memoriser = () => { c.login = inLogin.value.trim(); };
+    c.zone.appendChild(f.el);
+    c.zone.appendChild(liensConnexion([
+      c.infos.motDePasseOublie ? ['Mot de passe oublié ?', () => { memoriser(); vueDemande(c); }, 'lien-oubli'] : null,
+      ['J\'ai un code de réinitialisation', () => { memoriser(); vueCode(c, 'code'); }, 'lien-code'],
+    ]));
+    mettreAuPoint(c, c.login ? f.controles.password.input : inLogin);
+  }
+
+  /** « Mot de passe oublié ? » : demande adressée au pôle informatique (réponse identique pour tout identifiant). */
+  function vueDemande(c) {
+    ui.vider(c.zone);
+    erreurConnexion(c, '');
+    const f = ui.form({ colonnes: 1, champs: [
+      { nom: 'identifiant', label: 'Identifiant', type: 'texte', requis: true, valeur: c.login, placeholder: 'Votre identifiant de connexion' },
+      { nom: 'message', label: 'Message pour le pôle informatique (facultatif)', type: 'texte_long', lignes: 2, placeholder: 'ex. atelier 2, joignable au poste 2145' },
+    ] });
+    const inLogin = f.controles.identifiant.input;
+    inLogin.setAttribute('autocomplete', 'username');
+    const msg = f.controles.message.input;
+    msg.setAttribute('maxlength', '300');
+    const compteur = el('div', { class: 'aide texte-droite' }, '0 / 300');
+    msg.addEventListener('input', () => { compteur.textContent = `${msg.value.length} / 300`; });
+    f.champ('message').insertBefore(compteur, f.champ('message').querySelector('.erreur-champ'));
+    const btn = el('button', { class: 'btn btn-primaire', type: 'submit' }, 'Envoyer la demande');
+    f.el.appendChild(el('div', { class: 'champ pleine-largeur' }, btn));
+    let envoi = false;
+    f.el.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      if (envoi || !f.valider()) return;
+      const v = f.valeurs();
+      envoi = true; erreurConnexion(c, '');
+      try {
+        await pendantEnvoi(btn, 'Envoi…', () => api.post('/api/auth/mot-de-passe-oublie', { login: v.identifiant.trim(), message: v.message.trim() || undefined }, { silent401: true }));
+        c.login = v.identifiant.trim();
+        vueDemandeEnvoyee(c);
+      } catch (e) {
+        erreurConnexion(c, e.message);
+      } finally { envoi = false; }
+    });
+    c.zone.appendChild(frag(
+      titrePanneau('cle', 'Demander une réinitialisation', 'Indiquez votre identifiant : le pôle informatique recevra votre demande et vous remettra un code de réinitialisation. Vous choisirez ensuite vous-même votre nouveau mot de passe.'),
+      f.el,
+      liensConnexion([['Retour à la connexion', () => { c.login = inLogin.value.trim(); vueConnexion(c); }], ['J\'ai déjà un code', () => { c.login = inLogin.value.trim(); vueCode(c, 'code'); }]])));
+    mettreAuPoint(c, inLogin.value ? msg : inLogin);
+  }
+
+  /** Confirmation générique de la demande (aucune indication sur l'existence du compte) et suite de la procédure. */
+  function vueDemandeEnvoyee(c) {
+    ui.vider(c.zone);
+    erreurConnexion(c, '');
+    const btn = el('button', { class: 'btn btn-primaire', type: 'button', onclick: () => vueCode(c, 'code') }, 'J\'ai reçu un code');
+    c.zone.appendChild(frag(
+      titrePanneau('check', 'Demande envoyée'),
+      ui.alerte('Si cet identifiant correspond à un compte actif, le pôle informatique a été prévenu de votre demande.', 'ok'),
+      el('div', { class: 'texte-petit texte-gras' }, 'Et ensuite ?'),
+      el('ol', { class: 'connexion-etapes' },
+        el('li', null, 'Le pôle informatique vérifie votre identité, puis vous remet un code de réinitialisation (8 caractères, valable un temps limité) ou un mot de passe temporaire.'),
+        el('li', null, 'Avec un code : revenez sur cet écran et choisissez « J\'ai un code de réinitialisation ».'),
+        el('li', null, 'Saisissez votre identifiant, le code et votre nouveau mot de passe : vous êtes aussitôt connecté.')),
+      c.infos.reinitialisationAutonome ? el('p', { class: 'texte-2 texte-petit' }, 'Double authentification active sur votre compte ? Vous pouvez aussi choisir vous-même un nouveau mot de passe avec votre application d\'authentification, depuis « J\'ai un code de réinitialisation ».') : null,
+      el('div', { class: 'champ' }, btn),
+      liensConnexion([['Retour à la connexion', () => vueConnexion(c)]])));
+    mettreAuPoint(c, btn);
+  }
+
+  /** Normalise la saisie d'un code de réinitialisation (minuscules, espaces et tirets tolérés) : « ABCD-EF23 ». */
+  const ALPHABET_CODE_REINIT = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  function formaterCodeReinit(saisie) {
+    const brut = String(saisie || '').toUpperCase().replace(/[\s-]/g, '').slice(0, 8);
+    return brut.length > 4 ? `${brut.slice(0, 4)}-${brut.slice(4)}` : brut;
+  }
+
+  /**
+   * Nouveau mot de passe depuis l'écran de connexion, avec un code de réinitialisation remis par le pôle
+   * informatique (`mode` « code ») ou, si la configuration le permet, un code de l'application
+   * d'authentification (`mode` « application »). Aucune session n'est ouverte par la réinitialisation :
+   * une connexion normale suit (double authentification comprise).
+   */
+  function vueCode(c, mode) {
+    ui.vider(c.zone);
+    erreurConnexion(c, '');
+    const viaApplication = mode === 'application' && !!c.infos.reinitialisationAutonome;
+    const pol = c.infos.politiqueMdp || {};
+    const f = ui.form({ colonnes: 1, champs: [
+      { nom: 'identifiant', label: 'Identifiant', type: 'texte', requis: true, valeur: c.login, placeholder: 'Votre identifiant de connexion' },
+      { nom: 'codeReinit', label: viaApplication ? 'Code de votre application d\'authentification' : 'Code de réinitialisation', type: 'texte', requis: true, placeholder: viaApplication ? '000000' : 'XXXX-XXXX',
+        aide: viaApplication ? 'Code à 6 chiffres affiché par votre application (les codes de secours ne sont pas acceptés).' : 'Code de 8 caractères remis par le pôle informatique (majuscules ou minuscules, avec ou sans tiret).' },
+      { nom: 'nouveauMdp', label: 'Nouveau mot de passe', type: 'mdp', requis: true },
+      { nom: 'confirmationMdp', label: 'Confirmer le nouveau mot de passe', type: 'mdp', requis: true, valider: (v, vals) => (v !== vals.nouveauMdp ? 'Les mots de passe ne correspondent pas' : '') },
+    ] });
+    const inLogin = f.controles.identifiant.input;
+    const inCode = f.controles.codeReinit.input;
+    const inNouveau = f.controles.nouveauMdp.input;
+    const inConfirmation = f.controles.confirmationMdp.input;
+    inLogin.setAttribute('autocomplete', 'username');
+    inNouveau.setAttribute('autocomplete', 'new-password');
+    inConfirmation.setAttribute('autocomplete', 'new-password');
+    inCode.classList.add('saisie-code');
+    inCode.setAttribute('spellcheck', 'false');
+    inCode.setAttribute('autocomplete', viaApplication ? 'one-time-code' : 'off');
+    inCode.setAttribute('inputmode', viaApplication ? 'numeric' : 'text');
+    inCode.setAttribute('autocapitalize', 'characters');
+    inCode.setAttribute('maxlength', viaApplication ? '6' : '20');
+    inCode.addEventListener('input', () => {
+      const v = viaApplication ? inCode.value.replace(/\D/g, '').slice(0, 6) : formaterCodeReinit(inCode.value);
+      if (v !== inCode.value) inCode.value = v;
+    });
+    const regles = ui.reglesMdp(inNouveau, { politique: pol, login: () => inLogin.value, confirmation: inConfirmation });
+    inLogin.addEventListener('input', regles.maj);
+    f.champ('nouveauMdp').insertBefore(regles.el, f.champ('nouveauMdp').querySelector('.erreur-champ'));
+    const btn = el('button', { class: 'btn btn-primaire', type: 'submit' }, 'Enregistrer et me connecter');
+    f.el.appendChild(el('div', { class: 'champ pleine-largeur' }, btn));
+    let envoi = false;
+    f.el.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      if (envoi || !f.valider()) return;
+      const v = f.valeurs();
+      const code = viaApplication ? v.codeReinit.replace(/\s/g, '') : formaterCodeReinit(v.codeReinit).replace('-', '');
+      if (viaApplication ? !/^\d{6}$/.test(code) : (code.length !== 8 || [...code].some((x) => !ALPHABET_CODE_REINIT.includes(x)))) {
+        f.erreur('codeReinit', viaApplication ? 'Saisissez les 6 chiffres affichés par votre application' : 'Le code comporte 8 caractères, par exemple ABCD-EF23 (il ne contient ni I, ni O, ni 0, ni 1)');
+        inCode.focus();
+        return;
+      }
+      if (!regles.conforme()) { f.erreur('nouveauMdp', 'Le nouveau mot de passe ne respecte pas toutes les règles indiquées'); inNouveau.focus(); return; }
+      const login = v.identifiant.trim();
+      envoi = true; erreurConnexion(c, '');
+      try {
+        await pendantEnvoi(btn, 'Enregistrement…', async () => {
+          await api.post(viaApplication ? '/api/auth/reinitialiser-autonome' : '/api/auth/reinitialiser', { login, code, nouveau: v.nouveauMdp }, { silent401: true });
+          await connexionApresReinitialisation(c, login, v.nouveauMdp, viaApplication);
+        });
+      } catch (e) {
+        erreurConnexion(c, e.message);
+        // Code refusé : nouvelle saisie du code ; mot de passe refusé : nouvelle saisie du mot de passe
+        if (e.status === 400 && /code/i.test(e.message)) { inCode.select(); inCode.focus(); } else inNouveau.focus();
+      } finally { envoi = false; }
+    });
+    const memoriser = () => { c.login = inLogin.value.trim(); };
+    c.zone.appendChild(frag(
+      titrePanneau(viaApplication ? 'profils' : 'cle', viaApplication ? 'Nouveau mot de passe avec votre application' : 'Nouveau mot de passe avec un code',
+        viaApplication ? 'Possible uniquement si la double authentification est active sur votre compte. Le pôle informatique en est informé.' : null),
+      f.el,
+      liensConnexion([
+        c.infos.reinitialisationAutonome ? [viaApplication ? 'Utiliser un code du pôle informatique' : 'Utiliser mon application d\'authentification', () => { memoriser(); vueCode(c, viaApplication ? 'code' : 'application'); }, 'lien-mode'] : null,
+        !viaApplication && c.infos.motDePasseOublie ? ['Je n\'ai pas de code', () => { memoriser(); vueDemande(c); }] : null,
+        ['Retour à la connexion', () => { memoriser(); vueConnexion(c); }],
+      ])));
+    mettreAuPoint(c, inLogin.value ? inCode : inLogin);
+  }
+
+  /**
+   * Après une réinitialisation réussie : connexion normale avec le nouveau mot de passe, code de la double
+   * authentification demandé si elle est active (la réinitialisation ne la contourne jamais).
+   */
+  async function connexionApresReinitialisation(c, login, motDePasse, viaApplication) {
+    c.login = login;
+    let data;
+    try {
+      data = await api.post('/api/auth/login', { login, password: motDePasse }, { silent401: true });
+    } catch (e) {
+      vueConnexion(c);
+      erreurConnexion(c, `Votre nouveau mot de passe est enregistré, mais la connexion automatique a échoué : ${e.message}`);
+      return;
+    }
+    if (data && data.deuxFacteurs === true && data.jeton) {
+      etapeCode(c.zone, c.err, data.jeton, viaApplication
+        ? 'Nouveau mot de passe enregistré. Pour vous connecter, saisissez le prochain code affiché par votre application (celui que vous venez d\'utiliser n\'est plus valable).'
+        : 'Nouveau mot de passe enregistré. La double authentification reste exigée : saisissez le code de votre application pour vous connecter.');
+      return;
+    }
+    await demarrer(data);
+    toast('Nouveau mot de passe enregistré : vous êtes connecté', 'succes');
   }
 
   /** Champ de saisie d'un code de vérification (6 chiffres) ou, en mode secours, d'un code de secours. */
@@ -271,8 +546,11 @@
     return input;
   }
 
-  /** Seconde étape de la connexion : code de l'application d'authentification ou code de secours. */
-  function etapeCode(zone, err, jeton) {
+  /**
+   * Seconde étape de la connexion : code de l'application d'authentification ou code de secours.
+   * `info` : message affiché au-dessus (ex. nouveau mot de passe enregistré après une réinitialisation).
+   */
+  function etapeCode(zone, err, jeton, info) {
     ui.vider(zone);
     err.classList.add('masque');
     let secours = false;
@@ -312,10 +590,11 @@
     const form = el('form', { class: 'formulaire colonnes-1', novalidate: true },
       el('div', { class: 'champ pleine-largeur' }, label, input, aide),
       el('div', { class: 'champ pleine-largeur' }, btn),
-      el('div', { style: { display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '6px' } }, lienSecours, lienRetour));
+      el('div', { class: 'connexion-liens' }, lienSecours, lienRetour));
     form.addEventListener('submit', (ev) => { ev.preventDefault(); soumettre(); });
+    if (info) zone.appendChild(ui.alerte(info, 'ok'));
     zone.appendChild(el('div', { class: 'inline texte-gras', style: { fontSize: '16px', marginBottom: '6px' } }, icone('cle'), 'Vérification en deux étapes'));
-    zone.appendChild(el('p', { class: 'texte-2 texte-petit', style: { marginTop: '0' } }, 'Mot de passe correct. Ouvrez votre application d\'authentification et saisissez le code affiché pour « GMAO SICAF ».'));
+    zone.appendChild(el('p', { class: 'texte-2 texte-petit', style: { marginTop: '0' } }, info ? 'Ouvrez votre application d\'authentification et saisissez le code affiché pour « GMAO SICAF ».' : 'Mot de passe correct. Ouvrez votre application d\'authentification et saisissez le code affiché pour « GMAO SICAF ».'));
     zone.appendChild(form);
     majMode();
   }
@@ -343,11 +622,11 @@
     app.appendChild(layout);
     construireNavigation();
     document.addEventListener('click', fermerMenus);
+    majRappelMdp();
     GMAO.rendre();
     // Écrans imposés : nouveau mot de passe, puis enrôlement de la double authentification si elle est obligatoire
-    const suite = () => { if (GMAO.deuxFacteursRequis()) imposerEnrolement(); };
-    if (GMAO.user.doitChangerMdp && (GMAO.config.securite || {}).forcerChangementMdpInitial !== false) GMAO.ouvrirChangementMdp(true, suite);
-    else suite();
+    if (GMAO.changementMdpRequis()) imposerChangementMdp();
+    else if (GMAO.deuxFacteursRequis()) imposerEnrolement();
     majNotifications();
     if (GMAO._notifTimer) clearInterval(GMAO._notifTimer);
     GMAO._notifTimer = setInterval(majNotifications, 60000);
@@ -415,7 +694,8 @@
       el('div', { class: 'menu-entete' }, `Connecté en tant que ${GMAO.user.login}`, el('br'), `Profil : ${GMAO.perms.profilNom || '—'} · Portée : ${(GMAO.catalogue.portees || {})[GMAO.perms.portee] || GMAO.perms.portee}`),
       el('div', { class: 'menu-sep' }),
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); afficherMonCompte(); } }, icone('utilisateur'), 'Mon compte'),
-      el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.ouvrirChangementMdp(false); } }, icone('cle'), 'Changer mon mot de passe'),
+      el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.ouvrirChangementMdp(false); } }, icone('cle'), 'Changer mon mot de passe',
+        GMAO.motDePasse && GMAO.motDePasse.rappel ? el('span', { class: 'texte-alerte texte-petit', style: { marginLeft: 'auto', whiteSpace: 'nowrap' }, title: `Votre mot de passe ${libelleEcheance(GMAO.motDePasse.joursRestants)}` }, GMAO.motDePasse.joursRestants <= 1 ? libelleEcheance(GMAO.motDePasse.joursRestants).replace('expire ', '') : `dans ${GMAO.motDePasse.joursRestants} j`) : null),
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.ouvrirDoubleAuthentification(); } }, icone('profils'), 'Double authentification',
         el('span', { class: 'texte-2 texte-petit', style: { marginLeft: 'auto' } }, GMAO.deuxFacteurs && GMAO.deuxFacteurs.actif ? 'activée' : 'désactivée')),
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); GMAO.setTheme(theme === 'sombre' ? 'clair' : 'sombre'); } }, icone(theme === 'sombre' ? 'soleil' : 'lune'), theme === 'sombre' ? 'Thème clair' : 'Thème sombre'),
@@ -441,11 +721,61 @@
         { label: 'Secteurs', valeur: (u.secteurIds || []).length ? u.secteurIds.map((s) => ui.nomSecteur(s)).join(', ') : 'Tous' },
         { label: 'Supérieur hiérarchique', valeur: u.managerId != null ? ui.nomUser(u.managerId) : '—' },
         { label: 'Dernière connexion', valeur: ui.formatDateHeure(u.derniereConnexion) },
+        { label: 'Mot de passe', valeur: frag(resumeMdp(GMAO.motDePasse), ' ', el('button', { type: 'button', class: 'btn btn-lien btn-sm', onclick: () => GMAO.ouvrirChangementMdp(false) }, 'Changer')) },
         { label: 'Double authentification', valeur: frag(badgeDeuxFacteurs(GMAO.deuxFacteurs), ' ', el('button', { type: 'button', class: 'btn btn-lien btn-sm', onclick: () => GMAO.ouvrirDoubleAuthentification() }, 'Gérer')) },
       ], { colonnes: 2 }),
       el('h3', { class: 'mt' }, 'Mes droits'),
       el('div', { class: 'tableau-conteneur' }, el('table', { class: 'tableau tableau-compact' }, el('thead', null, el('tr', null, el('th', null, 'Module'), el('th', null, 'Actions autorisées'))), el('tbody', null, mods)))
     ), boutons: [{ label: 'Fermer' }] });
+  }
+
+  // ----- Changement de mot de passe imposé -----------------------------------
+  /** Changement imposé par le serveur (mot de passe initial, réinitialisé, expiré ou défini par un administrateur). */
+  GMAO.changementMdpRequis = () => {
+    if (!GMAO.user) return false;
+    if (GMAO.motDePasse) return !!GMAO.motDePasse.doitChanger;
+    return !!GMAO.user.doitChangerMdp && (GMAO.config.securite || {}).forcerChangementMdpInitial !== false;
+  };
+  let modaleMdpImposee = null;
+  /** Fenêtre de changement imposée (une seule à la fois) ; ensuite, amorçage rechargé (droits, enrôlement éventuel). */
+  function imposerChangementMdp() {
+    if (modaleMdpImposee || !GMAO.user) return;
+    GMAO.ouvrirChangementMdp(true, () => { GMAO.refresh(true).then(() => majNotifications()).catch(erreur); });
+  }
+
+  /** « aujourd'hui », « demain », « dans 5 jours ». */
+  function libelleEcheance(jours) {
+    if (jours == null) return '';
+    return jours <= 0 ? 'expire aujourd\'hui' : jours === 1 ? 'expire demain' : `expire dans ${jours} jours`;
+  }
+  /** Résumé de l'état de son mot de passe (fenêtre « Mon compte »). */
+  function resumeMdp(etat) {
+    if (!etat) return '—';
+    const parts = [etat.dateMdp ? `modifié le ${ui.formatDate(etat.dateMdp)}` : 'jamais modifié', etat.expireLe ? `expire le ${ui.formatDate(etat.expireLe)}` : 'sans expiration'];
+    return el('span', { class: etat.rappel ? 'texte-alerte' : '' }, parts.join(' · '));
+  }
+  /**
+   * Rappel discret sous l'en-tête quand l'échéance du mot de passe approche (config.securite.rappelExpirationJours),
+   * masquable jusqu'à la prochaine session.
+   */
+  function majRappelMdp() {
+    const existant = document.querySelector('.rappel-mdp');
+    if (existant) existant.remove();
+    const etat = GMAO.motDePasse;
+    if (!GMAO.user || !etat || !etat.rappel || etat.joursRestants == null || GMAO.changementMdpRequis()) return;
+    const entete = document.querySelector('.principal > .entete');
+    if (!entete) return;
+    const cle = 'gmao.rappelMdp.' + GMAO.user.id;
+    try { if (sessionStorage.getItem(cle) === String(etat.expireLe)) return; } catch (e) { /* stockage indisponible */ }
+    const bandeau = el('div', { class: 'rappel-mdp', role: 'status' },
+      icone('cle'),
+      el('span', null, `Votre mot de passe ${libelleEcheance(etat.joursRestants)} (le ${ui.formatDate(etat.expireLe)}).`),
+      ui.bouton('Changer maintenant', { classe: 'btn-sm btn-primaire', onClic: () => GMAO.ouvrirChangementMdp(false) }),
+      el('button', { type: 'button', class: 'btn btn-icone btn-sm', title: 'Masquer ce rappel', 'aria-label': 'Masquer ce rappel', onclick: () => {
+        try { sessionStorage.setItem(cle, String(etat.expireLe)); } catch (e) { /* stockage indisponible */ }
+        bandeau.remove();
+      } }, icone('fermer')));
+    entete.after(bandeau);
   }
 
   // ----- Double authentification -------------------------------------------
@@ -480,7 +810,7 @@
 
   /** Fenêtres imposées (mot de passe initial, enrôlement) : fermées lorsque la session se termine. */
   const modalesImposees = new Set();
-  function fermerModalesImposees() { modalesImposees.forEach((m) => m.fermer()); modalesImposees.clear(); }
+  function fermerModalesImposees() { modalesImposees.forEach((m) => m.fermer()); modalesImposees.clear(); modaleMdpImposee = null; }
 
   /** Champ de mot de passe ou de code dans un petit formulaire (Entrée = bouton principal de la modale). */
   function formulaireConfirmation(m, avecCode) {
@@ -666,7 +996,7 @@
   // ----- Notifications ----------------------------------------------------
   let notifs = { nonLues: 0, notifications: [] };
   async function majNotifications() {
-    if (!GMAO.user) return;
+    if (!GMAO.user || GMAO.changementMdpRequis()) return; // aucune donnée avant le changement de mot de passe imposé
     try {
       notifs = await api.get('/api/notifications', null, { silent401: true });
       const btn = document.querySelector('.btn-notifs');

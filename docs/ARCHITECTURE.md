@@ -7,10 +7,10 @@ HTML/CSS/JS « vanilla », données JSON. Tout le code et l'interface sont en **
 ```
 server/                 serveur HTTP + API JSON
   index.js              point d'entrée (CLI : --port --host --data --open)
-  server.js             createApp() : routes cœur (auth, amorçage, notifications), statiques, sessions, ctx
+  server.js             createApp() : routes cœur (auth, mot de passe oublié, amorçage, notifications), statiques, sessions, ctx
   db.js                 base documentaire JSON (collections, ids, sauvegardes, numérotation)
   router.js             mini routeur (HttpError, patterns /api/x/:id, opts { public, perm })
-  auth.js               scrypt, sessions, anti-force-brute
+  auth.js               scrypt, sessions, anti-force-brute, quotas, codes de réinitialisation
   permissions.js        catalogue MODULES/ACTIONS, droits effectifs, portée, hiérarchie
   seed.js               configuration et données par défaut (profils, secteurs, admin)
   modules/              UN FICHIER PAR MODULE MÉTIER, chargé automatiquement (ordre alphabétique)
@@ -50,13 +50,15 @@ module.exports = { nom, register, seedDemo };
 | `ctx.requirePerm(req, module, action)` | lève 403 |
 | `ctx.scope(req, rows)` | filtre une liste selon la **portée** de l'utilisateur (voir §4) |
 | `ctx.canSee(req, record)` / `ctx.getVisible(req, col, id)` | contrôle de portée sur un enregistrement (404 sinon) |
-| `ctx.audit(req, action, entite, entiteId, details)` | journal d'audit (actions : creation, modification, suppression, validation, refus, cloture, affectation, statut, mouvement, generation…) |
+| `ctx.audit(req, action, entite, entiteId, details, options?)` | journal d'audit (actions : creation, modification, suppression, validation, refus, cloture, affectation, statut, mouvement, generation…) ; `options.notifier === false` : sans notification des rôles responsables |
 | `ctx.notify(userIds, { titre, message, lien, type })` | notifications internes (`lien` = hash de vue, ex. `#/ot/12`) |
 | `ctx.usersAvecDroit(module, action, filtre?)` | utilisateurs actifs possédant un droit (ex. valideurs) |
 | `ctx.liste(nom)` / `ctx.codeListe(nom, code, obligatoire)` | listes de valeurs configurées (voir §5) et validation d'un code |
 | `ctx.champsPerso(entite, input)` | valide les champs personnalisés configurés → objet `{ cle: valeur }` à stocker dans `record.champs` |
 | `ctx.config()` | configuration complète (copie) |
 | `ctx.nomUser(id)` | nom affichable |
+| `ctx.utilisateurVisible(lecteur, droits, compte, ecriture)` | règle de visibilité d'un compte utilisateur (soi-même, sans secteur, secteur partagé, site courant) — module utilisateurs et destinataires des demandes de réinitialisation |
+| `ctx.motsDePasse` | cycle de vie des mots de passe (cœur, `server/server.js`) : `changementImpose(user)`, `raison(user)`, `infos(user)`, `refus(user, nouveau)` (async : politique + historique), `champsNouveau(user, nouveau, { doitChanger, raison })`, `poserCode(user, { creePar, origine })`, `annulerCode(userId)`, `etatCode(user)`, `traiterDemandes(userId, { mode, par })`, `gestionnaires(user)`, `purger()` |
 | `ctx.on(evt, fn)` / `ctx.emit(evt, data)` | événements |
 | `ctx.services` | **objet partagé** `{}` : chaque module peut y publier des fonctions ; les consommateurs y accèdent **au moment de la requête** (`ctx.services.stock && ctx.services.stock.sortir(...)`) |
 | `req.user`, `req.perms`, `req.profil`, `req.body`, `req.query`, `req.params` | requête authentifiée |
@@ -87,7 +89,7 @@ Règles :
 ```
 
 ### API globale `GMAO`
-`GMAO.user`, `GMAO.perms`, `GMAO.config`, `GMAO.modules`, `GMAO.refs` (`users`, `secteurs`, `profils`), `GMAO.catalogue`,
+`GMAO.user`, `GMAO.perms`, `GMAO.config`, `GMAO.modules`, `GMAO.refs` (`users`, `secteurs`, `profils`), `GMAO.catalogue`, `GMAO.deuxFacteurs`, `GMAO.motDePasse` (voir §8), `GMAO.changementMdpRequis()`,
 `GMAO.can(module, action)`, `GMAO.estAdmin()`, `GMAO.liste(nom)`, `GMAO.moduleLabel(key)`, `GMAO.navigate('#/ot/12')`, `GMAO.refreshRefs()`, `GMAO.setNavBadge(module, n)`, `GMAO.route`.
 
 ### API `api`
@@ -100,6 +102,7 @@ Règles :
 - Tableau : `ui.table({ colonnes: [{ cle, label, rendu(row), type: 'date'|'datetime'|'nombre'|'montant'|'user'|'secteur'|'booleen', liste: 'statutsOT', aligner, largeur, tri }], lignes, onClic(row), actions: [{ icone, titre, onClic(row), visible(row), classe }], recherche, exportCsv: 'fichier.csv', groupe: { cle(row), label(val, rows) }, triInitial: { cle, sens }, ligneClasse(row), pagination, compact })` → `{ el, maj(lignes), setGroupe(g), setTri(t) }`.
 - Formulaires : `ui.form({ champs, valeurs, colonnes })` → `{ el, valeurs(), valider(), set(nom, v), get(nom), majOptions(nom, opts), erreur(nom, msg) }` ; `ui.formModal({ titre, champs, valeurs, taille: 'large'|'tres-large'|'petite', onSubmit(valeurs, modal, form), submitLabel, boutonsSupp })`.
   Types de champs : texte, texte_long, nombre, date, datetime, heure, select (`options` [{value,label}] ou `liste: 'priorites'`), multiselect, cases, radio, booleen, interrupteur, couleur, mdp, email, tel, fichier, image, lecture, separateur, html (`rendu(form)`), cache. Options : `requis, placeholder, aide, pleineLargeur, disabled, min, max, step, onChange(valeur, form), afficherSi(valeurs), valider(v, valeurs)`.
+- Mots de passe : le type de champ `mdp` porte un bouton afficher / masquer ; `ui.reglesMdp(input, { politique: { longueurMin, complexite, interdireIdentifiant }, login, confirmation, historique })` → `{ el, maj(), conforme() }` affiche les règles cochées pendant la saisie et la robustesse ; `ui.copier(texte)` → Promise<bool> (repli par sélection sur une adresse http).
 - Champs personnalisés : `...ui.champsPersoDefs('ot')` dans `champs` ; `ui.champsPersoInitiaux(record)` dans `valeurs` ; à l'envoi `body.champs = ui.champsPersoValeurs(v)` et supprimer les clés `champs.*` ; affichage `ui.champsPersoAffichage('ot', record)` (tableau `{label, valeur}` pour `ui.details`).
 - Modales : `ui.modal({ titre, contenu, boutons: [{ label, classe, icone, onClic(modal) }], taille })`, `ui.confirm({ titre, message, okLabel, danger })` → Promise<bool>, `ui.prompt({ titre, label, type })`, `ui.toast(msg, 'succes'|'erreur'|'alerte'|'info')`, `ui.erreur(e)`.
 - Mise en page : `ui.pageEntete({ titre, icone, sousTitre, actions, filAriane })`, `ui.bouton(label, { icone, classe, onClic, disabled })`, `ui.carte(titre, contenu, { actions })`, `ui.onglets([{ cle, label, icone, rendu(cont) | contenu, badge }], { hash: true })`, `ui.kpi({ label, valeur, couleur, icone, detail, onClic })`, `ui.details([{ label, valeur }], { colonnes: 2 })`, `ui.arbre(noeuds, { label, enfants, icone, onSelect, compteur, couleur, niveauReplie })`, `ui.badge(label, couleur)`, `ui.pastille(couleur)`, `ui.alerte(msg, type)`, `ui.vide(msg)`, `ui.chargement()`, `ui.graphiqueBarres([{ label, valeur, couleur }])`, `ui.imprimer(titre, html)`, `ui.exportCsv(nom, colonnes, lignes)`, `ui.telecharger(nom, contenu, type)`, `ui.avatar(nom)`.
@@ -138,7 +141,13 @@ Champs communs : `id` (nombre), `createdAt`, `updatedAt`, `createdBy` (id utilis
 `nom`, `typeCode` (liste `typesFournisseur`), `contact`, `telephone`, `email`, `adresse`, `siteWeb`, `siret`, `notes`, `delaiLivraisonJours`, `actif`.
 
 ### Collections existantes
-`users`, `profils`, `secteurs`, `audit`, `notifications`, `documents` (libre).
+`users`, `profils`, `secteurs`, `audit`, `notifications`, `documents` (libre), `demandesMdp` (voir §8).
+
+### `users` : champs liés au mot de passe (jamais envoyés au poste)
+`passwordHash` (scrypt), `historiqueMdp` (empreintes des `config.securite.historiqueMdp` mots de passe précédents),
+`reinitialisation` `{ empreinte (scrypt du code), expireLe, creeLe, creePar (id, ou null pour la récupération d'urgence), origine ('pole_informatique' | 'recuperation_urgence'), essais }` (un seul code actif par compte).
+Champs transmis : `dateMdp` (dernier changement), `dateReferenceMdp` (date de référence de l'expiration pour un compte sans `dateMdp`), `doitChangerMdp`, `raisonChangementMdp` (`initial` | `reinitialise` | `expire` | `administrateur`).
+`auth.cleanUser` retire les secrets ; en dernier recours, toute réponse JSON contenant un `passwordHash`, un `historiqueMdp` (tableau) ou un objet `reinitialisation` en est expurgée (`sendJson`, `server/server.js`).
 
 ## 4. Droits, portée, hiérarchie, multi-site
 
@@ -169,13 +178,65 @@ Sections de configuration des modules (valeurs par défaut dans `server/seed.js`
 | stock | `ctx.services.stock.annulerSortie(mouvementId, userId)` | retour en stock (mouvement `retour`) |
 | preventif | `ctx.services.preventif.generer(options?)` | génère les OT à échéance (idempotent : pas de doublon si un OT ouvert existe pour le plan), retourne la liste des OT créés |
 | equipements | `ctx.services.equipements.releverCompteur(equipementId, valeur, req)` | met à jour `compteur.valeur` |
+| cœur | `ctx.services.motsDePasse.comptesRecuperables()` | application de bureau (mode serveur) : comptes actifs administrateurs ou avec Système › Modifier, `[{ login, nom }]` |
+| cœur | `ctx.services.motsDePasse.recuperationUrgence({ login, origine })` | synchrone : code de réinitialisation (origine `recuperation_urgence`, `creePar` null), journal `recuperation_urgence` (auteur `origine`, ex. « Poste serveur »), notification à tous les comptes Système › Modifier ; renvoie `{ login, nom, code, expireLe }` ; lève une erreur pour un compte non récupérable |
 
 Événements (`ctx.emit`) : `demande:soumise`, `demande:validee`, `demande:refusee`, `ot:cree`, `ot:statut` (`{ ot, ancien, nouveau }`), `ot:termine` (OT passé à un statut final `termine`), `ot:annule`, `stock:sousSeuil` (`article`), `preventif:genere` (`{ plan, ot }`).
 Réactions attendues : demandes écoute `ot:termine` (clôture la DI si `cloturerDemandeAvecOt`) ; preventif écoute `ot:termine` (met à jour `derniereExecution` / `prochaineEcheance` du plan) ; stock émet `stock:sousSeuil` et notifie les utilisateurs ayant `stock.modifier`.
 
 ## 7. Tests
 
-- API : `tests/<module>.test.js` avec `node:test` et `tests/helpers.js` (`demarrer()` → `{ client(), db, ctx, stop }`, serveur en mémoire sur port aléatoire ; `client().login('admin','admin')`, `.ok(method, url, body)`). Dans les tests, la politique de mot de passe est assouplie ; `demarrer({ politiqueReelle: true })` conserve la politique réelle. Tester : CRUD, validation, droits (403), portée par secteur et par site, workflow.
+- API : `tests/<module>.test.js` avec `node:test` et `tests/helpers.js` (`demarrer()` → `{ client(), db, ctx, stop }`, serveur en mémoire sur port aléatoire ; `client().login('admin','admin')`, `.ok(method, url, body)`). Dans les tests, la politique de mot de passe est assouplie et le mot de passe initial (admin / admin) utilisable sans changement préalable (`forcerChangementMdpInitial: false`) ; `demarrer({ politiqueReelle: true })` conserve la politique réelle : le serveur refuse alors toute route hors `/api/auth/*` (403 `changementMdpRequis`) tant que le mot de passe initial n'est pas changé. Un test qui démarre son serveur sans `tests/helpers.js` doit faire de même (ou changer le mot de passe initial). Tester : CRUD, validation, droits (403), portée par secteur et par site, workflow.
 - Lancer : `npm test` (tous) ou `node --test tests/ot.test.js`.
 - Démo : chaque module fournit `seedDemo(ctx)` idempotent (vérifier l'existence avant d'insérer) produisant des données réalistes en français (équipements industriels, pannes, pièces…), utilisées par le bouton « Charger les données de démonstration ».
 - Interface : `node tests/e2e/run.js` (Playwright) parcourt toutes les vues ; pour un nouveau parcours, se connecter avec admin / admin puis changer le mot de passe dans la fenêtre imposée (`#f_nouveau`, `#f_confirmation`, mot de passe conforme à la politique), et surveiller `page.on('pageerror')` et les violations de la politique de contenu en console.
+
+## 8. Mots de passe : changer, oublier, recréer
+
+Configuration (`config.securite`) : `motDePasseOublie` (défaut vrai), `dureeCodeReinitialisationMinutes` (5–1440, défaut 60),
+`reinitialisationAutonome` (défaut faux), `expirationMdpJours` (0 = jamais, sinon 30–730), `rappelExpirationJours` (1–60, défaut 14),
+`historiqueMdp` (0–24, défaut 5 : mots de passe précédents refusés, en plus de l'actuel), `forcerChangementMdpInitial`.
+
+**Amorçage** (`GET /api/auth/me`, réponse de `POST /api/auth/login` ou `/api/auth/login/code`) : clé de premier niveau
+`motDePasse` = `{ doitChanger, raison, dateMdp, expireLe, joursRestants, rappel }` → `GMAO.motDePasse` côté client.
+`doitChanger` : changement **imposé par le serveur** (raison `reinitialise`, `expire`, `administrateur`, ou `initial` si
+`forcerChangementMdpInitial !== false`) ; `raison` : raison du changement attendu (ou null) ; `expireLe` / `joursRestants` : null sans
+expiration ; `rappel` : vrai si `joursRestants ≤ rappelExpirationJours` (et pas de changement imposé). L'expiration est évaluée à la
+connexion et à chaque amorçage ; un compte sans `dateMdp` reçoit une `dateReferenceMdp` à la première évaluation (rien n'expire d'un coup).
+
+**Changement imposé** : tant que `doitChanger` est vrai, toute route authentifiée hors `/api/auth/*` (notifications comprises : aucune
+donnée de l'application avant le changement) renvoie `403 { erreur, changementMdpRequis: true, details: { changementMdpRequis: true, raison } }`.
+Côté client, `api.js` n'interroge plus le serveur (hors authentification) tant que `GMAO.changementMdpRequis()` est vrai et appelle
+`GMAO.onChangementMdpRequis()` sur un tel 403 ; `app.js` n'affiche aucune vue et impose une seule fenêtre de changement.
+
+**Routes publiques** (aucune n'ouvre de session : le poste enchaîne une connexion normale, double authentification comprise) :
+- `POST /api/auth/mot-de-passe-oublie { login, message? }` → toujours `200 { ok: true }` (traitement après la réponse ; compte inconnu
+  ou désactivé : journal seulement) ; `403` si `motDePasseOublie` est faux ; `429` au-delà de 5 demandes par poste en 15 minutes.
+  Une demande en attente est mise à jour (`repetitions` = nombre de demandes reçues), notifications au plus toutes les 30 minutes aux
+  comptes ayant Utilisateurs › Modifier qui peuvent gérer et voir le compte, et au titulaire.
+- `POST /api/auth/reinitialiser { login, code, nouveau }` → `200 { ok: true }` ; sinon `400` générique ; message de la politique
+  seulement après un code valide (code non consommé) ; `429` après 8 échecs (clés `reinit|ip|login` et `reinit-compte|login`).
+- `POST /api/auth/reinitialiser-autonome { login, code, nouveau }` (si `reinitialisationAutonome`) : code à 6 chiffres de
+  l'application d'authentification (jamais un code de secours), anti-rejeu, même blocage que les codes de vérification du compte.
+- `GET /api/auth/infos` : `motDePasseOublie`, `reinitialisationAutonome`, `politiqueMdp { longueurMin, complexite, interdireIdentifiant }`.
+
+**Codes de réinitialisation** : 8 caractères de `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, affichés `XXXX-XXXX`, saisie tolérante ;
+empreinte scrypt seule conservée ; usage unique ; expiration ; 5 essais incorrects puis annulation (pôle informatique prévenu) ;
+annulés par un changement de mot de passe, une nouvelle réinitialisation ou la désactivation du compte.
+
+**Routes de gestion** (droit Utilisateurs › Modifier, règle hiérarchique `canManageUser` et portée, sites compris) :
+- `POST /api/utilisateurs/:id/reinitialiser-mdp { mode: 'code' | 'temporaire', password?, demandeId? }` → `{ ok, mode: 'code', code, expireLe, login }`
+  (renvoyé une seule fois ; mot de passe et sessions inchangés) ou `{ ok, mode: 'temporaire', motDePasse }` (changement imposé, sessions
+  fermées) ; refusé pour soi-même et pour un compte désactivé ; demandes en attente du compte traitées, titulaire prévenu.
+- `DELETE /api/utilisateurs/:id/code-reinitialisation` : annule le code actif.
+- `GET /api/utilisateurs/:id` : `motDePasse { dateMdp, expireLe, doitChanger (indicateur du compte), raison, codeActif, codeExpireLe, codeOrigine }` pour les gestionnaires.
+- `GET /api/utilisateurs-demandes-mdp` : demandes en attente `{ id, userId, login, nom, profilNom, message, ip, poste, repetitions,
+  createdAt, derniereDemande, statut }` ; `?toutes=1` ajoute les 50 dernières traitées ou rejetées (`mode`, `traiteePar`, `traiteeParNom`, `traiteeLe`, `motifRejet`).
+- `POST /api/utilisateurs-demandes-mdp/:id/rejeter { motif? }`.
+
+Collection `demandesMdp` : `{ id, userId, login, message (≤ 300 caractères, texte brut), ip, poste (≤ 200), statut ('en_attente' | 'traitee' |
+'rejetee'), repetitions, derniereDemande, createdAt, traiteePar, traiteeLe, mode ('code' | 'temporaire' | 'utilisateur' | 'rejet'), motifRejet,
+derniereNotification }` ; demandes traitées ou rejetées purgées après 90 jours. Journal : `demande_reinitialisation_mdp`,
+`rejet_demande_reinitialisation_mdp`, `code_reinitialisation_mdp`, `annulation_code_reinitialisation`, `echec_reinitialisation_mdp`,
+`reinitialisation_mdp_code`, `reinitialisation_mdp_autonome`, `recuperation_urgence`, `expiration_mdp` (libellés : `ctx.libellesActions`,
+renvoyés par `GET /api/audit` dans `libellesActions`).

@@ -28,7 +28,7 @@ async function lancer() {
   const dataDir = dossierTemp();
   const app = createApp({ dataDir, log: () => {} });
   // Politique de mot de passe assouplie pour les comptes de test (voir tests/helpers.js)
-  { const cfg = app.db.getConfig(); cfg.securite = Object.assign({}, cfg.securite, { longueurMinMdp: 4, complexite: false, refuserCourants: false, interdireIdentifiant: false }); app.db.setConfig(cfg); }
+  { const cfg = app.db.getConfig(); cfg.securite = Object.assign({}, cfg.securite, { longueurMinMdp: 4, complexite: false, refuserCourants: false, interdireIdentifiant: false, forcerChangementMdpInitial: false }); app.db.setConfig(cfg); }
   const addr = await app.start(0);
   return { app, dataDir, base: `http://127.0.0.1:${addr.port}`, db: app.db, ctx: app.ctx };
 }

@@ -1,7 +1,8 @@
 /**
  * Vue Utilisateurs : comptes internes, hiérarchie (supérieur, niveau), secteurs,
  * surcharges individuelles de droits (« voit plus ou moins » que son profil),
- * état et réinitialisation de la double authentification.
+ * état et réinitialisation de la double authentification, réinitialisation du mot de passe
+ * (code à usage unique ou mot de passe temporaire) et demandes faites depuis l'écran de connexion.
  */
 (function () {
   'use strict';
@@ -146,10 +147,15 @@
     try { u = await api.get('/api/utilisateurs/' + id); } catch (e) { return erreur(e); }
     const p = u.permissionsEffectives;
     const profil = ui.profil(u.profilId);
+    const demande = demandeDe(u);
+    const recharger = () => { m.fermer(); afficherFiche(u.id); };
     const m = ui.modal({
       titre: nomComplet(u), taille: 'large',
       contenu: ui.onglets([
         { cle: 'infos', label: 'Informations', rendu: () => frag(
+          demande && peutReinitialiserMdp(u) ? el('div', { class: 'alerte alerte-alerte bandeau-demandes' }, icone('cle'),
+            el('span', null, `Demande de réinitialisation du mot de passe en attente (${ui.relatif(demande.derniereDemande)}${demande.repetitions > 1 ? `, ${demande.repetitions} demandes` : ''}).`),
+            ui.bouton('Traiter', { classe: 'btn-sm btn-primaire', onClic: () => { m.fermer(); reinitialiserMdp(u, { demande, apres: () => { majDemandes(true); } }); } })) : null,
           ui.details([
             { label: 'Identifiant', valeur: u.login }, { label: 'Statut', valeur: u.actif === false ? ui.badge('Désactivé', '#dc2626') : ui.badge('Actif', '#16a34a') },
             { label: 'Fonction', valeur: u.fonction }, { label: 'Matricule', valeur: u.matricule },
@@ -162,6 +168,7 @@
             { label: 'Subordonnés', valeur: (u.subordonnes || []).length ? u.subordonnes.map((s) => nomComplet(s)).join(', ') : '—' },
             { label: 'Dernière connexion', valeur: ui.formatDateHeure(u.derniereConnexion) }, { label: 'Créé le', valeur: ui.formatDateHeure(u.createdAt) },
             { label: 'Double authentification', valeur: badgeDeuxFacteurs(u, true) },
+            u.motDePasse ? { label: 'Mot de passe', valeur: etatMotDePasse(u, recharger) } : null,
             ...ui.champsPersoAffichage('utilisateurs', u),
           ], { colonnes: 2 }),
         ) },
@@ -171,6 +178,7 @@
         ) },
       ]).el,
       boutons: [
+        peutReinitialiserMdp(u) ? { label: 'Réinitialiser le mot de passe', icone: 'cle', gauche: true, onClic: () => { m.fermer(); reinitialiserMdp(u, { demande, apres: () => { majDemandes(true); } }); } } : null,
         peutReinitialiserDeuxFacteurs(u) ? { label: 'Réinitialiser la double authentification', icone: 'profils', gauche: true, onClic: () => { m.fermer(); reinitialiserDeuxFacteurs(u, () => rafraichir()); } } : null,
         u.id === GMAO.user.id ? { label: 'Ma double authentification', icone: 'profils', gauche: true, onClic: () => { m.fermer(); GMAO.ouvrirDoubleAuthentification(); } } : null,
         peutModifier(u) ? { label: 'Modifier', icone: 'modifier', classe: 'btn-primaire', onClic: () => { m.fermer(); ouvrirFormulaire(u, () => rafraichir()); } } : null,
@@ -179,13 +187,236 @@
     });
   }
 
-  async function reinitialiserMdp(u) {
-    const pwd = await ui.prompt({ titre: 'Réinitialiser le mot de passe', message: `Nouveau mot de passe pour ${nomComplet(u)} (vide = généré automatiquement)`, label: 'Mot de passe', type: 'texte', requis: false });
-    if (pwd === null) return;
+  // ----- Mots de passe : réinitialisation (code ou mot de passe temporaire), demandes de l'écran de connexion -----
+  /** Demandes de réinitialisation en attente (comptes que l'on peut gérer) ; rechargées par `majDemandes`. */
+  let demandesEnAttente = [];
+  let majDemandes = async () => {};
+  /** Dernière liste des comptes chargée par la vue (état de la double authentification compris). */
+  let utilisateursCharges = [];
+
+  const LIBELLES_RAISON = { initial: 'mot de passe initial', reinitialise: 'mot de passe temporaire', expire: 'mot de passe expiré', administrateur: 'défini par un administrateur' };
+  const LIBELLES_TRAITEMENT = { code: 'Code de réinitialisation remis', temporaire: 'Mot de passe temporaire remis', utilisateur: 'Mot de passe changé par l\'utilisateur' };
+  /** Issue d'une demande traitée ou rejetée : « Code de réinitialisation remis par … le … ». */
+  function issueDemande(d) {
+    const le = d.traiteeLe ? `le ${ui.formatDateHeure(d.traiteeLe)}` : '';
+    if (d.statut === 'rejetee') return [d.traiteeParNom ? `Par ${d.traiteeParNom}` : '', le].filter(Boolean).join(' ');
+    if (d.mode === 'utilisateur') return [LIBELLES_TRAITEMENT.utilisateur, le].filter(Boolean).join(' ');
+    const par = d.traiteeParNom ? `par ${d.traiteeParNom}` : (d.mode === 'code' ? 'par récupération d\'urgence' : '');
+    return [LIBELLES_TRAITEMENT[d.mode] || 'Traitée', par, le].filter(Boolean).join(' ');
+  }
+
+  function peutReinitialiserMdp(u) {
+    return GMAO.can('utilisateurs', 'modifier') && u.id !== GMAO.user.id && peutModifier(u) && u.actif !== false;
+  }
+  const demandeDe = (u) => demandesEnAttente.find((d) => d.userId === u.id) || null;
+  /** Adresse du poste (IPv4 sans préfixe IPv6). */
+  const adresse = (ip) => String(ip || '').replace(/^::ffff:/, '') || 'adresse inconnue';
+  /** Résumé du poste à partir de son identification (application ou navigateur, système). */
+  function resumePoste(ua) {
+    const s = String(ua || '');
+    if (!s) return 'Poste non identifié';
+    const appli = /GMAO|Electron/i.test(s) ? 'Application GMAO' : /Edg\//.test(s) ? 'Edge' : /Firefox\//.test(s) ? 'Firefox' : /Chrome\//.test(s) ? 'Chrome' : /Safari\//.test(s) ? 'Safari' : 'Navigateur';
+    const os = /Windows NT 10/.test(s) ? 'Windows 10/11' : /Windows/.test(s) ? 'Windows' : /Android/.test(s) ? 'Android' : /iPhone|iPad/.test(s) ? 'iOS' : /Mac OS X/.test(s) ? 'macOS' : /Linux/.test(s) ? 'Linux' : '';
+    return os ? `${appli} · ${os}` : appli;
+  }
+  /** Durée lisible : « 60 minutes », « 2 heures », « 1 h 30 ». */
+  function duree(minutes) {
+    const m = Math.max(0, Math.round(minutes));
+    if (m < 60) return `${m} minute${m > 1 ? 's' : ''}`;
+    const h = Math.floor(m / 60); const r = m % 60;
+    return r ? `${h} h ${String(r).padStart(2, '0')}` : `${h} heure${h > 1 ? 's' : ''}`;
+  }
+
+  /** Mode d'emploi remis à l'utilisateur (fenêtre de résultat et fiche imprimée). */
+  function etapesUtilisateur(u, r) {
+    if (r.mode === 'code') {
+      return [
+        'Sur l\'écran de connexion de la GMAO, cliquez sur « J\'ai un code de réinitialisation ».',
+        `Saisissez votre identifiant « ${u.login} » et le code ${r.code} (majuscules ou minuscules, avec ou sans tiret).`,
+        'Choisissez votre nouveau mot de passe : vous êtes aussitôt connecté (le code de votre application d\'authentification vous est demandé si la double authentification est active).',
+      ];
+    }
+    return [
+      `Sur l'écran de connexion de la GMAO, saisissez votre identifiant « ${u.login} » et ce mot de passe temporaire.`,
+      'Choisissez aussitôt votre nouveau mot de passe personnel : il vous est demandé avant tout autre écran.',
+      'Détruisez ce document une fois votre mot de passe changé.',
+    ];
+  }
+
+  /** Fiche à remettre à l'utilisateur (impression sans script : bouton [data-imprimer] piloté par l'application). */
+  function imprimerFiche(u, r) {
+    const code = r.mode === 'code';
+    const valeur = code ? r.code : r.motDePasse;
+    const html = `<h2>${code ? 'Code de réinitialisation de votre mot de passe' : 'Mot de passe temporaire'}</h2>`
+      + `<dl><dt>Nom</dt><dd>${ui.esc(nomComplet(u))}</dd><dt>Identifiant</dt><dd><strong>${ui.esc(u.login)}</strong></dd>`
+      + `<dt>${code ? 'Code' : 'Mot de passe temporaire'}</dt><dd><span style="font-family:Consolas,'Courier New',monospace;font-size:26px;font-weight:700;letter-spacing:3px">${ui.esc(valeur)}</span></dd>`
+      + `<dt>Validité</dt><dd>${code ? `jusqu'au ${ui.esc(ui.formatDateHeure(r.expireLe))}, utilisable une seule fois` : 'à remplacer dès la première connexion'}</dd></dl>`
+      + `<h2>Mode d'emploi</h2><ol style="font-size:14px;line-height:1.7">${etapesUtilisateur(u, r).map((t) => `<li>${ui.esc(t)}</li>`).join('')}</ol>`
+      + '<p>Document confidentiel : ne le confiez à personne et détruisez-le une fois votre mot de passe changé. Le pôle informatique ne vous demandera jamais votre mot de passe.</p>'
+      + `<p class="texte-2">Remis par ${ui.esc(ui.nomUser(GMAO.user.id) || GMAO.user.login)} le ${ui.esc(ui.formatDateHeure(new Date()))}.</p>`
+      + '<p><button type="button" data-imprimer>Imprimer</button></p>';
+    ui.imprimer(code ? 'Réinitialisation du mot de passe' : 'Mot de passe temporaire', html);
+  }
+
+  /** Résultat affiché une seule fois : code (ou mot de passe temporaire) en grand, validité, copie, fiche imprimable. */
+  function afficherResultat(m, u, r) {
+    const code = r.mode === 'code';
+    const valeur = code ? r.code : r.motDePasse;
+    m.setTitre(code ? 'Code de réinitialisation' : 'Mot de passe temporaire');
+    ui.vider(m.corps);
+    m.corps.appendChild(frag(
+      el('p', null, 'Pour ', el('strong', null, nomComplet(u)), ` (identifiant « ${u.login} »)`),
+      el('div', { class: 'secret-unique' + (code ? '' : ' mdp'), 'aria-label': code ? 'Code de réinitialisation' : 'Mot de passe temporaire' }, valeur),
+      el('div', { class: 'texte-centre texte-petit texte-2 mb' }, code
+        ? `Valable jusqu'au ${ui.formatDateHeure(r.expireLe)} (${duree((Date.parse(r.expireLe) - Date.now()) / 60000)}) · utilisable une seule fois`
+        : 'À changer à la première connexion · ses sessions ouvertes ont été fermées'),
+      ui.alerte(`${code ? 'Ce code' : 'Ce mot de passe'} ne sera plus affiché. Remettez-le à l'utilisateur en personne ou par téléphone, après avoir vérifié son identité.`, 'alerte'),
+      el('div', { class: 'texte-gras texte-petit' }, 'Mode d\'emploi pour l\'utilisateur'),
+      el('ol', { class: 'texte-petit etapes-reinit' }, etapesUtilisateur(u, r).map((t) => el('li', null, t)))));
+    m.setBoutons([
+      { label: 'Copier', icone: 'copier', gauche: true, onClic: async () => {
+        if (await ui.copier(valeur)) toast(code ? 'Code copié' : 'Mot de passe copié', 'succes');
+        else toast('Copie impossible : sélectionnez le texte et utilisez Ctrl+C', 'info');
+        return false;
+      } },
+      { label: 'Imprimer la fiche', icone: 'imprimer', onClic: () => { imprimerFiche(u, r); return false; } },
+      { label: 'Fermer', classe: 'btn-primaire' },
+    ]);
+  }
+
+  /**
+   * Réinitialisation du mot de passe d'un compte : code de réinitialisation (recommandé, l'utilisateur choisit
+   * lui-même son mot de passe) ou mot de passe temporaire. `options.demande` : demande traitée ; `options.apres`.
+   */
+  function reinitialiserMdp(u, options = {}) {
+    const sc = GMAO.config.securite || {};
+    const demande = options.demande || null;
+    let mode = 'code';
+    const cartes = [];
+    const fTemp = ui.form({ colonnes: 1, champs: [{ nom: 'motDePasseTemporaire', label: 'Mot de passe temporaire (facultatif)', type: 'mdp', placeholder: 'Vide = généré automatiquement', aide: 'Doit respecter la politique de mot de passe.' }] });
+    fTemp.controles.motDePasseTemporaire.input.setAttribute('autocomplete', 'new-password');
+    const detailTemp = el('div', { class: 'choix-detail masque' }, fTemp.el);
+    const choix = (valeur, titre, texte, recommande) => {
+      const radio = el('input', { type: 'radio', name: 'modeReinitialisation', value: valeur, id: 'f_mode_' + valeur, checked: valeur === mode });
+      radio.addEventListener('change', () => { if (radio.checked) { mode = valeur; maj(); } });
+      const carte = el('label', { class: 'choix-carte', for: 'f_mode_' + valeur }, radio,
+        el('div', null, el('div', { class: 'choix-titre' }, titre, recommande ? ui.badge('Recommandé', '#16a34a') : null), el('div', { class: 'texte-2 texte-petit' }, texte)));
+      cartes.push({ valeur, carte });
+      return carte;
+    };
+    const m = ui.modal({ titre: 'Réinitialiser le mot de passe', classe: 'modal-reinit', contenu: frag(
+      el('p', null, 'Compte de ', el('strong', null, nomComplet(u)), ` (identifiant « ${u.login} »)`),
+      demande ? ui.alerte(`Demande faite depuis l'écran de connexion ${ui.relatif(demande.derniereDemande)} (poste ${adresse(demande.ip)})${demande.repetitions > 1 ? `, ${demande.repetitions} fois` : ''} : elle sera marquée comme traitée.`, 'info') : null,
+      el('div', { class: 'choix-liste', role: 'radiogroup', 'aria-label': 'Mode de réinitialisation' },
+        choix('code', 'Code de réinitialisation', `L'utilisateur choisit lui-même son nouveau mot de passe depuis l'écran de connexion. Code à usage unique, valable ${duree(Number(sc.dureeCodeReinitialisationMinutes) || 60)} ; son mot de passe actuel reste valable d'ici là.`, true),
+        choix('temporaire', 'Mot de passe temporaire', 'À changer à la première connexion. Ses sessions ouvertes sont fermées immédiatement.'),
+        detailTemp),
+      u.deuxFacteurs && u.deuxFacteurs.actif ? el('p', { class: 'texte-2 texte-petit' }, 'La double authentification de ce compte reste exigée à la connexion.') : null,
+      el('p', { class: 'texte-2 texte-petit' }, 'Vérifiez l\'identité de la personne (en face à face ou en la rappelant à un numéro connu) avant de lui remettre le code ou le mot de passe.')) });
+    function maj() {
+      cartes.forEach((c) => c.carte.classList.toggle('actif', c.valeur === mode));
+      detailTemp.classList.toggle('masque', mode !== 'temporaire');
+      m.setBoutons([{ label: 'Annuler' }, { label: mode === 'code' ? 'Générer le code' : 'Réinitialiser', classe: 'btn-primaire', icone: 'cle', onClic: async () => {
+        const body = { mode };
+        if (demande) body.demandeId = demande.id;
+        if (mode === 'temporaire' && fTemp.valeurs().motDePasseTemporaire) body.password = fTemp.valeurs().motDePasseTemporaire;
+        const r = await api.post(`/api/utilisateurs/${u.id}/reinitialiser-mdp`, body);
+        afficherResultat(m, u, r);
+        toast(mode === 'code' ? 'Code de réinitialisation créé' : 'Mot de passe réinitialisé', 'succes');
+        if (options.apres) options.apres(r);
+        return false;
+      } }]);
+    }
+    fTemp.el.addEventListener('submit', (ev) => { ev.preventDefault(); const b = m.pied.querySelector('.btn-primaire'); if (b) b.click(); });
+    maj();
+  }
+
+  /** Annulation du code de réinitialisation actif d'un compte. */
+  async function annulerCode(u, apres) {
+    const ok = await ui.confirm({ titre: 'Annuler le code de réinitialisation', message: `Annuler le code de réinitialisation de ${nomComplet(u)} ? Il ne pourra plus être utilisé.`, okLabel: 'Annuler le code', annulerLabel: 'Conserver', danger: true });
+    if (!ok) return;
     try {
-      const r = await api.post(`/api/utilisateurs/${u.id}/reinitialiser-mdp`, { password: pwd || undefined });
-      ui.modal({ titre: 'Mot de passe réinitialisé', taille: 'petite', contenu: frag(el('p', null, `Nouveau mot de passe de ${nomComplet(u)} :`), el('p', null, el('code', { style: { fontSize: '16px' } }, r.motDePasse)), el('p', { class: 'texte-2 texte-petit' }, 'L\'utilisateur devra le changer à sa prochaine connexion.')), boutons: [{ label: 'Fermer' }] });
+      await api.del(`/api/utilisateurs/${u.id}/code-reinitialisation`);
+      toast('Code de réinitialisation annulé', 'succes');
+      if (apres) apres();
     } catch (e) { erreur(e); }
+  }
+
+  /** État du mot de passe dans la fiche (gestionnaires de comptes) : dernier changement, expiration, code actif. */
+  function etatMotDePasse(u, recharger) {
+    const mp = u.motDePasse || {};
+    const lignes = [el('div', null, mp.dateMdp ? `Modifié le ${ui.formatDateHeure(mp.dateMdp)}` : 'Jamais modifié')];
+    lignes.push(el('div', { class: mp.expireLe && Date.parse(mp.expireLe) < Date.now() ? 'texte-danger' : 'texte-2 texte-petit' }, mp.expireLe ? `Expire le ${ui.formatDate(mp.expireLe)}` : 'Sans expiration'));
+    if (mp.doitChanger) lignes.push(el('div', null, ui.badge('À changer à la prochaine connexion', '#f59e0b'), mp.raison && LIBELLES_RAISON[mp.raison] ? el('span', { class: 'texte-2 texte-petit' }, ` (${LIBELLES_RAISON[mp.raison]})`) : null));
+    if (mp.codeActif) {
+      lignes.push(el('div', { class: 'inline', style: { flexWrap: 'wrap' } },
+        ui.badge(mp.codeOrigine === 'recuperation_urgence' ? 'Code de récupération d\'urgence actif' : 'Code de réinitialisation actif', '#2563eb'),
+        el('span', { class: 'texte-2 texte-petit' }, `jusqu'au ${ui.formatDateHeure(mp.codeExpireLe)}`),
+        peutModifier(u) && u.id !== GMAO.user.id ? ui.bouton('Annuler le code', { classe: 'btn-sm btn-lien texte-danger', onClic: () => annulerCode(u, recharger) }) : null));
+    }
+    return el('div', { class: 'etat-mdp' }, lignes);
+  }
+
+  /** Demandes de réinitialisation : en attente (réinitialiser, rejeter) et, sur demande, historique. */
+  function ouvrirDemandes() {
+    let historique = false;
+    const corps = el('div');
+    const cb = el('input', { type: 'checkbox', id: 'f_historique_demandes' });
+    const m = ui.modal({ titre: 'Demandes de réinitialisation de mot de passe', taille: 'large', classe: 'modal-demandes-mdp', contenu: frag(
+      el('p', { class: 'texte-2 texte-petit' }, 'Demandes faites depuis l\'écran de connexion (« Mot de passe oublié ? »). Vérifiez l\'identité de la personne avant de lui remettre un code ; rejetez une demande dont elle n\'est pas à l\'origine.'),
+      el('div', { class: 'barre-outils' }, el('label', { class: 'inline', for: 'f_historique_demandes' }, cb, 'Afficher aussi les demandes traitées ou rejetées')),
+      corps), boutons: [{ label: 'Fermer' }] });
+    cb.addEventListener('change', () => { historique = cb.checked; charger(); });
+
+    const colUtilisateur = { cle: 'nom', label: 'Utilisateur', rendu: (d) => el('div', null, el('div', { class: 'cellule-principale' }, d.nom), el('div', { class: 'cellule-secondaire' }, [d.login, d.profilNom].filter(Boolean).join(' · '))) };
+    const colDemande = { cle: 'derniereDemande', label: 'Demande', rendu: (d) => el('div', null,
+      el('div', { title: ui.formatDateHeure(d.derniereDemande) }, ui.relatif(d.derniereDemande), d.repetitions > 1 ? frag(' ', ui.badge(`${d.repetitions} demandes`, '#f59e0b')) : null),
+      el('div', { class: 'cellule-secondaire' }, d.repetitions > 1 ? `première le ${ui.formatDateHeure(d.createdAt)}` : ui.formatDateHeure(d.createdAt))) };
+    const colPoste = { cle: 'ip', label: 'Poste', rendu: (d) => el('div', { title: d.poste || '' }, el('div', null, adresse(d.ip)), el('div', { class: 'cellule-secondaire' }, resumePoste(d.poste))) };
+    const colMessage = { cle: 'message', label: 'Message', tri: false, rendu: (d) => (d.message ? el('div', { class: 'message-demande' }, d.message) : el('span', { class: 'texte-2' }, '—')) };
+
+    function utilisateurDe(d) {
+      return utilisateursCharges.find((x) => x.id === d.userId) || (GMAO.refs.users || []).find((x) => x.id === d.userId) || { id: d.userId, login: d.login, nom: d.nom };
+    }
+    async function rejeter(d) {
+      const motif = await ui.prompt({ titre: 'Rejeter la demande', message: `Rejeter la demande de réinitialisation de ${d.nom} ? L'utilisateur en est informé par une notification.`, label: 'Motif (facultatif, communiqué à l\'utilisateur)', type: 'texte_long', requis: false, okLabel: 'Rejeter la demande' });
+      if (motif === null) return;
+      try {
+        await api.post(`/api/utilisateurs-demandes-mdp/${d.id}/rejeter`, { motif: motif.trim() || undefined });
+        toast('Demande rejetée', 'succes');
+        charger();
+      } catch (e) { erreur(e); }
+    }
+    async function charger() {
+      ui.vider(corps);
+      corps.appendChild(ui.chargement());
+      let rows;
+      try { rows = await api.get('/api/utilisateurs-demandes-mdp', historique ? { toutes: 1 } : null); } catch (e) { ui.vider(corps); corps.appendChild(ui.alerte(e.message, 'danger')); return; }
+      const attente = rows.filter((d) => d.statut === 'en_attente');
+      demandesEnAttente = attente;
+      majDemandes(false);
+      ui.vider(corps);
+      corps.appendChild(ui.table({
+        colonnes: [colUtilisateur, colDemande, colPoste, colMessage, { cle: 'actions', label: '', tri: false, rendu: (d) => el('div', { class: 'inline', style: { justifyContent: 'flex-end' } },
+          ui.bouton('Réinitialiser…', { classe: 'btn-sm btn-primaire', icone: 'cle', onClic: () => reinitialiserMdp(utilisateurDe(d), { demande: d, apres: () => { charger(); } }) }),
+          ui.bouton('Rejeter', { classe: 'btn-sm', onClic: () => rejeter(d) })) }],
+        lignes: attente, recherche: false, pagination: false, compact: true, vide: 'Aucune demande en attente',
+      }).el);
+      if (historique) {
+        const traitees = rows.filter((d) => d.statut !== 'en_attente');
+        corps.appendChild(el('h3', { class: 'mt' }, 'Demandes traitées ou rejetées'));
+        corps.appendChild(ui.table({
+          colonnes: [colUtilisateur, { cle: 'createdAt', label: 'Demande', rendu: (d) => el('div', null, ui.formatDateHeure(d.createdAt), d.repetitions > 1 ? el('div', { class: 'cellule-secondaire' }, `${d.repetitions} demandes`) : null) },
+            { cle: 'statut', label: 'Issue', rendu: (d) => el('div', null, d.statut === 'rejetee' ? ui.badge('Rejetée', '#dc2626') : ui.badge('Traitée', '#16a34a'),
+              el('div', { class: 'cellule-secondaire' }, issueDemande(d)),
+              d.motifRejet ? el('div', { class: 'cellule-secondaire message-demande' }, `Motif : ${d.motifRejet}`) : null) },
+            colPoste, colMessage],
+          lignes: traitees, recherche: false, pagination: false, compact: true, vide: 'Aucune demande traitée au cours des 90 derniers jours',
+        }).el);
+      }
+    }
+    charger();
+    return m;
   }
 
   async function supprimer(u) {
@@ -213,7 +444,7 @@
 
   GMAO.registerView('utilisateurs', {
     titre: 'Utilisateurs', icone: 'utilisateurs',
-    async rendu(container, { params }) {
+    async rendu(container, { params, query }) {
       const cfg = GMAO.config.utilisateurs || {};
       let utilisateurs = [];
       let tri = cfg.triParSecteur ? 'secteur' : 'nom';
@@ -239,7 +470,7 @@
         groupe: grouper ? groupeSecteur : null,
         actions: [
           { icone: 'modifier', titre: 'Modifier', visible: peutModifier, onClic: (u) => ouvrirFormulaire(u, rafraichir) },
-          { icone: 'cle', titre: 'Réinitialiser le mot de passe', visible: (u) => peutModifier(u) && u.id !== GMAO.user.id, onClic: reinitialiserMdp },
+          { icone: 'cle', titre: 'Réinitialiser le mot de passe', visible: peutReinitialiserMdp, onClic: (u) => reinitialiserMdp(u, { demande: demandeDe(u), apres: () => { majDemandes(true); } }) },
           { icone: 'profils', titre: 'Réinitialiser la double authentification', visible: peutReinitialiserDeuxFacteurs, onClic: (u) => reinitialiserDeuxFacteurs(u, rafraichir) },
           { icone: 'supprimer', titre: 'Supprimer', classe: 'texte-danger', visible: (u) => GMAO.can('utilisateurs', 'supprimer') && u.id !== GMAO.user.id && peutModifier(u), onClic: supprimer },
         ],
@@ -259,7 +490,24 @@
         tableau.setTri(null);
         tableau.maj(rows);
       }
-      rafraichir = async () => { try { utilisateurs = await api.get('/api/utilisateurs'); appliquer(); } catch (e) { erreur(e); } };
+      rafraichir = async () => { try { utilisateurs = await api.get('/api/utilisateurs'); utilisateursCharges = utilisateurs; appliquer(); } catch (e) { erreur(e); } };
+
+      // Demandes de réinitialisation en attente : bandeau, compteur du menu ; `recharger` : nouvelle lecture du serveur
+      const zoneDemandes = el('div');
+      const gestionnaire = GMAO.can('utilisateurs', 'modifier');
+      majDemandes = async (recharger) => {
+        if (!gestionnaire) return;
+        if (recharger) {
+          try { demandesEnAttente = await api.get('/api/utilisateurs-demandes-mdp'); } catch (e) { return; }
+        }
+        GMAO.setNavBadge('utilisateurs', demandesEnAttente.length);
+        ui.vider(zoneDemandes);
+        const n = demandesEnAttente.length;
+        if (!n) return;
+        zoneDemandes.appendChild(el('div', { class: 'alerte alerte-alerte bandeau-demandes' }, icone('cle'),
+          el('span', null, `${n} demande${n > 1 ? 's' : ''} de réinitialisation de mot de passe en attente`),
+          ui.bouton('Traiter', { classe: 'btn-sm btn-primaire', onClic: () => ouvrirDemandes() })));
+      };
 
       const selectSecteur = el('select', { onchange: () => { filtreSecteur = selectSecteur.value; appliquer(); } }, [{ value: '', label: 'Tous les secteurs' }, { value: 'aucun', label: 'Sans secteur' }].concat(ui.optionsSecteurs({ vide: false })).map((o) => el('option', { value: o.value }, o.label)));
       const selectProfil = el('select', { onchange: () => { filtreProfil = selectProfil.value; appliquer(); } }, [{ value: '', label: 'Tous les profils' }].concat(ui.optionsProfils({ inactifs: true })).map((o) => el('option', { value: o.value }, o.label)));
@@ -273,14 +521,20 @@
 
       container.appendChild(ui.pageEntete({
         titre: GMAO.moduleLabel('utilisateurs'), icone: 'utilisateurs', sousTitre: 'Comptes internes, profils et hiérarchie',
-        actions: [GMAO.can('utilisateurs', 'creer') ? ui.bouton('Nouvel utilisateur', { icone: 'plus', classe: 'btn-primaire', onClic: () => ouvrirFormulaire(null, rafraichir) }) : null],
+        actions: [
+          gestionnaire ? ui.bouton('Demandes de mot de passe', { icone: 'cle', titre: 'Demandes de réinitialisation faites depuis l\'écran de connexion', onClic: () => ouvrirDemandes() }) : null,
+          GMAO.can('utilisateurs', 'creer') ? ui.bouton('Nouvel utilisateur', { icone: 'plus', classe: 'btn-primaire', onClic: () => ouvrirFormulaire(null, rafraichir) }) : null,
+        ],
       }));
+      container.appendChild(zoneDemandes);
       container.appendChild(ui.onglets([
         { cle: 'liste', label: 'Liste', icone: 'liste', contenu: vueListe },
         { cle: 'organigramme', label: 'Organigramme', icone: 'organigramme', rendu: (c) => { rendreOrganigramme(c); } },
       ], { hash: true }).el);
-      await rafraichir();
+      await Promise.all([rafraichir(), majDemandes(true)]);
       if (params[0]) afficherFiche(params[0]);
+      // Lien des notifications « demande de réinitialisation » : #/utilisateurs?demandesMdp=1
+      else if (gestionnaire && query && query.demandesMdp === '1') ouvrirDemandes();
     },
   });
 })();

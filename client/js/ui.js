@@ -9,7 +9,8 @@
  *   ui.onglets / ui.arbre / ui.kpi / ui.details / ui.pageEntete / ui.badge
  *   ui.formatDate / ui.formatDateHeure / ui.formatNombre / ui.formatMontant / ui.formatDuree
  *   ui.optionsListe / ui.optionsUsers / ui.optionsSecteurs / ui.optionsProfils
- *   ui.exportCsv / ui.imprimer / ui.telecharger
+ *   ui.exportCsv / ui.imprimer / ui.telecharger / ui.copier
+ *   ui.reglesMdp                           règles du mot de passe cochées en direct et robustesse
  */
 (function () {
   'use strict';
@@ -33,6 +34,7 @@
     modifier: '<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.1 2.1 0 0 1 3 3L12 15l-4 1 1-4z"/>',
     supprimer: '<path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6h12z"/>',
     voir: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+    masquer: '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/>',
     fermer: '<path d="M18 6L6 18M6 6l12 12"/>',
     recherche: '<circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/>',
     export: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
@@ -277,7 +279,140 @@
     setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity 0.3s'; setTimeout(() => t.remove(), 300); }, duree || (type === 'erreur' ? 7000 : 3500));
     return t;
   }
-  function erreur(e) { toast((e && e.message) || String(e), 'erreur'); if (window.console) console.error(e); }
+  function erreur(e) {
+    // Changement de mot de passe imposé : la fenêtre de changement est déjà affichée, aucun message en double
+    if (e && e.details && e.details.changementMdpRequis) return;
+    toast((e && e.message) || String(e), 'erreur'); if (window.console) console.error(e);
+  }
+
+  /**
+   * Copie un texte dans le presse-papiers ; sur une adresse http (poste client du réseau), l'API du
+   * presse-papiers est indisponible : copie par sélection. Renvoie vrai si la copie a réussi.
+   */
+  async function copier(texte) {
+    try {
+      if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(String(texte)); return true; }
+    } catch (e) { /* repli ci-dessous */ }
+    const zone = el('textarea', { readOnly: true, 'aria-hidden': 'true', style: { position: 'fixed', top: '-1000px', left: '0', opacity: '0' } });
+    zone.value = String(texte);
+    document.body.appendChild(zone);
+    zone.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    zone.remove();
+    return ok;
+  }
+
+  // ----- Mots de passe : afficher / masquer, règles vérifiées en direct, robustesse -----
+  /** Bouton « œil » d'un champ mot de passe (le champ garde le focus). */
+  function boutonVoirMdp(input) {
+    const b = el('button', { type: 'button', class: 'mdp-voir', title: 'Afficher le mot de passe', 'aria-label': 'Afficher le mot de passe', 'aria-pressed': 'false', disabled: input.disabled }, icone('voir'));
+    b.addEventListener('mousedown', (ev) => ev.preventDefault());
+    b.addEventListener('click', () => {
+      const afficher = input.type === 'password';
+      input.type = afficher ? 'text' : 'password';
+      vider(b); b.appendChild(icone(afficher ? 'masquer' : 'voir'));
+      const t = afficher ? 'Masquer le mot de passe' : 'Afficher le mot de passe';
+      b.title = t; b.setAttribute('aria-label', t); b.setAttribute('aria-pressed', String(afficher));
+    });
+    return b;
+  }
+  /** Champ mot de passe avec son bouton afficher / masquer. */
+  function champMdp(input) {
+    input.setAttribute('spellcheck', 'false');
+    input.setAttribute('autocapitalize', 'off');
+    return el('div', { class: 'champ-mdp' }, input, boutonVoirMdp(input));
+  }
+
+  const FAMILLES_MDP = [
+    { re: /[a-z]/, court: 'a-z', label: 'minuscules' }, { re: /[A-Z]/, court: 'A-Z', label: 'majuscules' },
+    { re: /[0-9]/, court: '0-9', label: 'chiffres' }, { re: /[^A-Za-z0-9]/, court: '#@!', label: 'caractères spéciaux' },
+  ];
+  /** Robustesse indicative (0 = vide, 1 faible … 4 excellente) : longueur, variété, répétitions et suites évidentes. */
+  function robustesseMdp(pwd) {
+    if (!pwd) return 0;
+    const pool = [26, 26, 10, 33].reduce((s, n, i) => s + (FAMILLES_MDP[i].re.test(pwd) ? n : 0), 0);
+    let bits = pwd.length * Math.log2(Math.max(pool, 2));
+    if (new Set(pwd).size < pwd.length / 2) bits *= 0.6;
+    if (/(0123|1234|2345|3456|4567|5678|6789|abcd|bcde|cdef|azer|qwer|motdepasse|password)/i.test(pwd)) bits *= 0.75;
+    return bits < 30 ? 1 : bits < 48 ? 2 : bits < 66 ? 3 : 4;
+  }
+
+  /**
+   * Règles du nouveau mot de passe cochées pendant la saisie, et indication de robustesse.
+   * @param {HTMLInputElement} input champ du nouveau mot de passe
+   * @param {{ politique?: { longueurMin, complexite, interdireIdentifiant }, login?: string|Function,
+   *   confirmation?: HTMLInputElement, historique?: number }} options
+   * @returns {{ el: HTMLElement, maj: Function, conforme: Function }}
+   */
+  function reglesMdp(input, options = {}) {
+    const pol = Object.assign({ longueurMin: 10, complexite: true, interdireIdentifiant: true }, options.politique || {});
+    const min = Math.max(4, Number(pol.longueurMin) || 10);
+    const login = () => String((typeof options.login === 'function' ? options.login() : options.login) || '').trim().toLowerCase();
+    const etat = () => el('span', { class: 'regle-etat' });
+    const ligne = (...texte) => el('li', { class: 'regle' }, etat(), el('span', null, ...texte));
+    const familles = FAMILLES_MDP.map((f) => el('span', { title: f.label }, f.court));
+    const rLongueur = ligne(`Au moins ${min} caractères`);
+    const compteur = el('span', { class: 'texte-2' });
+    rLongueur.lastChild.appendChild(compteur);
+    const rComplexite = pol.complexite !== false ? ligne('Au moins 3 types de caractères ', el('span', { class: 'familles-mdp' }, familles)) : null;
+    const rIdentifiant = pol.interdireIdentifiant !== false ? ligne('Ne contient pas l\'identifiant') : null;
+    const rConfirmation = options.confirmation ? ligne('Les deux saisies sont identiques') : null;
+    const liste = el('ul', { class: 'regles-mdp', 'aria-live': 'polite' }, rLongueur, rComplexite, rIdentifiant, rConfirmation);
+    const jauge = el('span', { class: 'jauge' }, el('span'), el('span'), el('span'), el('span'));
+    const libelleRobustesse = el('span');
+    const robustesse = el('div', { class: 'robustesse-mdp', dataset: { niveau: '0' } }, el('span', null, 'Robustesse :'), jauge, libelleRobustesse);
+    const note = options.historique > 0 || pol.refuserCourants !== false
+      ? el('div', { class: 'aide' }, `Les mots de passe trop courants${options.historique > 0 ? ` et vos ${options.historique} derniers mots de passe` : ''} sont également refusés.`)
+      : null;
+    const conteneur = el('div', { class: 'controle-mdp' }, liste, robustesse, note);
+    const marquer = (li, ok, neutre) => {
+      if (!li) return;
+      li.classList.toggle('ok', !neutre && ok);
+      li.classList.toggle('ko', !neutre && !ok);
+      const e = li.firstChild; vider(e);
+      if (!neutre) e.appendChild(icone(ok ? 'check' : 'fermer'));
+    };
+    const verifier = () => {
+      const v = input.value || '';
+      const l = login();
+      const r = {
+        longueur: v.length >= min,
+        complexite: FAMILLES_MDP.filter((f) => f.re.test(v)).length >= 3,
+        identifiant: !(l.length >= 3 && v.toLowerCase().includes(l)),
+        confirmation: !options.confirmation || options.confirmation.value === v,
+      };
+      // Règles de la politique (hors confirmation) : la robustesse n'est pas plafonnée par une confirmation à venir
+      r.politique = r.longueur && (pol.complexite === false || r.complexite) && (pol.interdireIdentifiant === false || r.identifiant);
+      return { v, l, r };
+    };
+    const api = {
+      el: conteneur,
+      maj() {
+        const { v, l, r } = verifier();
+        const vide = !v;
+        marquer(rLongueur, r.longueur, vide);
+        compteur.textContent = v ? ` (${v.length})` : '';
+        marquer(rComplexite, r.complexite, vide);
+        familles.forEach((s, i) => s.classList.toggle('actif', FAMILLES_MDP[i].re.test(v)));
+        marquer(rIdentifiant, r.identifiant, vide || l.length < 3);
+        marquer(rConfirmation, r.confirmation, vide || !options.confirmation.value);
+        let niveau = robustesseMdp(v);
+        if (v && !r.politique) niveau = Math.min(niveau, 1);
+        robustesse.dataset.niveau = String(niveau);
+        libelleRobustesse.textContent = ['—', 'faible', 'moyenne', 'bonne', 'excellente'][niveau];
+      },
+      /** Toutes les règles vérifiables sur le poste sont respectées (confirmation comprise). */
+      conforme() {
+        const { r } = verifier();
+        return r.politique && r.confirmation;
+      },
+    };
+    input.addEventListener('input', api.maj);
+    if (options.confirmation) options.confirmation.addEventListener('input', api.maj);
+    api.maj();
+    return api;
+  }
 
   // ----- Modales ------------------------------------------------------------
   const modales = [];
@@ -324,7 +459,8 @@
     document.body.appendChild(fond);
     modales.push(api);
     const focusable = corps.querySelector('input:not([type=hidden]):not([disabled]), select, textarea, button');
-    if (focusable) setTimeout(() => focusable.focus(), 30);
+    // Mise au point différée, sauf si la saisie a déjà commencé dans la fenêtre
+    if (focusable) setTimeout(() => { if (!boite.contains(document.activeElement)) focusable.focus(); }, 30);
     return api;
   }
   document.addEventListener('keydown', (ev) => {
@@ -551,8 +687,12 @@
           if (def.suggestions) wrap.appendChild(el('datalist', { id: 'dl_' + nomChamp }, def.suggestions.map((s) => el('option', { value: s }))));
         }
         input.addEventListener('change', notifier);
+        // Erreur affichée effacée dès que la saisie est corrigée
+        input.addEventListener('input', () => { if (wrap.classList.contains('invalide')) api.erreur(nomChamp, ''); });
         if (def.onInput) input.addEventListener('input', () => def.onInput(input.value, api));
-        wrap.appendChild(labelEl); wrap.appendChild(input);
+        wrap.appendChild(labelEl);
+        // Mot de passe : bouton afficher / masquer
+        wrap.appendChild(type === 'mdp' ? champMdp(input) : input);
         ctrl.input = input;
         ctrl.get = () => {
           const v = input.value;
@@ -1082,7 +1222,7 @@
     formatDate, formatHeure, formatDateHeure, dateISO, dateHeureLocale, aujourdhui, formatNombre, formatMontant, formatDuree, relatif, joursEntre, initiales, parseDate,
     liste, itemListe, libelle, couleur, user, nomUser, secteur, nomSecteur, cheminSecteur, profil, nomProfil, secteursDuSiteCourant,
     optionsListe, optionsUsers, optionsSecteurs, optionsProfils,
-    badge, badgeListe, pastille, toast, erreur, modal, fermerModales, confirm, prompt,
+    badge, badgeListe, pastille, toast, erreur, copier, modal, fermerModales, confirm, prompt, champMdp, reglesMdp, robustesseMdp,
     form, formModal, lireFichier, champsPersoDefs, champsPersoValeurs, champsPersoInitiaux, champsPersoAffichage,
     table, exportCsv, telecharger, imprimer, lancerImpression,
     pageEntete, bouton, vide, chargement, kpi, details, alerte, carte, onglets, arbre, avatar, lien, graphiqueBarres,

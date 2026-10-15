@@ -88,6 +88,20 @@
         { value: 'obligatoire_sensibles', label: 'Obligatoire pour les comptes sensibles (administrateurs, gestion du système, des utilisateurs, des profils ou de la configuration)' },
         { value: 'obligatoire_tous', label: 'Obligatoire pour tous les utilisateurs' },
       ], aide: 'Applications compatibles : Microsoft Authenticator, Google Authenticator, FreeOTP. Un compte concerné qui ne l\'a pas encore activée doit le faire dès sa connexion, avant tout autre écran. En cas de perte du téléphone, le pôle informatique réinitialise la double authentification depuis la fiche de l\'utilisateur.' },
+      { type: 'separateur', label: 'Mots de passe oubliés, expiration et historique' },
+      { nom: 'securite.motDePasseOublie', label: 'Afficher « Mot de passe oublié ? » sur l\'écran de connexion', type: 'booleen', pleineLargeur: true, sansDecalage: true,
+        aide: 'L\'utilisateur adresse une demande à ceux qui gèrent son compte (Utilisateurs › Modifier) ; ils lui remettent un code de réinitialisation et il choisit lui-même son nouveau mot de passe. La réponse est identique que le compte existe ou non.' },
+      { nom: 'securite.reinitialisationAutonome', label: 'Réinitialisation autonome avec l\'application d\'authentification', type: 'booleen', pleineLargeur: true, sansDecalage: true,
+        aide: 'Un utilisateur dont la double authentification est active peut définir lui-même un nouveau mot de passe depuis l\'écran de connexion avec un code de son application (jamais avec un code de secours). Le pôle informatique en est informé.' },
+      { nom: 'securite.dureeCodeReinitialisationMinutes', label: 'Validité d\'un code de réinitialisation (minutes)', type: 'nombre', min: 5, max: 1440, step: 1,
+        aide: 'De 5 à 1440 minutes. Un code ne sert qu\'une fois et il est annulé après 5 essais incorrects.' },
+      { nom: 'securite.historiqueMdp', label: 'Anciens mots de passe refusés', type: 'nombre', min: 0, max: 24, step: 1,
+        aide: 'De 0 à 24 : le nouveau mot de passe doit différer de l\'actuel et d\'autant de mots de passe précédents.' },
+      { nom: 'securite.expirationMdpJours', label: 'Expiration des mots de passe (jours)', type: 'nombre', min: 0, max: 730, step: 1,
+        valider: (v) => (v !== null && v !== '' && Number(v) !== 0 && Number(v) < 30 ? '0 (jamais) ou entre 30 et 730 jours' : ''),
+        aide: '0 = jamais ; sinon de 30 à 730 jours. Un compte dont le mot de passe n\'a jamais été changé dispose du délai complet à partir de l\'activation.' },
+      { nom: 'securite.rappelExpirationJours', label: 'Rappel avant l\'expiration (jours)', type: 'nombre', min: 1, max: 60, step: 1,
+        afficherSi: (v) => Number(v['securite.expirationMdpJours']) > 0, aide: 'De 1 à 60 jours : un rappel discret invite l\'utilisateur à changer son mot de passe avant l\'échéance.' },
       { type: 'separateur', label: 'Circuit de travail (workflow)' },
       { nom: 'workflow.validationDemandes', label: 'Les demandes d\'intervention doivent être validées avant de devenir des OT', type: 'booleen', sansDecalage: true },
       { nom: 'workflow.validerParSuperieurUniquement', label: 'Seul le supérieur hiérarchique du demandeur (ou un admin) peut valider sa demande', type: 'booleen', sansDecalage: true },
@@ -106,6 +120,10 @@
       'securite.inactiviteMinutes': c.securite.inactiviteMinutes, 'securite.dureeSessionHeures': c.securite.dureeSessionHeures, 'securite.complexite': c.securite.complexite,
       'securite.refuserCourants': c.securite.refuserCourants, 'securite.interdireIdentifiant': c.securite.interdireIdentifiant, 'securite.notifierBlocages': c.securite.notifierBlocages,
       'securite.deuxFacteurs': c.securite.deuxFacteurs || 'facultatif',
+      'securite.motDePasseOublie': c.securite.motDePasseOublie !== false, 'securite.reinitialisationAutonome': c.securite.reinitialisationAutonome === true,
+      'securite.dureeCodeReinitialisationMinutes': c.securite.dureeCodeReinitialisationMinutes == null ? 60 : c.securite.dureeCodeReinitialisationMinutes,
+      'securite.historiqueMdp': c.securite.historiqueMdp == null ? 5 : c.securite.historiqueMdp,
+      'securite.expirationMdpJours': c.securite.expirationMdpJours || 0, 'securite.rappelExpirationJours': c.securite.rappelExpirationJours == null ? 14 : c.securite.rappelExpirationJours,
       'workflow.validationDemandes': c.workflow.validationDemandes, 'workflow.validerParSuperieurUniquement': c.workflow.validerParSuperieurUniquement, 'workflow.otAutoDepuisDemande': c.workflow.otAutoDepuisDemande, 'workflow.cloturerDemandeAvecOt': c.workflow.cloturerDemandeAvecOt, 'workflow.notifierValidateurs': c.workflow.notifierValidateurs, 'workflow.autoriserTechnicienCloture': c.workflow.autoriserTechnicienCloture, 'workflow.stockNegatif': c.workflow.stockNegatif,
       'preventif.genererAuto': c.preventif.genererAuto, 'preventif.horizonJours': c.preventif.horizonJours,
     } });
@@ -119,6 +137,13 @@
       const etat2fa = GMAO.deuxFacteurs || {};
       if (mode2fa !== (c.securite.deuxFacteurs || 'facultatif') && mode2fa !== 'facultatif' && !etat2fa.actif && (mode2fa === 'obligatoire_tous' || GMAO.compteSensible())) {
         const ok = await ui.confirm({ titre: 'Double authentification obligatoire', message: 'Votre propre compte est concerné et la double authentification n\'y est pas encore activée : vous devrez l\'activer immédiatement après l\'enregistrement (munissez-vous de votre téléphone). Continuer ?', okLabel: 'Enregistrer et activer' });
+        if (!ok) return;
+      }
+      // Expiration activée ou raccourcie : les mots de passe plus anciens devront être changés à la prochaine connexion
+      const expiration = Number(d.securite.expirationMdpJours) || 0;
+      const expirationAvant = Number(c.securite.expirationMdpJours) || 0;
+      if (expiration > 0 && (expirationAvant === 0 || expiration < expirationAvant)) {
+        const ok = await ui.confirm({ titre: 'Expiration des mots de passe', message: `Les mots de passe changés il y a plus de ${expiration} jours devront être changés à la prochaine connexion (votre compte compris). Les comptes dont le mot de passe n'a jamais été changé disposent de ${expiration} jours à partir de maintenant. Continuer ?`, okLabel: 'Enregistrer' });
         if (!ok) return;
       }
       if (await enregistrer(d)) GMAO.rendre();
@@ -225,7 +250,10 @@
   const ACTIONS_JOURNAL = [
     ['creation', 'Créations'], ['suppression', 'Suppressions'], ['modification', 'Modifications'], ['desactivation', 'Désactivations'],
     ['validation', 'Validations'], ['cloture', 'Clôtures'], ['restauration', 'Restaurations de sauvegarde'], ['import', 'Imports de données'],
-    ['reinitialisation_mdp', 'Réinitialisations de mot de passe'],
+    ['reinitialisation_mdp', 'Mots de passe temporaires remis'],
+    ['demande_reinitialisation_mdp', 'Demandes de réinitialisation (mot de passe oublié)'], ['code_reinitialisation_mdp', 'Codes de réinitialisation créés'],
+    ['reinitialisation_mdp_code', 'Mots de passe réinitialisés avec un code'], ['reinitialisation_mdp_autonome', 'Mots de passe réinitialisés avec l\'application d\'authentification'],
+    ['recuperation_urgence', 'Récupérations d\'urgence d\'un compte'],
   ];
   const ENTITES_JOURNAL = [
     ['users', 'Utilisateurs'], ['profils', 'Profils'], ['secteurs', 'Secteurs & sites'], ['configuration', 'Configuration'], ['equipements', 'Équipements'],

@@ -41,7 +41,15 @@ async function main() {
     await page.fill('#f_password', 'admin'); await page.click('button[type=submit]');
     await page.waitForSelector('.modal #f_nouveau', { timeout: 10000 });
     etape('Changement de mot de passe forcé à la première connexion', true);
-    await page.fill('#f_nouveau', 'Gmao-Essai#2026'); await page.fill('#f_confirmation', 'Gmao-Essai#2026'); await page.click('.modal .btn-primaire');
+    // Règles du mot de passe cochées pendant la saisie, robustesse, bouton afficher / masquer
+    await page.fill('#f_nouveau', 'admin');
+    etape('Règles non respectées signalées en direct', (await page.$$('.modal .regles-mdp .regle.ko')).length >= 2);
+    await page.click('.modal .champ-mdp .mdp-voir');
+    etape('Bouton afficher le mot de passe', (await page.getAttribute('#f_nouveau', 'type')) === 'text');
+    await page.fill('#f_nouveau', 'Gmao-Essai#2026'); await page.fill('#f_confirmation', 'Gmao-Essai#2026');
+    etape('Règles respectées et robustesse affichée', (await page.$$('.modal .regles-mdp .regle.ko')).length === 0 && (await page.textContent('.modal .robustesse-mdp')).includes('excellente'));
+    await capture('changement-mdp-regles');
+    await page.click('.modal .btn-primaire');
     await page.waitForSelector('.sidebar-nav .nav-item');
     const nav = await page.$$eval('.sidebar-nav .nav-item', (a) => a.map((x) => x.dataset.module));
     etape('Navigation construite', nav.length >= 4, nav.join(', '));
@@ -108,6 +116,63 @@ async function main() {
     await capture('theme-sombre');
     await page.click('.entete-utilisateur'); await page.click('text=Se déconnecter'); await page.waitForSelector('.connexion-carte');
     etape('Déconnexion', true);
+
+    // Mot de passe oublié : demande depuis l'écran de connexion, code remis par l'administrateur, nouveau mot de passe
+    await page.fill('#f_login', 'jbernard');
+    await page.click('text=Mot de passe oublié ?');
+    await page.waitForSelector('#f_identifiant');
+    etape('Demande de réinitialisation : identifiant prérempli', (await page.inputValue('#f_identifiant')) === 'jbernard');
+    await page.fill('#f_message', 'Atelier 2, joignable au 2145');
+    await page.click('.connexion button[type=submit]');
+    await page.waitForSelector('text=Demande envoyée');
+    etape('Demande de réinitialisation envoyée (confirmation générique)', (await page.textContent('.connexion-carte')).includes('Si cet identifiant correspond à un compte actif'));
+    await capture('mdp-oublie-demande');
+    await page.click('text=Retour à la connexion');
+    await page.fill('#f_login', 'admin'); await page.fill('#f_password', 'Gmao-Essai#2026'); await page.click('button[type=submit]');
+    await page.waitForSelector('.sidebar-nav .nav-item');
+    await page.waitForSelector('.notif-compteur');
+    await page.click('.btn-notifs');
+    await page.click('.notif-item:has-text("Demande de réinitialisation de mot de passe")');
+    await page.waitForSelector('.modal-demandes-mdp table.tableau');
+    etape('Notification → fenêtre des demandes de réinitialisation', (await page.textContent('.modal-demandes-mdp')).includes('Atelier 2, joignable au 2145'));
+    await page.click('.modal-demandes-mdp >> text=Réinitialiser…');
+    await page.waitForSelector('.modal-reinit #f_mode_code');
+    await page.click('.modal-reinit .btn-primaire');
+    await page.waitForSelector('.modal-reinit .secret-unique');
+    const codeReinit = (await page.textContent('.modal-reinit .secret-unique')).trim();
+    etape('Code de réinitialisation affiché une seule fois', /^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/.test(codeReinit), codeReinit);
+    await capture('mdp-oublie-code');
+    const [fiche] = await Promise.all([page.waitForEvent('popup'), page.click('.modal-reinit >> text=Imprimer la fiche')]);
+    fiche.on('pageerror', (e) => erreurs.push('[pageerror fiche] ' + e.message));
+    await fiche.waitForLoadState();
+    const texteFiche = await fiche.textContent('body');
+    etape('Fiche imprimable du code', texteFiche.includes(codeReinit) && texteFiche.includes('jbernard') && texteFiche.includes('Mode d\'emploi'));
+    await fiche.close();
+    await page.click('.modal-reinit >> text=Fermer');
+    await page.keyboard.press('Escape');
+    await page.click('.entete-utilisateur'); await page.click('text=Se déconnecter'); await page.waitForSelector('.connexion-carte');
+    await page.click('text=J\'ai un code de réinitialisation');
+    await page.waitForSelector('#f_codeReinit');
+    await page.fill('#f_identifiant', 'jbernard');
+    await page.type('#f_codeReinit', codeReinit.replace('-', '').toLowerCase());
+    etape('Saisie tolérante du code', (await page.inputValue('#f_codeReinit')) === codeReinit);
+    await page.fill('#f_nouveauMdp', 'jbernard-2026');
+    etape('Règles vérifiées en direct sur l\'écran de connexion', (await page.$$('.connexion .regles-mdp .regle.ko')).length >= 1);
+    await page.fill('#f_nouveauMdp', 'Bernard-Atelier#26'); await page.fill('#f_confirmationMdp', 'Bernard-Atelier#26');
+    await capture('mdp-oublie-nouveau');
+    await page.click('.connexion button[type=submit]');
+    await page.waitForSelector('.sidebar-nav .nav-item');
+    etape('Nouveau mot de passe enregistré et connexion automatique', (await page.textContent('.entete-utilisateur')).includes('Bernard'));
+    // Changement depuis le menu du compte, avec les règles cochées en direct
+    await page.click('.entete-utilisateur'); await page.click('.menu-utilisateur >> text=Changer mon mot de passe');
+    await page.waitForSelector('.modal #f_ancien');
+    await page.fill('#f_ancien', 'Bernard-Atelier#26'); await page.fill('#f_nouveau', 'Bernard-Second#27'); await page.fill('#f_confirmation', 'Bernard-Second');
+    etape('Saisies différentes signalées', await page.$eval('.modal .regles-mdp', (u) => Array.from(u.querySelectorAll('.regle.ko')).some((li) => li.textContent.includes('identiques'))));
+    await page.fill('#f_confirmation', 'Bernard-Second#27');
+    await page.click('.modal .btn-primaire');
+    await page.waitForSelector('.toast.succes >> text=Mot de passe modifié');
+    etape('Mot de passe changé depuis le menu du compte', true);
+    await page.click('.entete-utilisateur'); await page.click('.menu-utilisateur >> text=Se déconnecter'); await page.waitForSelector('.connexion-carte');
 
     // Connexion avec un profil restreint (données de démo : demandeur)
     await page.fill('#f_login', 'spetit'); await page.fill('#f_password', 'demo'); await page.click('button[type=submit]');

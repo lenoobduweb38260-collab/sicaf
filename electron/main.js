@@ -11,6 +11,9 @@
  *   connexion chiffrée, le pôle informatique confirme l'empreinte du certificat du serveur ;
  *   ensuite, tout autre certificat bloque la connexion (protection contre l'usurpation du serveur).
  * - Icône dans la zone de notification, démarrage avec Windows, instance unique.
+ * - Récupération d'urgence (mode serveur uniquement) : après le code du pôle informatique, un code
+ *   de réinitialisation est généré pour un compte administrateur ou du pôle informatique
+ *   (journalisé et signalé dans la GMAO).
  * - Mises à jour automatiques (GitHub Releases, dossier réseau ou adresse web) : l'installateur
  *   est téléchargé, vérifié (SHA-256) puis installé en silence, et l'application redémarre.
  */
@@ -32,6 +35,11 @@ const DEPOT_DEFAUT = (PKG.gmao && PKG.gmao.depotMisesAJour) || '';
 const PORTABLE = !!process.env.PORTABLE_EXECUTABLE_FILE;
 const DEMARRAGE_CACHE = process.argv.includes('--cache');
 const LONGUEUR_MIN_CODE = 8;
+const ESSAIS_CODE_MAX = 8;                        // codes du pôle informatique incorrects consécutifs avant blocage
+const BLOCAGE_CODE_MS = 15 * 60 * 1000;           // durée du blocage de la saisie du code
+const RECUPERATION_DEVERROUILLAGE_MS = 5 * 60 * 1000; // validité du code saisi pour une récupération d'urgence
+const MESSAGE_RECUPERATION_INDISPONIBLE = 'La récupération d\'urgence n\'est possible que sur le poste qui héberge la GMAO, lorsque celle-ci est démarrée.';
+const MESSAGE_RECUPERATION_SANS_CODE = 'Aucun code du pôle informatique n\'est défini sur ce poste : définissez-le d\'abord dans les paramètres de connexion (pôle informatique).';
 const MESSAGE_USURPATION = 'Le serveur GMAO présente un certificat différent de celui confirmé par le pôle informatique. '
   + 'La connexion est bloquée car il peut s\'agir d\'une usurpation du serveur. Ne saisissez aucun mot de passe et prévenez le pôle informatique.';
 const MESSAGE_DECLASSEMENT = 'Ce serveur répond sans chiffrement alors qu\'une connexion chiffrée a été confirmée pour ce poste. '
@@ -53,8 +61,9 @@ let quitter = false;
 let infoBulleMontree = false;
 let majEnCours = false;
 let minuterieMaj = null;
+let modeAssistant = 'parametres'; // 'parametres' | 'recuperation' (récupération d'urgence d'un compte)
 let assistantDeverrouille = false; // code du pôle informatique saisi pour la fenêtre de paramètres ouverte
-let echecsCode = 0;
+let recuperationDeverrouillee = null; // { fenetre, jusqua } : code saisi dans la fenêtre de récupération ouverte
 let fileCode = Promise.resolve();
 
 // ----- Instance unique -----------------------------------------------------------------
@@ -340,23 +349,38 @@ function garderEnArrierePlan() {
 /**
  * @param {string} [erreur]  message affiché en tête de l'assistant
  * @param {'securite'} [type] alerte de sécurité (certificat refusé)
+ * @param {'parametres'|'recuperation'} [mode] récupération d'urgence d'un compte (mode serveur uniquement)
  */
-function ouvrirAssistant(erreur, type) {
-  if (fenetreAssistant) { fenetreAssistant.show(); fenetreAssistant.focus(); return; }
-  assistantDeverrouille = !parametres.valeurs.codeInformatique; // premier lancement : pas encore de code
-  fenetreAssistant = new BrowserWindow({
-    width: 860, height: 780, minWidth: 700, minHeight: 600, title: `${NOM} — Paramètres de connexion`, icon: ICONE, autoHideMenuBar: true, backgroundColor: '#0f172a',
+function ouvrirAssistant(erreur, type, mode = 'parametres') {
+  const recuperation = mode === 'recuperation';
+  if (recuperation && !serviceRecuperation()) return;
+  if (fenetreAssistant) {
+    if (modeAssistant === mode) { fenetreAssistant.show(); fenetreAssistant.focus(); return; }
+    // Autre mode : la fenêtre est remplacée et le code du pôle informatique sera redemandé
+    const ancienne = fenetreAssistant;
+    fenetreAssistant = null;
+    ancienne.destroy();
+  }
+  modeAssistant = recuperation ? 'recuperation' : 'parametres';
+  recuperationDeverrouillee = null;
+  // Premier lancement : pas encore de code pour les paramètres ; la récupération l'exige toujours
+  assistantDeverrouille = !recuperation && !parametres.valeurs.codeInformatique;
+  const f = new BrowserWindow({
+    width: 860, height: 780, minWidth: 700, minHeight: 600, title: recuperation ? `${NOM} — Récupération d'un compte administrateur` : `${NOM} — Paramètres de connexion`, icon: ICONE, autoHideMenuBar: true, backgroundColor: '#0f172a',
     webPreferences: { preload: PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
+  fenetreAssistant = f;
   const query = {};
+  if (recuperation) query.mode = 'recuperation';
   if (erreur) query.erreur = String(erreur).slice(0, 1000);
   if (erreur && type === 'securite') query.alerte = 'securite';
-  fenetreAssistant.loadFile(PAGE_DEMARRAGE, { query });
-  fenetreAssistant.webContents.setWindowOpenHandler(({ url: u }) => { if (/^https?:/i.test(u)) shell.openExternal(u); return { action: 'deny' }; });
-  fenetreAssistant.on('closed', () => {
-    fenetreAssistant = null;
-    assistantDeverrouille = false;
-    if (!fenetre && !quitter && !parametres.valeurs.configure) { quitter = true; app.quit(); }
+  f.loadFile(PAGE_DEMARRAGE, { query });
+  f.webContents.setWindowOpenHandler(({ url: u }) => { if (/^https?:/i.test(u)) shell.openExternal(u); return { action: 'deny' }; });
+  f.on('closed', () => {
+    if (fenetreAssistant === f) fenetreAssistant = null;
+    // Une fenêtre remplacée ne touche pas à l'état de sa remplaçante
+    if (!fenetreAssistant) { assistantDeverrouille = false; recuperationDeverrouillee = null; }
+    if (!fenetre && !fenetreAssistant && !quitter && !parametres.valeurs.configure) { quitter = true; app.quit(); }
   });
 }
 
@@ -485,6 +509,7 @@ function menuModele() {
     empreinteAffichee() ? { label: 'Empreinte du certificat…', click: () => afficherEmpreinte() } : null,
     { type: 'separator' },
     { label: 'Paramètres de connexion (pôle informatique)…', click: () => ouvrirAssistant() },
+    serviceRecuperation() ? { label: 'Récupérer un compte administrateur…', click: () => ouvrirAssistant(undefined, undefined, 'recuperation') } : null,
     { label: 'Rechercher les mises à jour', click: () => verifierMisesAJour(true) },
     { type: 'separator' },
     { label: `Version ${app.getVersion()}`, enabled: false },
@@ -590,20 +615,143 @@ async function verifierMisesAJour(manuel) {
 
 /**
  * Déclare un canal IPC. Par défaut, seul l'assistant de connexion (page locale) peut l'appeler ;
- * `{ application: true }` l'ouvre aussi aux pages de la GMAO (serveur local ou distant).
+ * `{ application: true }` l'ouvre aussi aux pages de la GMAO (serveur local ou distant) ;
+ * `{ recuperation: true }` le réserve à la fenêtre de l'assistant ouverte en mode récupération.
  */
-function gerer(canal, fn, { application = false } = {}) {
+function gerer(canal, fn, { application = false, recuperation = false } = {}) {
   ipcMain.handle(canal, async (ev, ...args) => {
     const url = (ev && ev.senderFrame && ev.senderFrame.url) || '';
-    if (!(application ? origineAutorisee(url) : estPageAssistant(url))) throw new Error('Appel non autorisé');
+    let autorise = application ? origineAutorisee(url) : estPageAssistant(url);
+    // Récupération d'urgence : l'appel doit venir de la fenêtre créée par l'application pour cet usage
+    if (recuperation) autorise = autorise && modeAssistant === 'recuperation' && estFenetreAssistant(ev && ev.sender);
+    if (!autorise) throw new Error('Appel non autorisé');
     return fn(ev, ...args);
   });
+}
+
+/** Vrai si le contenu web expéditeur est celui de la fenêtre de l'assistant actuellement ouverte. */
+function estFenetreAssistant(expediteur) {
+  const wc = fenetreAssistant && fenetreAssistant.webContents;
+  if (!wc || !expediteur) return false;
+  return expediteur === wc || (typeof wc.id === 'number' && expediteur.id === wc.id);
 }
 
 /** Les paramètres de connexion ne se modifient qu'après saisie du code du pôle informatique. */
 function exigerDeverrouillage() {
   if (parametres.valeurs.codeInformatique && !assistantDeverrouille) throw new Error('Code du pôle informatique requis');
 }
+
+/**
+ * Fin du blocage de la saisie du code du pôle informatique (date ISO), ou '' si la saisie est permise.
+ * Un blocage plus long que sa durée normale (horloge du poste reculée) est ramené à cette durée.
+ */
+function blocageCode() {
+  const v = parametres.valeurs.verrouCode;
+  const fin = Date.parse(v.bloqueJusqua || '');
+  if (!(fin > Date.now())) return '';
+  if (fin > Date.now() + BLOCAGE_CODE_MS) {
+    const borne = new Date(Date.now() + BLOCAGE_CODE_MS).toISOString();
+    parametres.enregistrer({ verrouCode: { echecs: v.echecs, bloqueJusqua: borne } });
+    return borne;
+  }
+  return v.bloqueJusqua;
+}
+
+function messageBlocage(fin) {
+  const d = new Date(fin);
+  const heure = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return `Trop de codes incorrects : la saisie du code du pôle informatique est bloquée jusqu'à ${heure}.`;
+}
+
+/** Auteur des opérations faites sur ce poste, pour le journal d'activité de la GMAO. */
+function originePoste() {
+  let session = '';
+  try { session = os.userInfo().username || ''; } catch (e) { /* compte sans nom */ }
+  return `Poste serveur ${os.hostname()}${session ? `, session ${session}` : ''}`.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 80);
+}
+
+/**
+ * Inscrit un événement de ce poste au journal d'activité de la GMAO (mode serveur, serveur démarré).
+ * `alerte` : notification au pôle informatique (droit Système › Modifier).
+ */
+function journaliserPoste(action, details, alerte) {
+  if (parametres.valeurs.mode !== 'serveur' || !serveur || !serveur.ctx) return;
+  try {
+    const ctx = serveur.ctx;
+    ctx.audit({ user: { id: null, login: originePoste() } }, action, 'users', null, details);
+    if (alerte && (ctx.config().securite || {}).notifierBlocages !== false) {
+      ctx.notify(ctx.usersAvecDroit('systeme', 'modifier').map((u) => u.id), Object.assign({ type: 'alerte' }, alerte));
+    }
+  } catch (e) { journal('Journal d\'activité de la GMAO indisponible :', e.message); }
+}
+
+/**
+ * Vérifie le code du pôle informatique. Les essais sont traités un par un, avec un délai croissant
+ * après plusieurs échecs (essais automatisés) ; après ESSAIS_CODE_MAX échecs consécutifs, la saisie
+ * est bloquée BLOCAGE_CODE_MS. Le compteur est conservé dans les paramètres : redémarrer
+ * l'application ne lève pas un blocage. Les échecs sont inscrits au journal d'activité de la GMAO.
+ * @param {*} code  saisie de la page
+ * @param {string} usage  ce que le code protège (« paramètres de connexion », « récupération d'urgence »)
+ * @returns {Promise<{ok:boolean, message?:string, bloque?:boolean}>}
+ */
+function verifierCodeInformatique(code, usage) {
+  const essai = fileCode.then(async () => {
+    const bloque = blocageCode();
+    if (bloque) return { ok: false, bloque: true, message: messageBlocage(bloque) };
+    const echecs = parametres.valeurs.verrouCode.echecs;
+    await attendre(400 + Math.min(30000, Math.max(0, echecs - 4) * 3000));
+    const ok = typeof code === 'string' && code.length > 0 && code.length <= 200 && !!parametres.valeurs.codeInformatique && verifyPassword(code, parametres.valeurs.codeInformatique);
+    if (ok) {
+      if (echecs) parametres.enregistrer({ verrouCode: { echecs: 0, bloqueJusqua: '' } });
+      return { ok: true };
+    }
+    const n = echecs + 1;
+    const fin = n >= ESSAIS_CODE_MAX ? new Date(Date.now() + BLOCAGE_CODE_MS).toISOString() : '';
+    parametres.enregistrer({ verrouCode: { echecs: fin ? 0 : n, bloqueJusqua: fin } });
+    journal(`Code du pôle informatique incorrect (${usage}, ${n} échec(s) consécutif(s))${fin ? ' : saisie bloquée' : ''}`);
+    journaliserPoste('echec_connexion', `Code du pôle informatique incorrect sur le poste serveur (${usage}), ${n} essai(s) incorrect(s) consécutif(s)`);
+    if (!fin) return { ok: false, message: 'Code incorrect' };
+    const minutes = BLOCAGE_CODE_MS / 60000;
+    journaliserPoste('blocage', `Saisie du code du pôle informatique bloquée ${minutes} minutes sur le poste serveur après ${n} essais incorrects (${usage})`, {
+      titre: 'Code du pôle informatique bloqué sur le poste serveur',
+      message: `${n} codes du pôle informatique incorrects ont été saisis sur le poste serveur (${usage}) : saisie bloquée ${minutes} minutes. Si personne du pôle informatique n'est intervenu, vérifiez l'accès au poste serveur.`,
+      lien: '#/audit?action=blocage',
+    });
+    return { ok: false, bloque: true, message: messageBlocage(fin) };
+  });
+  fileCode = essai.catch(() => {});
+  return essai;
+}
+
+// ----- Récupération d'urgence d'un compte (mode serveur) -------------------------------------
+
+/** Service de récupération du serveur intégré, ou null (mode client, serveur arrêté). */
+function serviceRecuperation() {
+  if (!parametres || parametres.valeurs.mode !== 'serveur' || !serveur || !serveur.ctx) return null;
+  const s = serveur.ctx.services && serveur.ctx.services.motsDePasse;
+  return s && typeof s.comptesRecuperables === 'function' && typeof s.recuperationUrgence === 'function' ? s : null;
+}
+
+/** Code du pôle informatique saisi dans la fenêtre de récupération ouverte, depuis moins de 5 minutes. */
+function recuperationAutorisee() {
+  const r = recuperationDeverrouillee;
+  return !!r && !!fenetreAssistant && r.fenetre === fenetreAssistant && modeAssistant === 'recuperation' && Date.now() < r.jusqua;
+}
+
+function etatRecuperation() {
+  const disponible = !!serviceRecuperation();
+  const codeDefini = !!parametres.valeurs.codeInformatique;
+  const bloque = blocageCode();
+  return {
+    disponible: disponible && codeDefini,
+    message: !disponible ? MESSAGE_RECUPERATION_INDISPONIBLE : (!codeDefini ? MESSAGE_RECUPERATION_SANS_CODE : ''),
+    deverrouille: recuperationAutorisee(),
+    bloque: !!bloque,
+    messageBlocage: bloque ? messageBlocage(bloque) : '',
+  };
+}
+
+const recuperationVerrouillee = () => ({ ok: false, verrouille: true, message: 'Saisissez de nouveau le code du pôle informatique (délai de 5 minutes dépassé ou code déjà utilisé pour une récupération).' });
 
 /** Copie des données reçues d'une page, sans clés pouvant altérer les prototypes. */
 function donneesPage(v) {
@@ -615,19 +763,11 @@ function donneesPage(v) {
 
 function enregistrerIpc() {
   gerer('bureau:etat-verrou', () => ({ codeDefini: !!parametres.valeurs.codeInformatique, deverrouille: assistantDeverrouille }));
-  gerer('bureau:deverrouiller', (ev, code) => {
-    // Essais traités un par un, avec un délai croissant après plusieurs échecs (essais automatisés)
-    const essai = fileCode.then(async () => {
-      if (!parametres.valeurs.codeInformatique) { assistantDeverrouille = true; return { ok: true }; }
-      await attendre(400 + Math.min(30000, Math.max(0, echecsCode - 4) * 3000));
-      const ok = typeof code === 'string' && code.length > 0 && code.length <= 200 && verifyPassword(code, parametres.valeurs.codeInformatique);
-      assistantDeverrouille = ok;
-      echecsCode = ok ? 0 : echecsCode + 1;
-      if (!ok) journal(`Code du pôle informatique incorrect (${echecsCode} échec(s) consécutif(s))`);
-      return { ok, message: ok ? '' : 'Code incorrect' };
-    });
-    fileCode = essai.catch(() => {});
-    return essai;
+  gerer('bureau:deverrouiller', async (ev, code) => {
+    if (!parametres.valeurs.codeInformatique) { assistantDeverrouille = true; return { ok: true }; }
+    const r = await verifierCodeInformatique(code, 'paramètres de connexion');
+    assistantDeverrouille = r.ok;
+    return { ok: r.ok, message: r.ok ? '' : r.message };
   });
   gerer('bureau:reessayer', () => { if (fenetreAssistant) { const f = fenetreAssistant; fenetreAssistant = null; f.destroy(); } lancer(); return true; });
   gerer('bureau:infos', () => ({
@@ -642,6 +782,7 @@ function enregistrerIpc() {
     const v = JSON.parse(JSON.stringify(parametres.valeurs));
     v.codeInformatiqueDefini = !!v.codeInformatique;
     delete v.codeInformatique;
+    delete v.verrouCode;
     if (v.codeInformatiqueDefini && !assistantDeverrouille) return { verrouille: true, configure: v.configure, mode: v.mode, codeInformatiqueDefini: true };
     return v;
   });
@@ -696,10 +837,53 @@ function enregistrerIpc() {
     return r.canceled ? '' : r.filePaths[0];
   });
   gerer('bureau:verifier-maj', () => verifierMisesAJour(true), { application: true });
-  gerer('bureau:ouvrir-parametres', () => { ouvrirAssistant(); return true; }, { application: true });
+  gerer('bureau:ouvrir-parametres', () => {
+    // Une récupération d'urgence en cours (code affiché) n'est pas interrompue par une page de la GMAO
+    if (fenetreAssistant && modeAssistant === 'recuperation') { fenetreAssistant.show(); fenetreAssistant.focus(); return true; }
+    ouvrirAssistant();
+    return true;
+  }, { application: true });
   gerer('bureau:ouvrir-dossier-donnees', () => { exigerDeverrouillage(); return parametres.valeurs.mode === 'serveur' ? shell.openPath(dossierDonnees()) : ''; });
   gerer('bureau:fermer-assistant', () => { if (fenetreAssistant) fenetreAssistant.close(); return true; });
   gerer('bureau:quitter', () => quitterApplication());
+
+  // Récupération d'urgence : fenêtre de l'assistant ouverte depuis la zone de notification du poste serveur
+  gerer('bureau:recuperation-etat', () => etatRecuperation(), { recuperation: true });
+  gerer('bureau:recuperation-deverrouiller', async (ev, code) => {
+    const etat = etatRecuperation();
+    if (!etat.disponible) return { ok: false, message: etat.message };
+    const appelante = fenetreAssistant;
+    const r = await verifierCodeInformatique(code, 'récupération d\'urgence');
+    if (!r.ok) return { ok: false, bloque: !!r.bloque, message: r.message };
+    // Fenêtre fermée ou remplacée pendant la vérification : rien n'est déverrouillé
+    if (fenetreAssistant !== appelante || modeAssistant !== 'recuperation') return { ok: false, message: 'Fenêtre de récupération fermée' };
+    recuperationDeverrouillee = { fenetre: appelante, jusqua: Date.now() + RECUPERATION_DEVERROUILLAGE_MS };
+    return { ok: true };
+  }, { recuperation: true });
+  gerer('bureau:recuperation-comptes', () => {
+    const s = serviceRecuperation();
+    if (!s) return { ok: false, message: MESSAGE_RECUPERATION_INDISPONIBLE };
+    if (!recuperationAutorisee()) return recuperationVerrouillee();
+    return { ok: true, comptes: s.comptesRecuperables().map((c) => ({ login: String(c.login), nom: String(c.nom || c.login) })) };
+  }, { recuperation: true });
+  gerer('bureau:recuperation-generer', (ev, login) => {
+    const s = serviceRecuperation();
+    if (!s) return { ok: false, message: MESSAGE_RECUPERATION_INDISPONIBLE };
+    if (!recuperationAutorisee()) return recuperationVerrouillee();
+    const cible = typeof login === 'string' ? login.trim().slice(0, 100) : '';
+    if (!cible) return { ok: false, message: 'Choisissez le compte à récupérer' };
+    let r;
+    try {
+      r = s.recuperationUrgence({ login: cible, origine: originePoste() });
+    } catch (e) {
+      if (!(e && e.status)) journal('Récupération d\'urgence impossible :', e && e.message ? e.message : e);
+      return { ok: false, message: e && e.status && e.message ? e.message : 'Génération du code impossible' };
+    }
+    // Un code par saisie du code du pôle informatique ; le code généré n'est conservé nulle part ici
+    recuperationDeverrouillee = null;
+    journal('Récupération d\'urgence : code de réinitialisation généré pour le compte', r.login);
+    return { ok: true, login: r.login, nom: r.nom, code: r.code, expireLe: r.expireLe };
+  }, { recuperation: true });
 }
 
 // ----- Durcissement : aucune vue intégrée (webview) ni navigation hors de l'application -------

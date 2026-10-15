@@ -35,6 +35,8 @@ function register(ctx) {
       lignes: rows.slice(0, limite),
       entites: Array.from(new Set(db.list('audit').map((r) => r.entite))).sort(),
       actions: Array.from(new Set(db.list('audit').map((r) => r.action))).sort(),
+      // Libellés des actions du cœur (connexions, mots de passe, double authentification…)
+      libellesActions: Object.assign({}, ctx.libellesActions || {}),
     };
   }, { perm: ['audit', 'voir'] });
 

@@ -5,12 +5,19 @@
   'use strict';
   const { el, erreur } = ui;
 
-  const LIBELLES_ACTION = { connexion: 'Connexion', creation: 'Création', modification: 'Modification', suppression: 'Suppression', desactivation: 'Désactivation', changement_mdp: 'Changement de mot de passe', reinitialisation_mdp: 'Réinitialisation de mot de passe', duplication: 'Duplication', sauvegarde: 'Sauvegarde', restauration: 'Restauration', import: 'Import', demo: 'Données de démonstration', reinitialisation: 'Réinitialisation', validation: 'Validation', refus: 'Refus', cloture: 'Clôture', affectation: 'Affectation', statut: 'Changement de statut', mouvement: 'Mouvement de stock', generation: 'Génération', compteur: 'Relevé de compteur', document: 'Document', export: 'Export', etat: 'Changement d\'état', commentaire: 'Commentaire', convertir: 'Conversion', reouverture: 'Réouverture', temps: 'Temps passé', pieces: 'Pièces' };
+  const LIBELLES_ACTION = { connexion: 'Connexion', creation: 'Création', modification: 'Modification', suppression: 'Suppression', desactivation: 'Désactivation', changement_mdp: 'Changement de mot de passe', reinitialisation_mdp: 'Réinitialisation de mot de passe', duplication: 'Duplication', sauvegarde: 'Sauvegarde', restauration: 'Restauration', import: 'Import', demo: 'Données de démonstration', reinitialisation: 'Réinitialisation', validation: 'Validation', refus: 'Refus', cloture: 'Clôture', affectation: 'Affectation', statut: 'Changement de statut', mouvement: 'Mouvement de stock', generation: 'Génération', compteur: 'Relevé de compteur', document: 'Document', export: 'Export', etat: 'Changement d\'état', commentaire: 'Commentaire', convertir: 'Conversion', reouverture: 'Réouverture', temps: 'Temps passé', pieces: 'Pièces',
+    // Mots de passe (libellés complétés par ceux du serveur, GET /api/audit → libellesActions)
+    demande_reinitialisation_mdp: 'Demande de réinitialisation de mot de passe', rejet_demande_reinitialisation_mdp: 'Demande de réinitialisation refusée',
+    code_reinitialisation_mdp: 'Code de réinitialisation de mot de passe', annulation_code_reinitialisation: 'Annulation d\'un code de réinitialisation',
+    echec_reinitialisation_mdp: 'Code de réinitialisation incorrect', reinitialisation_mdp_code: 'Mot de passe réinitialisé avec un code',
+    reinitialisation_mdp_autonome: 'Mot de passe réinitialisé avec l\'application d\'authentification', recuperation_urgence: 'Récupération d\'urgence d\'un compte',
+    expiration_mdp: 'Mot de passe expiré' };
   const LIBELLES_ENTITE = { users: 'Utilisateurs', profils: 'Profils', secteurs: 'Secteurs', configuration: 'Configuration', equipements: 'Équipements', demandes: 'Demandes', ot: 'Ordres de travail', plansPreventifs: 'Plans préventifs', articles: 'Articles', mouvementsStock: 'Mouvements de stock', fournisseurs: 'Fournisseurs' };
 
   GMAO.registerView('audit', {
     titre: 'Journal d\'activité', icone: 'audit',
     async rendu(container, { query }) {
+      const libellesActions = Object.assign({}, LIBELLES_ACTION);
       const filtres = { entite: (query && query.entite) || '', action: (query && query.action) || '', userId: '', du: '', au: '', recherche: '' };
       const selEntite = el('select', { onchange: () => { filtres.entite = selEntite.value; charger(); } });
       const selAction = el('select', { onchange: () => { filtres.action = selAction.value; charger(); } });
@@ -25,7 +32,7 @@
         colonnes: [
           { cle: 'date', label: 'Date', type: 'datetime', largeur: '150px' },
           { cle: 'userNom', label: 'Utilisateur' },
-          { cle: 'action', label: 'Action', rendu: (r) => ui.badge(LIBELLES_ACTION[r.action] || r.action) },
+          { cle: 'action', label: 'Action', rendu: (r) => ui.badge(libellesActions[r.action] || r.action) },
           { cle: 'entite', label: 'Entité', rendu: (r) => LIBELLES_ENTITE[r.entite] || r.entite },
           { cle: 'entiteId', label: 'Réf.', aligner: 'centre' },
           { cle: 'details', label: 'Détails', rendu: (r) => el('span', { class: 'texte-petit', style: { wordBreak: 'break-word' } }, r.details) },
@@ -37,11 +44,12 @@
       async function charger() {
         try {
           const r = await api.get('/api/audit', { entite: filtres.entite, action: filtres.action, userId: filtres.userId, du: filtres.du, au: filtres.au, recherche: filtres.recherche, limite: 1000 });
+          Object.assign(libellesActions, r.libellesActions || {});
           tableau.maj(r.lignes);
           compteur.textContent = `${r.total} entrée(s)${r.total > r.lignes.length ? ` (${r.lignes.length} affichées)` : ''}`;
           const remplir = (sel, valeurs, libelles, vide) => { const cur = sel.value || (sel === selEntite ? filtres.entite : sel === selAction ? filtres.action : ''); ui.vider(sel); sel.appendChild(el('option', { value: '' }, vide)); valeurs.forEach((v) => sel.appendChild(el('option', { value: v }, libelles[v] || v))); sel.value = cur; };
           remplir(selEntite, r.entites, LIBELLES_ENTITE, 'Toutes les entités');
-          remplir(selAction, r.actions, LIBELLES_ACTION, 'Toutes les actions');
+          remplir(selAction, r.actions, libellesActions, 'Toutes les actions');
         } catch (e) { erreur(e); }
       }
 

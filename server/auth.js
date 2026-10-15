@@ -1,7 +1,7 @@
 'use strict';
 /**
  * Authentification : hachage des mots de passe (scrypt), sessions en mémoire,
- * limitation des tentatives de connexion.
+ * limitation des tentatives de connexion, codes de réinitialisation du mot de passe.
  */
 const crypto = require('crypto');
 
@@ -22,6 +22,23 @@ function verifyPassword(password, stored) {
   const test = crypto.scryptSync(String(password), salt, 64);
   const ref = Buffer.from(hash, 'hex');
   return test.length === ref.length && crypto.timingSafeEqual(test, ref);
+}
+
+/**
+ * Comme verifyPassword, sans bloquer le serveur pendant le calcul (plusieurs empreintes à comparer :
+ * historique des mots de passe, code de réinitialisation). Une empreinte mal formée est comparée
+ * à une empreinte factice, pour un temps de réponse identique.
+ */
+function verifyPasswordAsync(password, stored) {
+  const [algo, salt, hash] = typeof stored === 'string' ? stored.split('$') : [];
+  const valide = algo === 'scrypt' && !!salt && !!hash;
+  return new Promise((resolve) => {
+    crypto.scrypt(String(password), valide ? salt : '00', 64, (err, test) => {
+      if (err || !valide) return resolve(false);
+      const ref = Buffer.from(hash, 'hex');
+      resolve(test.length === ref.length && crypto.timingSafeEqual(test, ref));
+    });
+  });
 }
 
 /** Mots de passe trop courants, refusés quelle que soit la politique. */
@@ -62,6 +79,32 @@ function genererMotDePasse(longueur = 14) {
   return out.join('');
 }
 
+/** Codes de réinitialisation : 8 caractères sans ambiguïté de lecture (ni I, ni O, ni 0, ni 1). */
+const ALPHABET_CODE_REINIT = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const LONGUEUR_CODE_REINIT = 8;
+
+/** Nouveau code de réinitialisation (8 caractères, sans tiret). */
+function genererCodeReinitialisation() {
+  let code = '';
+  for (let i = 0; i < LONGUEUR_CODE_REINIT; i++) code += ALPHABET_CODE_REINIT[crypto.randomInt(ALPHABET_CODE_REINIT.length)];
+  return code;
+}
+
+/** Présentation « XXXX-XXXX ». */
+function formaterCodeReinitialisation(code) {
+  const c = String(code || '');
+  return c.length === LONGUEUR_CODE_REINIT ? `${c.slice(0, 4)}-${c.slice(4)}` : c;
+}
+
+/** Saisie tolérante (minuscules, espaces, tirets) : code normalisé ou null s'il est mal formé. */
+function normaliserCodeReinitialisation(saisie) {
+  if (typeof saisie !== 'string' && typeof saisie !== 'number') return null;
+  const c = String(saisie).slice(0, 40).toUpperCase().replace(/[\s-]/g, '');
+  if (c.length !== LONGUEUR_CODE_REINIT) return null;
+  for (const x of c) if (!ALPHABET_CODE_REINIT.includes(x)) return null;
+  return c;
+}
+
 class Sessions {
   /**
    * @param {{ inactiviteMs?: Function, dureeMaxMs?: Function }} [options] fonctions renvoyant les délais
@@ -70,6 +113,7 @@ class Sessions {
   constructor(options = {}) {
     this.map = new Map();
     this.tentatives = new Map();
+    this.quotas = new Map(); // clé → instants des demandes récentes (fenêtre glissante)
     this.inactiviteMs = options.inactiviteMs || (() => SESSION_DUREE_MS);
     this.dureeMaxMs = options.dureeMaxMs || (() => SESSION_DUREE_MS);
   }
@@ -113,6 +157,25 @@ class Sessions {
     const now = Date.now();
     for (const [t, s] of this.map) if (this.expiree(s, now)) this.map.delete(t);
     for (const [k, v] of this.tentatives) if (v.until && v.until < now && v.count === 0) this.tentatives.delete(k);
+    for (const [k, q] of this.quotas) if (!q.instants.length || q.instants[q.instants.length - 1] <= now - q.fenetreMs) this.quotas.delete(k);
+  }
+
+  /**
+   * Quota sur une fenêtre glissante (ex. 5 demandes par poste en 15 minutes) : enregistre la demande
+   * si elle est permise et renvoie 0, sinon renvoie le nombre de secondes avant la prochaine demande permise.
+   */
+  quota(cle, max, fenetreMs) {
+    const now = Date.now();
+    const q = this.quotas.get(cle) || { instants: [], fenetreMs };
+    q.fenetreMs = fenetreMs;
+    q.instants = q.instants.filter((t) => t > now - fenetreMs);
+    if (q.instants.length >= max) {
+      this.quotas.set(cle, q);
+      return Math.max(1, Math.ceil((q.instants[0] + fenetreMs - now) / 1000));
+    }
+    q.instants.push(now);
+    this.quotas.set(cle, q);
+    return 0;
   }
 
   /** Limitation des tentatives : retourne le nombre de secondes de blocage restantes (0 si libre). */
@@ -138,13 +201,13 @@ class Sessions {
 }
 
 /**
- * Retire les informations sensibles avant envoi au client : empreinte du mot de passe, clé de double
- * authentification (active ou en attente) et empreintes des codes de secours. Seul un résumé de l'état
- * de la double authentification est conservé.
+ * Retire les informations sensibles avant envoi au client : empreinte du mot de passe et des mots de passe
+ * précédents, code de réinitialisation, clé de double authentification (active ou en attente) et empreintes
+ * des codes de secours. Seul un résumé de l'état de la double authentification est conservé.
  */
 function cleanUser(u) {
   if (!u) return null;
-  const { passwordHash, deuxFacteurs, codesSecours, ...rest } = u;
+  const { passwordHash, historiqueMdp, reinitialisation, deuxFacteurs, codesSecours, ...rest } = u;
   rest.deuxFacteurs = resumeDeuxFacteurs(u);
   return rest;
 }
@@ -173,4 +236,8 @@ function parseCookies(header) {
   return out;
 }
 
-module.exports = { hashPassword, verifyPassword, validerMotDePasse, genererMotDePasse, Sessions, cleanUser, resumeDeuxFacteurs, parseCookies, SESSION_DUREE_MS, MAX_TENTATIVES, BLOCAGE_MS };
+module.exports = {
+  hashPassword, verifyPassword, verifyPasswordAsync, validerMotDePasse, genererMotDePasse, Sessions, cleanUser, resumeDeuxFacteurs, parseCookies,
+  genererCodeReinitialisation, formaterCodeReinitialisation, normaliserCodeReinitialisation, ALPHABET_CODE_REINIT,
+  SESSION_DUREE_MS, MAX_TENTATIVES, BLOCAGE_MS,
+};

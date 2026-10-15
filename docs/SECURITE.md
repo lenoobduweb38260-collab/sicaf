@@ -19,8 +19,38 @@ destinées au pôle informatique.
 - **Politique** (Configuration › Général › Sécurité) : 10 caractères minimum par défaut, au moins 3 types de
   caractères, refus des mots de passe courants et de ceux qui contiennent l'identifiant, changement obligatoire
   du mot de passe initial, nouveau mot de passe différent de l'ancien.
+- **Changement imposé par le serveur** : tant qu'un mot de passe initial (si la configuration l'exige), réinitialisé,
+  expiré ou défini par un administrateur n'a pas été changé, le serveur refuse toute opération autre que
+  l'authentification (aucune donnée de l'application, notifications comprises).
+- **Historique** : les 5 derniers mots de passe (réglable de 0 à 24) sont refusés, en plus du mot de passe actuel ;
+  seules leurs empreintes scrypt sont conservées.
+- **Expiration** (désactivée par défaut, 30 à 730 jours) avec rappel avant l'échéance ; l'activer ne fait pas expirer
+  d'un coup les comptes jamais changés (date de référence posée à la première évaluation).
 - **Comptes créés par le pôle informatique** : sans mot de passe saisi, un mot de passe aléatoire conforme est
   généré et affiché une seule fois.
+- **Mot de passe oublié** : depuis l'écran de connexion, l'utilisateur adresse une demande au pôle informatique.
+  La réponse est identique que le compte existe ou non (aucune énumération des identifiants), 5 demandes au plus
+  par poste en 15 minutes ; les gestionnaires du compte et son titulaire sont prévenus (au plus toutes les 30 minutes).
+- **Codes de réinitialisation** (recommandé plutôt qu'un mot de passe temporaire) : 8 caractères sans ambiguïté de
+  lecture, à usage unique, valables 60 minutes par défaut, affichés une seule fois au pôle informatique ; seule leur
+  empreinte scrypt est conservée ; annulés après 5 essais incorrects, par un changement de mot de passe, une nouvelle
+  réinitialisation ou la désactivation du compte. L'utilisateur choisit lui-même son nouveau mot de passe ; ses sessions
+  sont fermées et **la double authentification reste exigée** à la connexion suivante (aucune session n'est ouverte
+  par la réinitialisation). Réponses génériques et blocage après 8 échecs, comme la connexion.
+- **Réinitialisation autonome** (désactivée par défaut) : un utilisateur dont la double authentification est active peut
+  définir un nouveau mot de passe avec un code de son application d'authentification (jamais avec un code de secours) ;
+  le pôle informatique en est informé.
+- **Récupération d'urgence** (application de bureau, mode serveur) : sur le poste serveur (icône de la zone de
+  notification › « Récupérer un compte administrateur… »), après le code du pôle informatique, un code de
+  réinitialisation peut être généré pour un compte actif administrateur ou du pôle informatique. Le code du pôle
+  informatique est redemandé pour chaque code généré (saisie valable 5 minutes) ; le code de réinitialisation est
+  affiché une seule fois et n'est conservé nulle part sur le poste ; l'opération est journalisée (auteur : poste
+  serveur et session Windows) et signalée à tout le pôle informatique. Indisponible en mode client et depuis les
+  pages de la GMAO (canaux réservés à la fenêtre ouverte par l'application pour cet usage).
+- **Code du pôle informatique** (paramètres du poste, récupération d'urgence) : seule son empreinte scrypt est
+  conservée ; essais traités un par un et freinés, saisie bloquée 15 minutes après 8 essais incorrects consécutifs
+  (même après un redémarrage de l'application) ; sur le poste serveur, chaque échec est inscrit au journal
+  d'activité et chaque blocage signalé au pôle informatique.
 - **Blocage** après 8 échecs, par poste et par compte (10 minutes) ; chaque échec et chaque blocage sont inscrits
   au journal d'activité et le pôle informatique est notifié.
 - **Sessions** : jeton aléatoire de 256 bits dans un cookie `HttpOnly`, `SameSite=Strict` (et `Secure` en HTTPS) ;
@@ -59,7 +89,8 @@ destinées au pôle informatique.
 ## 5. Traçabilité
 
 - **Journal d'activité** : connexions, échecs, blocages, créations, modifications, suppressions, changements
-  d'état, sauvegardes, imports, restaurations… (5 000 dernières entrées, export CSV).
+  d'état, sauvegardes, imports, restaurations, demandes et réinitialisations de mot de passe, récupérations d'urgence…
+  (5 000 dernières entrées, export CSV).
 - **Notifications** aux rôles responsables pour les événements choisis (Configuration › Journal & notifications).
 
 ## 6. Sauvegardes

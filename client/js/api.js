@@ -27,6 +27,12 @@
       const s = qs.toString();
       if (s) url += (url.includes('?') ? '&' : '?') + s;
     }
+    // Changement de mot de passe imposé : aucune donnée n'est demandée au serveur avant le nouveau mot de passe
+    // (badges et rafraîchissements périodiques des vues compris), hors authentification
+    if (window.GMAO && typeof window.GMAO.changementMdpRequis === 'function' && window.GMAO.changementMdpRequis()
+      && /^\/api\//.test(url) && !/^\/api\/(auth\/|views)/.test(url)) {
+      throw new ApiError(403, 'Vous devez changer votre mot de passe avant de continuer.', { changementMdpRequis: true });
+    }
     const headers = { 'X-Requested-With': 'GMAO' };
     const site = siteCourant();
     if (site) headers['X-GMAO-Site'] = site;
@@ -52,6 +58,10 @@
     if (!res.ok) {
       if (res.status === 401 && !options.silent401 && window.GMAO && typeof window.GMAO.onNonAuthentifie === 'function') {
         window.GMAO.onNonAuthentifie();
+      }
+      // Changement de mot de passe imposé par le serveur : l'application affiche la fenêtre de changement
+      if (res.status === 403 && data && data.changementMdpRequis && window.GMAO && typeof window.GMAO.onChangementMdpRequis === 'function') {
+        window.GMAO.onChangementMdpRequis(data.details || {});
       }
       const msg = (data && data.erreur) || (typeof data === 'string' && data) || `Erreur ${res.status}`;
       throw new ApiError(res.status, msg, data && data.details);

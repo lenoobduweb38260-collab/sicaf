@@ -1,7 +1,8 @@
 'use strict';
 /**
- * Application de bureau (Electron) : paramètres, mises à jour automatiques et démarrage
- * de electron/main.js avec un module « electron » simulé (Electron n'est pas installé ici).
+ * Application de bureau (Electron) : paramètres, mises à jour automatiques, démarrage de
+ * electron/main.js et pont electron/preload.js avec un module « electron » simulé (Electron
+ * n'est pas installé ici), récupération d'urgence d'un compte depuis le poste serveur.
  */
 const { test, describe, before, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -21,6 +22,16 @@ const { createApp } = require('../server/server');
 const { hashPassword } = require('../server/auth');
 
 const tmp = (p) => fs.mkdtempSync(path.join(os.tmpdir(), p));
+
+/** Charge un module de electron/ en remplaçant le module « electron » par un objet simulé. */
+function chargerAvecElectron(fichier, electron) {
+  const chemin = require.resolve(fichier);
+  delete require.cache[chemin];
+  const resoudre = Module._resolveFilename;
+  Module._resolveFilename = function (req, ...r) { return req === 'electron' ? 'electron-simule' : resoudre.call(this, req, ...r); };
+  require.cache['electron-simule'] = { id: 'electron-simule', filename: 'electron-simule', loaded: true, exports: electron };
+  try { return require(chemin); } finally { Module._resolveFilename = resoudre; }
+}
 
 describe('Paramètres du poste', () => {
   test('valeurs par défaut et normalisation', () => {
@@ -202,7 +213,10 @@ describe('electron/main.js avec un Electron simulé', () => {
       once(n, fn) { this.handlers[n] = fn; }
       on(n, fn) { this.handlers[n] = fn; }
       show() {} hide() {} focus() {} maximize() {} isMaximized() { return false; } isMinimized() { return false; } restore() {}
-      getSize() { return [1400, 900]; } setProgressBar() {} destroy() {} close() {}
+      getSize() { return [1400, 900]; } setProgressBar() {}
+      // Comme Electron : « closed » est émis après destroy(), et après close() sauf si « close » l'empêche
+      destroy() { if (this.detruite) return; this.detruite = true; setImmediate(() => { if (this.handlers.closed) this.handlers.closed(); }); }
+      close() { let empeche = false; if (this.handlers.close) this.handlers.close({ preventDefault: () => { empeche = true; } }); if (!empeche) this.destroy(); }
     }
     const app = {
       isPackaged: false,
@@ -215,7 +229,7 @@ describe('electron/main.js avec un Electron simulé', () => {
     const electron = {
       app, BrowserWindow,
       Menu: { buildFromTemplate: (t) => { journal.menus += 1; return t; }, setApplicationMenu() {} },
-      Tray: class { constructor() { journal.trays += 1; } on() {} setToolTip() {} setContextMenu() {} },
+      Tray: class { constructor() { journal.trays += 1; } on() {} setToolTip() {} setContextMenu(m) { journal.menuTray = m; } },
       shell: { openExternal() {}, openPath() {} },
       dialog: { showMessageBox: async () => ({ response: 1 }), showOpenDialog: async () => ({ canceled: true }), showErrorBox() {} },
       ipcMain: { handle: (c, fn) => { handlers[c] = fn; } },
@@ -228,14 +242,7 @@ describe('electron/main.js avec un Electron simulé', () => {
     return { electron, journal, handlers, ev, demarrer: () => pret() };
   }
 
-  function chargerMain(faux) {
-    const chemin = require.resolve('../electron/main.js');
-    delete require.cache[chemin];
-    const resoudre = Module._resolveFilename;
-    Module._resolveFilename = function (req, ...r) { return req === 'electron' ? 'electron-simule' : resoudre.call(this, req, ...r); };
-    require.cache['electron-simule'] = { id: 'electron-simule', filename: 'electron-simule', loaded: true, exports: faux.electron };
-    try { return require(chemin); } finally { Module._resolveFilename = resoudre; }
-  }
+  const chargerMain = (faux) => chargerAvecElectron('../electron/main.js', faux.electron);
   const attendre = (cond, ms = 5000) => new Promise((ok, ko) => { const t0 = Date.now(); const i = setInterval(() => { if (cond()) { clearInterval(i); ok(); } else if (Date.now() - t0 > ms) { clearInterval(i); ko(new Error('délai dépassé')); } }, 20); });
 
   test('premier lancement : assistant de connexion, puis démarrage du serveur intégré', async () => {
@@ -336,6 +343,7 @@ describe('electron/main.js avec un Electron simulé', () => {
     return { port: ecoute.adresse.port, url: `https://127.0.0.1:${ecoute.adresse.port}/`, arreter: async () => { await ecoute.fermer(); await srv.stop(); } };
   }
   const lireParametres = (userData) => JSON.parse(fs.readFileSync(path.join(userData, 'parametres.json'), 'utf8'));
+  const CANAUX_RECUPERATION = ['bureau:recuperation-etat', 'bureau:recuperation-deverrouiller', 'bureau:recuperation-comptes', 'bureau:recuperation-generer'];
 
   test('mode serveur partagé : HTTPS avec le certificat du poste, fenêtre limitée à ce certificat', async () => {
     const userData = tmp('gmao-bureau-');
@@ -432,7 +440,9 @@ describe('electron/main.js avec un Electron simulé', () => {
       assert.equal(faux.journal.urls[0], distant.url);
       assert.equal(await verifier(faux, '127.0.0.1', cert.certificat), 0, 'certificat confirmé accepté par la fenêtre');
       assert.equal(await verifier(faux, 'github.com', pirate.certificat), -3);
-      // Nouveau test : empreinte reconnue sans nouvelle confirmation
+      // Nouveau test : empreinte reconnue sans nouvelle confirmation (assistant fermé : code redemandé)
+      await assert.rejects(() => faux.handlers['bureau:tester-serveur'](cadreAssistant, distant.url), /Code du pôle informatique requis/);
+      assert.equal((await faux.handlers['bureau:deverrouiller'](cadreAssistant, CODE)).ok, true);
       const t2 = await faux.handlers['bureau:tester-serveur'](cadreAssistant, distant.url);
       assert.equal(t2.ok, true);
       assert.equal(t2.chiffre, true);
@@ -519,6 +529,14 @@ describe('electron/main.js avec un Electron simulé', () => {
       assert.equal(t.ok, true);
       assert.equal(t.chiffre, false);
       assert.match(t.avertissement, /circulent en clair/);
+      // Récupération d'urgence : jamais en mode client (ni entrée de menu, ni canal utilisable)
+      assert.ok(!f1.journal.menuTray.some((m) => /Récupérer un compte/.test(m.label || '')), 'aucune entrée « Récupérer un compte administrateur… »');
+      await f1.handlers['bureau:ouvrir-parametres'](cadreApplication(url));
+      const assistant = f1.journal.fenetres[f1.journal.fenetres.length - 1];
+      assert.match(assistant.opts.title, /Paramètres de connexion/);
+      for (const canal of CANAUX_RECUPERATION) {
+        await assert.rejects(() => f1.handlers[canal]({ sender: assistant.webContents, senderFrame: cadreAssistant.senderFrame }, 'admin'), /non autorisé/, canal);
+      }
       await arreter(f1);
       // Même serveur alors qu'une empreinte avait été confirmée : déclassement refusé
       const u2 = tmp('gmao-bureau-');
@@ -531,5 +549,261 @@ describe('electron/main.js avec un Electron simulé', () => {
       assert.equal(f2.journal.requetes[0].alerte, 'securite');
       assert.match(f2.journal.requetes[0].erreur, /sans chiffrement/);
     } finally { await ancienServeur.stop(); }
+  });
+
+  // ----- Récupération d'urgence d'un compte (poste serveur) ----------------------------------
+  const FORMAT_CODE = /^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/;
+  const entreeMenu = (faux, libelle) => (faux.journal.menuTray || []).find((m) => m && m.label === libelle);
+  const derniereFenetre = (faux) => faux.journal.fenetres[faux.journal.fenetres.length - 1];
+  /** Appel IPC depuis une fenêtre donnée (expéditeur) affichant la page locale de l'assistant. */
+  const depuis = (fen) => ({ sender: fen.webContents, senderFrame: cadreAssistant.senderFrame });
+  /** Ouvre la fenêtre de récupération par la zone de notification ; renvoie l'émetteur IPC de cette fenêtre. */
+  function ouvrirRecuperation(faux) {
+    const entree = entreeMenu(faux, 'Récupérer un compte administrateur…');
+    assert.ok(entree, 'entrée du menu de la zone de notification');
+    entree.click();
+    const fen = derniereFenetre(faux);
+    assert.match(fen.opts.title, /Récupération d'un compte administrateur/);
+    return { fen, ev: depuis(fen) };
+  }
+  /** Requête vers le serveur intégré, comme l'application (marqueur de l'application de bureau). */
+  async function requete(url, chemin, { corps, cookie } = {}) {
+    const h = { 'user-agent': UA, 'x-requested-with': 'GMAO' };
+    if (corps) h['content-type'] = 'application/json';
+    if (cookie) h.cookie = cookie;
+    const rep = await fetch(url + chemin.replace(/^\//, ''), { method: corps ? 'POST' : 'GET', headers: h, body: corps ? JSON.stringify(corps) : undefined });
+    const texte = await rep.text();
+    let body = texte;
+    try { body = JSON.parse(texte); } catch (e) { /* texte brut */ }
+    return { status: rep.status, body, cookie: String(rep.headers.get('set-cookie') || '').split(';')[0] };
+  }
+  const demarrerServeurBureau = async (userData) => {
+    const faux = fauxElectron(userData);
+    chargerMain(faux);
+    faux.demarrer();
+    await attendre(() => faux.journal.urls.length === 1, 10000);
+    return { faux, url: faux.journal.urls[0] };
+  };
+
+  test('mode serveur : récupération d\'urgence d\'un compte administrateur (zone de notification, code du pôle informatique, code à usage unique)', async () => {
+    const userData = tmp('gmao-bureau-');
+    const port = 49000 + Math.floor(Math.random() * 1000);
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port, partageReseau: false } });
+    const sortie = [];
+    const consoleLog = console.log;
+    console.log = (...a) => { sortie.push(a.join(' ')); consoleLog(...a); };
+    let faux;
+    let codeGenere = '';
+    try {
+      const d = await demarrerServeurBureau(userData);
+      faux = d.faux;
+      const url = d.url;
+      const h = faux.handlers;
+      // Fenêtre principale de la GMAO (et toute page autre que l'assistant ouvert pour cet usage) : aucun accès
+      const principale = faux.journal.fenetres[0];
+      for (const canal of CANAUX_RECUPERATION) {
+        await assert.rejects(() => h[canal]({ sender: principale.webContents, senderFrame: { url: url + '#/systeme' } }, CODE), /non autorisé/, canal);
+        await assert.rejects(() => h[canal](cadreAssistant, CODE), /non autorisé/, `${canal} sans fenêtre de récupération`);
+      }
+
+      const { fen, ev } = ouvrirRecuperation(faux);
+      assert.equal(faux.journal.requetes[faux.journal.requetes.length - 1].mode, 'recuperation');
+      assert.equal(fen.opts.webPreferences.sandbox, true);
+      assert.equal(fen.opts.webPreferences.contextIsolation, true);
+      // Même page locale, mais une autre fenêtre (ex. ouverte depuis une page) : refusé
+      const intruse = new faux.electron.BrowserWindow({ title: 'autre' });
+      await assert.rejects(() => h['bureau:recuperation-etat'](depuis(intruse)), /non autorisé/);
+      let etat = await h['bureau:recuperation-etat'](ev);
+      assert.deepEqual([etat.disponible, etat.deverrouille, etat.bloque], [true, false, false]);
+      // Sans le code du pôle informatique : ni liste des comptes, ni code
+      assert.equal((await h['bureau:recuperation-comptes'](ev)).verrouille, true);
+      assert.equal((await h['bureau:recuperation-generer'](ev, 'admin')).verrouille, true);
+      // Le déverrouillage des paramètres ne vaut pas pour la récupération
+      assert.equal((await h['bureau:deverrouiller'](ev, CODE)).ok, true);
+      assert.equal((await h['bureau:recuperation-comptes'](ev)).verrouille, true);
+      const mauvais = await h['bureau:recuperation-deverrouiller'](ev, 'pas-le-bon-code');
+      assert.deepEqual([mauvais.ok, mauvais.message], [false, 'Code incorrect']);
+      assert.equal((await h['bureau:recuperation-deverrouiller'](ev, CODE)).ok, true);
+      etat = await h['bureau:recuperation-etat'](ev);
+      assert.equal(etat.deverrouille, true);
+
+      // Comptes récupérables : identifiant et nom seulement
+      const c = await h['bureau:recuperation-comptes'](ev);
+      assert.equal(c.ok, true);
+      assert.ok(c.comptes.some((x) => x.login === 'admin'));
+      assert.ok(c.comptes.every((x) => Object.keys(x).sort().join() === 'login,nom'));
+      // Compte inconnu : refusé, sans consommer la saisie du code
+      const inconnu = await h['bureau:recuperation-generer'](ev, 'inexistant');
+      assert.equal(inconnu.ok, false);
+      assert.match(inconnu.message, /non récupérable/);
+      assert.equal((await h['bureau:recuperation-generer'](ev, { login: 'admin' })).ok, false, 'identifiant non textuel refusé');
+      // Génération : code affiché une seule fois, valable 60 minutes par défaut
+      const avant = Date.now();
+      const r = await h['bureau:recuperation-generer'](ev, ' ADMIN ');
+      assert.equal(r.ok, true);
+      assert.deepEqual(Object.keys(r).sort(), ['code', 'expireLe', 'login', 'nom', 'ok']);
+      assert.equal(r.login, 'admin');
+      assert.match(r.code, FORMAT_CODE);
+      codeGenere = r.code;
+      const duree = Date.parse(r.expireLe) - avant;
+      assert.ok(duree > 59 * 60000 && duree <= 61 * 60000, 'validité de 60 minutes');
+      // Un code par saisie du code du pôle informatique
+      assert.equal((await h['bureau:recuperation-generer'](ev, 'admin')).verrouille, true);
+      assert.equal((await h['bureau:recuperation-etat'](ev)).deverrouille, false);
+      // Saisie du code valable 5 minutes
+      assert.equal((await h['bureau:recuperation-deverrouiller'](ev, CODE)).ok, true);
+      const maintenant = Date.now;
+      let tardif;
+      Date.now = () => maintenant() + 6 * 60 * 1000;
+      try { tardif = h['bureau:recuperation-comptes'](ev); } finally { Date.now = maintenant; }
+      assert.equal((await tardif).verrouille, true);
+
+      // Le code s'utilise depuis l'écran de connexion de la GMAO, une seule fois ; il ne contourne rien
+      const nouveau = 'Recuperation-Urgence-2026!';
+      assert.equal((await requete(url, '/api/auth/reinitialiser', { corps: { login: 'admin', code: r.code.toLowerCase().replace('-', ' '), nouveau } })).status, 200);
+      assert.equal((await requete(url, '/api/auth/reinitialiser', { corps: { login: 'admin', code: r.code, nouveau: nouveau + 'x' } })).status, 400, 'usage unique');
+      const login = await requete(url, '/api/auth/login', { corps: { login: 'admin', password: nouveau } });
+      assert.equal(login.status, 200);
+      const cookie = login.cookie;
+      // Journal d'activité : génération attribuée au poste serveur (sans le code), code incorrect inscrit
+      const audit = (await requete(url, '/api/audit?limite=2000', { cookie })).body;
+      const ligne = audit.lignes.find((x) => x.action === 'recuperation_urgence');
+      assert.ok(ligne, 'récupération journalisée');
+      assert.match(ligne.userNom, /^Poste serveur /);
+      assert.ok(ligne.userNom.includes(os.hostname()));
+      assert.ok(!ligne.details.includes(r.code));
+      assert.ok(audit.lignes.some((x) => x.action === 'echec_connexion' && /Code du pôle informatique incorrect.*récupération d'urgence/.test(x.details) && /^Poste serveur /.test(x.userNom)));
+      const notifs = (await requete(url, '/api/notifications', { cookie })).body.notifications;
+      assert.ok(notifs.some((n) => n.titre === 'Récupération d\'urgence d\'un compte' && n.type === 'alerte'), 'pôle informatique prévenu');
+
+      // Changement de mode : la fenêtre est remplacée, l'ancienne n'a plus aucun accès
+      assert.equal((await h['bureau:recuperation-deverrouiller'](ev, CODE)).ok, true);
+      const nbFenetres = faux.journal.fenetres.length;
+      await h['bureau:ouvrir-parametres'](cadreApplication(url));
+      assert.equal(faux.journal.fenetres.length, nbFenetres, 'une page de la GMAO n\'interrompt pas une récupération en cours');
+      entreeMenu(faux, 'Paramètres de connexion (pôle informatique)…').click();
+      const parametresFen = derniereFenetre(faux);
+      assert.match(parametresFen.opts.title, /Paramètres de connexion/);
+      await new Promise((ok) => setImmediate(ok));
+      await assert.rejects(() => h['bureau:recuperation-comptes'](ev), /non autorisé/);
+      await assert.rejects(() => h['bureau:recuperation-etat'](depuis(parametresFen)), /non autorisé/, 'fenêtre des paramètres');
+      // Nouvelle ouverture : code redemandé ; fermeture : plus aucun accès
+      const second = ouvrirRecuperation(faux);
+      assert.equal((await h['bureau:recuperation-etat'](second.ev)).deverrouille, false);
+      assert.equal((await h['bureau:recuperation-deverrouiller'](second.ev, CODE)).ok, true);
+      await h['bureau:fermer-assistant'](second.ev);
+      await new Promise((ok) => setImmediate(ok));
+      await assert.rejects(() => h['bureau:recuperation-comptes'](second.ev), /non autorisé/);
+
+      // Le code généré n'est écrit ni dans le journal du poste ni dans ses paramètres
+      assert.ok(sortie.some((l) => /Récupération d'urgence : code de réinitialisation généré pour le compte admin/.test(l)));
+      assert.ok(!sortie.some((l) => l.includes(r.code)));
+      assert.ok(!fs.readFileSync(path.join(userData, 'parametres.json'), 'utf8').includes(r.code));
+    } finally {
+      console.log = consoleLog;
+      if (faux) await arreter(faux);
+    }
+    // Base de données : le code n'y figure jamais en clair et a été supprimé à son utilisation
+    const base = fs.readFileSync(path.join(userData, 'data', 'gmao.json'), 'utf8');
+    assert.ok(codeGenere && !base.includes(codeGenere) && !base.includes(codeGenere.replace('-', '')), 'aucun code en clair');
+    assert.ok(!JSON.parse(base).collections.users.find((u) => u.login === 'admin').reinitialisation, 'code consommé');
+  });
+
+  test('code du pôle informatique : blocage après 8 essais incorrects, conservé au redémarrage et signalé dans la GMAO', async () => {
+    const userData = tmp('gmao-bureau-');
+    const port = 46000 + Math.floor(Math.random() * 1000);
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port, partageReseau: false }, verrouCode: { echecs: 7 } });
+    let { faux } = await demarrerServeurBureau(userData);
+    let { ev } = ouvrirRecuperation(faux);
+    // 8e essai incorrect : freiné, puis saisie bloquée 15 minutes
+    const t0 = Date.now();
+    const r = await faux.handlers['bureau:recuperation-deverrouiller'](ev, 'encore-faux');
+    assert.ok(Date.now() - t0 >= 9000, 'essai freiné après plusieurs échecs');
+    assert.equal(r.ok, false);
+    assert.equal(r.bloque, true);
+    assert.match(r.message, /bloquée jusqu'à \d{2}:\d{2}/);
+    const fin = Date.parse(lireParametres(userData).verrouCode.bloqueJusqua);
+    assert.ok(fin > Date.now() + 14 * 60000 && fin <= Date.now() + 15 * 60000);
+    // Même le bon code est refusé pendant le blocage, pour la récupération comme pour les paramètres
+    const t1 = Date.now();
+    assert.equal((await faux.handlers['bureau:recuperation-deverrouiller'](ev, CODE)).bloque, true);
+    assert.ok(Date.now() - t1 < 300, 'refus immédiat, sans vérification du code');
+    assert.equal((await faux.handlers['bureau:recuperation-etat'](ev)).bloque, true);
+    entreeMenu(faux, 'Paramètres de connexion (pôle informatique)…').click();
+    const p = await faux.handlers['bureau:deverrouiller'](depuis(derniereFenetre(faux)), CODE);
+    assert.equal(p.ok, false);
+    assert.match(p.message, /bloquée/);
+    assert.equal((await faux.handlers['bureau:parametres'](cadreAssistant)).verrouille, true);
+    assert.equal((await faux.handlers['bureau:parametres'](cadreAssistant)).verrouCode, undefined);
+    await arreter(faux);
+    // Journal d'activité et notification du pôle informatique
+    const base = JSON.parse(fs.readFileSync(path.join(userData, 'data', 'gmao.json'), 'utf8')).collections;
+    const blocage = base.audit.find((a) => a.action === 'blocage');
+    assert.ok(blocage);
+    assert.match(blocage.userNom, /^Poste serveur /);
+    assert.match(blocage.details, /code du pôle informatique bloquée 15 minutes.*8 essais incorrects/);
+    const admin = base.users.find((u) => u.login === 'admin');
+    assert.ok(base.notifications.some((n) => n.userId === admin.id && n.titre === 'Code du pôle informatique bloqué sur le poste serveur' && n.type === 'alerte'));
+
+    // Redémarrage : le blocage demeure (une date trop lointaine est ramenée à 15 minutes)
+    new Parametres(userData).enregistrer({ verrouCode: { echecs: 0, bloqueJusqua: '2100-01-01T00:00:00.000Z' } });
+    ({ faux } = await demarrerServeurBureau(userData));
+    ({ ev } = ouvrirRecuperation(faux));
+    const etat = await faux.handlers['bureau:recuperation-etat'](ev);
+    assert.equal(etat.bloque, true);
+    assert.ok(Date.parse(lireParametres(userData).verrouCode.bloqueJusqua) <= Date.now() + 15 * 60000, 'blocage borné à sa durée normale');
+    assert.equal((await faux.handlers['bureau:recuperation-deverrouiller'](ev, CODE)).ok, false);
+    await arreter(faux);
+
+    // Fin du blocage : le bon code est accepté et le compteur remis à zéro
+    new Parametres(userData).enregistrer({ verrouCode: { echecs: 3, bloqueJusqua: new Date(Date.now() - 1000).toISOString() } });
+    ({ faux } = await demarrerServeurBureau(userData));
+    ({ ev } = ouvrirRecuperation(faux));
+    assert.equal((await faux.handlers['bureau:recuperation-etat'](ev)).bloque, false);
+    assert.equal((await faux.handlers['bureau:recuperation-deverrouiller'](ev, CODE)).ok, true);
+    assert.deepEqual(lireParametres(userData).verrouCode, { echecs: 0, bloqueJusqua: '' });
+    await arreter(faux);
+  });
+});
+
+describe('Pont preload.js', () => {
+  /** Charge preload.js pour une page d'adresse donnée ; renvoie l'objet exposé et les appels IPC. */
+  function chargerPreload(protocole) {
+    const expose = {};
+    const appels = [];
+    const electron = {
+      contextBridge: { exposeInMainWorld: (nom, valeur) => { expose[nom] = valeur; } },
+      ipcRenderer: { invoke: (...a) => { appels.push(a); return Promise.resolve(null); } },
+    };
+    const avant = Object.getOwnPropertyDescriptor(globalThis, 'location');
+    Object.defineProperty(globalThis, 'location', { value: { protocol: protocole }, configurable: true, writable: true });
+    try {
+      chargerAvecElectron('../electron/preload.js', electron);
+    } finally {
+      if (avant) Object.defineProperty(globalThis, 'location', avant); else delete globalThis.location;
+    }
+    return { pont: expose.gmaoBureau, appels };
+  }
+  const RECUPERATION = ['etatRecuperation', 'deverrouillerRecuperation', 'comptesRecuperables', 'genererCodeRecuperation'];
+
+  test('récupération d\'urgence exposée à la page locale de l\'assistant uniquement, arguments bornés', () => {
+    const local = chargerPreload('file:');
+    assert.ok(Object.isFrozen(local.pont));
+    for (const f of RECUPERATION) assert.equal(typeof local.pont[f], 'function', f);
+    local.pont.etatRecuperation();
+    local.pont.deverrouillerRecuperation('x'.repeat(500));
+    local.pont.comptesRecuperables();
+    local.pont.genererCodeRecuperation({ login: 'admin' });
+    local.pont.genererCodeRecuperation('a'.repeat(300));
+    assert.deepEqual(local.appels.map((a) => a[0]), ['bureau:recuperation-etat', 'bureau:recuperation-deverrouiller', 'bureau:recuperation-comptes', 'bureau:recuperation-generer', 'bureau:recuperation-generer']);
+    assert.equal(local.appels[1][1].length, 200);
+    assert.equal(local.appels[3][1], '', 'valeur non textuelle remplacée');
+    assert.equal(local.appels[4][1].length, 100);
+    // Pages de la GMAO (serveur local ou distant) : aucune fonction de récupération
+    for (const protocole of ['https:', 'http:']) {
+      const gmao = chargerPreload(protocole);
+      for (const f of RECUPERATION) assert.equal(gmao.pont[f], undefined, `${f} (${protocole})`);
+      assert.equal(typeof gmao.pont.infos, 'function');
+    }
   });
 });

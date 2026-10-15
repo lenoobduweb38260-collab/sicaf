@@ -25,6 +25,16 @@ function configParDefaut() {
       longueurMinMdp: 10, complexite: true, refuserCourants: true, interdireIdentifiant: true, forcerChangementMdpInitial: true, dureeSessionHeures: 12, inactiviteMinutes: 60, notifierBlocages: true,
       // Double authentification : 'facultatif' | 'obligatoire_sensibles' (administrateurs, gestion du système, des utilisateurs, des profils, de la configuration) | 'obligatoire_tous'
       deuxFacteurs: 'facultatif',
+      // Mot de passe oublié : demandes depuis l'écran de connexion, codes de réinitialisation à usage unique
+      motDePasseOublie: true,
+      dureeCodeReinitialisationMinutes: 60,
+      // Réinitialisation par l'utilisateur lui-même avec un code de son application d'authentification
+      reinitialisationAutonome: false,
+      // Expiration du mot de passe (0 = jamais, sinon 30 à 730 jours) et rappel avant l'échéance
+      expirationMdpJours: 0,
+      rappelExpirationJours: 14,
+      // Nombre de mots de passe précédents refusés (0 à 24)
+      historiqueMdp: 5,
     },
     numerotation: { ot: 'OT-{annee}-{num:4}', di: 'DI-{annee}-{num:4}', eq: 'EQ-{num:4}', art: 'ART-{num:4}', pp: 'PP-{num:3}', inv: 'INV-{annee}-{num:3}', vis: 'VIS-{annee}-{num:3}', cmd: 'CMD-{annee}-{num:4}', fac: 'FAC-{annee}-{num:4}', pl: 'PL-{num:3}', mat: 'MAT-{num:4}' },
     etiquettes: {
@@ -48,7 +58,7 @@ function configParDefaut() {
     journal: {
       notifications: true,
       profilsNotifies: null, // null = profils « Responsable maintenance » et « Pôle informatique » (renseigné au premier démarrage)
-      actions: ['creation', 'suppression', 'desactivation', 'restauration', 'import', 'reinitialisation_mdp'],
+      actions: ['creation', 'suppression', 'desactivation', 'restauration', 'import', 'reinitialisation_mdp', 'demande_reinitialisation_mdp', 'recuperation_urgence'],
       entites: [],           // vide = toutes les entités
     },
     sauvegardes: {
@@ -355,6 +365,19 @@ function seed(db, options = {}) {
   if (cfgJ.journal && !Array.isArray(cfgJ.journal.profilsNotifies)) {
     cfgJ.journal.profilsNotifies = db.list('profils', (p) => ['Responsable maintenance', 'Pôle informatique'].includes(p.nom)).map((p) => p.id);
     db.setConfig(cfgJ);
+  }
+  // Bases antérieures : si les réinitialisations de mot de passe sont notifiées, les demandes de réinitialisation
+  // et les récupérations d'urgence le sont aussi (une seule fois : un retrait ultérieur est respecté)
+  const migrations = db.data.meta.migrations = db.data.meta.migrations || {};
+  if (!migrations.journalMotsDePasse) {
+    const cfgM = db.getConfig();
+    const actions = cfgM.journal && Array.isArray(cfgM.journal.actions) ? cfgM.journal.actions : null;
+    if (actions && actions.includes('reinitialisation_mdp')) {
+      for (const a of ['demande_reinitialisation_mdp', 'recuperation_urgence']) if (!actions.includes(a)) actions.push(a);
+      db.setConfig(cfgM);
+    }
+    migrations.journalMotsDePasse = true;
+    db.touch();
   }
 
   // Secteurs : un site principal et ses services

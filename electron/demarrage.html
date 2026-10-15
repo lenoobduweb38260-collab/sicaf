@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-8Fe4jMIi+iNXoF1DgRv8K3XgpozCTuyNb+jbk+YC9NQ='; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-qVYaO1Lq/dWwAzroOWsdXGGu5XqDoDYzjZhYIQJjI+c='; base-uri 'none'; form-action 'none'">
   <title>GMAO SICAF — Paramètres de connexion</title>
   <style>
     :root { --primaire: #2563eb; --fond: #0f172a; --carte: #ffffff; --texte: #111827; --texte2: #6b7280; --bordure: #e5e7eb; --ok: #15803d; --danger: #b91c1c; --alerte: #b45309; }
@@ -35,8 +35,8 @@
     .champ label.ligne { display: flex; font-size: 13px; font-weight: 600; color: inherit; margin: 10px 0 4px; }
     .champ { margin: 8px 0; }
     .champ label { display: block; font-size: 12.5px; font-weight: 600; color: var(--texte2); margin-bottom: 4px; }
-    input[type=text], input[type=number], input[type=password] { width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px; font: inherit; }
-    input:focus { outline: none; border-color: var(--primaire); box-shadow: 0 0 0 3px #dbeafe; }
+    input[type=text], input[type=number], input[type=password], select { width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px; font: inherit; background: #fff; }
+    input:focus, select:focus { outline: none; border-color: var(--primaire); box-shadow: 0 0 0 3px #dbeafe; }
     .rangee { display: flex; gap: 8px; align-items: center; }
     .rangee input { flex: 1; }
     button { font: inherit; padding: 8px 16px; border-radius: 6px; border: 1px solid #d1d5db; background: #fff; cursor: pointer; }
@@ -52,6 +52,8 @@
     code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
     .empreinte { display: block; font-family: Consolas, "Cascadia Mono", monospace; font-size: 13.5px; letter-spacing: .3px; background: #fff; color: #111827; border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; margin: 6px 0; line-height: 1.6; user-select: all; word-break: break-all; }
     .petit { font-size: 12px; color: var(--texte2); }
+    .code-genere { display: block; font-family: Consolas, "Cascadia Mono", monospace; font-size: 34px; font-weight: 700; letter-spacing: 6px; text-align: center; color: #1e3a8a; background: #eff6ff; border: 2px dashed var(--primaire); border-radius: 10px; padding: 14px 10px; margin: 10px 0; user-select: all; }
+    ol.etapes { margin: 8px 0; padding-left: 22px; } ol.etapes li { margin: 5px 0; }
     @media (max-width: 700px) { .choix { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -125,8 +127,50 @@
     </div>
     </div>
 
+    <div id="recuperation" class="masque">
+      <div class="avert">
+        <div class="titre-encart"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l8 3v6c0 5-3.5 9.5-8 11-4.5-1.5-8-6-8-11V5z"/><path d="M12 8v4M12 16h.01"/></svg>Réservé au pôle informatique</div>
+        <p>À utiliser uniquement lorsque plus aucun administrateur ne peut se connecter (mot de passe perdu). Pour les autres comptes, utilisez la GMAO : Utilisateurs › Réinitialiser le mot de passe.</p>
+        <p>L'opération est inscrite au journal d'activité de la GMAO et signalée à tous les membres du pôle informatique.</p>
+      </div>
+      <div id="rec-indisponible" class="danger masque" role="alert"></div>
+
+      <div id="rec-etape-code" class="bloc masque">
+        <h3><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>1. Code du pôle informatique</h3>
+        <div class="champ"><label for="rec-code">Code du pôle informatique</label><div class="rangee"><input type="password" id="rec-code" autocomplete="off" maxlength="200"><button type="button" class="primaire" id="btn-rec-deverrouiller">Continuer</button></div><div id="rec-resultat-code" class="resultat ko" aria-live="polite"></div></div>
+      </div>
+
+      <div id="rec-etape-compte" class="bloc masque">
+        <h3><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>2. Compte à récupérer</h3>
+        <p class="petit" style="margin-top:0">Seuls les comptes actifs administrateurs ou du pôle informatique sont proposés.</p>
+        <div class="champ"><label for="rec-compte">Compte</label><select id="rec-compte"></select></div>
+        <div id="rec-aucun" class="avert masque">Aucun compte actif administrateur ou du pôle informatique n'a été trouvé dans la GMAO.</div>
+        <label class="ligne"><input type="checkbox" id="rec-confirmer"> J'ai vérifié l'identité de la personne à qui ce code sera remis.</label>
+        <div class="pied" style="margin-top:8px"><span class="petit">Le mot de passe actuel du compte reste valable tant que le code n'est pas utilisé.</span><button type="button" class="primaire" id="btn-rec-generer">Générer le code de réinitialisation</button></div>
+        <div id="rec-resultat-compte" class="resultat ko" aria-live="polite"></div>
+      </div>
+
+      <div id="rec-etape-resultat" class="bloc masque">
+        <h3><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M16 7l3 3M14 9l2 2"/></svg>3. Code de réinitialisation</h3>
+        <p style="margin-top:0">Compte : <strong id="rec-nom"></strong> (identifiant <code id="rec-login"></code>)</p>
+        <code class="code-genere" id="rec-code-genere"></code>
+        <div class="pied" style="margin-top:0"><span class="petit">Valable jusqu'au <strong id="rec-validite"></strong>, à usage unique.</span><button type="button" class="petit-bouton" id="btn-rec-copier">Copier</button></div>
+        <div class="info">
+          <div class="titre-encart">Mode d'emploi pour la personne concernée</div>
+          <ol class="etapes">
+            <li>Ouvrir la GMAO et, sur l'écran de connexion, cliquer sur « J'ai un code de réinitialisation ».</li>
+            <li>Saisir l'identifiant <code id="rec-login-etape"></code>, ce code, puis choisir un nouveau mot de passe (deux fois).</li>
+            <li>Se connecter avec le nouveau mot de passe ; si la double authentification est active, son code reste demandé (application d'authentification ou code de secours).</li>
+          </ol>
+        </div>
+        <p class="petit">Ce code ne sera plus affiché : remettez-le directement à la personne concernée. Il est annulé par un changement de mot de passe, une nouvelle réinitialisation ou après 5 essais incorrects.</p>
+        <div class="pied"><button type="button" id="btn-rec-autre">Récupérer un autre compte</button><button type="button" class="primaire" id="btn-rec-terminer">Terminer</button></div>
+      </div>
+    </div>
+
     <div class="pied">
       <button type="button" id="btn-quitter">Quitter</button>
+      <button type="button" id="btn-fermer" class="masque">Fermer</button>
       <button type="button" class="primaire" id="btn-valider">Démarrer la GMAO</button>
     </div>
   </div>
@@ -159,8 +203,8 @@
       const octets = String(fp || '').split(':');
       return el('code', { class: 'empreinte' }, octets.slice(0, 16).join(':'), el('br'), octets.slice(16).join(':'));
     }
-    async function copier(texte, bouton) {
-      try { await navigator.clipboard.writeText(texte); bouton.textContent = 'Copiée'; } catch (e) { bouton.textContent = 'Copie impossible'; }
+    async function copier(texte, bouton, fait) {
+      try { await navigator.clipboard.writeText(texte); bouton.textContent = fait || 'Copiée'; } catch (e) { bouton.textContent = 'Copie impossible'; }
       setTimeout(() => { bouton.textContent = 'Copier'; }, 1800);
     }
 
@@ -383,9 +427,131 @@
       choisir(p.mode || 'serveur');
     }
 
+    // ----- Récupération d'urgence d'un compte (poste serveur) -----------------------------
+    const ETAPES_RECUPERATION = ['rec-etape-code', 'rec-etape-compte', 'rec-etape-resultat'];
+
+    function etapeRecuperation(id) {
+      ETAPES_RECUPERATION.forEach((e) => $(e).classList.toggle('masque', e !== id));
+    }
+
+    /** Efface le code affiché (il n'est conservé nulle part). */
+    function effacerCodeAffiche() {
+      ['rec-code-genere', 'rec-nom', 'rec-login', 'rec-login-etape', 'rec-validite'].forEach((id) => { $(id).textContent = ''; });
+    }
+
+    function recuperationIndisponible(message) {
+      etapeRecuperation('');
+      $('rec-indisponible').textContent = message || 'Récupération d\'urgence indisponible sur ce poste.';
+      $('rec-indisponible').classList.remove('masque');
+    }
+
+    /** Retour à la saisie du code du pôle informatique, avec un message éventuel. */
+    function retourCode(message) {
+      effacerCodeAffiche();
+      $('rec-code').value = '';
+      $('rec-resultat-code').className = 'resultat ko';
+      $('rec-resultat-code').textContent = message || '';
+      etapeRecuperation('rec-etape-code');
+      $('rec-code').focus();
+    }
+
+    async function deverrouillerRecuperation() {
+      const bouton = $('btn-rec-deverrouiller');
+      const resultat = $('rec-resultat-code');
+      if (!$('rec-code').value) { resultat.className = 'resultat ko'; resultat.textContent = 'Saisissez le code du pôle informatique'; $('rec-code').focus(); return; }
+      bouton.disabled = true; $('rec-code').disabled = true;
+      resultat.className = 'resultat'; resultat.textContent = 'Vérification…';
+      try {
+        const r = await B.deverrouillerRecuperation($('rec-code').value);
+        if (!r || !r.ok) {
+          resultat.className = 'resultat ko';
+          resultat.textContent = (r && r.message) || 'Code incorrect';
+          $('rec-code').disabled = false; $('rec-code').select();
+          return;
+        }
+        $('rec-code').value = '';
+        resultat.textContent = '';
+        await chargerComptes();
+      } catch (e) {
+        resultat.className = 'resultat ko'; resultat.textContent = e.message || String(e);
+      } finally { bouton.disabled = false; $('rec-code').disabled = false; }
+    }
+
+    async function chargerComptes() {
+      const r = await B.comptesRecuperables();
+      if (!r || !r.ok) { if (r && r.verrouille) retourCode(r.message); else recuperationIndisponible(r && r.message); return; }
+      const liste = $('rec-compte');
+      vider(liste);
+      liste.appendChild(el('option', { value: '' }, r.comptes.length ? 'Choisir un compte…' : 'Aucun compte récupérable'));
+      for (const c of r.comptes) liste.appendChild(el('option', { value: c.login }, `${c.nom} (${c.login})`));
+      if (r.comptes.length === 1) liste.value = r.comptes[0].login;
+      $('rec-aucun').classList.toggle('masque', r.comptes.length > 0);
+      $('rec-confirmer').checked = false;
+      $('rec-resultat-compte').textContent = '';
+      etapeRecuperation('rec-etape-compte');
+      liste.focus();
+    }
+
+    async function genererCode() {
+      const resultat = $('rec-resultat-compte');
+      const login = $('rec-compte').value;
+      if (!login) { resultat.textContent = 'Choisissez le compte à récupérer'; $('rec-compte').focus(); return; }
+      if (!$('rec-confirmer').checked) { resultat.textContent = 'Cochez la case de vérification de l\'identité'; return; }
+      const bouton = $('btn-rec-generer'); bouton.disabled = true;
+      resultat.textContent = '';
+      try {
+        const r = await B.genererCodeRecuperation(login);
+        if (!r || !r.ok) { if (r && r.verrouille) retourCode(r.message); else resultat.textContent = (r && r.message) || 'Génération du code impossible'; return; }
+        afficherCode(r);
+      } catch (e) {
+        resultat.textContent = e.message || String(e);
+      } finally { bouton.disabled = false; }
+    }
+
+    function afficherCode(r) {
+      $('rec-nom').textContent = r.nom || r.login;
+      $('rec-login').textContent = r.login;
+      $('rec-login-etape').textContent = r.login;
+      $('rec-code-genere').textContent = r.code;
+      const fin = new Date(r.expireLe);
+      const minutes = Math.max(1, Math.round((fin.getTime() - Date.now()) / 60000));
+      const heure = fin.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+      $('rec-validite').textContent = `${fin.toLocaleDateString('fr-FR')} à ${heure} (${minutes} minute${minutes > 1 ? 's' : ''})`;
+      $('rec-confirmer').checked = false;
+      etapeRecuperation('rec-etape-resultat');
+      $('btn-rec-terminer').focus();
+    }
+
+    function fermerRecuperation() {
+      effacerCodeAffiche();
+      B.fermerAssistant();
+    }
+
+    async function initRecuperation() {
+      document.title = 'GMAO SICAF — Récupération d\'un compte administrateur';
+      $('sous-titre').textContent = 'Récupération d\'urgence d\'un compte administrateur ou du pôle informatique, depuis le poste qui héberge la GMAO.';
+      ['formulaire', 'verrou', 'btn-valider', 'btn-quitter'].forEach((id) => $(id).classList.add('masque'));
+      $('btn-fermer').classList.remove('masque');
+      $('recuperation').classList.remove('masque');
+      if (typeof B.etatRecuperation !== 'function') { recuperationIndisponible(); return; }
+      const e = await B.etatRecuperation();
+      if (!e || !e.disponible) { recuperationIndisponible(e && e.message); return; }
+      retourCode(e.bloque ? e.messageBlocage : '');
+    }
+
+    $('btn-fermer').addEventListener('click', fermerRecuperation);
+    $('btn-rec-deverrouiller').addEventListener('click', deverrouillerRecuperation);
+    $('rec-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') deverrouillerRecuperation(); });
+    $('btn-rec-generer').addEventListener('click', genererCode);
+    ['rec-compte', 'rec-confirmer'].forEach((id) => $(id).addEventListener('change', () => { $('rec-resultat-compte').textContent = ''; }));
+    $('btn-rec-copier').addEventListener('click', () => copier($('rec-code-genere').textContent, $('btn-rec-copier'), 'Copié'));
+    $('btn-rec-autre').addEventListener('click', () => retourCode(''));
+    $('btn-rec-terminer').addEventListener('click', fermerRecuperation);
+
     (async function init() {
       if (!B) { erreur('Cette page doit être ouverte depuis l\'application GMAO SICAF.'); return; }
       const q = new URLSearchParams(location.search);
+      if (q.get('mode') === 'recuperation') { await initRecuperation(); return; }
       const securite = q.get('alerte') === 'securite';
       if (q.get('erreur')) {
         erreur(q.get('erreur'), securite);

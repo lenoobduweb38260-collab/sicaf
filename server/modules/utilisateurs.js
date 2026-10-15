@@ -2,14 +2,18 @@
 /**
  * Module Utilisateurs : comptes internes, hiérarchie (supérieur, niveau de profil),
  * rattachement aux secteurs, surcharges individuelles de droits, état et réinitialisation
- * de la double authentification.
+ * de la double authentification, réinitialisation du mot de passe (code à usage unique ou
+ * mot de passe temporaire) et traitement des demandes faites depuis l'écran de connexion.
  */
 const nom = 'Utilisateurs';
 
 function register(ctx) {
   const { router, db, HttpError, auth, perms } = ctx;
 
-  /** Fiche sans secret (mot de passe, clé et codes de double authentification), avec l'état de la double authentification. */
+  /**
+   * Fiche sans secret (empreintes du mot de passe et des précédents, code de réinitialisation, clé et codes de
+   * double authentification), avec l'état de la double authentification.
+   */
   const clean = (u) => {
     const c = auth.cleanUser(u);
     if (c && ctx.deuxFacteurs) c.deuxFacteurs = Object.assign(c.deuxFacteurs, { exige: ctx.deuxFacteurs.exige(u) });
@@ -19,22 +23,13 @@ function register(ctx) {
   /**
    * Portée : un utilisateur est visible s'il s'agit de soi, s'il n'est rattaché à aucun secteur ou s'il partage
    * un secteur accessible (en modification, les sites en lecture seule sont exclus) ; le site choisi dans
-   * l'en-tête filtre en plus.
+   * l'en-tête filtre en plus. Même règle pour les destinataires des demandes de réinitialisation (ctx.utilisateurVisible).
    */
   function visible(req, u, ecriture) {
-    if (!u) return false;
-    if (u.id === req.user.id) return true;
-    const ids = (u.secteurIds || []).map(Number);
-    if (req.perms.portee !== 'tous') {
-      const accessibles = new Set(ecriture ? req.perms.secteurIds : req.perms.secteurIds.concat(req.perms.secteurIdsLecture || []));
-      if (ids.length && !ids.some((s) => accessibles.has(s))) return false;
-    }
-    if (req.perms.siteFiltre) {
-      const site = new Set(req.perms.siteFiltre);
-      if (ids.length && !ids.some((x) => site.has(x)) && !(u.siteAcces || []).some((a) => site.has(Number(a.siteId)))) return false;
-    }
-    return true;
+    return ctx.utilisateurVisible(req.user, req.perms, u, ecriture);
   }
+  const mdp = () => ctx.motsDePasse;
+  const gerable = (req, u) => !!u && perms.canManageUser(req.perms, db.get('profils', u.profilId));
 
   /** Utilisateur visible ou 404. */
   function getVisible(req, id, ecriture) {
@@ -141,10 +136,16 @@ function register(ctx) {
   router.get('/api/utilisateurs/:id', async (req) => {
     const u = getVisible(req, req.params.id, false);
     const profil = db.get('profils', u.profilId);
-    return Object.assign(clean(u), {
+    const fiche = Object.assign(clean(u), {
       permissionsEffectives: perms.effectivePermissions(db, u, profil, db.getConfig()),
       subordonnes: db.list('users', (x) => x.managerId === u.id).map((x) => ({ id: x.id, nom: x.nom, prenom: x.prenom, login: x.login })),
     });
+    // État du mot de passe pour les gestionnaires de comptes (jamais l'empreinte ni le code)
+    if (perms.can(req.perms, 'utilisateurs', 'modifier')) {
+      const i = mdp().infos(u);
+      fiche.motDePasse = Object.assign({ dateMdp: i.dateMdp, expireLe: i.expireLe, doitChanger: !!u.doitChangerMdp, raison: i.raison }, mdp().etatCode(u));
+    }
+    return fiche;
   }, { perm: ['utilisateurs', 'voir'] });
 
   router.post('/api/utilisateurs', async (req) => {
@@ -156,6 +157,8 @@ function register(ctx) {
     if (err) throw new HttpError(400, err);
     data.passwordHash = auth.hashPassword(pwd);
     data.doitChangerMdp = req.body.doitChangerMdp === undefined ? true : !!req.body.doitChangerMdp;
+    data.raisonChangementMdp = data.doitChangerMdp ? 'initial' : null;
+    data.dateMdp = new Date().toISOString();
     data.preferences = { theme: 'clair' };
     data.derniereConnexion = null;
     data.createdBy = req.user.id;
@@ -176,15 +179,25 @@ function register(ctx) {
     const data = validerUser(req, body, existant);
     verifierDernierAdmin(existant, data);
     if (body.password) {
-      const err = auth.validerMotDePasse(body.password, db.getConfig(), { login: data.login });
+      // Son propre mot de passe se change avec l'ancien (et l'historique) : « Changer mon mot de passe »
+      if (existant.id === req.user.id) throw new HttpError(400, 'Pour votre propre compte, utilisez « Changer mon mot de passe » dans le menu de votre compte');
+      const pwd = String(body.password);
+      const err = auth.validerMotDePasse(pwd, db.getConfig(), { login: data.login });
       if (err) throw new HttpError(400, err);
-      data.passwordHash = auth.hashPassword(body.password);
-      data.doitChangerMdp = body.doitChangerMdp === undefined ? true : !!body.doitChangerMdp;
+      // Mot de passe défini par un administrateur : à changer à la prochaine connexion (sauf indication contraire)
+      const imposer = body.doitChangerMdp === undefined ? true : !!body.doitChangerMdp;
+      Object.assign(data, mdp().champsNouveau(existant, pwd, { doitChanger: imposer, raison: 'administrateur' }));
       if (existant.id !== req.user.id) ctx.sessions.destroyUser(existant.id);
       if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(existant.id);
     }
     const u = db.update('users', existant.id, data);
-    if (u.actif === false) { ctx.sessions.destroyUser(u.id); if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(u.id); }
+    if (u.actif === false) {
+      ctx.sessions.destroyUser(u.id);
+      if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(u.id);
+      // Compte désactivé : code de réinitialisation annulé, demandes en attente rejetées
+      mdp().annulerCode(u.id);
+      if (existant.actif !== false) mdp().rejeterDemandes(u.id, 'Compte désactivé', req.user.id);
+    }
     ctx.audit(req, 'modification', 'users', u.id, `Utilisateur ${u.login}`);
     return clean(u);
   }, { perm: ['utilisateurs', 'modifier'] });
@@ -197,9 +210,10 @@ function register(ctx) {
     // On conserve la traçabilité : désactivation plutôt que suppression si l'utilisateur est référencé
     const reference = ['ot', 'demandes'].some((c) => db.count(c, (r) => r.createdBy === existant.id || r.demandeurId === existant.id || r.technicienId === existant.id || (r.techniciens || []).includes(existant.id)) > 0);
     if (reference) {
-      db.update('users', existant.id, { actif: false, supprime: true });
+      db.update('users', existant.id, { actif: false, supprime: true, reinitialisation: null });
       ctx.sessions.destroyUser(existant.id);
       if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(existant.id);
+      mdp().rejeterDemandes(existant.id, 'Compte désactivé', req.user.id);
       ctx.audit(req, 'desactivation', 'users', existant.id, `Utilisateur ${existant.login} (référencé, désactivé)`);
       return { ok: true, desactive: true };
     }
@@ -207,22 +221,110 @@ function register(ctx) {
     for (const u of db.list('users', (x) => x.managerId === existant.id)) db.update('users', u.id, { managerId: null });
     ctx.sessions.destroyUser(existant.id);
     if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(existant.id);
+    mdp().rejeterDemandes(existant.id, 'Compte supprimé', req.user.id);
     ctx.audit(req, 'suppression', 'users', existant.id, `Utilisateur ${existant.login}`);
     return { ok: true };
   }, { perm: ['utilisateurs', 'supprimer'] });
 
-  /** Réinitialisation du mot de passe par un gestionnaire. */
+  /**
+   * Réinitialisation du mot de passe par un gestionnaire :
+   *  - mode « code » (recommandé) : code à usage unique et durée limitée, renvoyé une seule fois ; l'utilisateur
+   *    choisit lui-même son nouveau mot de passe depuis l'écran de connexion (mot de passe actuel et sessions inchangés) ;
+   *  - mode « temporaire » : mot de passe saisi ou généré, à changer à la première connexion, sessions fermées.
+   * Les demandes en attente du compte sont traitées et l'utilisateur est prévenu.
+   */
   router.post('/api/utilisateurs/:id/reinitialiser-mdp', async (req) => {
+    const b = req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body) ? req.body : {};
     const existant = getVisible(req, req.params.id, true);
-    if (!perms.canManageUser(req.perms, db.get('profils', existant.profilId))) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
-    const pwd = req.body && req.body.password ? String(req.body.password) : auth.genererMotDePasse();
+    if (existant.id === req.user.id) throw new HttpError(400, 'Pour votre propre compte, utilisez « Changer mon mot de passe » dans le menu de votre compte');
+    if (!gerable(req, existant)) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
+    if (existant.actif === false) throw new HttpError(400, 'Ce compte est désactivé : réactivez-le avant de réinitialiser son mot de passe');
+    const mode = b.mode == null || b.mode === '' ? 'temporaire' : b.mode;
+    if (!['code', 'temporaire'].includes(mode)) throw new HttpError(400, 'Mode de réinitialisation invalide (code ou temporaire)');
+    if (b.demandeId != null && b.demandeId !== '') {
+      const d = db.get('demandesMdp', b.demandeId);
+      if (!d || d.userId !== existant.id) throw new HttpError(400, 'Demande de réinitialisation introuvable pour cet utilisateur');
+    }
+    const auteur = ctx.nomUser(req.user.id);
+    if (mode === 'code') {
+      const { code, expireLe } = mdp().poserCode(existant, { creePar: req.user.id, origine: 'pole_informatique' });
+      mdp().traiterDemandes(existant.id, { mode: 'code', par: req.user.id });
+      ctx.audit(req, 'code_reinitialisation_mdp', 'users', existant.id, `Code de réinitialisation créé pour ${existant.login}, valable jusqu'au ${mdp().dateHeure(expireLe)}`);
+      ctx.notify(existant.id, { titre: 'Code de réinitialisation de votre mot de passe', message: `${auteur} a créé un code de réinitialisation de votre mot de passe, valable jusqu'au ${mdp().dateHeure(expireLe)}. Utilisez-le depuis l'écran de connexion (« J'ai un code de réinitialisation »). Si vous n'avez rien demandé, prévenez le pôle informatique.`, lien: '', type: 'alerte' });
+      return { ok: true, mode: 'code', code, expireLe, login: existant.login };
+    }
+    const pwd = b.password ? String(b.password) : auth.genererMotDePasse();
     const err = auth.validerMotDePasse(pwd, db.getConfig(), { login: existant.login });
     if (err) throw new HttpError(400, err);
-    db.update('users', existant.id, { passwordHash: auth.hashPassword(pwd), doitChangerMdp: true });
+    db.update('users', existant.id, mdp().champsNouveau(existant, pwd, { doitChanger: true, raison: 'reinitialise' }));
     ctx.sessions.destroyUser(existant.id);
     if (ctx.deuxFacteurs) ctx.deuxFacteurs.annulerAttentes(existant.id);
-    ctx.audit(req, 'reinitialisation_mdp', 'users', existant.id, `Utilisateur ${existant.login}`);
-    return { ok: true, motDePasse: pwd };
+    mdp().traiterDemandes(existant.id, { mode: 'temporaire', par: req.user.id });
+    ctx.audit(req, 'reinitialisation_mdp', 'users', existant.id, `Utilisateur ${existant.login} (mot de passe temporaire)`);
+    ctx.notify(existant.id, { titre: 'Mot de passe réinitialisé', message: `${auteur} a réinitialisé votre mot de passe le ${mdp().dateHeure(Date.now())} : un mot de passe temporaire vous a été remis, vous le changerez à votre prochaine connexion. Si vous n'avez rien demandé, prévenez le pôle informatique.`, lien: '', type: 'alerte' });
+    return { ok: true, mode: 'temporaire', motDePasse: pwd };
+  }, { perm: ['utilisateurs', 'modifier'] });
+
+  /** Annulation du code de réinitialisation d'un compte (avant qu'il ne soit utilisé). */
+  router.delete('/api/utilisateurs/:id/code-reinitialisation', async (req) => {
+    const existant = getVisible(req, req.params.id, true);
+    if (existant.id !== req.user.id && !gerable(req, existant)) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
+    if (!mdp().annulerCode(existant.id)) throw new HttpError(400, 'Aucun code de réinitialisation actif pour ce compte');
+    ctx.audit(req, 'annulation_code_reinitialisation', 'users', existant.id, `Code de réinitialisation de ${existant.login} annulé`);
+    return { ok: true };
+  }, { perm: ['utilisateurs', 'modifier'] });
+
+  // ----- Demandes de réinitialisation faites depuis l'écran de connexion -----
+  /** Demande avec le compte concerné, si l'appelant peut le voir et le gérer (jamais sa propre demande). */
+  function demandeTraitable(req, d) {
+    const u = d ? db.get('users', d.userId) : null;
+    if (!u || u.id === req.user.id || !visible(req, u, true) || !gerable(req, u)) return null;
+    return u;
+  }
+  const presenterDemande = (d, u) => {
+    const profil = u ? db.get('profils', u.profilId) : null;
+    const out = {
+      id: d.id, userId: d.userId, login: u ? u.login : d.login, nom: u ? ctx.nomUser(u.id) : d.login, profilNom: profil ? profil.nom : '',
+      message: d.message || '', ip: d.ip || '', poste: d.poste || '', repetitions: Number(d.repetitions) || 1, createdAt: d.createdAt, derniereDemande: d.derniereDemande || d.createdAt,
+      statut: d.statut,
+    };
+    if (d.statut !== 'en_attente') Object.assign(out, { mode: d.mode || null, traiteePar: d.traiteePar == null ? null : d.traiteePar, traiteeParNom: d.traiteePar == null ? '' : ctx.nomUser(d.traiteePar), traiteeLe: d.traiteeLe || null, motifRejet: d.motifRejet || '' });
+    return out;
+  };
+
+  /** Demandes en attente des comptes que l'appelant peut voir et gérer ; ?toutes=1 ajoute les 50 dernières traitées ou rejetées. */
+  router.get('/api/utilisateurs-demandes-mdp', async (req) => {
+    mdp().purger();
+    const rows = [];
+    for (const d of db.list('demandesMdp', (x) => x.statut === 'en_attente')) {
+      const u = demandeTraitable(req, d);
+      if (u && u.actif !== false) rows.push(presenterDemande(d, u));
+    }
+    rows.sort((a, b) => (a.derniereDemande < b.derniereDemande ? 1 : -1));
+    if (req.query.toutes === '1' || req.query.toutes === 'true') {
+      const histo = [];
+      for (const d of db.list('demandesMdp', (x) => x.statut !== 'en_attente').sort((a, b) => ((a.traiteeLe || a.updatedAt) < (b.traiteeLe || b.updatedAt) ? 1 : -1))) {
+        const u = demandeTraitable(req, d);
+        if (u) histo.push(presenterDemande(d, u));
+        if (histo.length >= 50) break;
+      }
+      rows.push(...histo);
+    }
+    return rows;
+  }, { perm: ['utilisateurs', 'modifier'] });
+
+  /** Rejet d'une demande (motif facultatif communiqué à l'utilisateur). */
+  router.post('/api/utilisateurs-demandes-mdp/:id/rejeter', async (req) => {
+    const b = req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body) ? req.body : {};
+    const d = db.get('demandesMdp', req.params.id);
+    const u = demandeTraitable(req, d);
+    if (!u) throw new HttpError(404, 'Demande introuvable');
+    if (d.statut !== 'en_attente') throw new HttpError(400, 'Cette demande a déjà été traitée');
+    const motif = typeof b.motif === 'string' ? b.motif.replace(/[\u0000-\u0009\u000B-\u001F\u007F]/g, ' ').trim().slice(0, 300) : '';
+    const maj = db.update('demandesMdp', d.id, { statut: 'rejetee', mode: 'rejet', motifRejet: motif, traiteePar: req.user.id, traiteeLe: new Date().toISOString() });
+    ctx.audit(req, 'rejet_demande_reinitialisation_mdp', 'users', u.id, `Demande de réinitialisation de ${u.login} refusée${motif ? ' : ' + motif : ''}`);
+    ctx.notify(u.id, { titre: 'Demande de réinitialisation refusée', message: `Votre demande de réinitialisation du mot de passe du ${mdp().dateHeure(d.createdAt)} a été refusée par ${ctx.nomUser(req.user.id)}.${motif ? ' Motif : ' + motif : ''} Pour toute question, contactez le pôle informatique.`, lien: '', type: 'info' });
+    return presenterDemande(maj, u);
   }, { perm: ['utilisateurs', 'modifier'] });
 
   /**

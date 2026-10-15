@@ -10,8 +10,9 @@
  *    L'empreinte du certificat du serveur, confirmée par le pôle informatique à la première
  *    connexion chiffrée, est enregistrée ici : toute empreinte différente bloque ensuite la connexion.
  *
- * Le fichier contient l'empreinte (scrypt) du code du pôle informatique : il est écrit avec des
- * droits restreints à l'utilisateur courant.
+ * Le fichier contient l'empreinte (scrypt) du code du pôle informatique et le compteur de ses essais
+ * incorrects (un redémarrage ne lève pas un blocage) : il est écrit avec des droits restreints à
+ * l'utilisateur courant.
  *
  * Module sans dépendance à Electron : testable avec node:test.
  */
@@ -44,6 +45,10 @@ const DEFAUTS = {
     ignorerVersion: '',        // version que l'utilisateur a choisi d'ignorer
   },
   fenetre: { largeur: 1400, hauteur: 900, maximisee: false },
+  verrouCode: {
+    echecs: 0,                 // essais incorrects consécutifs du code du pôle informatique
+    bloqueJusqua: '',          // fin du blocage de la saisie du code (date ISO), vide sans blocage
+  },
 };
 
 function cloner(o) { return JSON.parse(JSON.stringify(o)); }
@@ -96,6 +101,10 @@ function normaliser(p) {
   out.fenetre.largeur = entier(f.largeur, 800, 10000, d.fenetre.largeur);
   out.fenetre.hauteur = entier(f.hauteur, 600, 10000, d.fenetre.hauteur);
   out.fenetre.maximisee = !!f.maximisee;
+  const v = src.verrouCode || {};
+  out.verrouCode.echecs = entier(v.echecs, 0, 1000, 0);
+  const fin = typeof v.bloqueJusqua === 'string' ? Date.parse(v.bloqueJusqua) : NaN;
+  out.verrouCode.bloqueJusqua = Number.isFinite(fin) ? new Date(fin).toISOString() : '';
   // Un mode client sans adresse n'est pas utilisable : retour à l'assistant
   if (out.mode === 'client' && !out.client.url) out.configure = false;
   return out;

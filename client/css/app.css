@@ -83,6 +83,23 @@ hr { border: 0; border-top: 1px solid var(--bordure); margin: 12px 0; }
 .connexion-erreur { background: #fee2e2; color: #991b1b; padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; }
 .connexion-pied { text-align: center; color: var(--texte-2); font-size: 12px; margin-top: 18px; }
 .connexion-accueil { background: var(--primaire-clair); color: var(--texte); padding: 10px; border-radius: 6px; margin-bottom: 14px; font-size: 13px; }
+.connexion-liens { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 2px 8px; margin: 2px -4px 0; }
+.connexion .connexion-liens .btn { width: auto; padding: 4px; font-size: 12.5px; }
+.connexion-panneau-titre { display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+.connexion-panneau-titre svg { width: 20px; height: 20px; color: var(--primaire); }
+.connexion-panneau-texte { margin-top: 0; }
+.connexion-etapes { margin: 4px 0 14px; padding-left: 20px; font-size: 13px; }
+.connexion-etapes li { margin-bottom: 4px; }
+.connexion .champ .aide.texte-droite { margin-top: -2px; }
+input.saisie-code { font-family: Consolas, "Courier New", monospace; font-size: 20px; letter-spacing: 3px; text-align: center; }
+input.saisie-code::placeholder { letter-spacing: 3px; opacity: 0.5; }
+[data-theme="sombre"] .connexion-erreur { background: #7f1d1d; color: #fee2e2; }
+/* Rappel d'expiration du mot de passe (sous l'en-tête) */
+.rappel-mdp { display: flex; align-items: center; gap: 10px; padding: 6px 20px; background: #fef3c7; color: #78350f; border-bottom: 1px solid #fcd34d; font-size: 13px; }
+.rappel-mdp > svg { width: 16px; height: 16px; }
+.rappel-mdp > span { flex: 1; }
+.rappel-mdp .btn-icone { color: inherit; }
+[data-theme="sombre"] .rappel-mdp { background: #422006; color: #fef3c7; border-bottom-color: #78350f; }
 
 /* ----- Structure ----- */
 .app { min-height: 100vh; }
@@ -225,11 +242,43 @@ input[type="checkbox"], input[type="radio"] { width: 16px; height: 16px; accent-
 .champ-case { flex-direction: row; align-items: center; gap: 8px; padding-top: 22px; }
 .champ-case label { font-weight: 500; color: var(--texte); cursor: pointer; }
 .champ-case.sans-decalage { padding-top: 0; }
+.champ-case { flex-wrap: wrap; row-gap: 2px; }
+.champ-case > label { flex: 1 1 0; min-width: 0; }
+.champ-case .aide { flex-basis: 100%; padding-left: 24px; }
 .cases-liste { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 6px 0; }
 .cases-liste label { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; color: var(--texte); font-size: 13px; cursor: pointer; }
 .champ-lecture { padding: 7px 0; font-size: 13.5px; min-height: 32px; }
 .champ-fichier img { max-height: 70px; margin-top: 6px; border-radius: 4px; border: 1px solid var(--bordure); }
 .formulaire-separateur { grid-column: 1 / -1; border-top: 1px solid var(--bordure); padding-top: 10px; margin-top: 6px; font-weight: 600; font-size: 13px; color: var(--primaire); }
+/* Mots de passe : afficher / masquer, règles cochées en direct, robustesse */
+.champ-mdp { position: relative; display: flex; align-items: center; }
+.champ-mdp input { padding-right: 38px; }
+.champ-mdp .mdp-voir { position: absolute; right: 3px; top: 50%; transform: translateY(-50%); display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 28px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--texte-2); cursor: pointer; }
+.champ-mdp .mdp-voir:hover { color: var(--texte); background: var(--fond); }
+.champ-mdp .mdp-voir:focus-visible { outline: 2px solid var(--primaire); outline-offset: 1px; }
+.champ-mdp .mdp-voir:disabled { opacity: 0.4; cursor: not-allowed; }
+.champ-mdp .mdp-voir svg { width: 18px; height: 18px; }
+.controle-mdp { margin-top: 4px; }
+.regles-mdp { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; font-size: 12px; }
+.regles-mdp .regle { display: flex; align-items: center; gap: 7px; color: var(--texte-2); }
+.regles-mdp .regle.ok { color: var(--texte); }
+.regles-mdp .regle-etat { width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid var(--bordure-2); flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
+.regles-mdp .regle-etat svg { width: 10px; height: 10px; stroke-width: 3; }
+.regles-mdp .regle.ok .regle-etat { background: var(--ok); border-color: var(--ok); color: #fff; }
+.regles-mdp .regle.ko .regle-etat { border-color: var(--danger); color: var(--danger); }
+.familles-mdp { display: inline-flex; gap: 3px; margin-left: 2px; }
+.familles-mdp span { font-family: Consolas, "Courier New", monospace; font-size: 10.5px; padding: 0 5px; border-radius: 8px; border: 1px solid var(--bordure-2); color: var(--texte-2); }
+.familles-mdp span.actif { background: var(--primaire-clair); border-color: var(--primaire); color: var(--texte); }
+.robustesse-mdp { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--texte-2); }
+.robustesse-mdp .jauge { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; width: 120px; }
+.robustesse-mdp .jauge span { height: 5px; border-radius: 3px; background: var(--bordure-2); }
+.robustesse-mdp[data-niveau="1"] .jauge span:nth-child(1) { background: var(--danger); }
+.robustesse-mdp[data-niveau="2"] .jauge span:nth-child(-n+2) { background: var(--alerte); }
+.robustesse-mdp[data-niveau="3"] .jauge span:nth-child(-n+3) { background: #65a30d; }
+.robustesse-mdp[data-niveau="4"] .jauge span { background: var(--ok); }
+.robustesse-mdp[data-niveau="1"] > span:last-child { color: var(--danger); }
+.robustesse-mdp[data-niveau="4"] > span:last-child, .robustesse-mdp[data-niveau="3"] > span:last-child { color: var(--ok); }
+.controle-mdp .aide { margin-top: 4px; font-size: 11.5px; color: var(--texte-2); }
 .interrupteur { position: relative; width: 38px; height: 22px; background: var(--bordure-2); border-radius: 11px; cursor: pointer; transition: background 0.15s; flex-shrink: 0; }
 .interrupteur::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; background: #fff; border-radius: 50%; transition: left 0.15s; }
 .interrupteur.actif { background: var(--primaire); }
@@ -389,3 +438,21 @@ div.vide:not(.bascule) svg { width: 40px; height: 40px; opacity: 0.4; margin-bot
   .carte, .tableau-conteneur { box-shadow: none; border-color: #999; }
   body { background: #fff; color: #000; }
 }
+
+/* ----- Réinitialisation des mots de passe (vue Utilisateurs) ----- */
+.bandeau-demandes { display: flex; align-items: center; gap: 10px; }
+.bandeau-demandes > svg { width: 18px; height: 18px; flex-shrink: 0; }
+.bandeau-demandes > span { flex: 1; }
+.choix-liste { display: grid; gap: 8px; margin: 12px 0; }
+.choix-carte { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 1px solid var(--bordure-2); border-radius: 8px; cursor: pointer; }
+.choix-carte:hover { background: var(--surface-2); }
+.choix-carte.actif { border-color: var(--primaire); background: var(--primaire-clair); }
+.choix-carte input { margin-top: 3px; flex-shrink: 0; }
+.choix-carte .choix-titre { font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
+.choix-detail { padding: 2px 4px 0 38px; }
+.secret-unique { font-family: Consolas, "Courier New", monospace; font-size: 32px; font-weight: 700; letter-spacing: 4px; text-align: center; padding: 14px 10px; margin: 10px 0 6px; background: var(--surface-2); color: var(--texte); border: 2px dashed var(--primaire); border-radius: 10px; user-select: all; word-break: break-all; }
+.secret-unique.mdp { font-size: 22px; letter-spacing: 2px; }
+.etapes-reinit { margin: 4px 0 0; padding-left: 20px; }
+.etapes-reinit li { margin-bottom: 3px; }
+.message-demande { white-space: pre-wrap; word-break: break-word; max-width: 320px; font-size: 12.5px; }
+.etat-mdp { display: grid; gap: 4px; }

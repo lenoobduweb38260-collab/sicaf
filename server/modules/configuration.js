@@ -92,6 +92,15 @@ function register(ctx) {
       const bs = b.securite;
       const bool = (k) => (bs[k] === undefined ? cfg.securite[k] : !!bs[k]);
       if (bs.deuxFacteurs !== undefined && !MODES_DEUX_FACTEURS.includes(bs.deuxFacteurs)) throw new HttpError(400, 'Mode de double authentification invalide (facultatif, obligatoire_sensibles ou obligatoire_tous)');
+      /** Entier dans les bornes (valeur actuelle si absent), sinon 400 avec un message explicite. */
+      const entier = (k, min, max, message) => {
+        if (bs[k] === undefined || bs[k] === null || bs[k] === '') return cfg.securite[k];
+        const n = Number(bs[k]);
+        if (!Number.isInteger(n) || n < min || n > max) throw new HttpError(400, message);
+        return n;
+      };
+      const expiration = entier('expirationMdpJours', 0, 730, 'Expiration du mot de passe : 0 (jamais) ou entre 30 et 730 jours');
+      if (expiration !== 0 && expiration < 30) throw new HttpError(400, 'Expiration du mot de passe : 0 (jamais) ou entre 30 et 730 jours');
       cfg.securite = Object.assign({}, cfg.securite, {
         longueurMinMdp: Math.min(64, Math.max(8, Number(bs.longueurMinMdp) || cfg.securite.longueurMinMdp)),
         complexite: bool('complexite'),
@@ -102,6 +111,13 @@ function register(ctx) {
         inactiviteMinutes: Math.min(24 * 60, Math.max(5, Number(bs.inactiviteMinutes) || cfg.securite.inactiviteMinutes || 60)),
         dureeSessionHeures: Math.min(72, Math.max(1, Number(bs.dureeSessionHeures) || cfg.securite.dureeSessionHeures || 12)),
         deuxFacteurs: bs.deuxFacteurs !== undefined ? bs.deuxFacteurs : (MODES_DEUX_FACTEURS.includes(cfg.securite.deuxFacteurs) ? cfg.securite.deuxFacteurs : 'facultatif'),
+        // Mot de passe oublié, réinitialisation, expiration, historique
+        motDePasseOublie: bool('motDePasseOublie'),
+        dureeCodeReinitialisationMinutes: entier('dureeCodeReinitialisationMinutes', 5, 1440, 'Durée de validité d\'un code de réinitialisation : entre 5 et 1440 minutes'),
+        reinitialisationAutonome: bool('reinitialisationAutonome'),
+        expirationMdpJours: expiration,
+        rappelExpirationJours: entier('rappelExpirationJours', 1, 60, 'Rappel avant l\'expiration du mot de passe : entre 1 et 60 jours'),
+        historiqueMdp: entier('historiqueMdp', 0, 24, 'Historique des mots de passe : entre 0 et 24 mots de passe'),
       });
     }
     if (b.numerotation) {
@@ -216,6 +232,9 @@ function register(ctx) {
 
   router.get('/api/export', async (req, res) => {
     const data = db.exportAll();
+    // Codes de réinitialisation en cours : temporaires, jamais exportés (les empreintes de mot de passe restent
+    // dans l'export complet, nécessaires à une restauration)
+    for (const u of (data.collections && data.collections.users) || []) delete u.reinitialisation;
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="gmao-export-${new Date().toISOString().slice(0, 10)}.json"` });
     res.end(JSON.stringify(data, null, 1));
   }, { perm: ['systeme', 'modifier'] });

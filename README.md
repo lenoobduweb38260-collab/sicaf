@@ -71,7 +71,10 @@ Le profil **Pôle informatique** (et l'administrateur) est le seul à pouvoir :
 - accéder à l'écran **Système & informatique** : base de données, sauvegardes (locales, multi-destinations,
   autres sites), export / import / restauration, réseau, postes connectés (déconnexion à distance),
   autorisation éventuelle de l'accès par navigateur web (désactivé par défaut), informations système ;
-- modifier les paramètres de connexion des postes (code du pôle informatique).
+- modifier les paramètres de connexion des postes (code du pôle informatique) ;
+- en dernier recours, si plus aucun administrateur ne peut se connecter : sur le poste serveur, icône de la zone
+  de notification › **Récupérer un compte administrateur…** (code du pôle informatique) génère un code de
+  réinitialisation à saisir sur l'écran de connexion (« J'ai un code de réinitialisation »).
 
 ### Première connexion
 

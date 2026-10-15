@@ -17,6 +17,7 @@ const COLLECTIONS = [
   'equipements', 'demandes', 'ot', 'plansPreventifs',
   'articles', 'mouvementsStock', 'fournisseurs',
   'documents', 'audit', 'notifications',
+  'demandesMdp', // demandes de réinitialisation du mot de passe (écran de connexion)
 ];
 
 class Db {

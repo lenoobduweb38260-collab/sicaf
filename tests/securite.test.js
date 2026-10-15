@@ -20,6 +20,8 @@ function brut(port, chemin, entetes = {}) {
   });
 }
 
+const MDP_ADMIN = 'Pompe-Centrale#2026';
+
 describe('Sécurité', () => {
   let srv, admin, port;
   before(async () => {
@@ -27,6 +29,9 @@ describe('Sécurité', () => {
     port = Number(new URL(srv.base).port);
     admin = srv.client();
     await admin.login('admin', 'admin');
+    // Politique réelle : le mot de passe initial doit être changé avant toute autre opération
+    assert.equal((await admin.get('/api/profils')).status, 403);
+    await admin.ok('POST', '/api/auth/mot-de-passe', { nouveau: MDP_ADMIN });
   });
   after(async () => { await srv.stop(); });
 
@@ -126,7 +131,7 @@ describe('Sécurité', () => {
 
   test('session expirée après inactivité', async () => {
     const c = srv.client();
-    await c.login('admin', 'admin');
+    await c.login('admin', MDP_ADMIN);
     for (const s of srv.app.sessions.map.values()) s.lastSeen -= 2 * 60 * 60 * 1000; // 2 h sans activité (> 60 min)
     assert.equal((await c.get('/api/auth/me')).status, 401);
   });
