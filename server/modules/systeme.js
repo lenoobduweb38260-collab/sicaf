@@ -34,6 +34,7 @@ function register(ctx) {
         ip: (s.info && s.info.ip) || '', poste: /GMAO-SICAF-Bureau\//.test(ua) ? 'Application GMAO' : 'Navigateur web',
         connexion: new Date(s.createdAt).toISOString(), derniereActivite: new Date(s.lastSeen).toISOString(),
         courante: req.session && req.session.token === token,
+        deuxFacteurs: !!(s.info && s.info.deuxFacteurs), // session ouverte avec un code de double authentification
       });
     }
     return out.sort((a, b) => (a.derniereActivite < b.derniereActivite ? 1 : -1));
@@ -46,6 +47,9 @@ function register(ctx) {
       accesNavigateur: !!(cfg.reseau && cfg.reseau.accesNavigateur),
       applicationBureau: ctx.bureau,
       port: adr && adr.port ? adr.port : null,
+      // Protocole servi et empreinte du certificat (HTTPS) : adresses à communiquer et empreinte à confirmer sur les postes
+      protocole: req.socket && req.socket.encrypted ? 'https' : 'http',
+      empreinte: ctx.empreinteCertificat || '',
       nomPoste: os.hostname(),
       adresses: adresses(),
       sessions: listeSessions(req),

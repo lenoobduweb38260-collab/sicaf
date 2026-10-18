@@ -22,6 +22,10 @@
 
   const GMAO = window.GMAO = {
     user: null, perms: null, config: {}, modules: [], refs: { users: [], secteurs: [], profils: [] }, catalogue: { modules: [], actions: {}, portees: {} }, version: '',
+    /** Libellés du journal d'activité (actions et éléments), partagés par les vues qui affichent un historique. */
+    libelles: { actions: {}, entites: {} },
+    libelleAction(code) { return (this.libelles.actions || {})[code] || (code == null ? '' : String(code)); },
+    libelleEntite(code) { return (this.libelles.entites || {})[code] || (code == null ? '' : String(code)); },
     /** État de la double authentification du compte : { actif, activeLe, codesSecoursRestants, mode, exige, enrolementRequis }. */
     deuxFacteurs: null,
     /** État du mot de passe : { doitChanger (changement imposé par le serveur), raison, dateMdp, expireLe, joursRestants, rappel }. */
@@ -255,6 +259,7 @@
     GMAO.version = data.version || '';
     GMAO.deuxFacteurs = data.deuxFacteurs || null;
     GMAO.motDePasse = data.motDePasse || null;
+    if (data.libelles) GMAO.libelles = { actions: data.libelles.actions || {}, entites: data.libelles.entites || {} };
   }
 
   function hexToRgb(hex) {

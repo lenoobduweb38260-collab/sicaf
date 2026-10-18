@@ -52,7 +52,23 @@ destinées au pôle informatique.
   (même après un redémarrage de l'application) ; sur le poste serveur, chaque échec est inscrit au journal
   d'activité et chaque blocage signalé au pôle informatique.
 - **Blocage** après 8 échecs, par poste et par compte (10 minutes) ; chaque échec et chaque blocage sont inscrits
-  au journal d'activité et le pôle informatique est notifié.
+  au journal d'activité et le pôle informatique est notifié. En plus, **20 échecs en 15 minutes depuis un même poste**,
+  tous identifiants confondus (connexion, codes de vérification, codes de réinitialisation), bloquent ce poste 15 minutes
+  avant tout calcul d'empreinte : un poste qui change d'identifiant à chaque essai ne peut ni saturer le journal ni
+  noyer les alertes (une seule alerte « Poste temporairement bloqué », regroupée). Les identifiants saisis sont cités dans
+  le journal et les alertes sans caractères de mise en forme (direction d'écriture, séparateurs de ligne).
+- **Double authentification** (TOTP, applications Microsoft Authenticator, Google Authenticator, FreeOTP…) :
+  facultative par défaut, ou obligatoire pour les comptes sensibles (administrateurs, gestion du système, des utilisateurs,
+  des profils ou de la configuration) ou pour tous (Configuration › Général › Sécurité). La session n'est ouverte qu'après le
+  code (5 essais, puis nouveau mot de passe ; blocage du compte après des codes incorrects répétés) ; anti-rejeu ; 10 codes de
+  secours à usage unique affichés une seule fois ; clé chiffrée au repos (AES-256-GCM) avec une clé conservée hors de la base
+  (`cle-double-authentification.key`, à copier avec les données lors d'un changement de serveur) ; désactivation et nouveaux
+  codes de secours avec mot de passe **et** code ; réinitialisation par le pôle informatique depuis la fiche de l'utilisateur
+  (journalisée, notifiée), jamais contournée par un code de réinitialisation ni par la récupération d'urgence.
+- **Prise en main d'un compte** (mot de passe défini ou réinitialisé, code, double authentification) : réservée à un gestionnaire
+  de niveau hiérarchique supérieur qui possède lui-même tous les droits du compte (surcharges, portée, secteurs, sites) ; sinon
+  seul un administrateur peut agir. Changer son mot de passe exige le mot de passe actuel, y compris quand il expire pendant une
+  session ouverte (sauf si le changement était imposé dès la connexion, où il vient d'être saisi).
 - **Sessions** : jeton aléatoire de 256 bits dans un cookie `HttpOnly`, `SameSite=Strict` (et `Secure` en HTTPS) ;
   déconnexion après inactivité (60 minutes par défaut) et durée maximale (12 heures) ; changer son mot de passe
   ferme les autres sessions ; le pôle informatique peut fermer une session à distance
@@ -85,13 +101,26 @@ destinées au pôle informatique.
   informatique de retrouver l'erreur dans le journal du serveur.
 - **Accès par navigateur web** : refusé par défaut, l'application GMAO SICAF est seule autorisée
   (Système & informatique › Réseau & postes).
+- **Chiffrement du réseau (HTTPS)** : quand le poste serveur partage la GMAO, il sert l'application en HTTPS avec un
+  certificat généré sur ce poste (TLS 1.2 minimum, HSTS, cookie `Secure`) ; le HTTP en clair est redirigé. Sur chaque poste
+  client, le pôle informatique **confirme l'empreinte** du certificat (affichée sur le poste serveur : icône de la zone de
+  notification › « Empreinte du certificat… », et dans Système & informatique › Réseau & postes) ; le poste n'accepte ensuite
+  que ce certificat (épinglage, reconnu aussi par l'empreinte de sa clé lors d'un renouvellement). Une empreinte différente
+  signifie une usurpation possible ou un poste serveur réinstallé : ne pas confirmer sans vérification.
+- **Fichiers reçus** : les secrets de sauvegarde (clés, mot de passe de chiffrement, destinations) ne figurent dans aucun
+  export ni aucune réponse ; un import ou une restauration contrôle le fichier (collections attendues, identifiants, au moins
+  un administrateur actif) avant de remplacer quoi que ce soit, conserve les paramètres de sauvegarde de ce serveur, et n'est
+  possible qu'avec l'accès à tous les sites. Les routes brutes publiques (réception d'une sauvegarde) peuvent vérifier la clé
+  avant de lire le corps (`avantCorps`).
 
 ## 5. Traçabilité
 
 - **Journal d'activité** : connexions, échecs, blocages, créations, modifications, suppressions, changements
   d'état, sauvegardes, imports, restaurations, demandes et réinitialisations de mot de passe, récupérations d'urgence…
-  (5 000 dernières entrées, export CSV).
-- **Notifications** aux rôles responsables pour les événements choisis (Configuration › Journal & notifications).
+  (5 000 dernières entrées dans l'application, les plus anciennes archivées dans `data\journal\audit-AAAA-MM.jsonl`, export CSV).
+- **Notifications** aux rôles responsables pour les événements choisis (Configuration › Journal & notifications) : seuls
+  les comptes qui ont accès au journal d'activité et qui peuvent consulter l'élément concerné (portée, sites) les reçoivent,
+  car leur texte reprend les détails de l'événement.
 
 ## 6. Sauvegardes
 
@@ -107,6 +136,10 @@ destinées au pôle informatique.
 - L'application vérifie la présence d'une nouvelle version, télécharge l'installateur, contrôle son empreinte
   SHA-256 puis l'installe en silence. Les données ne sont pas modifiées par une mise à jour.
 - Source au choix : publications GitHub du dépôt, dossier réseau interne ou adresse web interne.
+- **Signature des mises à jour** : dès qu'une clé publique est configurée (`clePubliqueMaj` dans `package.json`, voir
+  `docs/MISES-A-JOUR.md`), le manifeste de chaque version doit être signé avec la clé privée Ed25519 de l'entreprise ;
+  un manifeste non signé ou mal signé est refusé, le retour à une version antérieure est interdit et, pour la source GitHub,
+  seuls les hôtes GitHub sont acceptés. Sans clé configurée, l'empreinte SHA-256 reste vérifiée.
 
 ## 8. Recommandations de déploiement
 

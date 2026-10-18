@@ -88,11 +88,21 @@
     return Array.isArray(v) ? v.filter((f) => f.actif !== false) : (v && Array.isArray(v.lignes) ? v.lignes : []);
   };
 
-  function optionsTechniciens(techs, vide) {
+  /**
+   * Options d'intervenants. La liste du serveur est limitée au périmètre de l'utilisateur : les intervenants
+   * déjà affectés (`actuels`) qui n'y figurent pas sont conservés pour ne pas être retirés à leur insu.
+   */
+  function optionsTechniciens(techs, vide, actuels) {
     const base = techs.length ? techs.map((t) => ({ value: t.id, label: `${t.nomComplet}${t.fonction ? ' — ' + t.fonction : ''} · ${t.charge} OT ouvert${t.charge > 1 ? 's' : ''}` }))
       : ui.optionsUsers({ vide: false });
+    const connus = new Set(base.map((x) => String(x.value)));
+    for (const id of Array.from(new Set((actuels || []).filter((x) => x != null && x !== '').map(Number)))) {
+      if (!connus.has(String(id))) base.push({ value: id, label: `${ui.nomUser(id) || '#' + id} — hors de votre périmètre` });
+    }
     return vide === false ? base : [{ value: '', label: vide || '— Non affecté —' }].concat(base);
   }
+  /** Référence d'une ligne (temps, pièce, tâche, commentaire, document) dans les routes : identifiant stable, sinon index. */
+  const refLigne = (x) => (x && x.uid ? x.uid : x.index);
 
   /** <select> des équipements regroupés par secteur (optgroup). */
   function selectEquipements(equipements, valeur, libelleActuel) {
@@ -172,7 +182,8 @@
     selEq.addEventListener('change', majInfo);
     const priorites = GMAO.liste('priorites');
     const aidePriorite = priorites.filter((p) => p.delaiHeures).map((p) => `${p.label} : ${p.delaiHeures} h`).join(' · ');
-    const optTech = affecter ? optionsTechniciens(techs, '— Non affecté —') : [{ value: '', label: '— Non affecté —' }, { value: moi(), label: 'Moi-même' }];
+    const actuels = existant ? [existant.technicienId].concat(existant.techniciens || []) : [];
+    const optTech = affecter ? optionsTechniciens(techs, '— Non affecté —', actuels) : [{ value: '', label: '— Non affecté —' }, { value: moi(), label: 'Moi-même' }];
     const lienDemande = demande ? el('a', { href: '#/demandes/' + demande.id, target: '_blank' }, `${demande.numero || 'DI #' + demande.id}${demande.titre ? ' — ' + demande.titre : ''}`) : null;
     const champs = [
       { type: 'separateur', label: 'Intervention' },
@@ -185,7 +196,7 @@
       { type: 'separateur', label: 'Planification' },
       { nom: 'technicienId', label: 'Technicien responsable', type: 'select', options: optTech, disabled: !creation && !affecter, aide: !affecter ? 'L\'affectation d\'autres personnes nécessite le droit « Affecter »' : '' },
       { nom: 'datePrevue', label: 'Date prévue', type: 'date' },
-      affecter ? { nom: 'techniciens', label: 'Intervenants', type: 'multiselect', options: optionsTechniciens(techs, false), pleineLargeur: true, aide: 'Le technicien responsable fait automatiquement partie des intervenants.' } : null,
+      affecter ? { nom: 'techniciens', label: 'Intervenants', type: 'multiselect', options: optionsTechniciens(techs, false, actuels), pleineLargeur: true, aide: 'Le technicien responsable fait automatiquement partie des intervenants.' } : null,
       { nom: 'dureeEstimee', label: 'Durée estimée (heures)', type: 'nombre', min: 0, step: 0.25 },
       fournisseurs.length ? { nom: 'fournisseurId', label: 'Prestataire externe', type: 'select', options: [{ value: '', label: '— Aucun —' }].concat(fournisseurs.map((f) => ({ value: f.id, label: f.nom }))) } : null,
       lienDemande ? { nom: 'demandeLiee', label: 'Demande d\'origine', type: 'lecture', valeur: lienDemande } : null,
@@ -258,13 +269,14 @@
     const st = S();
     const techs = await chargerTechniciens();
     const planifiable = o.statut === st.initial && st.planifie && st.planifie !== st.initial;
+    const actuels = [o.technicienId].concat(o.techniciens || []);
     ui.formModal({
       titre: `Affecter ${o.numero}`, taille: 'large', submitLabel: 'Affecter',
       avant: el('p', { class: 'texte-2 texte-petit', style: { marginTop: 0 } }, 'La charge indiquée correspond au nombre d\'ordres de travail ouverts de chaque intervenant. Les nouveaux intervenants sont notifiés.'),
       champs: [
-        { nom: 'technicienId', label: 'Technicien responsable', type: 'select', options: optionsTechniciens(techs, '— Non affecté —') },
+        { nom: 'technicienId', label: 'Technicien responsable', type: 'select', options: optionsTechniciens(techs, '— Non affecté —', actuels) },
         { nom: 'datePrevue', label: 'Date prévue', type: 'date' },
-        { nom: 'techniciens', label: 'Intervenants', type: 'multiselect', options: optionsTechniciens(techs, false), pleineLargeur: true },
+        { nom: 'techniciens', label: 'Intervenants', type: 'multiselect', options: optionsTechniciens(techs, false, actuels), pleineLargeur: true },
         { nom: 'dureeEstimee', label: 'Durée estimée (heures)', type: 'nombre', min: 0, step: 0.25 },
         planifiable ? { nom: 'planifier', label: `Passer au statut « ${st.libelle(st.planifie)} »`, type: 'booleen', valeur: true } : null,
         { nom: 'commentaire', label: 'Consignes (facultatif)', type: 'texte_long', lignes: 2 },
@@ -498,15 +510,16 @@
         const cb = el('input', { type: 'checkbox', checked: !!t.fait, disabled: !a.realiser, title: a.realiser ? 'Cocher / décocher' : '' });
         cb.addEventListener('change', async () => {
           cb.disabled = true;
-          try { maj(await api.put(`/api/ot/${o.id}/taches/${t.index}`, { fait: cb.checked })); } catch (e) { cb.checked = !cb.checked; cb.disabled = false; erreur(e); }
+          try { maj(await api.put(`/api/ot/${o.id}/taches/${refLigne(t)}`, { fait: cb.checked })); } catch (e) { cb.checked = !cb.checked; cb.disabled = false; erreur(e); }
         });
         return el('div', { style: FLEX({ padding: '6px 0', borderBottom: '1px solid var(--bordure)', alignItems: 'flex-start', gap: '10px' }) },
           el('label', { class: 'inline', style: { flex: 1, cursor: a.realiser ? 'pointer' : 'default', alignItems: 'flex-start' } }, cb,
             el('div', null, el('div', { style: { textDecoration: t.fait ? 'line-through' : 'none', color: t.fait ? 'var(--texte-2)' : 'inherit' } }, `${t.ordre || t.index + 1}. ${t.libelle}`),
               t.fait ? el('div', { class: 'texte-2 texte-petit' }, `Fait${t.faitParNom ? ' par ' + t.faitParNom : ''}${t.dateFait ? ' le ' + ui.formatDateHeure(t.dateFait) : ''}`) : (t.duree ? el('div', { class: 'texte-2 texte-petit' }, 'Durée indicative : ' + duree(t.duree)) : null))),
-          a.realiser ? el('button', { type: 'button', class: 'btn btn-icone btn-sm texte-danger', title: 'Supprimer la tâche', onclick: async () => {
+          // Retirer une étape de la gamme est réservé au droit « modifier » (un intervenant coche et ajoute, sans réduire la gamme)
+          a.modifier ? el('button', { type: 'button', class: 'btn btn-icone btn-sm texte-danger', title: 'Supprimer la tâche', onclick: async () => {
             if (!(await ui.confirm({ titre: 'Supprimer la tâche', message: `Supprimer « ${t.libelle} » de la gamme ?`, okLabel: 'Supprimer', danger: true }))) return;
-            try { maj(await api.del(`/api/ot/${o.id}/taches/${t.index}`)); toast('Tâche supprimée', 'succes'); } catch (e) { erreur(e); }
+            try { maj(await api.del(`/api/ot/${o.id}/taches/${refLigne(t)}`)); toast('Tâche supprimée', 'succes'); } catch (e) { erreur(e); }
           } }, icone('supprimer')) : null);
       })));
     } else cont.appendChild(el('p', { class: 'texte-2 texte-petit' }, 'Aucune tâche : ajoutez les opérations à réaliser pour suivre l\'avancement.'));
@@ -539,7 +552,7 @@
         ],
         actions: a.realiser ? [{ icone: 'supprimer', titre: 'Supprimer la saisie', classe: 'texte-danger', visible: (t) => a.modifier || Number(t.userId) === moi() || Number(t.saisiPar) === moi(), onClic: async (t) => {
           if (!(await ui.confirm({ titre: 'Supprimer la saisie de temps', message: `Supprimer ${duree(t.heures)} du ${ui.formatDate(t.date)} (${t.userNom}) ?`, okLabel: 'Supprimer', danger: true }))) return;
-          try { maj(await api.del(`/api/ot/${o.id}/temps/${t.index}`)); toast('Saisie supprimée', 'succes'); } catch (e) { erreur(e); }
+          try { maj(await api.del(`/api/ot/${o.id}/temps/${refLigne(t)}`)); toast('Saisie supprimée', 'succes'); } catch (e) { erreur(e); }
         } }] : [],
       }).el);
       const ecart = o.dureeEstimee ? o.tempsTotal - o.dureeEstimee : null;
@@ -586,7 +599,7 @@
         ],
         actions: a.realiser && o.stockDisponible ? [{ icone: 'supprimer', titre: 'Retour en stock', classe: 'texte-danger', onClic: async (p) => {
           if (!(await ui.confirm({ titre: 'Retour en stock', message: `Annuler la sortie de ${ui.formatNombre(p.quantite)} × ${p.designation} ? Les pièces seront remises en stock.`, okLabel: 'Remettre en stock', danger: true }))) return;
-          try { maj(await api.del(`/api/ot/${o.id}/pieces/${p.index}`)); toast('Pièce remise en stock', 'succes'); } catch (e) { erreur(e); }
+          try { maj(await api.del(`/api/ot/${o.id}/pieces/${refLigne(p)}`)); toast('Pièce remise en stock', 'succes'); } catch (e) { erreur(e); }
         } }] : [],
       }).el);
       cont.appendChild(el('div', { class: 'mt texte-droite' }, el('strong', null, 'Total pièces : ' + ui.formatMontant(o.coutPieces))));
@@ -658,8 +671,19 @@
       btnEnr.disabled = true;
       try { maj(await api.put(`/api/ot/${o.id}`, body)); toast('Compte rendu enregistré', 'succes'); } catch (e) { erreur(e); btnEnr.disabled = false; }
     } }, icone('sauvegarde'), 'Enregistrer');
+    // Clôture depuis le brouillon : tout ce qui vient d'être saisi (compte rendu, cause, relevé, coût externe)
+    // pré-remplit la fenêtre de clôture, même sans « Enregistrer » préalable
+    const avecBrouillon = () => {
+      const v = lireBrouillon();
+      const vide = (x) => x == null || x === '';
+      return Object.assign({}, o, {
+        rapport: v.rapport || o.rapport, causeCode: v.causeCode || o.causeCode,
+        compteurReleve: vide(v.compteurReleve) ? o.compteurReleve : v.compteurReleve,
+        coutExterne: vide(v.coutExterne) ? o.coutExterne : v.coutExterne,
+      });
+    };
     cont.appendChild(el('div', { class: 'mt', style: FLEX({ justifyContent: 'flex-end' }) }, btnEnr,
-      a.cloturer ? el('button', { type: 'button', class: 'btn btn-sm btn-ok', onclick: () => cloturerOt(Object.assign({}, o, { rapport: lireBrouillon().rapport || o.rapport, causeCode: lireBrouillon().causeCode || o.causeCode }), maj) }, icone('check'), 'Clôturer l\'OT') : null));
+      a.cloturer ? el('button', { type: 'button', class: 'btn btn-sm btn-ok', onclick: () => cloturerOt(avecBrouillon(), maj) }, icone('check'), 'Clôturer l\'OT') : null));
     return ui.carte('Compte rendu', cont);
   }
 
@@ -680,7 +704,7 @@
         el('div', { style: FLEX({ gap: '6px' }) }, ui.avatar(c.userNom || '?', 24), el('span', { class: 'c-auteur' }, c.userNom || ('#' + c.userId)), el('span', { class: 'c-date', title: ui.formatDateHeure(c.date) }, ui.relatif(c.date)),
           supprimable ? el('button', { type: 'button', class: 'btn btn-icone btn-sm', style: { marginLeft: 'auto' }, title: 'Supprimer le commentaire', onclick: async () => {
             if (!(await ui.confirm({ titre: 'Supprimer le commentaire', message: 'Supprimer ce commentaire ?', okLabel: 'Supprimer', danger: true }))) return;
-            try { maj(await api.del(`/api/ot/${o.id}/commentaires/${c.index}`)); toast('Commentaire supprimé', 'succes'); } catch (e) { erreur(e); }
+            try { maj(await api.del(`/api/ot/${o.id}/commentaires/${refLigne(c)}`)); toast('Commentaire supprimé', 'succes'); } catch (e) { erreur(e); }
           } }, icone('supprimer')) : null),
         el('div', { style: { whiteSpace: 'pre-wrap', marginTop: '4px' } }, c.texte)));
     }
@@ -719,7 +743,7 @@
     if (!docs.length) cont.appendChild(ui.vide('Aucun document joint', 'piece_jointe'));
     const tailleLisible = (t) => (t > 1024 * 1024 ? (t / 1024 / 1024).toFixed(1) + ' Mo' : Math.max(1, Math.round(t / 1024)) + ' Ko');
     for (const d of docs) {
-      const url = `/api/ot/${o.id}/documents/${d.index}`;
+      const url = `/api/ot/${o.id}/documents/${refLigne(d)}`;
       const supprimable = a.supprimerDocuments || (Number(d.userId) === moi() && a.joindre);
       cont.appendChild(el('div', { class: 'inline', style: { gap: '10px', padding: '8px 0', borderBottom: '1px solid var(--bordure)', width: '100%' } },
         d.estImage ? el('img', { src: url, alt: d.nom, style: { width: '48px', height: '48px', objectFit: 'cover', borderRadius: '6px', border: '1px solid var(--bordure)' } })

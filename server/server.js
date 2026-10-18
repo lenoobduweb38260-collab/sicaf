@@ -121,6 +121,7 @@ function createApp(options = {}) {
   });
   const router = new Router();
   const hooks = {}; // événements inter-modules : ctx.on('ot:cree', fn) / ctx.emit('ot:cree', data)
+  const arrets = []; // fonctions appelées à l'arrêt du serveur (minuteurs des modules)
 
   /**
    * Entrées les plus anciennes du journal d'activité (au-delà de AUDIT_MAX) : archivées dans
@@ -148,8 +149,13 @@ function createApp(options = {}) {
     bureau: !!options.bureau,
     clientDir: CLIENT_DIR,
     version: require('../package.json').version,
+    /** Empreinte SHA-256 du certificat du serveur (HTTPS), vide en HTTP : affichée aux postes pour confirmation. */
+    empreinteCertificat: (() => { try { return options.tls && options.tls.cert ? require('./tls').empreinte(options.tls.cert) : ''; } catch (e) { return ''; } })(),
     /** Services publiés par les modules (ex. ctx.services.stock.sortir), consultés au moment des requêtes. */
     services: {},
+
+    /** Fonction appelée à l'arrêt du serveur (app.stop()) : les modules y arrêtent leurs minuteurs. */
+    onArret(fn) { if (typeof fn === 'function') arrets.push(fn); },
 
     /** Configuration courante (copie). */
     config() { return db.getConfig(); },
@@ -417,6 +423,11 @@ function createApp(options = {}) {
 
     // Corps JSON
     if (req.method !== 'GET' && req.method !== 'HEAD') {
+      // Contrôle avant la lecture du corps (clé d'une route brute publique, par exemple) : une requête refusée
+      // n'est jamais chargée en mémoire, et la connexion est fermée après la réponse sans lire la suite
+      if (typeof route.opts.avantCorps === 'function') {
+        try { await route.opts.avantCorps(req, ctx); } catch (e) { res.setHeader('Connection', 'close'); throw e; }
+      }
       const raw = await readBody(req, route.opts.maxBody);
       const ct = String(req.headers['content-type'] || '');
       if (route.opts.brut) {
@@ -581,6 +592,7 @@ function createApp(options = {}) {
     },
     stop() {
       clearInterval(sweeper);
+      for (const fn of arrets.splice(0)) { try { fn(); } catch (e) { log('Erreur à l\'arrêt d\'un module', e && e.message); } }
       db.saveNow();
       return new Promise((resolve) => server.close(() => resolve()));
     },
@@ -1068,6 +1080,8 @@ function registerCoreRoutes(ctx) {
       modules,
       catalogue: { modules: perms.MODULES, actions: perms.ACTIONS, portees: perms.PORTEES, modesSite: perms.MODES_SITE },
       references: { secteurs, profils, users },
+      // Libellés du journal d'activité (actions, éléments) repris par les vues qui affichent un historique
+      libelles: { actions: ctx.libellesActions || {}, entites: ctx.libellesEntites || {} },
       version: ctx.version,
       serveur: { heure: new Date().toISOString() },
     };

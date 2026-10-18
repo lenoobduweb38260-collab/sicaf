@@ -92,7 +92,8 @@
       ui.vider(cont);
       let r;
       try { r = await api.get('/api/systeme/reseau'); } catch (e) { cont.appendChild(ui.alerte(e.message, 'danger')); return; }
-      const adresses = (r.adresses || []).map((a) => `http://${a.adresse}:${r.port || 8585}/`);
+      const protocole = r.protocole === 'https' ? 'https' : 'http';
+      const adresses = (r.adresses || []).map((a) => `${protocole}://${a.adresse}:${r.port || 8585}/`);
       const inter = el('div', { class: 'interrupteur' + (r.accesNavigateur ? ' actif' : ''), role: 'switch', tabindex: 0, title: peutModifier() ? '' : 'Droit Système › Modifier requis' });
       const bascule = async () => {
         if (!peutModifier()) return;
@@ -106,6 +107,8 @@
         ui.details([
           { label: 'Poste serveur', valeur: r.nomPoste },
           { label: 'Adresse(s) pour les autres postes', valeur: adresses.length ? el('div', null, adresses.map((a) => el('div', null, el('code', null, a)))) : '—' },
+          { label: 'Connexion', valeur: protocole === 'https' ? frag(ui.badge('Chiffrée (HTTPS)', '#16a34a'), ' ', el('span', { class: 'texte-2 texte-petit' }, 'certificat généré sur ce poste, reconnu par son empreinte')) : ui.badge('Non chiffrée (HTTP)', '#f59e0b') },
+          r.empreinte ? { label: 'Empreinte du certificat', valeur: frag(el('code', null, r.empreinte), el('div', { class: 'texte-2 texte-petit' }, 'À comparer avec l\'empreinte affichée sur chaque poste client lors de sa première connexion (confirmation par le pôle informatique).')) } : null,
           { label: 'Mode', valeur: r.applicationBureau ? 'Application de bureau GMAO SICAF (serveur intégré)' : 'Serveur Node.js autonome (développement)' },
         ], { colonnes: 1 }),
         el('p', { class: 'texte-2 texte-petit mt' }, 'Sur chaque poste, installez l\'application GMAO SICAF et choisissez « Se connecter à la GMAO d\'un autre poste » avec l\'une des adresses ci-dessus. Les paramètres de connexion des postes sont protégés par le code du pôle informatique.'),
@@ -116,6 +119,7 @@
           { cle: 'nom', label: 'Utilisateur', rendu: (s) => el('div', null, el('div', { class: 'cellule-principale' }, s.nom, s.courante ? frag(' ', ui.badge('vous', '#2563eb')) : null), el('div', { class: 'cellule-secondaire' }, s.login)) },
           { cle: 'poste', label: 'Poste', rendu: (s) => ui.badge(s.poste, s.poste === 'Application GMAO' ? '#16a34a' : '#f59e0b') },
           { cle: 'ip', label: 'Adresse IP' },
+          { cle: 'deuxFacteurs', label: 'Double auth.', aligner: 'centre', rendu: (s) => (s.deuxFacteurs ? ui.badge('Oui', '#16a34a', { titre: 'Session ouverte avec un code de double authentification' }) : el('span', { class: 'texte-2' }, '—')) },
           { cle: 'connexion', label: 'Connecté depuis', type: 'datetime' },
           { cle: 'derniereActivite', label: 'Dernière activité', rendu: (s) => ui.relatif(s.derniereActivite), valeurTri: (s) => s.derniereActivite },
         ],
@@ -145,6 +149,8 @@
           { label: 'Version', valeur: i.version + (i.portable ? ' (version portable)' : '') },
           { label: 'Mode', valeur: i.mode === 'client' ? 'Connecté au serveur d\'un autre poste' : 'Ce poste héberge la GMAO' },
           { label: 'Accès', valeur: i.acces },
+          i.chiffrement ? { label: 'Connexion', valeur: i.chiffrement === 'https' ? ui.badge('Chiffrée (HTTPS)', '#16a34a') : ui.badge('Non chiffrée (HTTP)', '#f59e0b') } : null,
+          i.empreinte ? { label: 'Empreinte du certificat', valeur: frag(el('code', null, i.empreinte), el('div', { class: 'texte-2 texte-petit' }, i.mode === 'client' ? 'Empreinte du serveur confirmée sur ce poste.' : 'Empreinte du certificat de ce serveur, à confirmer sur chaque poste client.')) } : null,
           i.mode === 'serveur' ? { label: 'Dossier des données', valeur: el('code', null, i.dossierDonnees) } : null,
         ], { colonnes: 1 }),
         el('div', { class: 'barre-outils mt' },

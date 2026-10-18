@@ -9,9 +9,11 @@
  *    panneau d'information (état, OT, demandes, liens vers l'équipement, nouvelle demande, nouvel OT),
  *    rafraîchissement de l'état des équipements toutes les 60 s. ?equipementId=ID → focus direct.
  *    Édition (plans › modifier) : sélection / déplacement (magnétisme), rotation, zones, bâtiments, murs,
- *    allées, machines, installations, portes, textes ; dupliquer, supprimer, copier / coller,
- *    annuler / rétablir ; propriétés ; liaison aux équipements (ou création) et aux secteurs (ou création) ;
- *    fond de plan à décalquer (calibrage par deux points) ; niveaux ; enregistrement avec contrôle de version.
+ *    allées, machines, installations, portes, textes ; poignées de sommets des zones et bâtiments ;
+ *    dupliquer, supprimer, copier / coller, annuler / rétablir ; propriétés ; liaison aux équipements
+ *    (ou création) et aux secteurs (ou création) ; fond de plan à décalquer (calibrage par deux points) ;
+ *    niveaux ; enregistrement avec contrôle de version ; brouillon propre à l'utilisateur connecté.
+ *    Un code lu à la douchette localise l'équipement sur le plan (sinon, fiche de l'élément scanné).
  * Le rendu est assuré par la bibliothèque client/js/lib/moteur3d.js (WebGL, repli Canvas 2D).
  */
 (function () {
@@ -60,6 +62,8 @@
   ];
   const ALERTES = { urgent: { label: 'Intervention urgente', couleur: '#dc2626' }, en_cours: { label: 'OT / demande en cours', couleur: '#f59e0b' }, aucun: { label: 'Aucune intervention', couleur: '#16a34a' } };
   const NEUTRE = '#9ca3af';
+  /** Bornes des champs numériques des objets (mètres), identiques à celles du serveur. */
+  const BORNES_OBJET = { x: [-5000, 5000], y: [-5000, 5000], x2: [-5000, 5000], y2: [-5000, 5000], z: [-100, 500], hauteur: [0, 300], largeur: [0.01, 4000], profondeur: [0.01, 4000], epaisseur: [0.01, 100] };
   const OUTILS = [
     { cle: 'selection', label: 'Sélection / déplacement', icone: 'curseur', touche: 'V', aide: 'Cliquez pour sélectionner (Maj : ajouter à la sélection), glissez pour déplacer (Alt : sans magnétisme). Suppr : supprimer · Ctrl+D : dupliquer · R / Maj+R : pivoter de 15° · flèches : décaler.' },
     { cle: 'rotation', label: 'Rotation', icone: 'rotation', touche: 'O', aide: 'Glissez autour de la sélection pour la faire pivoter (pas de 15°, Alt : rotation libre).' },
@@ -182,18 +186,18 @@
       .p3d-carte-pied .espace { flex: 1; }
       .p3d-fiche { display: flex; flex-direction: column; height: calc(100vh - var(--entete-hauteur) - 44px); min-height: 520px; background: var(--surface); border: 1px solid var(--bordure); border-radius: var(--rayon); box-shadow: var(--ombre); overflow: hidden; }
       .p3d-fiche.p3d-plein-ecran { position: fixed; inset: 0; z-index: 90; height: auto; min-height: 0; border-radius: 0; border: 0; }
-      .p3d-barre { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-bottom: 1px solid var(--bordure); flex-wrap: wrap; background: var(--surface); position: relative; z-index: 6; }
-      .p3d-barre select { width: auto; padding: 5px 8px; font-size: 13px; }
-      .p3d-barre .espace { flex: 1; }
-      .p3d-barre .btn { padding: 5px 9px; }
+      .p3d-barre { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-bottom: 1px solid var(--bordure); flex-wrap: nowrap; min-width: 0; background: var(--surface); position: relative; z-index: 6; }
+      .p3d-barre select { width: auto; max-width: 180px; min-width: 90px; flex: 0 1 auto; text-overflow: ellipsis; padding: 5px 8px; font-size: 13px; }
+      .p3d-barre .espace { flex: 1 1 0; min-width: 0; }
+      .p3d-barre .btn { padding: 5px 9px; white-space: nowrap; flex-shrink: 0; }
       .p3d-barre .btn-icone { padding: 6px; border: 1px solid var(--bordure-2); background: var(--surface); }
       .p3d-barre .btn-icone.actif { background: var(--primaire-clair); color: var(--primaire); border-color: var(--primaire); }
-      .p3d-titre { display: flex; flex-direction: column; min-width: 0; margin: 0 6px 0 2px; }
+      .p3d-titre { display: flex; flex-direction: column; flex: 0 1 auto; min-width: 60px; margin: 0 6px 0 2px; }
       .p3d-titre .t { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
       .p3d-titre .s { font-size: 12px; color: var(--texte-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
       .p3d-point { width: 9px; height: 9px; border-radius: 50%; background: var(--alerte); box-shadow: 0 0 0 2px var(--surface); margin-left: 2px; }
       .p3d-corps { flex: 1; display: flex; min-height: 0; position: relative; }
-      .p3d-outils { width: 50px; flex-shrink: 0; border-right: 1px solid var(--bordure); display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 0; background: var(--surface-2); overflow-y: auto; }
+      .p3d-outils { width: 50px; flex-shrink: 0; border-right: 1px solid var(--bordure); display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 0; background: var(--surface-2); overflow-y: auto; scrollbar-width: thin; }
       .p3d-outil { width: 38px; height: 36px; display: flex; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--texte-2); cursor: pointer; flex-shrink: 0; }
       .p3d-outil:hover:not(:disabled) { background: var(--fond); color: var(--texte); }
       .p3d-outil.actif { background: var(--primaire-clair); color: var(--primaire); border-color: var(--primaire); }
@@ -201,7 +205,7 @@
       .p3d-outil:disabled { opacity: .35; cursor: default; }
       .p3d-sep { width: 26px; border-top: 1px solid var(--bordure-2); margin: 5px 0; flex-shrink: 0; }
       .p3d-scene { flex: 1; position: relative; min-width: 0; background: var(--fond); }
-      .p3d-panneau { width: 330px; flex-shrink: 0; border-left: 1px solid var(--bordure); overflow-y: auto; background: var(--surface); padding: 12px 14px 20px; }
+      .p3d-panneau { width: 330px; flex-shrink: 0; border-left: 1px solid var(--bordure); overflow-y: auto; background: var(--surface); padding: 12px 14px 96px; }
       .p3d-panneau.masque-panneau { display: none; }
       .p3d-panneau h3 { font-size: 15px; margin: 0 0 2px; display: flex; align-items: center; gap: 8px; }
       .p3d-panneau h3 svg { width: 18px; height: 18px; color: var(--primaire); flex-shrink: 0; }
@@ -237,8 +241,8 @@
       .p3d-statut .aide-outil { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex-shrink: 1; }
       .p3d-infobulle { position: absolute; pointer-events: none; background: var(--surface); color: var(--texte); border: 1px solid var(--bordure-2); border-radius: 8px; padding: 6px 9px; font-size: 12px; box-shadow: var(--ombre-2); z-index: 4; max-width: 280px; }
       .p3d-infobulle .t { font-weight: 600; }
-      .p3d-recherche { position: relative; }
-      .p3d-recherche input { width: 210px; padding: 5px 9px 5px 28px; font-size: 13px; }
+      .p3d-recherche { position: relative; flex: 0 1 210px; min-width: 120px; }
+      .p3d-recherche input { width: 100%; padding: 5px 9px 5px 28px; font-size: 13px; }
       .p3d-recherche > svg { position: absolute; left: 8px; top: 50%; transform: translateY(-50%); width: 14px; height: 14px; color: var(--texte-2); }
       .p3d-resultats { position: absolute; top: calc(100% + 4px); left: 0; width: 320px; max-height: 340px; overflow-y: auto; background: var(--surface); border: 1px solid var(--bordure); border-radius: 8px; box-shadow: var(--ombre-2); z-index: 20; padding: 4px; }
       .p3d-resultats .p3d-item.actif { background: var(--primaire-clair); }
@@ -255,8 +259,14 @@
       .p3d-niveaux-ligne { display: grid; grid-template-columns: 1fr 90px 90px 34px; gap: 6px; align-items: center; margin-bottom: 6px; }
       .p3d-vide-scene { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; z-index: 2; }
       .p3d-vide-scene > div { pointer-events: auto; background: var(--surface); border: 1px dashed var(--bordure-2); border-radius: 12px; padding: 16px 20px; max-width: 380px; text-align: center; color: var(--texte-2); box-shadow: var(--ombre); }
-      @media (max-width: 1100px) { .p3d-panneau { width: 280px; } .p3d-recherche input { width: 170px; } }
+      @media (max-width: 1100px) { .p3d-panneau { width: 280px; } .p3d-recherche { flex-basis: 170px; } }
+      @media (max-width: 900px) { .p3d-barre { flex-wrap: wrap; } }
       @media (max-width: 760px) { .p3d-panneau { position: absolute; right: 0; top: 0; bottom: 0; z-index: 7; box-shadow: var(--ombre-2); } }
+      /* écrans peu hauts (1366×768) : la colonne d'outils passe sur deux colonnes pour rester entièrement visible */
+      @media (max-height: 820px) {
+        .p3d-outils { width: 92px; flex-direction: row; flex-wrap: wrap; justify-content: center; align-content: flex-start; gap: 2px 4px; padding: 6px 3px; }
+        .p3d-sep { flex-basis: 100%; width: auto; margin: 3px 10px; }
+      }
     `;
     document.head.appendChild(st);
   }
@@ -524,7 +534,11 @@
   // =====================================================================================
   // FICHE : canevas 3D + panneau
   // =====================================================================================
-  const brouillons = new Map(); // planId → état non enregistré conservé lors d'une navigation
+  // Brouillons : état non enregistré conservé lors d'une navigation, propre à l'utilisateur connecté (clé « utilisateur:plan »)
+  // et oublié dès qu'un autre utilisateur se connecte sur le même poste.
+  const brouillons = new Map();
+  const cleBrouillon = (planId) => `${GMAO.user ? GMAO.user.id : 0}:${planId}`;
+  GMAO.onConnexion((user) => { for (const k of Array.from(brouillons.keys())) if (!k.startsWith(`${user.id}:`)) brouillons.delete(k); });
 
   class Fiche {
     constructor(container, plan, query) {
@@ -539,6 +553,7 @@
       this.couleurMode = MODES_COULEUR.some((m) => m.code === cfg().couleurParDefaut) ? cfg().couleurParDefaut : 'etat';
       this.avecEtiquettes = cfg().afficherEtiquettes !== false;
       this.historique = []; this.indexHisto = 0;
+      this.indexEnregistre = 0; // position de l'historique qui correspond à l'état enregistré (−1 : plus atteignable)
       this.pressePapier = [];
       this.modifie = false;
       this.trace = null; // tracé en cours (mur, allée, polygone)
@@ -595,10 +610,11 @@
       this.sceneEl.appendChild(this.infobulle);
 
       const th = this.couleursTheme();
+      this.force2D = (() => { try { return localStorage.getItem('gmao.plans.2d') === '1'; } catch (e) { return false; } })();
       this.moteur = Moteur3D.creer(zoneMoteur, Object.assign({}, th, {
         pasGrille: cfg().grilleM || 0.5,
         grille: true,
-        forcer2D: (() => { try { return localStorage.getItem('gmao.plans.2d') === '1'; } catch (e) { return false; } })(),
+        forcer2D: this.force2D,
         onClic: (inf) => this.surClic(inf),
         onDoubleClic: (inf) => this.surDoubleClic(inf),
         onSurvol: (id, p) => this.surSurvol(id, p),
@@ -608,7 +624,7 @@
         clavier: (ev) => !(this.edition && this.selection.length && ev.key.startsWith('Arrow')),
         onPerteContexte: () => toast('Le contexte graphique a été perdu : restauration en cours…', 'alerte'),
         onRestauration: () => { this.synchroniser(); toast('Affichage 3D restauré', 'info'); },
-        onCamera: () => { this.infobulle.classList.add('masque'); this.majStatut(); },
+        onCamera: () => { this.infobulle.classList.add('masque'); this.majStatut(); this.majPoignees(true); },
         onFondCharge: () => this.majStatut(),
       }));
       this.moteur.etiquettes(this.avecEtiquettes);
@@ -627,15 +643,15 @@
       this.majStatut();
       this.installerEcouteurs();
 
-      // Brouillon non enregistré d'une visite précédente
-      const brouillon = brouillons.get(this.plan.id);
+      // Brouillon non enregistré d'une visite précédente (du même utilisateur)
+      const brouillon = brouillons.get(cleBrouillon(this.plan.id));
       if (brouillon && this.peutEditer) {
-        brouillons.delete(this.plan.id);
+        brouillons.delete(cleBrouillon(this.plan.id));
         if (brouillon.version === this.version) {
           ui.confirm({ titre: 'Modifications non enregistrées', message: `Vous aviez quitté ce plan sans enregistrer ${brouillon.nb} modification(s). Voulez-vous les restaurer ?`, okLabel: 'Restaurer' }).then((ok) => {
             if (!ok) return;
             this.objets = brouillon.objets; this.niveaux = brouillon.niveaux; this.fond = brouillon.fond; this.fondModifie = brouillon.fondModifie; this.dimensions = brouillon.dimensions; this.proprietes = brouillon.proprietes;
-            this.historique = brouillon.historique || []; this.indexHisto = brouillon.indexHisto || 0;
+            this.historique = brouillon.historique || []; this.indexHisto = brouillon.indexHisto || 0; this.indexEnregistre = brouillon.indexEnregistre == null ? -1 : brouillon.indexEnregistre; this.vueModifiee = !!brouillon.vueModifiee; if (brouillon.vue) this.vue = brouillon.vue;
             this.basculerMode('edition'); this.marquerModifie(true); this.appliquerFond(); this.synchroniser(); this.rendrePanneau();
             toast('Modifications restaurées (non enregistrées)', 'info');
           });
@@ -643,7 +659,8 @@
       }
       if (this.query.edition === '1' && this.peutEditer && !brouillon) this.basculerMode('edition');
       if (this.query.equipementId) setTimeout(() => this.focaliserEquipement(Number(this.query.equipementId)), 120);
-      if (this.moteur.mode === '2d') toast('WebGL indisponible : le plan est affiché en vue de dessus 2D.', 'alerte');
+      // affichage 2D subi (WebGL absent) : signalé ; affichage 2D choisi par l'utilisateur : le badge « Vue 2D » de la barre d'état suffit
+      if (this.moteur.mode === '2d' && !this.force2D) toast('WebGL indisponible : le plan est affiché en vue de dessus 2D.', 'alerte');
     }
     couleursTheme() {
       return sombre()
@@ -660,7 +677,7 @@
       this.majTitre();
       b.appendChild(el('span', { class: 'espace' }));
       // recherche d'équipement / d'objet
-      const inp = el('input', { type: 'search', placeholder: 'Rechercher un équipement…', 'aria-label': 'Rechercher un équipement ou un objet du plan' });
+      const inp = el('input', { type: 'search', placeholder: 'Rechercher…', title: 'Rechercher un équipement ou un objet du plan', 'aria-label': 'Rechercher un équipement ou un objet du plan' });
       const res = el('div', { class: 'p3d-resultats masque' });
       let resultats = [], actif = 0;
       const choisir = (o) => { res.classList.add('masque'); inp.value = ''; inp.blur(); this.focaliserObjet(o.id); };
@@ -816,8 +833,9 @@
     basculerMode(mode) {
       if (mode === 'edition' && !this.peutEditer) return;
       if (mode === 'consultation' && this.modifie) {
-        ui.confirm({ titre: 'Modifications non enregistrées', message: 'Enregistrer les modifications avant de revenir en consultation ?', okLabel: 'Enregistrer', annulerLabel: 'Continuer l\'édition' }).then(async (ok) => {
-          if (ok && await this.enregistrer()) this.basculerMode('consultation');
+        this.proposerSortie().then(async (choix) => {
+          if (choix === 'enregistrer' && await this.enregistrer()) this.basculerMode('consultation');
+          else if (choix === 'abandonner') { await this.abandonner(); this.basculerMode('consultation'); }
         });
         return;
       }
@@ -849,6 +867,34 @@
       this.majBoutonsVue();
       this.majStatut();
       if (mode === 'edition') toast('Mode édition : choisissez un outil à gauche. Pensez à enregistrer.', 'info');
+    }
+    /** Sortie de l'édition avec des modifications en cours : enregistrer, abandonner ou continuer. */
+    proposerSortie() {
+      return new Promise((resolve) => {
+        let repondu = false;
+        ui.modal({
+          titre: 'Modifications non enregistrées', taille: 'petite',
+          contenu: el('p', null, 'Voulez-vous enregistrer les modifications avant de revenir en consultation ? Les abandonner rétablit la dernière version enregistrée du plan.'),
+          onFermer: (r) => { if (!repondu) { repondu = true; resolve(r || 'continuer'); } },
+          boutons: [
+            { label: 'Continuer l\'édition', onClic: () => 'continuer' },
+            { label: 'Abandonner les modifications', classe: 'btn-danger', onClic: () => 'abandonner' },
+            { label: 'Enregistrer', classe: 'btn-primaire', icone: 'sauvegarde', onClic: () => 'enregistrer' },
+          ],
+        });
+      });
+    }
+    /** Abandon des modifications en cours : dernière version enregistrée rechargée, historique vidé. */
+    async abandonner() {
+      let plan = this.plan;
+      try { plan = await api.get('/api/plans/' + this.plan.id); } catch (e) { /* version chargée à l'ouverture conservée */ }
+      this.annulerTrace();
+      this.chargerPlan(plan);
+      this.historique = []; this.indexHisto = 0; this.indexEnregistre = 0; this.vueModifiee = false;
+      this.selection = [];
+      this.marquerModifie(false);
+      this.majTitre(); this.majSelectNiveau(); this.appliquerFond(); this.synchroniser(); this.rendrePanneau(); this.majStatut();
+      toast('Modifications abandonnées : dernière version enregistrée rétablie', 'info');
     }
     basculerDessus(actif) {
       if (this.moteur.mode === '2d' && !actif) return;
@@ -888,6 +934,7 @@
       Object.entries(this.boutonsOutils || {}).forEach(([k, b]) => b.classList.toggle('actif', k === cle));
       this.moteur.definirCurseur(cle === 'selection' ? 'default' : (cle === 'rotation' ? 'alias' : 'crosshair'));
       if (cle === 'installation') this.ouvrirPalette(); else this.fermerPalette();
+      this.majPoignees();
       this.majStatut();
     }
     ouvrirPalette() {
@@ -994,6 +1041,9 @@
     synchroniser() {
       const desc = [];
       for (const o of this.objets) for (const d of this.descripteurs(o)) desc.push(d);
+      const poignees = this.descripteursPoignees();
+      this._poignees = poignees.map((d) => d.id); this._taillePoignees = poignees.length ? poignees[0].largeur : 0;
+      for (const d of poignees) desc.push(d);
       this.moteur.definirScene({ largeur: this.dimensions.largeur, profondeur: this.dimensions.profondeur, objets: desc });
       // grille : pas de magnétisme en édition, maillage de 5 m discret en consultation
       if (this.edition) this.moteur.definirGrille(true, cfg().grilleM || 0.5, 0.8);
@@ -1102,6 +1152,7 @@
       // les étiquettes des installations sans étiquette apparaissent à la sélection
       this.synchroniserEtiquettesSelection();
       this.moteur.selection(this.selection);
+      this.majPoignees();
       this.rendrePanneau();
       this.majBoutonsActions();
       this.majStatut();
@@ -1143,8 +1194,88 @@
     }
     surDoubleClic(inf) {
       if (this.trace) { this.terminerTrace(true); return; }
+      if (this.edition && this.outil === 'selection') {
+        // zone / bâtiment sélectionné : double-clic sur une poignée → sommet retiré ; sur le contour → sommet ajouté
+        const poignee = this.poigneeDe(inf.id);
+        if (poignee) { this.retirerSommet(poignee.o, poignee.index); return; }
+        const poly = this.polygoneEditable();
+        if (poly && inf.id === poly.id && inf.sol) { this.insererSommet(poly, inf.sol); return; }
+      }
       const o = this.selectionnable(inf.id);
       if (o) this.moteur.allerVers(o.id, { clignoter: false });
+    }
+
+    // ----- Poignées des sommets (zone / bâtiment sélectionné en édition) ------------------------
+    /** Polygone dont les sommets sont modifiables : seul objet sélectionné, non verrouillé, outil Sélection. */
+    polygoneEditable() {
+      if (!this.edition || this.outil !== 'selection' || this.selection.length !== 1) return null;
+      const o = this.objet(this.selection[0]);
+      return o && o.points && o.points.length >= 3 && !o.verrouille ? o : null;
+    }
+    /** Poignée désignée par un identifiant de scène « poignee:<objet>:<sommet> », ou null. */
+    poigneeDe(id) {
+      const m = typeof id === 'string' ? /^poignee:(.+):(\d+)$/.exec(id) : null;
+      if (!m) return null;
+      const o = this.polygoneEditable();
+      return o && o.id === m[1] && o.points[Number(m[2])] ? { o, index: Number(m[2]) } : null;
+    }
+    descripteursPoignees() {
+      const o = this.polygoneEditable();
+      if (!o || !this.moteur) return [];
+      const alt = this.niveauDe(o.niveauId).altitude;
+      const d = Math.max(0.25, Math.min(2, this.moteur.camera.distance * 0.014)); // taille liée au zoom
+      return o.points.map(([x, y], i) => ({ id: `poignee:${o.id}:${i}`, forme: 'cylindre', x, y, largeur: d, profondeur: d, hauteur: d * 0.35, y0: alt + 0.08, couleur: '#ffffff', opacite: 1, aretes: true, couleurAretes: '#2563eb', pickable: true }));
+    }
+    /** Met les poignées de la scène à jour ; `camera` : seulement si leur taille (liée au zoom) a sensiblement changé. */
+    majPoignees(camera) {
+      if (!this.moteur) return;
+      const anciens = this._poignees || [];
+      const desc = this.descripteursPoignees();
+      if (camera) {
+        if (!anciens.length && !desc.length) return;
+        const taille = desc.length ? desc[0].largeur : 0, avant = this._taillePoignees || 0;
+        if (desc.length && anciens.length === desc.length && Math.abs(taille - avant) < avant * 0.15) return;
+      }
+      if (anciens.length) this.moteur.supprimerObjets(anciens);
+      if (desc.length) this.moteur.majObjets(desc);
+      this._poignees = desc.map((x) => x.id);
+      this._taillePoignees = desc.length ? desc[0].largeur : 0;
+    }
+    /** Centre, emprise et rotation d'un polygone (même calcul que le serveur). */
+    geometriePolygone(points) {
+      const xs = points.map((p) => p[0]), ys = points.map((p) => p[1]);
+      const x1 = Math.min(...xs), x2 = Math.max(...xs), y1 = Math.min(...ys), y2 = Math.max(...ys);
+      return { points, x: r3((x1 + x2) / 2), y: r3((y1 + y2) / 2), largeur: r3(x2 - x1), profondeur: r3(y2 - y1), rotation: 0 };
+    }
+    /** Emprise redimensionnée autour du centre du polygone (champs largeur / profondeur du panneau). */
+    redimensionnerPolygone(o, L, P) {
+      const kx = L / (o.largeur || 1), ky = P / (o.profondeur || 1);
+      return this.geometriePolygone(o.points.map(([x, y]) => [r3(o.x + (x - o.x) * kx), r3(o.y + (y - o.y) * ky)]));
+    }
+    appliquerPolygone(o, points, libelle) {
+      const g = this.geometriePolygone(points);
+      if (g.largeur < 0.01 || g.profondeur < 0.01 || aire(points) < 0.1) { toast('Le polygone serait dégénéré (surface nulle) : modification ignorée', 'alerte'); this.majPoignees(); return; }
+      this.modifierObjet(o.id, g, libelle);
+    }
+    retirerSommet(o, index) {
+      if (o.points.length <= 3) { toast('Un polygone garde au moins 3 sommets', 'alerte'); return; }
+      this.appliquerPolygone(o, o.points.filter((p, i) => i !== index), 'Sommet retiré');
+    }
+    /** Ajoute un sommet sur le côté du polygone le plus proche du point cliqué. */
+    insererSommet(o, p) {
+      let best = null;
+      for (let i = 0; i < o.points.length; i++) {
+        const [ax, ay] = o.points[i], [bx, by] = o.points[(i + 1) % o.points.length];
+        const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy || 1e-9;
+        const t = Math.max(0, Math.min(1, ((p.x - ax) * dx + (p.y - ay) * dy) / l2));
+        const px = ax + t * dx, py = ay + t * dy, d = Math.hypot(p.x - px, p.y - py);
+        if (!best || d < best.d) best = { d, i, x: px, y: py };
+      }
+      if (!best) return;
+      const pts = o.points.slice();
+      pts.splice(best.i + 1, 0, [this.snap(best.x), this.snap(best.y)]);
+      this.appliquerPolygone(o, pts, 'Sommet ajouté');
+      toast('Sommet ajouté : glissez sa poignée pour l\'ajuster', 'info', 2000);
     }
     snap(v, sansSnap) { const g = Number(cfg().grilleM) || 0.5; return sansSnap ? r3(v) : r3(Math.round(v / g) * g); }
     surDeplacementSouris(inf) {
@@ -1160,6 +1291,8 @@
       if (this.calibrage) { this.drag = { type: 'clic', p, brut: inf.sol }; return true; }
       switch (this.outil) {
         case 'selection': {
+          const poignee = this.poigneeDe(inf.id);
+          if (poignee) { this.drag = { type: 'sommet', id: poignee.o.id, index: poignee.index, depart: inf.sol, p0: poignee.o.points[poignee.index], dx: 0, dy: 0, poignee: inf.id }; return true; }
           const o = this.selectionnable(inf.id);
           if (!o) return false;
           if (inf.shift) { this.selectionner([o.id], true); this.drag = { type: 'rien' }; return true; }
@@ -1195,8 +1328,17 @@
         const ref = d.ref;
         const nx = this.snap(ref.x + (inf.sol.x - d.depart.x), inf.alt), ny = this.snap(ref.y + (inf.sol.y - d.depart.y), inf.alt);
         d.dx = r3(nx - ref.x); d.dy = r3(ny - ref.y);
-        this.moteur.decalageTemporaire({ ids: d.ids, dx: d.dx, dy: d.dy });
+        this.moteur.decalageTemporaire({ ids: d.ids.concat(this._poignees || []), dx: d.dx, dy: d.dy });
         this.majStatut(`Déplacement : ${fmtL(d.dx)} ; ${fmtL(d.dy)}`);
+      } else if (d.type === 'sommet') {
+        const o = this.objet(d.id);
+        if (!o || !o.points) return;
+        const nx = this.snap(d.p0[0] + (inf.sol.x - d.depart.x), inf.alt), ny = this.snap(d.p0[1] + (inf.sol.y - d.depart.y), inf.alt);
+        d.dx = r3(nx - d.p0[0]); d.dy = r3(ny - d.p0[1]);
+        const pts = o.points.map((p, i) => (i === d.index ? [nx, ny] : p));
+        this.moteur.decalageTemporaire({ ids: [d.poignee], dx: d.dx, dy: d.dy });
+        this.moteur.definirApercus([{ forme: 'prisme', points: pts, y0: this.niveauDe(o.niveauId).altitude + 0.03, hauteur: 0.04, couleur: '#2563eb', opacite: 0.3, aretes: true, couleurAretes: '#2563eb' }]);
+        this.majStatut(`Sommet ${d.index + 1} : x ${fmtL(nx)} · y ${fmtL(ny)}`);
       } else if (d.type === 'rotation') {
         let a = (Math.atan2(inf.sol.y - d.c.y, inf.sol.x - d.c.x) - d.a0) * 180 / Math.PI;
         if (!inf.alt) a = Math.round(a / 15) * 15;
@@ -1227,6 +1369,13 @@
       if (d.type === 'rotation') {
         this.moteur.decalageTemporaire(null);
         if (d.drot) this.pivoter(d.ids, d.drot, d.c);
+        return;
+      }
+      if (d.type === 'sommet') {
+        this.moteur.decalageTemporaire(null); this.moteur.definirApercus([]);
+        const o = this.objet(d.id);
+        if (o && o.points && (d.dx || d.dy)) this.appliquerPolygone(o, o.points.map((p, i) => (i === d.index ? [r3(d.p0[0] + d.dx), r3(d.p0[1] + d.dy)] : p)), 'Déplacement d\'un sommet');
+        else this.majPoignees();
         return;
       }
       if (d.type === 'rectangle') {
@@ -1393,9 +1542,10 @@
     /** changements : [{ id, avant: objet | null, apres: objet | null }] ; plan : { avant, apres } (niveaux, fond, dimensions, propriétés). */
     appliquer(changements, libelle, plan) {
       const entree = { libelle, changements: changements.map((c) => ({ id: c.id, avant: c.avant ? copie(c.avant) : null, apres: c.apres ? copie(c.apres) : null })), plan: plan ? copie(plan) : null };
+      if (this.indexEnregistre > this.indexHisto) this.indexEnregistre = -1; // les entrées rétablissables sont abandonnées : l'état enregistré n'est plus atteignable par l'historique
       this.historique = this.historique.slice(0, this.indexHisto);
       this.historique.push(entree);
-      if (this.historique.length > 100) this.historique.shift();
+      if (this.historique.length > 100) { this.historique.shift(); this.indexEnregistre = this.indexEnregistre > 0 ? this.indexEnregistre - 1 : -1; }
       this.indexHisto = this.historique.length;
       this.rejouer(entree, 'apres');
     }
@@ -1420,8 +1570,10 @@
       } else {
         this.selection = this.selection.filter((id) => this.objet(id));
         this.majObjetsMoteur(ids);
+        this.majPoignees();
       }
-      this.marquerModifie(true);
+      // le plan n'est « modifié » que si l'historique ne se trouve pas à la position enregistrée (annulation complète comprise)
+      this.marquerModifie(this.indexHisto !== this.indexEnregistre || !!this.vueModifiee);
       this.rendrePanneau();
       this.majBoutonsActions();
       this.majStatut();
@@ -1503,7 +1655,7 @@
         const c = this.translater(o, dx, dy);
         c.id = nouvelId(ids); ids.add(c.id);
         c.equipementId = o.equipementId != null || o.equipementMasque ? null : c.equipementId;
-        delete c.equipementMasque;
+        delete c.equipementMasque; delete c.nomMasque;
         c.verrouille = false;
         return c;
       });
@@ -1530,22 +1682,36 @@
       const copies = this.copierObjets(this.pressePapier, dx, dy).map((o) => Object.assign(o, { niveauId: this.niveauActifId() }));
       this.ajouterObjets(copies, `Collage de ${copies.length} objet(s)`, true);
     }
-    supprimerSelection() {
+    async supprimerSelection() {
       if (!this.edition || !this.selection.length) return;
       const objs = this.selection.map((id) => this.objet(id)).filter(Boolean);
       const verrouilles = objs.filter((o) => o.verrouille);
       const libres = objs.filter((o) => !o.verrouille);
       if (verrouilles.length) toast(`${verrouilles.length} objet(s) verrouillé(s) non supprimé(s)`, 'alerte');
       if (!libres.length) return;
+      // confirmation pour une suppression multiple ou d'objets liés (équipement, secteur) ; un objet isolé se supprime directement (Ctrl+Z)
+      const lies = libres.filter((o) => o.equipementId != null || o.equipementMasque || o.secteurId != null);
+      if (libres.length > 1 || lies.length) {
+        const noms = libres.slice(0, 3).map((o) => `« ${o.nom || o.texte || libType(o)} »`).join(', ');
+        const ok = await ui.confirm({ titre: 'Supprimer du plan', message: `Supprimer ${libres.length > 1 ? `${libres.length} objets (${noms}${libres.length > 3 ? '…' : ''})` : noms}${lies.length ? `, dont ${lies.length} lié(s) à un équipement ou à un secteur` : ''} ? Les équipements de la GMAO ne sont pas supprimés. Ctrl+Z permet de rétablir les objets.`, okLabel: 'Supprimer', danger: true });
+        if (!ok || !this.edition) return;
+      }
+      const restants = libres.filter((o) => this.objet(o.id)); // la sélection a pu changer pendant la confirmation
+      if (!restants.length) return;
       this.selection = [];
-      this.appliquer(libres.map((o) => ({ id: o.id, avant: o, apres: null })), `Suppression de ${libres.length} objet(s)`);
+      this.appliquer(restants.map((o) => ({ id: o.id, avant: o, apres: null })), `Suppression de ${restants.length} objet(s)`);
     }
 
     // ----- Panneau latéral --------------------------------------------------------------------
     rendrePanneau() {
       const p = this.panneau;
-      ui.vider(p);
       const objs = this.selection.map((id) => this.objet(id)).filter(Boolean);
+      // modification saisie dans le panneau Propriétés : le formulaire est conservé (focus, tabulation), ses valeurs sont rafraîchies
+      if (this._modifDepuisPanneau && this.edition && objs.length === 1 && this.formProprietes && this.formProprietes.id === objs[0].id && p.contains(this.formProprietes.form.el)) { this.rafraichirPanneauProprietes(objs[0]); return; }
+      // un champ du panneau encore actif est quitté d'abord : sa saisie en attente est appliquée avant la reconstruction
+      if (p.contains(document.activeElement) && typeof document.activeElement.blur === 'function') document.activeElement.blur();
+      this.formProprietes = null;
+      ui.vider(p);
       if (objs.length > 1) return this.panneauMulti(objs);
       if (objs.length === 1) return this.edition ? this.panneauProprietes(objs[0]) : this.panneauConsultation(objs[0]);
       return this.panneauPlan();
@@ -1616,11 +1782,14 @@
           info.arretProduction ? { label: 'Production', valeur: el('span', { class: 'texte-danger texte-gras' }, 'Arrêt de production signalé') } : null,
         ])));
         const actions = el('div', { class: 'p3d-actions' });
+        // site accessible en lecture seule : aucune création de demande ou d'OT (le serveur la refuserait)
+        const lectureSeule = GMAO.siteLectureSeule(info.secteurId != null ? info.secteurId : this.plan.secteurId);
         if (GMAO.can('equipements', 'voir')) actions.appendChild(el('a', { class: 'btn btn-sm', href: '#/equipements/' + info.id }, icone('equipements'), 'Fiche équipement'));
-        if (GMAO.can('demandes', 'creer')) actions.appendChild(el('a', { class: 'btn btn-sm', href: `#/demandes?nouveau=1&equipementId=${info.id}` }, icone('demandes'), 'Nouvelle demande'));
-        if (GMAO.can('ot', 'creer')) actions.appendChild(el('a', { class: 'btn btn-sm btn-primaire', href: `#/ot?nouveau=1&equipementId=${info.id}` }, icone('ot'), 'Nouvel OT'));
+        if (GMAO.can('demandes', 'creer') && !lectureSeule) actions.appendChild(el('a', { class: 'btn btn-sm', href: `#/demandes?nouveau=1&equipementId=${info.id}` }, icone('demandes'), 'Nouvelle demande'));
+        if (GMAO.can('ot', 'creer') && !lectureSeule) actions.appendChild(el('a', { class: 'btn btn-sm btn-primaire', href: `#/ot?nouveau=1&equipementId=${info.id}` }, icone('ot'), 'Nouvel OT'));
         if (GMAO.can('ot', 'voir') && info.nbOtOuverts) actions.appendChild(el('a', { class: 'btn btn-sm btn-lien', href: `#/ot?equipementId=${info.id}` }, 'Voir les OT'));
         p.appendChild(actions);
+        if (lectureSeule && (GMAO.can('demandes', 'creer') || GMAO.can('ot', 'creer'))) p.appendChild(el('div', { class: 'texte-2 texte-petit mt' }, 'Site accessible en lecture seule : aucune demande ni aucun OT ne peut y être créé.'));
       } else if (o.equipementMasque) {
         p.appendChild(ui.alerte('Équipement hors de votre périmètre : ses informations ne sont pas affichées.', 'info'));
       } else if (o.type === 'machine') {
@@ -1671,11 +1840,35 @@
           el('div', { class: 'champ mt' }, el('label', null, 'Déplacer vers le niveau'), el('div', { class: 'inline' }, selNiv, ui.bouton('Appliquer', { classe: 'btn-sm', onClic: () => { const n = selNiv.value; this.appliquer(objs.map((o) => ({ id: o.id, avant: o, apres: Object.assign(copie(o), { niveauId: n }) })), 'Changement de niveau'); this.selectionner([]); } }))))));
       }
     }
+    /** Valeurs du formulaire Propriétés pour un objet (unité d'affichage). */
+    valeursProprietes(o) {
+      const seg = estSegment(o), poly = !!(o.points && o.points.length >= 3);
+      return {
+        nom: o.nom || '', categorie: o.categorie, texte: o.texte || '', taille: o.taille || 1,
+        x: versU(o.x), y: versU(o.y), x2: versU(o.x2), y2: versU(o.y2), epaisseur: versU(o.epaisseur), largeur: versU(o.largeur), profondeur: versU(o.profondeur), hauteur: versU(o.hauteur), z: versU(o.z || 0),
+        rotation: Math.round((o.rotation || 0) * 10) / 10, forme: o.forme || 'boite', couleur: o.couleur || '#6b7280', niveauId: o.niveauId, verrouille: !!o.verrouille,
+        longueur: seg ? fmtL(Math.hypot(o.x2 - o.x, o.y2 - o.y)) : '', sommets: poly ? `Polygone de ${o.points.length} sommets` : '', surface: poly ? `${ui.formatNombre(aire(o.points), 1)} m²` : '',
+      };
+    }
+    /** Rafraîchit le formulaire Propriétés sans le reconstruire (focus et tabulation conservés) ; `tous` : champ actif compris. */
+    rafraichirPanneauProprietes(o, tous) {
+      const fp = this.formProprietes;
+      if (!fp || fp.id !== o.id) return;
+      const v = this.valeursProprietes(o);
+      for (const [nom, ctrl] of Object.entries(fp.form.controles)) {
+        if (!(nom in v)) continue;
+        if (!tous && ctrl.input && ctrl.input === document.activeElement) continue;
+        fp.form.set(nom, v[nom]);
+      }
+      fp.titre.textContent = o.nom || o.texte || libType(o);
+      fp.sousTitre.textContent = libType(o) + (o.verrouille ? ' · verrouillé' : '');
+    }
     panneauProprietes(o) {
       const p = this.panneau;
-      const pre = (cle) => ({ nom: cle });
-      p.appendChild(el('div', { class: 'inline', style: { justifyContent: 'space-between', width: '100%' } }, el('span', { class: 'texte-2 texte-petit' }, libType(o) + (o.verrouille ? ' · verrouillé' : '')), el('button', { class: 'btn btn-icone btn-sm', title: 'Désélectionner (Échap)', onclick: () => this.selectionner([]) }, icone('fermer'))));
-      p.appendChild(el('h3', null, ic(TYPES[o.type] ? TYPES[o.type].icone : 'cube'), o.nom || o.texte || libType(o)));
+      const sousTitre = el('span', { class: 'texte-2 texte-petit' }, libType(o) + (o.verrouille ? ' · verrouillé' : ''));
+      p.appendChild(el('div', { class: 'inline', style: { justifyContent: 'space-between', width: '100%' } }, sousTitre, el('button', { class: 'btn btn-icone btn-sm', title: 'Désélectionner (Échap)', onclick: () => this.selectionner([]) }, icone('fermer'))));
+      const titre = el('span', null, o.nom || o.texte || libType(o));
+      p.appendChild(el('h3', null, ic(TYPES[o.type] ? TYPES[o.type].icone : 'cube'), titre));
       const u = unite().l;
       const champs = [];
       const seg = estSegment(o);
@@ -1694,7 +1887,11 @@
         if (!poly) {
           champs.push({ nom: 'largeur', label: `Largeur (${u})`, type: 'nombre', min: 0 }, { nom: 'profondeur', label: `Profondeur (${u})`, type: 'nombre', min: 0 });
           if (o.type !== 'zone') champs.push({ nom: 'rotation', label: 'Rotation (°)', type: 'nombre', step: 1 });
-        } else champs.push({ nom: 'sommets', label: 'Forme', type: 'lecture' }, { nom: 'surface', label: 'Surface', type: 'lecture' });
+        } else {
+          // polygone : l'emprise se redimensionne autour du centre ; les sommets se déplacent par leurs poignées sur le plan
+          champs.push({ nom: 'largeur', label: `Largeur de l'emprise (${u})`, type: 'nombre', min: 0 }, { nom: 'profondeur', label: `Profondeur de l'emprise (${u})`, type: 'nombre', min: 0 });
+          champs.push({ nom: 'sommets', label: 'Forme', type: 'lecture' }, { nom: 'surface', label: 'Surface', type: 'lecture' });
+        }
         if (o.type !== 'texte') champs.push({ nom: 'hauteur', label: o.type === 'zone' ? `Hauteur du volume (${u})` : `Hauteur (${u})`, type: 'nombre', min: 0, aide: o.type === 'zone' ? 'Laissez une faible valeur pour un marquage au sol' : undefined });
         if (o.type === 'machine' || o.type === 'installation' || o.type === 'porte') champs.push({ nom: 'z', label: `Élévation (${u})`, type: 'nombre', aide: 'Hauteur au-dessus du sol du niveau (ex. pont roulant)' });
         if (o.type === 'machine' || o.type === 'installation') champs.push({ nom: 'forme', label: 'Forme', type: 'select', options: [{ value: 'boite', label: 'Parallélépipède' }, { value: 'cylindre', label: 'Cylindre' }] });
@@ -1702,39 +1899,40 @@
       if (o.type !== 'texte') champs.push({ nom: 'couleur', label: 'Couleur', type: 'couleur' });
       champs.push({ nom: 'niveauId', label: 'Niveau', type: 'select', options: this.niveaux.map((n) => ({ value: n.id, label: n.nom })) });
       champs.push({ nom: 'verrouille', label: 'Verrouillé (protégé contre le déplacement)', type: 'booleen', pleineLargeur: true, sansDecalage: true });
-      const valeurs = {
-        nom: o.nom || '', categorie: o.categorie, texte: o.texte || '', taille: o.taille || 1,
-        x: versU(o.x), y: versU(o.y), x2: versU(o.x2), y2: versU(o.y2), epaisseur: versU(o.epaisseur), largeur: versU(o.largeur), profondeur: versU(o.profondeur), hauteur: versU(o.hauteur), z: versU(o.z || 0),
-        rotation: Math.round((o.rotation || 0) * 10) / 10, forme: o.forme || 'boite', couleur: o.couleur || '#6b7280', niveauId: o.niveauId, verrouille: !!o.verrouille,
-        longueur: seg ? fmtL(Math.hypot(o.x2 - o.x, o.y2 - o.y)) : '', sommets: poly ? `Polygone de ${o.points.length} sommets` : '', surface: poly ? `${ui.formatNombre(aire(o.points), 1)} m²` : '',
-      };
+      const valeurs = this.valeursProprietes(o);
       const NUM = new Set(['x', 'y', 'x2', 'y2', 'epaisseur', 'largeur', 'profondeur', 'hauteur', 'z']);
       champs.forEach((c) => {
         if (c.type === 'lecture') return;
+        if (NUM.has(c.nom) && BORNES_OBJET[c.nom]) { c.min = versU(BORNES_OBJET[c.nom][0]); c.max = versU(BORNES_OBJET[c.nom][1]); }
         c.onChange = (v) => {
           const actuel = this.objet(o.id);
           if (!actuel) return;
+          const restaurer = () => this.rafraichirPanneauProprietes(actuel, true); // valeur refusée : champ remis à sa valeur, sans perdre le focus
           let patch = {};
           if (NUM.has(c.nom)) {
             const n = depuisU(v);
-            if (n == null || isNaN(n)) { toast('Valeur numérique invalide', 'erreur'); this.rendrePanneau(); return; }
-            if (['epaisseur', 'largeur', 'profondeur'].includes(c.nom) && n <= 0) { toast('La dimension doit être positive', 'erreur'); this.rendrePanneau(); return; }
-            if ((c.nom === 'x' || c.nom === 'y') && poly) { const r = this.translater(actuel, c.nom === 'x' ? r3(n - actuel.x) : 0, c.nom === 'y' ? r3(n - actuel.y) : 0); patch = { x: r.x, y: r.y, points: r.points }; } else patch[c.nom] = r3(n);
-            if (seg && ['x', 'y', 'x2', 'y2'].includes(c.nom)) { const t = Object.assign({}, actuel, patch); if (Math.hypot(t.x2 - t.x, t.y2 - t.y) < 0.01) { toast('Le segment doit avoir une longueur non nulle', 'erreur'); this.rendrePanneau(); return; } patch.largeur = r3(Math.hypot(t.x2 - t.x, t.y2 - t.y)); }
+            if (n == null || isNaN(n)) { toast('Valeur numérique invalide', 'erreur'); restaurer(); return; }
+            const b = BORNES_OBJET[c.nom];
+            if (b && (n < b[0] || n > b[1])) { toast(`${(c.label || c.nom).replace(/ \(.*\)$/, '')} : valeur hors limites (${fmtL(b[0])} à ${fmtL(b[1])})`, 'erreur'); restaurer(); return; }
+            if (poly && (c.nom === 'largeur' || c.nom === 'profondeur')) patch = this.redimensionnerPolygone(actuel, c.nom === 'largeur' ? n : actuel.largeur, c.nom === 'profondeur' ? n : actuel.profondeur);
+            else if ((c.nom === 'x' || c.nom === 'y') && poly) { const r = this.translater(actuel, c.nom === 'x' ? r3(n - actuel.x) : 0, c.nom === 'y' ? r3(n - actuel.y) : 0); patch = { x: r.x, y: r.y, points: r.points }; } else patch[c.nom] = r3(n);
+            if (seg && ['x', 'y', 'x2', 'y2'].includes(c.nom)) { const t = Object.assign({}, actuel, patch); if (Math.hypot(t.x2 - t.x, t.y2 - t.y) < 0.01) { toast('Le segment doit avoir une longueur non nulle', 'erreur'); restaurer(); return; } patch.largeur = r3(Math.hypot(t.x2 - t.x, t.y2 - t.y)); }
             if (c.nom === 'epaisseur') patch.profondeur = r3(n);
             if (c.nom === 'epaisseur' && o.type === 'installation') patch.hauteur = r3(n);
           } else if (c.nom === 'rotation') patch.rotation = r3((((Number(v) || 0) % 360) + 360) % 360);
           else if (c.nom === 'taille') patch.taille = Math.max(0.1, Math.min(50, Number(v) || 1));
-          else if (c.nom === 'texte') { if (!String(v).trim()) { toast('Le texte ne peut pas être vide', 'erreur'); this.rendrePanneau(); return; } patch.texte = String(v).slice(0, 200); }
+          else if (c.nom === 'texte') { if (!String(v).trim()) { toast('Le texte ne peut pas être vide', 'erreur'); restaurer(); return; } patch.texte = String(v).slice(0, 200); }
           else if (c.nom === 'categorie') { const cat = CATEGORIES[v]; patch.categorie = v; if (cat && !actuel.equipementId && (actuel.nom === (CATEGORIES[actuel.categorie] || {}).label || !actuel.nom)) patch.nom = cat.label; if (cat && cat.couleur && actuel.couleur === (CATEGORIES[actuel.categorie] || {}).couleur) patch.couleur = cat.couleur; }
           else if (c.nom === 'niveauId') { patch.niveauId = v; }
           else patch[c.nom] = c.type === 'booleen' ? !!v : v;
-          this.modifierObjet(o.id, patch, 'Modification : ' + (c.label || c.nom).replace(/ \(.*\)$/, '').toLowerCase());
+          this._modifDepuisPanneau = true;
+          try { this.modifierObjet(o.id, patch, 'Modification : ' + (c.label || c.nom).replace(/ \(.*\)$/, '').toLowerCase()); } finally { this._modifDepuisPanneau = false; }
           if (c.nom === 'niveauId' && v !== this.niveau) { this.niveau = v; this.majSelectNiveau(); this.appliquerFond(); this.synchroniser(); }
         };
       });
       const f = ui.form({ champs, valeurs, colonnes: 2 });
       p.appendChild(f.el);
+      this.formProprietes = { id: o.id, form: f, titre, sousTitre };
       // Liens
       if (o.type === 'machine' || o.type === 'installation') p.appendChild(this.section('Équipement lié', this.blocLienEquipement(o)));
       if (o.type === 'zone' || o.type === 'batiment') p.appendChild(this.section('Secteur lié', this.blocLienSecteur(o)));
@@ -1854,7 +2052,8 @@
         champs: [
           { nom: 'nom', label: 'Nom du secteur', requis: true },
           { nom: 'code', label: 'Code (facultatif)', placeholder: 'ex. PROD-L3' },
-          { nom: 'type', label: 'Type', type: 'select', liste: 'typesSecteur' },
+          // un site ne se crée pas depuis un plan (il changerait la hiérarchie des sites) : les autres types seulement
+          { nom: 'type', label: 'Type', type: 'select', options: GMAO.liste('typesSecteur').filter((t) => t.code !== 'site').map((t) => ({ value: t.code, label: t.label })) },
           { nom: 'parentId', label: 'Secteur parent', type: 'select', requis: true, options: parents },
           { nom: 'couleur', label: 'Couleur', type: 'couleur' },
         ],
@@ -2052,12 +2251,15 @@
         this.chargerPlan(r);
         this.selection = selection.filter((id) => this.objet(id));
         this.vueModifiee = false;
+        this.indexEnregistre = this.indexHisto;
         this.marquerModifie(false);
         this.majTitre(); this.majSelectNiveau(); this.appliquerFond(); this.synchroniser(); this.rendrePanneau(); this.majStatut();
         toast(`Plan enregistré (version ${r.version})`, 'succes');
         return true;
       } catch (e) {
         if (e.status === 409) { this.conflit(e); return false; }
+        // objet refusé par le serveur : sélectionné et centré pour être corrigé
+        if (e.status === 400 && e.details && e.details.objetId != null && this.objet(String(e.details.objetId))) this.focaliserObjet(String(e.details.objetId));
         erreur(e);
         return false;
       } finally {
@@ -2120,8 +2322,9 @@
     aideClavier() {
       const l = [
         ['Navigation', 'Glisser : pivoter · clic droit / Maj + glisser : déplacer · molette : zoom · flèches : pivoter (Maj : déplacer) · + / − : zoom · Origine : recentrer'],
-        ['Sélection', 'Clic : sélectionner · Maj + clic : ajouter / retirer · Ctrl+A : tout sélectionner (niveau actif) · Échap : désélectionner'],
-        ['Édition', 'Glisser : déplacer (Alt : sans magnétisme) · flèches : décaler (Maj : ×10) · R / Maj+R : pivoter de ±15° · Suppr : supprimer · Ctrl+D : dupliquer · Ctrl+C / Ctrl+V : copier / coller · Ctrl+Z / Ctrl+Y : annuler / rétablir · Ctrl+S : enregistrer'],
+        ['Sélection', 'Clic : sélectionner · Maj + clic : ajouter / retirer · F : cadrer la sélection · Échap : désélectionner'],
+        ['Édition', 'Glisser : déplacer (Alt : sans magnétisme) · Échap pendant un glisser : annuler · flèches : décaler (Maj : ×10) · R / Maj+R : pivoter de ±15° · Ctrl+A : tout sélectionner (niveau actif) · Suppr : supprimer · Ctrl+D : dupliquer · Ctrl+C / Ctrl+V : copier / coller · Ctrl+Z / Ctrl+Y : annuler / rétablir · Ctrl+S : enregistrer'],
+        ['Zones et bâtiments', 'Poignées : glisser un sommet pour le déplacer · double-clic sur le contour : ajouter un sommet · double-clic sur une poignée : retirer le sommet · Propriétés : largeur et profondeur de l\'emprise'],
         ['Outils', OUTILS.map((t) => `${t.touche} : ${t.label}`).join(' · ')],
       ];
       ui.modal({ titre: 'Raccourcis clavier', taille: 'large', contenu: ui.details(l.map(([label, valeur]) => ({ label, valeur }))), boutons: [{ label: 'Fermer' }] });
@@ -2154,9 +2357,31 @@
 
     // ----- Écouteurs globaux et nettoyage -------------------------------------------------------
     installerEcouteurs() {
+      // Douchette (saisie très rapide terminée par Entrée, hors champ de saisie), écoutée avant tout autre gestionnaire :
+      // le code est traité par la vue (équipement localisé sur le plan) et ses caractères n'atteignent ni les raccourcis
+      // de l'éditeur ni l'écoute globale (qui quitterait le plan sans confirmation)
+      const scan = { tampon: '', dernier: 0 };
+      const surScanTouche = (ev) => {
+        if (!this.container.isConnected) return;
+        const t = ev.target;
+        if ((t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) || document.querySelector('.modal-fond') || ev.ctrlKey || ev.metaKey || ev.altKey) { scan.tampon = ''; return; }
+        const maintenant = ev.timeStamp || performance.now(); // horodatage de la frappe elle-même, même si le rendu 3D retarde son traitement
+        if (ev.key === 'Enter') {
+          const code = scan.tampon; scan.tampon = '';
+          if (code.length >= 3 && maintenant - scan.dernier <= 100) { ev.preventDefault(); ev.stopPropagation(); this.annulerRaccourci(); this.surScan(code); }
+          return;
+        }
+        if (!ev.key || ev.key.length !== 1) return;
+        if (scan.tampon && maintenant - scan.dernier > 50) scan.tampon = '';
+        if (scan.tampon) { ev.preventDefault(); ev.stopPropagation(); this.annulerRaccourci(); } // deuxième caractère rapide : saisie d'une douchette en cours
+        scan.tampon += ev.key; scan.dernier = maintenant;
+      };
+      window.addEventListener('keydown', surScanTouche, true);
+      this.nettoyages.push(() => window.removeEventListener('keydown', surScanTouche, true));
+      // raccourcis de la vue, en phase de capture : une fenêtre modale encore ouverte est vue avant que le cœur ne la ferme avec Échap
       const clavier = (ev) => this.surClavier(ev);
-      document.addEventListener('keydown', clavier);
-      this.nettoyages.push(() => document.removeEventListener('keydown', clavier));
+      document.addEventListener('keydown', clavier, true);
+      this.nettoyages.push(() => { document.removeEventListener('keydown', clavier, true); this.annulerRaccourci(); });
       // protection des modifications non enregistrées : liens internes et fermeture de la page
       const clicLien = (ev) => {
         if (!this.modifie || !this.edition) return;
@@ -2197,12 +2422,13 @@
       const k = ev.key;
       let traite = true;
       if (k === 'Escape') {
-        if (this.trace || this.calibrage) this.terminerTrace(false);
+        if (this.drag && ['deplacer', 'rotation', 'rectangle', 'sommet'].includes(this.drag.type)) this.annulerGlisser();
+        else if (this.trace || this.calibrage) this.terminerTrace(false);
         else if (this.selection.length) this.selectionner([]);
         else if (this.edition && this.outil !== 'selection') this.choisirOutil('selection');
         else if (this.racine.classList.contains('p3d-plein-ecran')) this.basculerPleinEcran();
         else traite = false;
-      } else if (k === 'f' || k === 'F') { if (this.selection.length) this.moteur.cadrer(this.selection); else this.moteur.recentrer(true); }
+      } else if (k === 'f' || k === 'F') this.differerRaccourci(() => { if (this.selection.length) this.moteur.cadrer(this.selection); else this.moteur.recentrer(true); });
       else if (!this.edition) traite = false;
       else if (ctrl && (k === 'z' || k === 'Z') && !ev.shiftKey) this.annuler();
       else if (ctrl && (k === 'y' || k === 'Y' || ((k === 'z' || k === 'Z') && ev.shiftKey))) this.retablir();
@@ -2213,21 +2439,58 @@
       else if (ctrl && (k === 'a' || k === 'A')) this.selectionner(this.objets.filter((o) => o.niveauId === this.niveauActifId()).map((o) => o.id));
       else if (k === 'Delete' || k === 'Backspace') this.supprimerSelection();
       else if (k === 'Enter' && this.trace) this.terminerTrace(true);
-      else if ((k === 'r' || k === 'R') && !ctrl && this.selection.length) this.pivoter(this.selection, ev.shiftKey ? -15 : 15);
+      else if ((k === 'r' || k === 'R') && !ctrl && this.selection.length) this.differerRaccourci(() => this.pivoter(this.selection, ev.shiftKey ? -15 : 15));
       else if (k.startsWith('Arrow') && this.selection.length) {
         const pas = (Number(cfg().grilleM) || 0.5) * (ev.shiftKey ? 10 : 1);
         const dx = k === 'ArrowLeft' ? -pas : k === 'ArrowRight' ? pas : 0, dy = k === 'ArrowUp' ? -pas : k === 'ArrowDown' ? pas : 0;
         this.deplacer(this.selection, dx, dy, 'Décalage');
       } else if (!ctrl && !ev.altKey && k.length === 1) {
         const outil = OUTILS.find((o) => o.touche === k.toUpperCase());
-        if (outil) this.choisirOutil(outil.cle); else traite = false;
+        if (outil) this.differerRaccourci(() => this.choisirOutil(outil.cle)); else traite = false;
       } else traite = false;
       if (traite) { ev.preventDefault(); ev.stopPropagation(); }
+    }
+    /**
+     * Raccourci d'une seule touche exécuté après un court délai : si un second caractère arrive aussitôt
+     * (douchette), il est annulé au lieu de changer d'outil ou de pivoter la sélection.
+     */
+    differerRaccourci(fn) {
+      this.annulerRaccourci();
+      this._raccourci = setTimeout(() => { this._raccourci = null; if (this.container.isConnected) fn(); }, 60);
+    }
+    annulerRaccourci() { if (this._raccourci) { clearTimeout(this._raccourci); this._raccourci = null; } }
+    /** Échap pendant un glisser : l'objet (ou le sommet) reprend sa place, le relâchement ne fait rien. */
+    annulerGlisser() {
+      this.drag = { type: 'rien' };
+      this.moteur.decalageTemporaire(null);
+      this.moteur.definirApercus([]);
+      this.majStatut();
+      toast('Déplacement annulé', 'info', 1200);
+    }
+    /** Code lu à la douchette : équipement localisé sur le plan, sinon fiche de l'élément (comme le scan global). */
+    async surScan(code) {
+      const c = String(code).trim().toLowerCase();
+      if (!c) return;
+      let trouve = null;
+      for (const o of this.objets) {
+        const info = o.equipementId != null ? this.infos.get(Number(o.equipementId)) : null;
+        if (info && [info.numero, info.nom].some((v) => String(v || '').trim().toLowerCase() === c)) { trouve = { o, info }; break; }
+      }
+      if (trouve) { this.focaliserObjet(trouve.o.id); toast(`${trouve.info.numero} · ${trouve.info.nom} : localisé sur le plan`, 'info', 2500); return; }
+      let r;
+      try { r = await api.get('/api/codes/' + encodeURIComponent(code)); } catch (e) { toast(e && e.status === 404 ? `Code « ${code} » : aucun équipement de ce plan ni aucun élément accessible ne correspond` : (e && e.message) || 'Code non reconnu', 'erreur'); return; }
+      if (!r || !r.lien) return;
+      if (this.edition && this.modifie) {
+        const ok = await ui.confirm({ titre: 'Modifications non enregistrées', message: `Ouvrir « ${r.libelle || r.code} » et quitter le plan sans enregistrer ? Vos modifications seront conservées en brouillon jusqu'à la fermeture de l'application.`, okLabel: 'Quitter sans enregistrer', danger: true });
+        if (!ok) return;
+      }
+      toast(`${r.libelle || r.code} — ouverture de la fiche`, 'info');
+      GMAO.navigate(r.lien);
     }
     nettoyer() {
       if (this.nettoye) return;
       this.nettoye = true;
-      if (this.modifie && this.edition) brouillons.set(this.plan.id, { version: this.version, objets: this.objets, niveaux: this.niveaux, fond: this.fond, fondModifie: this.fondModifie, dimensions: this.dimensions, proprietes: this.proprietes, historique: this.historique, indexHisto: this.indexHisto, nb: this.indexHisto || 1 });
+      if (this.modifie && this.edition && GMAO.user) brouillons.set(cleBrouillon(this.plan.id), { version: this.version, objets: this.objets, niveaux: this.niveaux, fond: this.fond, fondModifie: this.fondModifie, dimensions: this.dimensions, proprietes: this.proprietes, vue: this.vue, vueModifiee: this.vueModifiee, historique: this.historique, indexHisto: this.indexHisto, indexEnregistre: this.indexEnregistre, nb: Math.max(1, Math.abs(this.indexHisto - Math.max(0, this.indexEnregistre))) });
       for (const f of this.nettoyages) { try { f(); } catch (e) { /* ignore */ } }
       this.nettoyages = [];
       if (this.racine.classList.contains('p3d-plein-ecran') && document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -2242,6 +2505,8 @@
   GMAO.registerView(MODULE, {
     titre: 'Plans 3D',
     icone: 'plan3d',
+    /** Changement de vue ou déconnexion : écouteurs libérés, brouillon de l'utilisateur mis de côté. */
+    quitter() { if (GMAO._plan3d) GMAO._plan3d.nettoyer(); },
     async rendu(container, { params, query }) {
       if (GMAO._plan3d) GMAO._plan3d.nettoyer();
       if (!params[0]) return rendreListe(container, query || {});

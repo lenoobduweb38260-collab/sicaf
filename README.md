@@ -49,7 +49,13 @@ et **aucune fenêtre de commandes**.
      sur le PC « serveur » de l'usine ; l'assistant affiche l'adresse à utiliser sur les autres postes
      (autorisez l'application dans le pare-feu Windows quand il le demande).
    - **Se connecter à la GMAO d'un autre poste** : saisissez l'adresse du poste serveur
-     (ex. `http://srv-gmao:8585`). Chaque poste client installe la même application.
+     (ex. `https://srv-gmao:8585`). Chaque poste client installe la même application.
+   - **Partage réseau chiffré (HTTPS)** : le poste serveur partagé génère son propre certificat et sert la GMAO en HTTPS
+     (le HTTP en clair est redirigé). À la première connexion d'un poste client, l'application affiche l'**empreinte**
+     du certificat du serveur : le pôle informatique la compare à celle affichée sur le poste serveur (icône de la zone
+     de notification › *Empreinte du certificat…*, ou *Système & informatique › Réseau & postes*) et la confirme ; le
+     poste n'accepte ensuite que ce certificat. Si l'empreinte change un jour sans réinstallation connue du poste serveur,
+     ne confirmez pas et prévenez le pôle informatique (usurpation possible).
    - Le **code du pôle informatique** est défini à ce moment : il protège ensuite ces paramètres
      (mode, réseau, port, dossier des données, mises à jour). Les utilisateurs ne peuvent pas les modifier.
 4. L'application se place dans la **zone de notification** (à côté de l'horloge) : sur le poste serveur
@@ -59,7 +65,8 @@ et **aucune fenêtre de commandes**.
 
 L'application vérifie au démarrage puis toutes les 6 heures si une nouvelle version est publiée, la
 télécharge, vérifie son empreinte (SHA-256), l'installe en silence et redémarre. Les données ne sont jamais
-touchées par une mise à jour. À chaque évolution du code sur la branche principale, GitHub Actions
+touchées par une mise à jour. Dès qu'une clé publique est configurée (`docs/MISES-A-JOUR.md`), chaque mise à jour
+doit en plus être **signée (Ed25519)** par l'entreprise : une version non signée ou antérieure est refusée. À chaque évolution du code sur la branche principale, GitHub Actions
 (`.github/workflows/build-windows.yml`) construit et publie automatiquement la nouvelle version
 (`v1.0.<n>`). Pour un réseau sans accès Internet, le pôle informatique peut choisir comme source un dossier
 réseau (ex. `\\NAS\gmao\mises-a-jour`, contenant `latest.json` et l'installateur).
@@ -118,18 +125,24 @@ framework : voir [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Sécurité
 
-Mots de passe robustes et hachés, blocage des comptes après des échecs répétés, sessions limitées dans le
-temps, droits contrôlés par le serveur, accès multi-site en lecture seule ou complet, journal d'activité,
-en-têtes de sécurité stricts, aucune dépendance tierce, accès par navigateur désactivé par défaut, sauvegardes
-chiffrables sur plusieurs sites. Détails et recommandations de déploiement : [`docs/SECURITE.md`](docs/SECURITE.md).
+Mots de passe robustes et hachés (expiration, historique, mot de passe oublié avec codes de réinitialisation),
+double authentification par application sur téléphone (facultative ou obligatoire), blocage des comptes et des postes
+après des échecs répétés, sessions limitées dans le temps, droits contrôlés par le serveur, accès multi-site en lecture
+seule ou complet, journal d'activité, partage réseau chiffré (HTTPS, empreinte confirmée sur chaque poste), en-têtes
+de sécurité stricts, aucune dépendance tierce, accès par navigateur désactivé par défaut, sauvegardes chiffrables sur
+plusieurs sites, mises à jour signées. Détails et recommandations de déploiement : [`docs/SECURITE.md`](docs/SECURITE.md).
 
 ## Données et sauvegardes
 
-- Base : un fichier JSON (`data/gmao.json`), écrit de manière atomique.
+- Base : un fichier JSON (`data/gmao.json`), écrit de manière atomique ; les photos et documents joints sont rangés
+  à part dans `data/pieces/` (espace réservé réglable, 400 Mo par défaut : *Configuration › Général*), le journal
+  d'activité ancien dans `data/journal/`.
 - Une sauvegarde quotidienne est créée automatiquement au démarrage dans `data/backups/` (30 conservées), plus
   des sauvegardes manuelles et une avant chaque import / restauration.
-- Export / import complet au format JSON depuis *Système & informatique › Base de données & sauvegardes*.
-- Pour déplacer la GMAO sur un autre PC : copiez le dossier `data`.
+- Export / import complet au format JSON (pièces jointes comprises, sans les secrets de sauvegarde) depuis
+  *Système & informatique › Base de données & sauvegardes*, réservé aux comptes ayant accès à tous les sites.
+- Pour déplacer la GMAO sur un autre PC : copiez le dossier `data` en entier (base, pièces jointes, journal,
+  clé de la double authentification).
 
 ## Pour les développeurs
 

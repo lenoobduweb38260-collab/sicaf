@@ -430,12 +430,20 @@ div.vide:not(.bascule) svg { width: 40px; height: 40px; opacity: 0.4; margin-bot
 .graphique-barres .barre { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; gap: 4px; min-width: 0; }
 .graphique-barres .barre > div { width: 100%; background: var(--primaire); border-radius: 4px 4px 0 0; min-height: 2px; }
 .graphique-barres .barre span { font-size: 10.5px; color: var(--texte-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+/* Barres empilées (ui.graphiqueBarres avec `series`) : segments du bas vers le haut, légende sous le graphique */
+.graphique-barres .barre > div.barre-pile { display: flex; flex-direction: column-reverse; overflow: hidden; }
+.graphique-barres .barre > div.barre-pile > div { width: 100%; min-height: 1px; }
+.graphique-legende { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: var(--texte-2); margin-top: 4px; }
+.graphique-legende > span { display: inline-flex; align-items: center; }
+/* Ligne pleine largeur (contrairement à .inline, en ligne) */
+.ligne { display: flex; align-items: center; gap: 8px; width: 100%; }
 .commentaires .commentaire { border-left: 3px solid var(--bordure-2); padding: 6px 12px; margin-bottom: 10px; }
 .commentaires .commentaire .c-auteur { font-weight: 600; font-size: 12.5px; }
 .commentaires .commentaire .c-date { color: var(--texte-2); font-size: 11.5px; margin-left: 6px; }
 .chronologie { list-style: none; padding: 0; margin: 0; }
 .chronologie li { position: relative; padding: 4px 0 10px 22px; border-left: 2px solid var(--bordure); margin-left: 6px; font-size: 13px; }
-.chronologie li::before { content: ""; position: absolute; left: -7px; top: 8px; width: 12px; height: 12px; border-radius: 50%; background: var(--primaire); border: 2px solid var(--surface); }
+/* Puce colorée par étape : style="--chrono-couleur: #16a34a" sur le <li> */
+.chronologie li::before { content: ""; position: absolute; left: -7px; top: 8px; width: 12px; height: 12px; border-radius: 50%; background: var(--chrono-couleur, var(--primaire)); border: 2px solid var(--surface); }
 .chronologie li .chrono-date { color: var(--texte-2); font-size: 11.5px; }
 .etiquette-impression { display: none; }
 

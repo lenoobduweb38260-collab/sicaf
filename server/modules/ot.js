@@ -13,8 +13,16 @@
  *   (modification complète, statuts, réouverture), ot.affecter (techniciens), ot.cloturer (statuts
  *   finaux), ot.supprimer, ot.exporter. Un technicien affecté (responsable ou intervenant) peut, sans
  *   le droit « modifier », renseigner la réalisation et faire avancer l'OT ; il peut le clôturer si
- *   config.workflow.autoriserTechnicienCloture est actif.
+ *   config.workflow.autoriserTechnicienCloture est actif. La gamme ne se réduit (suppression d'une
+ *   tâche) qu'avec le droit « modifier » ; saisir du temps pour une personne non affectée revient à
+ *   l'affecter (droit « affecter »).
  * Portée : celle de l'utilisateur (ctx.canSee), étendue aux OT dont il est créateur ou intervenant.
+ *   En écriture, le secteur de l'OT doit être un secteur modifiable de l'utilisateur (sites en lecture
+ *   seule exclus) ; les intervenants proposés suivent la règle du planning (secteurs partagés, site courant).
+ *   Une création manuelle depuis une demande exige une demande visible et validée ; depuis un plan,
+ *   un plan visible et actif, sans OT déjà ouvert, sur l'équipement du plan.
+ * Sous-éléments (temps, pièces, tâches, commentaires, documents) : chaque ligne porte un identifiant
+ *   stable `uid` ; les routes `…/:ref` acceptent cet identifiant ou, à défaut, l'index de la ligne.
  *
  * Services publiés   : ctx.services.ot.{ creerDepuisDemande(demande, req), ouvertsPour({ equipementId, planPreventifId }),
  *                      creer(donnees, req, options), get(id), estFinal(code), enRetard(ot), statuts() }
@@ -23,6 +31,7 @@
  *                      (lisible indifféremment comme `data.ot` ou comme l'OT lui-même).
  * Services consommés : ctx.services.stock.{ sortir, annulerSortie }, ctx.services.equipements.{ releverCompteur, visible, chemin }.
  */
+const crypto = require('crypto');
 const nom = 'Ordres de travail';
 const ENTITE = 'ot';
 const TAILLE_MAX_DOC = 5 * 1024 * 1024; // 5 Mo par document
@@ -78,6 +87,8 @@ function horodatage(s) {
 }
 function arrondi(n, dec = 2) { const f = 10 ** dec; return Math.round((Number(n) || 0) * f) / f; }
 function objet(b) { return b && typeof b === 'object' && !Buffer.isBuffer(b) && !Array.isArray(b) ? b : {}; }
+/** Identifiant stable d'une ligne (temps, pièce, tâche, commentaire, document) : jamais purement numérique. */
+function uid() { return 'u' + crypto.randomBytes(5).toString('hex'); }
 
 /** Outils de lecture de la liste de statuts configurée (codes sémantiques résolus avec repli). */
 function outilsStatuts(listeConfiguree) {
@@ -85,12 +96,14 @@ function outilsStatuts(listeConfiguree) {
   const item = (code) => liste.find((s) => s.code === code) || null;
   const estFinal = (code) => { const s = item(code); return !!(s && s.final); };
   const estAnnulation = (code) => { const s = item(code); return !!(s && s.final && (s.code === 'annule' || /annul/i.test(s.label || ''))); };
+  /** Statut final de réalisation (tout statut final qui n'est pas une annulation, y compris un statut personnalisé). */
+  const estCloture = (code) => estFinal(code) && !estAnnulation(code);
   const nonFinal = (code, re) => { const s = item(code); if (s && !s.final) return s.code; const t = liste.find((x) => !x.final && re.test(`${x.code} ${x.label || ''}`)); return t ? t.code : null; };
   const finaux = liste.filter((s) => s.final);
   const termine = (finaux.find((s) => s.code === 'termine') || finaux.find((s) => !estAnnulation(s.code)) || finaux[0] || { code: 'termine' }).code;
   const annuleItem = finaux.find((s) => s.code === 'annule') || finaux.find((s) => estAnnulation(s.code));
   return {
-    liste, item, estFinal, estAnnulation, termine,
+    liste, item, estFinal, estAnnulation, estCloture, termine,
     annule: annuleItem && annuleItem.code !== termine ? annuleItem.code : null,
     initial: (liste.find((s) => !s.final) || { code: 'nouveau' }).code,
     enCours: nonFinal('en_cours', /cours/i),
@@ -143,10 +156,20 @@ function register(ctx) {
     if (s && typeof s.visible === 'function') { try { return !!s.visible(req, e); } catch (err) { return ctx.canSee(req, e); } }
     return ctx.canSee(req, e);
   }
-  /** Un utilisateur limité à ses secteurs ne rattache un OT qu'à ses propres secteurs. */
+  /**
+   * En écriture, un utilisateur dont la portée n'est pas « tous » ne rattache un OT qu'à ses secteurs
+   * modifiables (`req.perms.secteurIds`) : les sites en lecture seule et les secteurs hors périmètre sont
+   * refusés, quelle que soit la portée (secteurs, site ou perso). Même règle que le module Équipements.
+   */
   function verifierPorteeSecteur(req, secteurId) {
-    if (!req || !req.perms || req.perms.portee !== 'secteurs' || secteurId == null) return;
-    if (!req.perms.secteurIds.includes(Number(secteurId))) throw new HttpError(403, 'Ce secteur est hors de votre périmètre : vous ne pouvez gérer que les ordres de travail de vos secteurs');
+    if (!req || !req.perms || req.perms.portee === 'tous' || secteurId == null) return;
+    const sid = Number(secteurId);
+    const modifiables = (req.perms.secteurIds || []).map(Number);
+    if (req.perms.portee === 'perso' && !modifiables.length) {
+      if ((req.perms.secteurIdsLecture || []).map(Number).includes(sid)) throw new HttpError(403, 'Ce site est accessible en lecture seule pour vous : modification impossible');
+      return;
+    }
+    if (!modifiables.includes(sid)) throw new HttpError(403, 'Ce secteur est hors de votre périmètre (ou dans un site en lecture seule) : vous ne pouvez gérer que les ordres de travail de vos secteurs');
   }
   function peutRealiser(req, o) { return can(req, 'modifier') || estAffecte(req.user.id, o); }
   function peutCloturer(req, o) { return can(req, 'cloturer') || (wf().autoriserTechnicienCloture !== false && estAffecte(req.user.id, o)); }
@@ -237,12 +260,29 @@ function register(ctx) {
     if (!u || u.actif === false) throw new HttpError(400, `${label} : utilisateur introuvable ou désactivé`);
     return u;
   }
-  function aAccesOt(u) {
-    const p = perms.effectivePermissions(db, u, null, db.getConfig());
+  function aAccesOt(u, config) {
+    const p = perms.effectivePermissions(db, u, null, config || db.getConfig());
     return perms.can(p, ENTITE, 'voir');
   }
-  /** Lit technicienId / techniciens ; seuls les identifiants nouveaux sont contrôlés. */
-  function lireAffectation(body, existant) {
+  /**
+   * Un intervenant ne peut être proposé que s'il est dans le périmètre du planificateur : même règle que
+   * le planning (portée « tous » : tout le monde ; sinon soi-même, les utilisateurs sans secteur et ceux
+   * dont un secteur recoupe les siens ; site courant de l'en-tête respecté).
+   */
+  function technicienDansPerimetre(req, u) {
+    if (!req || !req.perms || req.perms.portee === 'tous' || (req.user && u.id === req.user.id)) return true;
+    if (req.perms.portee === 'perso') return false;
+    const ids = (u.secteurIds || []).map(Number);
+    if (!ids.length) return true;
+    const desc = perms.secteursDescendants(db, ids).map(Number);
+    const miens = new Set((req.perms.secteurIds || []).map(Number));
+    if (!desc.some((s) => miens.has(s))) return false;
+    const filtreSite = Array.isArray(req.perms.siteFiltre) ? new Set(req.perms.siteFiltre.map(Number)) : null;
+    if (filtreSite && !desc.some((s) => filtreSite.has(s)) && !(u.siteAcces || []).some((a) => a && filtreSite.has(Number(a.siteId)))) return false;
+    return true;
+  }
+  /** Lit technicienId / techniciens ; seuls les identifiants nouveaux sont contrôlés (accès aux OT, périmètre de `req`). */
+  function lireAffectation(req, body, existant) {
     const anciens = new Set(existant ? [existant.technicienId].concat(existant.techniciens || []).filter((x) => x != null).map(Number) : []);
     let technicienId = body.technicienId !== undefined ? idRef(body.technicienId, 'Technicien responsable') : (existant && existant.technicienId != null ? Number(existant.technicienId) : null);
     let techniciens;
@@ -255,6 +295,7 @@ function register(ctx) {
       if (anciens.has(id)) return;
       const u = utilisateurActif(id, label);
       if (!aAccesOt(u)) throw new HttpError(400, `${ctx.nomUser(u.id)} n'a pas accès au module Ordres de travail`);
+      if (!technicienDansPerimetre(req, u)) throw new HttpError(400, `${ctx.nomUser(u.id)} est hors de votre périmètre (secteurs) : affectation impossible`);
     };
     if (technicienId != null) verifier(technicienId, 'Technicien responsable');
     for (const t of techniciens) verifier(t, 'Intervenant');
@@ -405,7 +446,14 @@ function register(ctx) {
     return u ? (`${u.prenom || ''} ${u.nom || ''}`.trim() || u.login) : '';
   }
   function estImage(type) { return /^image\/(png|jpe?g|gif|webp|bmp|svg\+xml)$/i.test(type || ''); }
-  function resumeDoc(d, i) { return { index: i, nom: d.nom, type: d.type, taille: d.taille, date: d.date, userId: d.userId, userNom: ctx.nomUser(d.userId), description: d.description || '', estImage: estImage(d.type) }; }
+  function resumeDoc(d, i) { return { index: i, uid: d.uid || null, nom: d.nom, type: d.type, taille: d.taille, date: d.date, userId: d.userId, userNom: ctx.nomUser(d.userId), description: d.description || '', estImage: estImage(d.type) }; }
+  /** Factures et commandes imputées à un OT (module Achats, interrogé au moment de la requête). */
+  function imputationsAchats(otId) {
+    const a = ctx.services.achats;
+    const factures = a && typeof a.facturesPourOt === 'function' ? (a.facturesPourOt(otId) || []).length : 0;
+    const commandes = a && typeof a.commandesPourOt === 'function' ? (a.commandesPourOt(otId) || []).length : 0;
+    return { factures, commandes, total: factures + commandes };
+  }
 
   /**
    * Fiches équipement ouvrables par l'utilisateur (droit equipements.voir et portée) : un intervenant peut
@@ -427,17 +475,20 @@ function register(ctx) {
       return cache.get(k);
     };
   }
-  /** Vue allégée pour les listes (sans contenu des documents). */
+  /**
+   * Vue allégée pour les listes : sans les documents, l'historique, les commentaires, les temps, les pièces
+   * ni les tâches (compteurs et totaux fournis à la place ; la fiche `detail` les renvoie en entier).
+   */
   function resume(o, refs) {
     refs = refs || references();
-    const { documents, ...reste } = o;
+    const { documents, historique, commentaires, tempsPasse, pieces, taches: lignesTaches, piecesPrevues, ...reste } = o;
     const e = o.equipementId != null ? refs.equipements.get(Number(o.equipementId)) : null;
     const d = o.demandeId != null ? refs.demandes.get(Number(o.demandeId)) : null;
     const p = o.planPreventifId != null ? refs.plans.get(Number(o.planPreventifId)) : null;
     const f = o.fournisseurId != null ? refs.fournisseurs.get(Number(o.fournisseurId)) : null;
     const s = o.secteurId != null ? refs.secteurs.get(Number(o.secteurId)) : null;
-    const taches = o.taches || [];
-    const tempsTotal = arrondi((o.tempsPasse || []).reduce((acc, t) => acc + (Number(t.heures) || 0), 0));
+    const taches = lignesTaches || [];
+    const tempsTotal = arrondi((tempsPasse || []).reduce((acc, t) => acc + (Number(t.heures) || 0), 0));
     return Object.assign(reste, {
       equipementNom: e ? e.nom : '', equipementNumero: e ? e.numero || '' : '',
       secteurNom: s ? s.nom : '', secteurChemin: cheminSecteur(refs.secteurs, o.secteurId),
@@ -453,7 +504,7 @@ function register(ctx) {
       coutPieces: arrondi(o.coutPieces || 0), coutMainOeuvre: arrondi(o.coutMainOeuvre || 0), coutExterne: arrondi(o.coutExterne || 0),
       coutTotal: arrondi((Number(o.coutPieces) || 0) + (Number(o.coutMainOeuvre) || 0) + (Number(o.coutExterne) || 0)),
       nbTaches: taches.length, nbTachesFaites: taches.filter((t) => t.fait).length,
-      nbCommentaires: (o.commentaires || []).length, nbDocuments: (documents || []).length, nbPieces: (o.pieces || []).length,
+      nbCommentaires: (commentaires || []).length, nbDocuments: (documents || []).length, nbPieces: (pieces || []).length,
     });
   }
 
@@ -473,7 +524,7 @@ function register(ctx) {
       cloturer: cloturer && !final,
       annuler: cloturer && !final && !!st.annule,
       reouvrir: modif && final,
-      supprimer: can(req, 'supprimer') && o.statut !== st.termine && !(o.pieces || []).length,
+      supprimer: can(req, 'supprimer') && !st.estCloture(o.statut) && !(o.pieces || []).length && !imputationsAchats(o.id).total,
       dupliquer: can(req, 'creer'),
       commenter: true,
       joindre: realiser,
@@ -533,12 +584,29 @@ function register(ctx) {
     return liste.map((t, i) => {
       const libelle = texte(typeof t === 'string' ? t : (t && t.libelle), 'Le libellé de la tâche', { requis: true, max: 300 });
       const duree = t && typeof t === 'object' ? nombre(t.duree, 'La durée de la tâche', { min: 0, max: 1000 }) : null;
-      return { ordre: i + 1, libelle, duree, fait: false, faitPar: null, dateFait: null };
+      return { uid: uid(), ordre: i + 1, libelle, duree, fait: false, faitPar: null, dateFait: null };
     });
+  }
+  /** Règle de visibilité d'une demande d'intervention (celle du module Demandes : portée, puis N+1 du demandeur). */
+  function demandeVisible(req, d) {
+    if (!perms.can(req.perms, 'demandes', 'voir')) return false;
+    if (ctx.canSee(req, d)) return true;
+    const dem = d.demandeurId != null ? db.get('users', d.demandeurId) : null;
+    return !!(dem && dem.managerId != null && Number(dem.managerId) === req.user.id);
+  }
+  function statutsDemande() {
+    const s = ctx.services.demandes;
+    const codes = Object.assign({ soumise: 'soumise', validee: 'validee', convertie: 'convertie' }, (s && s.STATUTS) || {});
+    const liste = ctx.liste('statutsDemande');
+    return { codes, libelle: (code) => { const it = liste.find((x) => x.code === code); return it ? it.label : String(code || ''); }, estFinal: (code) => { const it = liste.find((x) => x.code === code); return it ? !!it.final : ['refusee', 'cloturee'].includes(code); } };
   }
 
   /**
-   * Crée un OT. options : { systeme (pas de contrôle de droits/portée), createdBy, source, souple (champs perso non bloquants) }.
+   * Crée un OT. options : { systeme (pas de contrôle de droits/portée), createdBy, source, souple (champs perso
+   * non bloquants et équipement inactif toléré), champsSouples (champs perso non bloquants seulement) }.
+   * Hors création système, une demande d'origine doit être visible et validée (la validation reste du ressort
+   * du module Demandes) et un plan préventif visible, actif et sans OT ouvert ; l'OT d'un plan porte toujours
+   * sur l'équipement et le secteur du plan (la réalisation est reportée sur le plan à la clôture).
    */
   function creer(req, body, options = {}) {
     body = objet(body);
@@ -548,13 +616,28 @@ function register(ctx) {
     // Plan préventif : valeurs par défaut et gamme
     let plan = null;
     const planId = idRef(body.planPreventifId, 'Plan préventif');
-    if (planId != null) { plan = db.get('plansPreventifs', planId); if (!plan) throw new HttpError(400, 'Plan préventif introuvable'); }
+    if (planId != null) {
+      plan = db.get('plansPreventifs', planId);
+      if (!plan) throw new HttpError(400, 'Plan préventif introuvable');
+      if (!systeme) {
+        if (!perms.can(req.perms, 'preventif', 'voir') || !ctx.canSee(req, plan)) throw new HttpError(400, 'Plan préventif introuvable ou hors de votre périmètre');
+        if (plan.actif === false) throw new HttpError(400, `Le plan préventif ${plan.numero || plan.nom} est désactivé : aucun ordre de travail ne peut en être créé`);
+        const ouvert = db.findOne(ENTITE, (o) => Number(o.planPreventifId) === planId && !st.estFinal(o.statut));
+        if (ouvert) throw new HttpError(400, `Un ordre de travail est déjà ouvert pour ce plan préventif : ${ouvert.numero}`);
+        if (body.equipementId != null && body.equipementId !== '' && Number(body.equipementId) !== Number(plan.equipementId)) throw new HttpError(400, 'L\'ordre de travail d\'un plan préventif porte sur l\'équipement du plan');
+      }
+    }
     // Demande d'origine
     let demande = null;
     const demandeId = idRef(body.demandeId, 'Demande d\'intervention');
     if (demandeId != null) {
       demande = db.get('demandes', demandeId);
       if (!demande) throw new HttpError(400, 'Demande d\'intervention introuvable');
+      if (!systeme) {
+        if (!demandeVisible(req, demande)) throw new HttpError(400, 'Demande d\'intervention introuvable ou hors de votre périmètre');
+        const sd = statutsDemande();
+        if (demande.statut !== sd.codes.validee) throw new HttpError(400, `Seule une demande au statut « ${sd.libelle(sd.codes.validee)} » peut donner lieu à un ordre de travail (statut actuel : ${sd.libelle(demande.statut)})`);
+      }
       const existant = db.findOne(ENTITE, (o) => Number(o.demandeId) === demandeId && !st.estAnnulation(o.statut));
       if (existant) throw new HttpError(400, `Cette demande est déjà liée à l'ordre de travail ${existant.numero}`);
     }
@@ -563,8 +646,9 @@ function register(ctx) {
     if (demande) Object.assign(defauts, { titre: demande.titre, description: demande.description || '', typeCode: codeSouple('typesIntervention', demande.typeCode, 'correctif'), prioriteCode: codeSouple('priorites', demande.prioriteCode, 'normale'), equipementId: demande.equipementId == null ? undefined : demande.equipementId, secteurId: demande.secteurId == null ? undefined : demande.secteurId });
     const src = Object.assign({}, defauts);
     for (const [k, v] of Object.entries(body)) if (v !== undefined) src[k] = v;
-    const data = lireCorps(reqCtl, src, null, { champsSouples: !!options.souple, tolererInactif: !!options.souple });
-    const aff = lireAffectation(src, null);
+    if (plan && !systeme) { src.equipementId = plan.equipementId == null ? null : plan.equipementId; src.secteurId = plan.secteurId == null ? null : plan.secteurId; }
+    const data = lireCorps(reqCtl, src, null, { champsSouples: !!options.souple || !!options.champsSouples, tolererInactif: !!options.souple });
+    const aff = lireAffectation(reqCtl, src, null);
     if (!systeme && !can(req, 'affecter')) {
       // Sans le droit « affecter », seul l'utilisateur lui-même peut être désigné explicitement
       const demandes = [body.technicienId].concat(Array.isArray(body.techniciens) ? body.techniciens : []).filter((x) => x != null && x !== '');
@@ -599,10 +683,24 @@ function register(ctx) {
   }
 
   // ----- Changement de statut ---------------------------------------------------
-  function premiereDateTemps(o) {
-    const dates = (o.tempsPasse || []).map((t) => t.date).filter(Boolean).sort();
-    return dates[0] || null;
+  /**
+   * Le demandeur de la demande liée est-il prévenu par le module Demandes (clôture automatique de sa demande,
+   * ou retour à « validée » après annulation) ? Dans ce cas l'OT ne le notifie pas une seconde fois.
+   */
+  function demandeurPrevenuParDemandes(o, annulation) {
+    if (o.demandeId == null || !ctx.services.demandes) return false;
+    const d = db.get('demandes', o.demandeId);
+    if (!d || d.demandeurId == null) return false;
+    const sd = statutsDemande();
+    if (annulation) return d.statut === sd.codes.convertie;
+    if (wf().cloturerDemandeAvecOt === false) return false;
+    return !sd.estFinal(d.statut);
   }
+  /**
+   * Changement de statut. À la clôture, la date de début n'est jamais inventée : un OT clôturé sans avoir été
+   * démarré garde une date de début vide (les rapports l'excluent alors des durées d'intervention et du MTTR,
+   * plutôt que de compter 0 h ou les heures écoulées depuis minuit).
+   */
   function changerStatut(req, o, nouveau, opts = {}) {
     const st = ST();
     const ancien = o.statut;
@@ -613,7 +711,6 @@ function register(ctx) {
     if (nouveau === st.enCours && !o.dateDebut && !patch.dateDebut) patch.dateDebut = now;
     if (finalNouveau) {
       if (!patch.dateFin) patch.dateFin = now;
-      if (!o.dateDebut && !patch.dateDebut && !st.estAnnulation(nouveau)) patch.dateDebut = premiereDateTemps(o) || patch.dateFin;
       patch.cloturePar = req && req.user ? req.user.id : null;
       patch.dateCloture = now;
     } else if (finalAncien) {
@@ -628,7 +725,9 @@ function register(ctx) {
     const acteur = req && req.user ? req.user.id : null;
     if (opts.silencieux) { /* notifications déjà envoyées par l'appelant */ } else if (finalNouveau) {
       const annule = st.estAnnulation(nouveau);
-      notifier([maj.createdBy, demandeurDe(maj)].concat(maj.techniciens || []), acteur, {
+      const destinataires = [maj.createdBy].concat(maj.techniciens || []);
+      if (!demandeurPrevenuParDemandes(maj, annule)) destinataires.push(demandeurDe(maj));
+      notifier(destinataires, acteur, {
         titre: `OT ${maj.numero} ${annule ? 'annulé' : 'terminé'}`,
         message: annule ? `${maj.titre}${opts.commentaire ? ' — motif : ' + String(opts.commentaire).slice(0, 200) : ''}` : `${maj.titre}${maj.rapport ? ' — ' + String(maj.rapport).slice(0, 200) : ''}`,
         lien: `#/ot/${maj.id}`, type: annule ? 'alerte' : 'info',
@@ -731,7 +830,7 @@ function register(ctx) {
       enAttente: st.attente ? rows.filter((o) => o.statut === st.attente).length : 0,
       nonAffectes: ouverts.filter((o) => o.technicienId == null && !(o.techniciens || []).length).length,
       aujourdhui: ouverts.filter((o) => o.datePrevue && jourDe(o.datePrevue) === today).length,
-      terminesMois: rows.filter((o) => o.statut === st.termine && jourDe(o.dateFin || o.dateCloture).slice(0, 7) === mois).length,
+      terminesMois: rows.filter((o) => st.estCloture(o.statut) && jourDe(o.dateFin || o.dateCloture).slice(0, 7) === mois).length,
       parStatut,
     };
   }, { perm: [ENTITE, 'voir'] });
@@ -739,7 +838,10 @@ function register(ctx) {
   router.get('/api/ot-export', async (req, res) => {
     const refs = references();
     const rows = filtrer(req).map((o) => resume(o, refs));
-    const lib = (nomListe, code) => { const it = ctx.liste(nomListe).find((x) => x.code === code); return it ? it.label : (code || ''); };
+    // Listes de valeurs lues une seule fois (ctx.liste recopie la configuration à chaque appel)
+    const libelles = (nomListe) => new Map(ctx.liste(nomListe).map((x) => [x.code, x.label]));
+    const listes = { typesIntervention: libelles('typesIntervention'), priorites: libelles('priorites'), causesPanne: libelles('causesPanne') };
+    const lib = (nomListe, code) => (listes[nomListe].has(code) ? listes[nomListe].get(code) : (code || ''));
     const defs = ((ctx.config().champsPersonnalises || {})[ENTITE]) || [];
     const nombreFr = (n) => (n == null || n === '' ? '' : String(arrondi(n)).replace('.', ','));
     const entetes = ['Numéro', 'Titre', 'Type', 'Priorité', 'Statut', 'Équipement (n°)', 'Équipement', 'Secteur', 'Technicien responsable', 'Intervenants', 'Date prévue', 'Début', 'Fin', 'Durée estimée (h)', 'Temps passé (h)', 'Coût pièces', 'Coût main d\'œuvre', 'Coût externe', 'Coût total', 'Cause', 'Demande', 'Plan préventif', 'En retard', 'Créé le', 'Créé par', 'Clôturé par', 'Compte rendu'].concat(defs.map((d) => d.label));
@@ -757,14 +859,14 @@ function register(ctx) {
     res.end(lignes.join('\r\n'));
   }, { perm: [ENTITE, 'exporter'] });
 
-  /** Intervenants possibles (utilisateurs actifs ayant accès aux OT) avec leur charge. */
-  router.get('/api/ot-techniciens', async () => {
+  /** Intervenants possibles (utilisateurs actifs ayant accès aux OT, dans le périmètre du demandeur) avec leur charge. */
+  router.get('/api/ot-techniciens', async (req) => {
     const st = ST();
     const ouverts = db.list(ENTITE, (o) => !st.estFinal(o.statut));
     const config = db.getConfig();
     return db.list('users', (u) => u.actif !== false).map((u) => {
       const p = perms.effectivePermissions(db, u, null, config);
-      if (!perms.can(p, ENTITE, 'voir')) return null;
+      if (!perms.can(p, ENTITE, 'voir') || !technicienDansPerimetre(req, u)) return null;
       return {
         id: u.id, login: u.login, nom: u.nom, prenom: u.prenom || '', nomComplet: `${u.prenom || ''} ${u.nom || ''}`.trim() || u.login, fonction: u.fonction || '',
         secteurIds: u.secteurIds || [], profilNom: p.profilNom || '',
@@ -826,7 +928,7 @@ function register(ctx) {
     let affChangee = false;
     let nouveauxIntervenants = [];
     if (body.technicienId !== undefined || body.techniciens !== undefined) {
-      const aff = lireAffectation(body, o);
+      const aff = lireAffectation(req, body, o);
       affChangee = !egal(aff.technicienId, o.technicienId) || !egal(aff.techniciens.slice().sort(), (o.techniciens || []).map(Number).sort());
       if (affChangee) {
         if (!can(req, 'affecter')) throw new HttpError(403, 'Droit insuffisant : Ordres de travail › Affecter');
@@ -852,8 +954,10 @@ function register(ctx) {
   router.delete('/api/ot/:id', async (req) => {
     const o = getVisible(req, req.params.id);
     const st = ST();
-    if (o.statut === st.termine) throw new HttpError(400, `L'ordre de travail ${o.numero} est terminé : il ne peut pas être supprimé (traçabilité). Réouvrez-le puis annulez-le si nécessaire.`);
+    if (st.estCloture(o.statut)) throw new HttpError(400, `L'ordre de travail ${o.numero} est terminé (${st.libelle(o.statut)}) : il ne peut pas être supprimé (traçabilité). Réouvrez-le puis annulez-le si nécessaire.`);
     if ((o.pieces || []).length) throw new HttpError(400, 'Des pièces ont été sorties du stock pour cet ordre de travail : retirez-les (retour en stock) ou annulez l\'OT plutôt que de le supprimer');
+    const imput = imputationsAchats(o.id);
+    if (imput.total) throw new HttpError(400, `Des achats sont imputés à cet ordre de travail (${[imput.factures ? `${imput.factures} facture(s)` : '', imput.commandes ? `${imput.commandes} commande(s)` : ''].filter(Boolean).join(', ')}) : annulez-le plutôt que de le supprimer, pour conserver le lien et les coûts`);
     verifierPorteeSecteur(req, o.secteurId);
     db.remove(ENTITE, o.id);
     ctx.audit(req, 'suppression', ENTITE, o.id, `OT ${o.numero} : ${o.titre}`);
@@ -874,7 +978,8 @@ function register(ctx) {
       technicienId: garderAff ? source.technicienId : null, techniciens: garderAff ? (source.techniciens || []) : [],
       taches: (source.taches || []).map((t) => ({ libelle: t.libelle, duree: t.duree == null ? null : t.duree })), champs: source.champs || {},
     };
-    const o = creer(req, copie, { source: 'duplication', commentaire: `Copie de l'OT ${source.numero}` });
+    // Champs personnalisés repris tels quels : un champ rendu obligatoire après la création de la source ne bloque pas la copie
+    const o = creer(req, copie, { source: 'duplication', commentaire: `Copie de l'OT ${source.numero}`, champsSouples: true });
     return detail(req, o);
   }, { perm: [ENTITE, 'creer'] });
 
@@ -897,7 +1002,13 @@ function register(ctx) {
     }
     if (finalNouveau) {
       if (!peutCloturer(req, o)) throw new HttpError(403, 'Droit insuffisant : Ordres de travail › Clôturer');
-      if (st.estAnnulation(nouveau) && (o.pieces || []).length && !commentaire) throw new HttpError(400, 'Des pièces ont été consommées : précisez le motif de l\'annulation');
+      if (st.estAnnulation(nouveau)) {
+        if ((o.pieces || []).length && !commentaire) throw new HttpError(400, 'Des pièces ont été consommées : précisez le motif de l\'annulation');
+      } else {
+        // Statut final de réalisation : mêmes exigences que la clôture (compte rendu, relevé de compteur)
+        const r = cloturer(req, o, b, nouveau);
+        return Object.assign(detail(req, r.maj), { avertissements: r.avertissements });
+      }
     } else exigerRealisation(req, o);
     return detail(req, changerStatut(req, o, nouveau, { commentaire }));
   }, { perm: [ENTITE, 'voir'] });
@@ -908,7 +1019,7 @@ function register(ctx) {
     exigerOuvert(o, st);
     const b = objet(req.body);
     if (b.technicienId === undefined && b.techniciens === undefined && b.datePrevue === undefined) throw new HttpError(400, 'Indiquez un technicien, des intervenants ou une date prévue');
-    const aff = lireAffectation({ technicienId: b.technicienId, techniciens: b.techniciens }, o);
+    const aff = lireAffectation(req, { technicienId: b.technicienId, techniciens: b.techniciens }, o);
     const patch = Object.assign({}, aff);
     if (b.datePrevue !== undefined) patch.datePrevue = lireDate(b.datePrevue, 'La date prévue');
     if (b.dureeEstimee !== undefined) patch.dureeEstimee = nombre(b.dureeEstimee, 'La durée estimée', { min: 0, max: 10000 });
@@ -930,12 +1041,13 @@ function register(ctx) {
     return detail(req, maj);
   }, { perm: [ENTITE, 'affecter'] });
 
-  router.post('/api/ot/:id/cloturer', async (req) => {
-    const o = getVisible(req, req.params.id);
+  /**
+   * Clôture (statut final de réalisation `statutFinal`) : compte rendu obligatoire, relevé de compteur contrôlé
+   * puis reporté sur l'équipement, dates vérifiées. Retourne { maj, avertissements }.
+   */
+  function cloturer(req, o, b, statutFinal) {
     const st = ST();
-    if (!peutCloturer(req, o)) throw new HttpError(403, 'Droit insuffisant : Ordres de travail › Clôturer');
     exigerOuvert(o, st);
-    const b = objet(req.body);
     const rapport = texte(b.rapport, 'Le compte rendu', { requis: true, min: 3, max: MAX_RAPPORT });
     const causeCode = b.causeCode === undefined ? (o.causeCode == null ? null : o.causeCode) : codeListe('causesPanne', b.causeCode, 'Cause de panne', null);
     const compteurReleve = nombre(b.compteurReleve, 'Le relevé de compteur', { min: 0, max: 1e12 });
@@ -981,9 +1093,17 @@ function register(ctx) {
     const nonFaites = (o.taches || []).filter((t) => !t.fait).length;
     if (nonFaites) avertissements.push(`${nonFaites} tâche(s) de la gamme non cochée(s)`);
     if (!(o.tempsPasse || []).length) avertissements.push('Aucun temps passé n\'a été saisi');
-    const patch = { rapport, causeCode, compteurReleve, coutExterne, fournisseurId, dateFin, dateDebut: dateDebut || premiereDateTemps(o) || dateFin };
-    const maj = changerStatut(req, o, st.termine, { patch, commentaire: rapport.length > 160 ? rapport.slice(0, 157) + '…' : rapport });
-    return Object.assign(detail(req, maj), { avertissements });
+    if (!dateDebut) avertissements.push('L\'ordre de travail n\'a pas été démarré : sans date de début, sa durée d\'intervention n\'entre pas dans les indicateurs (MTTR, heures d\'arrêt)');
+    const patch = { rapport, causeCode, compteurReleve, coutExterne, fournisseurId, dateFin, dateDebut: dateDebut || null };
+    const maj = changerStatut(req, o, statutFinal, { patch, commentaire: rapport.length > 160 ? rapport.slice(0, 157) + '…' : rapport });
+    return { maj, avertissements };
+  }
+
+  router.post('/api/ot/:id/cloturer', async (req) => {
+    const o = getVisible(req, req.params.id);
+    if (!peutCloturer(req, o)) throw new HttpError(403, 'Droit insuffisant : Ordres de travail › Clôturer');
+    const r = cloturer(req, o, objet(req.body), ST().termine);
+    return Object.assign(detail(req, r.maj), { avertissements: r.avertissements });
   }, { perm: [ENTITE, 'voir'] });
 
   router.post('/api/ot/:id/reouvrir', async (req) => {
@@ -1005,24 +1125,48 @@ function register(ctx) {
     const heures = arrondi(nombre(b.heures, 'Le nombre d\'heures', { requis: true, positif: true, max: 24 }));
     if (heures <= 0) throw new HttpError(400, 'Le nombre d\'heures doit être strictement positif');
     const userId = b.userId == null || b.userId === '' ? req.user.id : idRef(b.userId, 'Intervenant');
-    if (userId !== req.user.id && !can(req, 'modifier') && !can(req, 'affecter')) throw new HttpError(403, 'Vous ne pouvez saisir que votre propre temps passé');
-    if (userId !== req.user.id) utilisateurActif(userId, 'Intervenant');
+    const pourAutrui = userId !== req.user.id;
+    if (pourAutrui && !can(req, 'modifier') && !can(req, 'affecter')) throw new HttpError(403, 'Vous ne pouvez saisir que votre propre temps passé');
     const commentaire = texte(b.commentaire, 'Le commentaire', { max: 500 });
     const temps = o.tempsPasse || [];
     if (temps.length >= MAX_TEMPS) throw new HttpError(400, 'Nombre maximal de saisies de temps atteint');
+    const patch = {};
+    let nouvelIntervenant = false;
+    if (!estAffecte(userId, o)) {
+      // Du temps pour une personne non affectée revient à l'affecter : droit « affecter » (sauf pour soi-même),
+      // intervenant contrôlé comme pour une affectation (accès aux OT, périmètre), ajout tracé et notifié
+      if (pourAutrui && !can(req, 'affecter')) throw new HttpError(403, `Droit insuffisant : Ordres de travail › Affecter (${ctx.nomUser(userId) || 'cette personne'} n'est pas affecté(e) à cet ordre de travail)`);
+      const aff = lireAffectation(req, { techniciens: (o.techniciens || []).concat([userId]) }, o);
+      patch.techniciens = aff.techniciens;
+      nouvelIntervenant = true;
+    } else if (pourAutrui) utilisateurActif(userId, 'Intervenant');
     const dejaJour = temps.filter((t) => Number(t.userId) === userId && t.date === date).reduce((s, t) => s + (Number(t.heures) || 0), 0);
     if (dejaJour + heures > 24) throw new HttpError(400, `Total journalier dépassé : ${ctx.nomUser(userId)} a déjà ${arrondi(dejaJour)} h saisies le ${date.split('-').reverse().join('/')}`);
-    const patch = { tempsPasse: temps.concat([{ userId, date, heures, commentaire, saisiPar: req.user.id, dateSaisie: maintenant() }]) };
-    if (!estAffecte(userId, o)) patch.techniciens = (o.techniciens || []).concat([userId]);
+    patch.tempsPasse = temps.concat([{ uid: uid(), userId, date, heures, commentaire, saisiPar: req.user.id, dateSaisie: maintenant() }]);
+    if (nouvelIntervenant) patch.historique = (o.historique || []).concat([entree(req, 'affectation', o.statut, `Intervenant ajouté : ${ctx.nomUser(userId)} (saisie de temps)`)]);
     avecCouts(o, patch);
     const maj = db.update(ENTITE, o.id, patch);
+    if (nouvelIntervenant) {
+      ctx.audit(req, 'affectation', ENTITE, o.id, `OT ${o.numero} : intervenant ajouté ${ctx.nomUser(userId)} (saisie de temps)`);
+      if (pourAutrui) notifier([userId], req.user.id, { titre: `Affectation : OT ${maj.numero}`, message: `${maj.titre} — ${heures} h saisie(s) pour vous par ${ctx.nomUser(req.user.id)}`, lien: `#/ot/${maj.id}`, type: 'info' });
+    }
     ctx.audit(req, 'temps', ENTITE, o.id, `OT ${o.numero} : ${heures} h le ${date} pour ${ctx.nomUser(userId)}${commentaire ? ' — ' + commentaire : ''}`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
-  function indexDans(liste, valeur, message) {
-    const idx = Number(valeur);
-    if (!Number.isInteger(idx) || idx < 0 || idx >= (liste || []).length) throw new HttpError(404, message);
+  /**
+   * Position d'une ligne désignée par son identifiant stable `uid` (recommandé : une requête rejouée après
+   * suppression échoue en 404 au lieu d'atteindre la ligne suivante) ou, à défaut, par son index.
+   */
+  function indexDans(liste, ref, message) {
+    const s = String(ref == null ? '' : ref).trim();
+    if (/^\d+$/.test(s)) {
+      const idx = Number(s);
+      if (idx >= (liste || []).length) throw new HttpError(404, message);
+      return idx;
+    }
+    const idx = (liste || []).findIndex((x) => x && x.uid != null && x.uid === s);
+    if (idx < 0) throw new HttpError(404, message);
     return idx;
   }
 
@@ -1065,7 +1209,7 @@ function register(ctx) {
     const art = (r && r.article) || db.get('articles', articleId) || article;
     const pu = mouvement && mouvement.prixUnitaire != null && mouvement.prixUnitaire !== '' ? Number(mouvement.prixUnitaire) : Number(art.prixUnitaire);
     const courant = db.get(ENTITE, o.id) || o;
-    const piece = { articleId, code: art.code || '', designation: art.designation || '', uniteCode: art.uniteCode || null, quantite, prixUnitaire: Number.isFinite(pu) ? pu : 0, mouvementId: mouvement && mouvement.id != null ? mouvement.id : null, date: maintenant(), userId: req.user.id };
+    const piece = { uid: uid(), articleId, code: art.code || '', designation: art.designation || '', uniteCode: art.uniteCode || null, quantite, prixUnitaire: Number.isFinite(pu) ? pu : 0, mouvementId: mouvement && mouvement.id != null ? mouvement.id : null, date: maintenant(), userId: req.user.id };
     const maj = db.update(ENTITE, o.id, avecCouts(courant, { pieces: (courant.pieces || []).concat([piece]) }));
     ctx.audit(req, 'pieces', ENTITE, o.id, `OT ${o.numero} : sortie de ${quantite} × ${piece.code ? piece.code + ' ' : ''}${piece.designation}`);
     return detail(req, maj);
@@ -1104,7 +1248,7 @@ function register(ctx) {
     const taches = o.taches || [];
     if (taches.length >= MAX_TACHES) throw new HttpError(400, `Nombre maximal de tâches atteint (${MAX_TACHES})`);
     const ordre = taches.reduce((m, t) => Math.max(m, Number(t.ordre) || 0), 0) + 1;
-    const maj = db.update(ENTITE, o.id, { taches: taches.concat([{ ordre, libelle, duree: nombre(b.duree, 'La durée de la tâche', { min: 0, max: 1000 }), fait: false, faitPar: null, dateFait: null }]) });
+    const maj = db.update(ENTITE, o.id, { taches: taches.concat([{ uid: uid(), ordre, libelle, duree: nombre(b.duree, 'La durée de la tâche', { min: 0, max: 1000 }), fait: false, faitPar: null, dateFait: null }]) });
     ctx.audit(req, 'modification', ENTITE, o.id, `OT ${o.numero} : tâche ajoutée « ${libelle} »`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
@@ -1133,14 +1277,16 @@ function register(ctx) {
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
+  /** Retirer une étape de la gamme (éventuellement réglementaire) exige le droit « modifier », comme la renommer ; la suppression est tracée dans l'historique. */
   router.delete('/api/ot/:id/taches/:index', async (req) => {
     const o = getVisible(req, req.params.id);
-    exigerRealisation(req, o);
+    if (!can(req, 'modifier')) throw new HttpError(403, 'Droit insuffisant : Ordres de travail › Modifier (la suppression d\'une tâche de la gamme est réservée à ce droit)');
     exigerOuvert(o);
     const idx = indexDans(o.taches, req.params.index, 'Tâche introuvable');
     const sup = o.taches[idx];
     const taches = o.taches.filter((_, i) => i !== idx).map((t, i) => Object.assign({}, t, { ordre: i + 1 }));
-    const maj = db.update(ENTITE, o.id, { taches });
+    const historique = (o.historique || []).concat([entree(req, 'modification', o.statut, `Tâche supprimée de la gamme : « ${sup.libelle} »${sup.fait ? ' (elle était cochée)' : ''}`)]);
+    const maj = db.update(ENTITE, o.id, { taches, historique });
     ctx.audit(req, 'modification', ENTITE, o.id, `OT ${o.numero} : tâche supprimée « ${sup.libelle} »`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
@@ -1150,7 +1296,7 @@ function register(ctx) {
     const o = getVisible(req, req.params.id);
     const b = objet(req.body);
     const t = texte(b.texte, 'Le commentaire', { requis: true, max: MAX_COMMENTAIRE });
-    const commentaires = (o.commentaires || []).concat([{ userId: req.user.id, date: maintenant(), texte: t }]);
+    const commentaires = (o.commentaires || []).concat([{ uid: uid(), userId: req.user.id, date: maintenant(), texte: t }]);
     const maj = db.update(ENTITE, o.id, { commentaires });
     ctx.audit(req, 'commentaire', ENTITE, o.id, `OT ${o.numero} : ${t.slice(0, 200)}`);
     notifier([o.createdBy].concat(o.techniciens || []), req.user.id, { titre: `Commentaire sur l'OT ${o.numero}`, message: `${ctx.nomUser(req.user.id)} : ${t.slice(0, 200)}`, lien: `#/ot/${o.id}?onglet=commentaires`, type: 'info' });
@@ -1185,7 +1331,7 @@ function register(ctx) {
     const docs = o.documents || [];
     if (docs.length >= MAX_DOCS) throw new HttpError(400, `Nombre maximal de documents atteint (${MAX_DOCS})`);
     const type = String(b.type || m[1] || 'application/octet-stream').slice(0, 100);
-    const doc = { nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, date: maintenant(), userId: req.user.id, description: String(b.description || '').trim().slice(0, 500) };
+    const doc = { uid: uid(), nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, date: maintenant(), userId: req.user.id, description: String(b.description || '').trim().slice(0, 500) };
     const maj = db.update(ENTITE, o.id, { documents: docs.concat([doc]) });
     ctx.audit(req, 'document', ENTITE, o.id, `OT ${o.numero} : document ajouté ${nomDoc} (${Math.max(1, Math.round(taille / 1024))} Ko)`);
     return { ok: true, document: resumeDoc(doc, maj.documents.length - 1), documents: maj.documents.map(resumeDoc) };

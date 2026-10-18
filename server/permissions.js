@@ -258,6 +258,13 @@ function can(perms, module, action) {
 /** Champs d'un enregistrement considérés comme « appartenance » pour la portée « perso ». */
 const CHAMPS_PERSO = ['createdBy', 'demandeurId', 'technicienId', 'responsableId', 'utilisateurId', 'assigneA'];
 
+/** L'utilisateur est-il l'intervenant désigné (OT, plan préventif : `technicienId`, `techniciens[]`) ? */
+function estIntervenant(record, uid) {
+  if (uid == null) return false;
+  if (record.technicienId != null && Number(record.technicienId) === uid) return true;
+  return Array.isArray(record.techniciens) && record.techniciens.map(Number).includes(uid);
+}
+
 /**
  * L'utilisateur peut-il voir cet enregistrement selon sa portée ?
  * @param {object} [options] { ecriture: true } pour une modification : les sites en lecture seule sont exclus.
@@ -273,14 +280,14 @@ function canSeeRecord(perms, user, record, options) {
   const lecture = !ecriture && sid != null && Array.isArray(perms.secteurIdsLecture) && perms.secteurIdsLecture.includes(sid);
   if (perms.portee === 'secteurs' || perms.portee === 'site') {
     if (sid == null) return true; // élément non rattaché à un secteur
-    return perms.secteurIds.includes(sid) || lecture;
+    // L'intervenant désigné d'un élément (OT, plan préventif) le voit même hors de ses secteurs, comme en portée « perso »
+    return perms.secteurIds.includes(sid) || lecture || estIntervenant(record, user ? user.id : null);
   }
   // perso
   if (lecture) return true;
   const uid = user.id;
   for (const c of CHAMPS_PERSO) if (record[c] != null && Number(record[c]) === uid) return true;
-  if (Array.isArray(record.techniciens) && record.techniciens.map(Number).includes(uid)) return true;
-  return false;
+  return estIntervenant(record, uid);
 }
 
 /** Applique le site choisi dans l'en-tête (« tous » ou id d'un site accessible). */

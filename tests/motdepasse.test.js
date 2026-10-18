@@ -1030,3 +1030,154 @@ describe('Changement de mot de passe imposé par le serveur', () => {
     assert.equal(b.motDePasse.doitChanger, false, 'le mot de passe choisi avec le code n\'est pas à changer');
   });
 });
+
+// =====================================================================================================
+// Constats de revue : inondation depuis un poste, mot de passe expiré en session, prise en main d'un
+// compte plus privilégié, identifiants et messages reçus des routes publiques
+// =====================================================================================================
+describe('Routes publiques et prise en main : limites par poste, session ouverte, droits, nettoyage', () => {
+  const http = require('http');
+  let srv, admin, info, profils, secteurs;
+  const profil = (nom) => profils.find((p) => p.nom === nom).id;
+  const secteur = (code) => secteurs.find((s) => s.code === code).id;
+  const user = (login) => srv.db.findOne('users', (u) => u.login === login);
+  const notifs = (login, filtre) => srv.db.list('notifications', (n) => n.userId === user(login).id && (!filtre || filtre(n)));
+  const journal = (filtre) => srv.db.list('audit', filtre);
+  /** Appel HTTP depuis une adresse locale donnée (127.0.0.x) : le serveur voit un poste différent. */
+  function appelDepuis(ip, method, url, body) {
+    return new Promise((resolve, reject) => {
+      const data = Buffer.from(JSON.stringify(body || {}));
+      const req = http.request({ host: '127.0.0.1', port: srv.app.server.address().port, method, path: url, localAddress: ip, headers: { 'x-requested-with': 'GMAO', host: '127.0.0.1', 'content-type': 'application/json', 'content-length': data.length } }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => { let b; try { b = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) { b = null; } resolve({ status: res.statusCode, body: b }); });
+      });
+      req.on('error', reject);
+      req.end(data);
+    });
+  }
+  async function compte(login, nomProfil, extra = {}) {
+    await admin.ok('POST', '/api/utilisateurs', Object.assign({ login, nom: login.toUpperCase(), prenom: 'P', profilId: profil(nomProfil), password: login + '-mdp1', doitChangerMdp: false }, extra));
+    return user(login);
+  }
+  async function connecte(login, mdp) { const c = srv.client(); await c.login(login, mdp || login + '-mdp1'); return c; }
+
+  before(async () => {
+    srv = await demarrer();
+    admin = srv.client(); await admin.login('admin', 'admin');
+    profils = await admin.ok('GET', '/api/profils');
+    secteurs = await admin.ok('GET', '/api/secteurs');
+    await compte('info', 'Pôle informatique');
+    info = await connecte('info');
+  });
+  after(async () => { await srv.stop(); });
+
+  test('un poste qui change d\'identifiant à chaque essai est refusé après 20 échecs : journal et alertes bornés', async () => {
+    const statuts = {};
+    for (let i = 0; i < 40; i++) {
+      const r = await appelDepuis('127.0.0.66', 'POST', '/api/auth/reinitialiser', { login: 'x' + i, code: 'AAAA-AAAA', nouveau: 'Abcdef-12345' });
+      statuts[r.status] = (statuts[r.status] || 0) + 1;
+    }
+    assert.deepEqual(statuts, { 400: 20, 429: 20 }, 'refus par poste, avant tout calcul d\'empreinte');
+    assert.equal(journal((a) => a.action === 'echec_reinitialisation_mdp' && a.ip === '127.0.0.66').length, 20, 'au plus 20 entrées par poste et par quart d\'heure');
+    assert.equal(journal((a) => a.action === 'blocage' && a.ip === '127.0.0.66').length, 1);
+    const alertes = notifs('info', (n) => n.titre === 'Poste temporairement bloqué');
+    assert.equal(alertes.length, 1, 'une seule alerte, regroupée');
+    assert.match(alertes[0].message, /127\.0\.0\.66/);
+    // La connexion depuis ce poste est refusée aussi ; les autres postes ne sont pas concernés
+    assert.equal((await appelDepuis('127.0.0.66', 'POST', '/api/auth/login', { login: 'admin', password: 'admin' })).status, 429);
+    assert.equal((await appelDepuis('127.0.0.67', 'POST', '/api/auth/login', { login: 'admin', password: 'admin' })).status, 200);
+    srv.app.sessions.quotas.clear();
+  });
+
+  test('identifiant saisi cité dans le journal et les alertes sans caractères de mise en forme ; message de demande nettoyé', async () => {
+    srv.app.sessions.tentatives.clear(); srv.app.sessions.quotas.clear();
+    for (let i = 0; i < 8; i++) await appelDepuis('127.0.0.77', 'POST', '/api/auth/reinitialiser', { login: '\u202eadmin\u2028x', code: 'AAAA-AAAA', nouveau: 'x' });
+    const alerte = notifs('info', (n) => n.titre === 'Compte temporairement bloqué').pop();
+    assert.ok(alerte, 'blocage signalé');
+    assert.ok(!/[\u202e\u2028]/.test(alerte.message), 'aucun caractère de direction ou séparateur de ligne');
+    assert.match(alerte.message, /« \?admin\?x »/);
+    assert.ok(journal((a) => a.ip === '127.0.0.77').every((a) => !/[\u202e\u2028]/.test(a.details)), 'journal nettoyé');
+    await compte('jdupont', 'Technicien');
+    await srv.client().post('/api/auth/mot-de-passe-oublie', { login: 'jdupont', message: 'Urgent\u200f \u2028\u0085\u200b\ufeff fin\nligne 2' });
+    await new Promise((r) => setTimeout(r, 50));
+    const d = srv.db.findOne('demandesMdp', (x) => x.login === 'jdupont');
+    assert.ok(!/[\u200f\u2028\u0085\u200b\ufeff]/.test(d.message), 'caractères invisibles retirés : ' + JSON.stringify(d.message));
+    assert.match(d.message, /^Urgent +fin\nligne 2$/, 'retour à la ligne ordinaire conservé');
+    srv.app.sessions.tentatives.clear(); srv.app.sessions.quotas.clear();
+  });
+
+  test('mot de passe expiré pendant une session ouverte : le mot de passe actuel reste exigé', async () => {
+    await compte('exp1', 'Technicien');
+    const c = await connecte('exp1');
+    const autre = await connecte('exp1');
+    const cfg = srv.db.getConfig(); cfg.securite.expirationMdpJours = 30; srv.db.setConfig(cfg);
+    srv.db.update('users', user('exp1').id, { dateMdp: new Date(Date.now() - 31 * JOUR).toISOString() });
+    const me = await c.ok('GET', '/api/auth/me');
+    assert.equal(me.motDePasse.raison, 'expire');
+    assert.equal(me.motDePasse.doitChanger, true);
+    assert.equal(me.motDePasse.ancienRequis, true, 'session ouverte avant l\'échéance : mot de passe actuel exigé');
+    assert.equal((await c.get('/api/equipements')).status, 403, 'changement imposé');
+    let r = await c.post('/api/auth/mot-de-passe', { nouveau: 'exp1-nouveau' });
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /mot de passe actuel/);
+    assert.equal((await c.post('/api/auth/mot-de-passe', { ancien: 'faux', nouveau: 'exp1-nouveau' })).status, 400);
+    assert.equal((await autre.get('/api/auth/me')).status, 200, 'l\'autre session n\'a pas été fermée par ces essais');
+    assert.equal((await c.post('/api/auth/mot-de-passe', { ancien: 'exp1-mdp1', nouveau: 'exp1-nouveau' })).status, 200);
+    assert.equal((await autre.get('/api/auth/me')).status, 401, 'autres sessions fermées par le changement');
+    // Changement imposé dès la connexion (mot de passe saisi à l'instant) : pas redemandé
+    srv.db.update('users', user('exp1').id, { dateMdp: new Date(Date.now() - 31 * JOUR).toISOString() });
+    const c2 = srv.client();
+    const b = await c2.login('exp1', 'exp1-nouveau');
+    assert.equal(b.motDePasse.raison, 'expire');
+    assert.equal(b.motDePasse.ancienRequis, false);
+    assert.equal((await c2.post('/api/auth/mot-de-passe', { nouveau: 'exp1-troisieme' })).status, 200);
+    const cfg2 = srv.db.getConfig(); cfg2.securite.expirationMdpJours = 0; srv.db.setConfig(cfg2);
+  });
+
+  test('réinitialisation, mot de passe, double authentification ou code d\'un compte qui a des droits que le gestionnaire ne peut pas accorder : refusés', async () => {
+    const valreas = await admin.ok('POST', '/api/secteurs', { nom: 'Valréas', code: 'VAL', type: 'site' });
+    const prodB = await admin.ok('POST', '/api/secteurs', { nom: 'Prod B', code: 'PRODB', type: 'service', parentId: valreas.id });
+    await compte('gest2', 'Chef de secteur', { secteurIds: [secteur('PROD')], overrides: { utilisateurs: { voir: true, modifier: true } }, siteAcces: [{ siteId: valreas.id, mode: 'lecture' }] });
+    const gest = await connecte('gest2');
+    await compte('cible2', 'Technicien', { secteurIds: [secteur('PROD'), prodB.id], overrides: { audit: { voir: true } } });
+    await compte('cible3', 'Technicien', { secteurIds: [secteur('PROD')] });
+    const id2 = user('cible2').id;
+    assert.equal((await gest.put('/api/utilisateurs/' + id2, { overrides: { audit: { voir: true } } })).status, 403, 'droit non possédé');
+    let r = await gest.post(`/api/utilisateurs/${id2}/reinitialiser-mdp`, { mode: 'code' });
+    assert.equal(r.status, 403);
+    assert.match(r.body.erreur, /Journal d'activité › Voir/);
+    assert.match(r.body.erreur, /Prod B/);
+    assert.equal((await gest.post(`/api/utilisateurs/${id2}/reinitialiser-mdp`, { mode: 'temporaire' })).status, 403);
+    assert.equal((await gest.put('/api/utilisateurs/' + id2, { password: 'Nouveau-Mdp#1' })).status, 403);
+    assert.equal((await gest.post(`/api/utilisateurs/${id2}/2fa/reinitialiser`)).status, 403);
+    await info.ok('POST', `/api/utilisateurs/${id2}/reinitialiser-mdp`, { mode: 'code' });
+    assert.equal((await gest.del(`/api/utilisateurs/${id2}/code-reinitialisation`)).status, 403);
+    assert.equal(user('cible2').reinitialisation != null, true, 'code conservé');
+    // Compte sans dépassement : réinitialisation permise
+    const ok = await gest.ok('POST', `/api/utilisateurs/${user('cible3').id}/reinitialiser-mdp`, { mode: 'code' });
+    assert.match(ok.code, FORMAT_CODE);
+    // Les gestionnaires notifiés d'une demande « mot de passe oublié » suivent la même règle
+    assert.equal(srv.ctx.motsDePasse.gestionnaires(user('cible2')).some((u) => u.login === 'gest2'), false);
+    assert.equal(srv.ctx.motsDePasse.gestionnaires(user('cible3')).some((u) => u.login === 'gest2'), true);
+  });
+
+  test('annuler son propre code de réinitialisation est refusé ; réglages oui / non en texte refusés', async () => {
+    await compte('info2', 'Pôle informatique');
+    const info2 = await connecte('info2');
+    const id = user('info2').id;
+    await admin.ok('POST', `/api/utilisateurs/${id}/reinitialiser-mdp`, { mode: 'code' });
+    const r = await info2.del(`/api/utilisateurs/${id}/code-reinitialisation`);
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /propre compte/);
+    assert.ok(user('info2').reinitialisation, 'code conservé');
+    for (const corps of [{ reinitialisationAutonome: 'false' }, { motDePasseOublie: 'non' }, { forcerChangementMdpInitial: 0 }, { notifierBlocages: 'true' }]) {
+      const rr = await admin.put('/api/configuration', { securite: corps });
+      assert.equal(rr.status, 400, JSON.stringify(corps));
+      assert.match(rr.body.erreur, /oui \/ non/);
+    }
+    const s = srv.db.getConfig().securite;
+    assert.equal(s.reinitialisationAutonome, false);
+    assert.equal(s.motDePasseOublie, true);
+  });
+});

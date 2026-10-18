@@ -435,3 +435,152 @@ describe('Options des modules : valeurs permises et bornes', () => {
     assert.match(lib.listes.statutsAbsence[0].label, /\(RH\)$/);
   });
 });
+
+describe('Secteurs, portée et crochets du cœur (constats de revue)', () => {
+  let srv, admin, profils, secteurs;
+  const profil = (n) => profils.find((p) => p.nom === n).id;
+  const secteur = (c) => secteurs.find((s) => s.code === c);
+  async function compte(login, nomProfil, extra = {}) {
+    await admin.ok('POST', '/api/utilisateurs', Object.assign({ login, nom: login, profilId: profil(nomProfil), password: login + '-mdp', doitChangerMdp: false }, extra));
+    const c = srv.client(); await c.login(login, login + '-mdp'); return c;
+  }
+  before(async () => {
+    srv = await demarrer(); admin = srv.client(); await admin.login('admin', 'admin');
+    profils = await admin.ok('GET', '/api/profils');
+    secteurs = await admin.ok('GET', '/api/secteurs');
+  });
+  after(async () => { await srv.stop(); });
+
+  test('un secteur ne peut pas être détaché de son site par un utilisateur limité à son périmètre (Plans 3D ou Configuration › Modifier)', async () => {
+    const prod = secteur('PROD');
+    const chef = await compte('chef_plans', 'Chef de secteur', { secteurIds: [prod.id], overrides: { plans: { modifier: true } } });
+    let r = await chef.put('/api/secteurs/' + prod.id, { parentId: null, type: 'site' });
+    assert.equal(r.status, 403, JSON.stringify(r.body));
+    r = await chef.put('/api/secteurs/' + prod.id, { parentId: null });
+    assert.equal(r.status, 403);
+    // Même avec Configuration › Modifier, sans accès à tous les sites
+    await admin.ok('POST', '/api/profils', { nom: 'Paramétreur de secteur', niveau: 3, portee: 'secteurs', permissions: { configuration: { voir: true, modifier: true } } });
+    profils = await admin.ok('GET', '/api/profils');
+    const param = await compte('param_secteur', 'Paramétreur de secteur', { secteurIds: [prod.id] });
+    r = await param.put('/api/secteurs/' + prod.id, { parentId: null, type: 'site' });
+    assert.equal(r.status, 403);
+    assert.match(r.body.erreur, /tous les sites/);
+    const apres = srv.db.get('secteurs', prod.id);
+    assert.equal(apres.parentId, prod.parentId, 'parent inchangé');
+    assert.equal(apres.type, 'service');
+    assert.equal(srv.ctx.siteDuSecteur(prod.id), secteur('SITE').id);
+    // Le chef renomme toujours son secteur (Plans 3D › Modifier)
+    assert.equal((await chef.put('/api/secteurs/' + prod.id, { nom: 'Production (atelier)' })).status, 200);
+    await admin.ok('PUT', '/api/secteurs/' + prod.id, { nom: 'Production' });
+  });
+
+  test('supprimer un secteur référencé par des articles, plans préventifs ou commandes est refusé sans ?forcer=1, qui rattache au parent', async () => {
+    const log = secteur('LOG');
+    const mag = await admin.ok('POST', '/api/secteurs', { nom: 'Magasin B', code: 'MAGB', type: 'magasin', parentId: log.id });
+    const art = srv.db.insert('articles', { code: 'ART-MB', designation: 'Roulement', secteurId: mag.id, actif: true, quantite: 1 });
+    const pp = srv.db.insert('plansPreventifs', { numero: 'PP-MB', nom: 'Graissage', secteurId: mag.id, actif: true });
+    const cmd = srv.db.insert('commandes', { numero: 'CMD-MB', secteurId: mag.id, statut: 'brouillon' });
+    const r = await admin.del('/api/secteurs/' + mag.id);
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /1 article\(s\) de stock/);
+    assert.match(r.body.erreur, /1 plan\(s\) préventif\(s\)/);
+    assert.match(r.body.erreur, /1 commande\(s\)/);
+    assert.ok(srv.db.get('secteurs', mag.id), 'secteur conservé');
+    const ok = await admin.ok('DELETE', `/api/secteurs/${mag.id}?forcer=1`);
+    assert.equal(ok.rattachesA, log.id);
+    assert.equal(srv.db.get('articles', art.id).secteurId, log.id);
+    assert.equal(srv.db.get('plansPreventifs', pp.id).secteurId, log.id);
+    assert.equal(srv.db.get('commandes', cmd.id).secteurId, log.id);
+    // Visible avec le site choisi dans l'en-tête (plus aucun secteur orphelin)
+    const perms = require('../server/permissions');
+    const u = srv.db.findOne('users', (x) => x.login === 'admin');
+    const p = perms.effectivePermissions(srv.db, u, null, srv.db.getConfig());
+    perms.appliquerSiteCourant(srv.db, p, String(secteur('SITE').id));
+    assert.equal(perms.canSeeRecord(p, u, srv.db.get('articles', art.id)), true);
+  });
+
+  test('portée « secteurs » : l\'intervenant désigné voit l\'OT ou le plan qui lui est affecté hors de ses secteurs', async () => {
+    const perms = require('../server/permissions');
+    await compte('tech_maint', 'Technicien', { secteurIds: [secteur('MAINT').id] });
+    const u = srv.db.findOne('users', (x) => x.login === 'tech_maint');
+    const p = perms.effectivePermissions(srv.db, u, null, srv.db.getConfig());
+    const prod = secteur('PROD').id;
+    const affecte = srv.db.insert('ot', { numero: 'OT-A', titre: 'Affecté', secteurId: prod, statut: 'nouveau', technicienId: u.id });
+    const equipe = srv.db.insert('ot', { numero: 'OT-E', titre: 'En équipe', secteurId: prod, statut: 'nouveau', techniciens: [99, u.id] });
+    const autre = srv.db.insert('ot', { numero: 'OT-X', titre: 'Autre', secteurId: prod, statut: 'nouveau', technicienId: 99 });
+    const req = { user: u, perms: p, ecriture: false };
+    assert.deepEqual(srv.ctx.scope(req, [affecte, equipe, autre]).map((o) => o.numero), ['OT-A', 'OT-E']);
+    assert.equal(perms.canSeeRecord(p, u, affecte, { ecriture: true }), true, 'il peut aussi y intervenir');
+    assert.equal(perms.canSeeRecord(p, u, autre), false);
+    // Le site choisi dans l'en-tête filtre toujours
+    const filtre = perms.effectivePermissions(srv.db, u, null, srv.db.getConfig());
+    filtre.siteFiltre = [];
+    assert.equal(perms.canSeeRecord(filtre, u, affecte), false);
+  });
+
+  test('section sauvegardes : non réinitialisable depuis Configuration ; paramètres réservés à Système › Modifier, bornes et chiffrement contrôlés', async () => {
+    const cfg = srv.db.getConfig();
+    cfg.sauvegardes = Object.assign({}, cfg.sauvegardes, { motDePasseChiffrement: '', cleReception: 'sha256:cle', destinations: [{ id: 1, type: 'serveur', nom: 'Valréas', cle: 'CLE-VAL' }], automatique: true, frequenceHeures: 24 });
+    srv.db.setConfig(cfg);
+    await admin.ok('POST', '/api/profils', { nom: 'Paramétreur', niveau: 3, portee: 'tous', permissions: { configuration: { voir: true, modifier: true } } });
+    profils = await admin.ok('GET', '/api/profils');
+    const param = await compte('param', 'Paramétreur');
+    for (const c of [param, admin]) {
+      const r = await c.post('/api/configuration/reinitialiser/sauvegardes');
+      assert.equal(r.status, 400);
+      assert.match(r.body.erreur, /Système & informatique/);
+      assert.equal((await c.post('/api/configuration/reinitialiser/reseau')).status, 400);
+    }
+    let s = srv.db.getConfig().sauvegardes;
+    assert.equal(s.destinations.length, 1, 'destinations conservées');
+    assert.equal(s.cleReception, 'sha256:cle', 'clé de réception conservée');
+    // Configuration › Modifier seul : aucun paramètre de sauvegarde modifiable
+    const r = await param.put('/api/configuration', { sauvegardes: { automatique: false, accepterReception: true, chiffrer: true, frequenceHeures: -5, conserverLocal: -1 } });
+    assert.equal(r.status, 403);
+    assert.match(r.body.erreur, /Système › Modifier/);
+    s = srv.db.getConfig().sauvegardes;
+    assert.equal(s.automatique, true); assert.equal(!!s.accepterReception, false); assert.equal(s.chiffrer, false); assert.equal(s.frequenceHeures, 24);
+    // Système › Modifier : bornes et invariant « chiffrement ⇒ mot de passe »
+    assert.equal((await admin.put('/api/configuration', { sauvegardes: { frequenceHeures: -5 } })).status, 400);
+    assert.equal((await admin.put('/api/configuration', { sauvegardes: { conserverLocal: -1 } })).status, 400);
+    assert.equal((await admin.put('/api/configuration', { sauvegardes: { automatique: 'false' } })).status, 400);
+    const chiffre = await admin.put('/api/configuration', { sauvegardes: { chiffrer: true } });
+    assert.equal(chiffre.status, 400);
+    assert.match(chiffre.body.erreur, /mot de passe de chiffrement/);
+    const ok = await admin.ok('PUT', '/api/configuration', { sauvegardes: { automatique: false, frequenceHeures: 12, cleReception: 'pirate', motDePasseChiffrement: 'pirate' } });
+    assert.equal(ok.sauvegardes.frequenceHeures, 12);
+    assert.equal(ok.sauvegardes.cleReception, undefined, 'secret jamais renvoyé');
+    s = srv.db.getConfig().sauvegardes;
+    assert.equal(s.cleReception, 'sha256:cle', 'secret jamais modifié par cette route');
+    assert.equal(s.motDePasseChiffrement, '');
+    const vue = await param.ok('GET', '/api/configuration');
+    assert.equal(vue.sauvegardes.cleReceptionDefinie, true);
+    assert.equal(vue.sauvegardes.nbDestinations, 1);
+    assert.ok(!JSON.stringify(vue).includes('CLE-VAL'));
+  });
+
+  test('amorçage : libellés du journal transmis aux vues ; crochets onArret et avantCorps', async () => {
+    const me = await admin.ok('GET', '/api/auth/me');
+    assert.equal(me.libelles.actions.echec_connexion, 'Échec de connexion');
+    assert.equal(me.libelles.entites.commandes, 'Commandes fournisseurs');
+    // avantCorps : contrôle avant la lecture du corps d'une route brute publique
+    let corpsVu = 'non appelé';
+    srv.ctx.router.post('/api/test-avant-corps', async (req) => ({ taille: req.body.length }), {
+      public: true, brut: true, maxBody: 1024 * 1024,
+      avantCorps: (req) => { corpsVu = req.body; if (req.headers['x-cle'] !== 'bonne') throw new srv.ctx.HttpError(403, 'Clé invalide'); },
+    });
+    const envoyer = (cle) => fetch(srv.base + '/api/test-avant-corps', { method: 'POST', headers: { 'content-type': 'application/octet-stream', 'x-cle': cle }, body: Buffer.alloc(300 * 1024, 65) });
+    let r = await envoyer('mauvaise');
+    assert.equal(r.status, 403);
+    assert.equal(corpsVu, undefined, 'corps non lu avant le contrôle');
+    r = await envoyer('bonne');
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).taille, 300 * 1024);
+    // onArret : appelé par app.stop()
+    const autre = await demarrer();
+    let arrete = false;
+    autre.ctx.onArret(() => { arrete = true; });
+    await autre.stop();
+    assert.equal(arrete, true);
+  });
+});

@@ -280,7 +280,7 @@ describe('Plans 3D', () => {
     assert.equal(imp.objets.find((o) => o.id === 'm1').equipementId, eqProd.id);
     assert.equal(imp.objets.find((o) => o.id === 'z').secteurId, prod.id);
     assert.ok(imp.fond && imp.fond.imageUrl);
-    assert.equal(imp.rapport.liensConserves, 1);
+    assert.equal(imp.rapport.liensConserves, 2, 'lien d\'équipement et lien de secteur rétablis, tous deux comptés');
     // import vers le site 2 : le lien d'équipement du site 1 est retiré (aucun EQ-T1 à Valréas)
     const imp2 = await admin.ok('POST', '/api/plans/import', { fichier: ex.body, secteurId: site2.id });
     assert.equal(imp2.objets.find((o) => o.id === 'm1').equipementId, null);
@@ -375,7 +375,10 @@ describe('Plans 3D', () => {
     assert.equal((await rm.post(`/api/plans/${p2.id}/dupliquer`, {})).status, 403, 'duplication vers le même site (lecture seule) refusée');
     // il modifie son propre site
     assert.equal((await rm.put('/api/plans/' + p1.id, { version: 1, nom: 'Plan Carpentras MS (modifié)' })).status, 200);
-    // il ne peut pas lier un équipement du site en lecture seule
+    // il ne peut pas lier un équipement du site en lecture seule à un plan de son site
+    const lien = await rm.put('/api/plans/' + p1.id, { version: 2, objets: [machine('v', { equipementId: eqSite2.id })] });
+    assert.equal(lien.status, 400);
+    assert.match(lien.body.erreur, /hors de votre portée|autre site/);
     // filtre de site courant par en-tête
     const a2 = clientSite(site2.id);
     await a2.login('admin', 'admin');
@@ -386,6 +389,152 @@ describe('Plans 3D', () => {
     await a1.login('admin', 'admin');
     assert.ok((await a1.ok('GET', '/api/plans')).every((x) => x.siteId === site1.id));
     assert.equal((await a1.post('/api/plans', planSimple({ nom: 'Hors site courant', secteurId: prod2.id }))).status, 403, 'création hors du site courant refusée');
+  });
+
+  test('plan général (sans secteur) : modifiable et supprimable uniquement avec la portée « tous »', async () => {
+    const general = await admin.ok('POST', '/api/plans', { nom: 'Plan général du groupe', secteurId: null, dimensions: { largeur: 100, profondeur: 80 } });
+    assert.equal(general.secteurId, null);
+    // responsable maintenance limité au site 2, avec l'en-tête de site de Valréas
+    await admin.ok('POST', '/api/utilisateurs', { login: 'rm_val_gen', nom: 'rm_val_gen', password: 'pass1234', doitChangerMdp: false, profilId: profil('Responsable maintenance'), porteeOverride: 'site', secteurIds: [prod2.id] });
+    const rmVal = clientSite(site2.id);
+    await rmVal.login('rm_val_gen', 'pass1234');
+    assert.equal((await rmVal.post('/api/plans', { nom: 'X', secteurId: null })).status, 400, 'création d\'un plan général refusée');
+    const vu = (await rmVal.ok('GET', '/api/plans')).find((p) => p.id === general.id);
+    assert.ok(vu, 'le plan général reste consultable');
+    assert.equal(vu.droits.modifier, false);
+    assert.equal(vu.droits.supprimer, false);
+    const det = await rmVal.put('/api/plans/' + general.id, { version: 1, secteurId: prod2.id });
+    assert.equal(det.status, 403, 'détournement vers son propre secteur refusé');
+    assert.equal(srv.db.get('plans', general.id).secteurId, null);
+    assert.equal((await rmVal.del('/api/plans/' + general.id)).status, 403);
+    // chef de secteur (portée secteurs) avec surcharges plans
+    const chef = await utilisateur('chef_gen', { profilId: profil('Chef de secteur'), secteurIds: [prod.id], overrides: { plans: { modifier: true, supprimer: true } } });
+    assert.equal((await chef.ok('GET', '/api/plans/' + general.id)).droits.modifier, false);
+    assert.equal((await chef.put('/api/plans/' + general.id, { version: 1, description: 'retouche' })).status, 403);
+    assert.equal((await chef.del('/api/plans/' + general.id)).status, 403);
+    assert.ok(srv.db.get('plans', general.id), 'plan général intact');
+    // l'administrateur, même sous le filtre d'un site, le modifie
+    const a2 = clientSite(site2.id);
+    await a2.login('admin', 'admin');
+    assert.equal((await a2.put('/api/plans/' + general.id, { version: 1, description: 'retouche' })).status, 200);
+  });
+
+  test('portée « perso » : le plan créé sur un site passé en lecture seule n\'est plus modifiable ni supprimable', async () => {
+    const d = await utilisateur('dem_perso', { profilId: profil('Demandeur'), secteurIds: [prod.id], siteAcces: [{ siteId: site2.id, mode: 'complet' }], overrides: { plans: { creer: true, modifier: true, supprimer: true } } });
+    const p = await d.ok('POST', '/api/plans', { nom: 'Plan du demandeur à Valréas', secteurId: prod2.id });
+    const p2 = await d.ok('POST', '/api/plans', { nom: 'Autre plan à Valréas', secteurId: prod2.id });
+    const mien = await d.ok('POST', '/api/plans', { nom: 'Plan de mon secteur', secteurId: prod.id });
+    assert.equal((await d.ok('GET', '/api/plans/' + p.id)).droits.modifier, true, 'accès complet : modifiable');
+    const uid = srv.db.findOne('users', (u) => u.login === 'dem_perso').id;
+    await admin.ok('PUT', '/api/utilisateurs/' + uid, { siteAcces: [{ siteId: site2.id, mode: 'lecture' }] });
+    const fiche = await d.ok('GET', '/api/plans/' + p.id);
+    assert.equal(fiche.droits.lectureSeule, true);
+    assert.equal(fiche.droits.modifier, false);
+    assert.equal(fiche.droits.supprimer, false);
+    const r = await d.put('/api/plans/' + p.id, { version: 1, nom: 'Modifié malgré la lecture seule' });
+    assert.equal(r.status, 403);
+    assert.match(r.body.erreur, /lecture seule/);
+    assert.equal((await d.del('/api/plans/' + p2.id)).status, 403);
+    assert.ok(srv.db.get('plans', p2.id));
+    // il garde la main sur le plan de son propre secteur
+    assert.equal((await d.put('/api/plans/' + mien.id, { version: 1, description: 'ok' })).status, 200);
+    assert.equal((await d.del('/api/plans/' + mien.id)).status, 200);
+  });
+
+  test('suppression du secteur d\'un plan : refusée sans ?forcer=1, puis plan rattaché au parent ; un plan au secteur disparu reste modifiable', async () => {
+    const bat = await admin.ok('POST', '/api/secteurs', { nom: 'Bâtiment B', code: 'BAT-B', type: 'batiment', parentId: site1.id });
+    const p = await admin.ok('POST', '/api/plans', planSimple({ nom: 'Plan du bâtiment B', secteurId: bat.id }));
+    const refus = await admin.del('/api/secteurs/' + bat.id);
+    assert.equal(refus.status, 400);
+    assert.match(refus.body.erreur, /plan/i);
+    assert.equal((await admin.del('/api/secteurs/' + bat.id + '?forcer=1')).status, 200);
+    assert.equal(srv.db.get('plans', p.id).secteurId, site1.id, 'plan rattaché au site parent');
+    const t = await utilisateur('tech_bat_b', { profilId: profil('Technicien'), porteeOverride: 'site', secteurIds: [prod.id] });
+    assert.equal((await t.get('/api/plans/' + p.id)).status, 200, 'toujours visible pour le site');
+    assert.equal((await admin.put('/api/plans/' + p.id, { version: 1, description: 'Retouche' })).status, 200);
+    // base ancienne : secteur disparu sans rattachement → le plan reste modifiable, et peut être déplacé
+    srv.db.update('plans', p.id, { secteurId: 987654 });
+    const m = await admin.put('/api/plans/' + p.id, { version: 2, description: 'Retouche 2' });
+    assert.equal(m.status, 200, JSON.stringify(m.body));
+    assert.equal((await admin.put('/api/plans/' + p.id, { version: 3, secteurId: 99999 })).status, 400, 'déplacement vers un secteur inexistant refusé');
+    assert.equal((await admin.put('/api/plans/' + p.id, { version: 3, secteurId: prod.id })).status, 200);
+  });
+
+  test('un équipement invisible n\'est pas distingué d\'un équipement inexistant dans les erreurs de validation', async () => {
+    const bat = await admin.ok('POST', '/api/secteurs', { nom: 'Bâtiment oracle', code: 'BAT-O', type: 'batiment', parentId: maint.id });
+    const p = await admin.ok('POST', '/api/plans', planSimple({ nom: 'Plan oracle', secteurId: bat.id }));
+    const rm = await utilisateur('rm_oracle', { profilId: profil('Responsable maintenance'), porteeOverride: 'secteurs', secteurIds: [maint.id] });
+    assert.equal((await rm.get('/api/equipements/' + eqSg.id)).status, 404);
+    const existe = await rm.put('/api/plans/' + p.id, { version: 1, objets: [machine('m', { equipementId: eqSg.id })] });
+    const inexistant = await rm.put('/api/plans/' + p.id, { version: 1, objets: [machine('m', { equipementId: 987654 })] });
+    assert.equal(existe.status, 400); assert.equal(inexistant.status, 400);
+    assert.equal(existe.body.erreur.replace(String(eqSg.id), 'N'), inexistant.body.erreur.replace('987654', 'N'), 'même message dans les deux cas');
+  });
+
+  test('erreur de validation d\'un objet : identifiant de l\'objet fautif dans les détails', async () => {
+    const r = await admin.post('/api/plans', planSimple({ objets: [machine('bon'), machine('mauvais', { x: 1e9 })] }));
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /hors limites/);
+    assert.deepEqual(r.body.details, { objetId: 'mauvais', index: 1 });
+  });
+
+  test('rapport d\'import et de duplication : les liens de secteur rétablis sont comptés', async () => {
+    const p = await admin.ok('POST', '/api/plans', planSimple({ nom: 'Zones seules', objets: [
+      { id: 'z1', type: 'zone', x: 5, y: 5, largeur: 4, profondeur: 4, secteurId: prod.id },
+      { id: 'z2', type: 'zone', x: 15, y: 5, largeur: 4, profondeur: 4, secteurId: maint.id },
+    ] }));
+    const ex = (await admin.get(`/api/plans/${p.id}/export`)).body;
+    const imp = await admin.ok('POST', '/api/plans/import', { fichier: ex, secteurId: site1.id });
+    assert.equal(imp.objets.find((o) => o.id === 'z1').secteurId, prod.id);
+    assert.deepEqual(imp.rapport, { liensRetires: 0, liensConserves: 2 });
+    const imp2 = await admin.ok('POST', '/api/plans/import', { fichier: ex, secteurId: site2.id });
+    assert.deepEqual(imp2.rapport, { liensRetires: 2, liensConserves: 0 });
+    const dup = await admin.ok('POST', `/api/plans/${p.id}/dupliquer`, {});
+    assert.deepEqual(dup.rapport, { liensRetires: 0, liensConserves: 2 });
+  });
+
+  test('duplication : les responsables du secteur et du site sont prévenus comme à la création', async () => {
+    const resp = await utilisateur('resp_dup', { profilId: profil('Chef de secteur'), secteurIds: [prod.id] });
+    void resp;
+    const rid = srv.db.findOne('users', (u) => u.login === 'resp_dup').id;
+    srv.db.update('secteurs', prod.id, { responsableId: rid });
+    try {
+      const p = await admin.ok('POST', '/api/plans', planSimple({ nom: 'Source notifiée', secteurId: prod.id }));
+      const nb = () => srv.db.count('notifications', (n) => n.userId === rid && /Nouveau plan 3D/.test(n.titre));
+      assert.equal(nb(), 1, 'création notifiée');
+      const c = await admin.ok('POST', `/api/plans/${p.id}/dupliquer`, { nom: 'Copie notifiée' });
+      assert.equal(nb(), 2, 'duplication notifiée');
+      assert.ok(srv.db.findOne('notifications', (n) => n.userId === rid && n.lien === '#/plans/' + c.id));
+    } finally { srv.db.update('secteurs', prod.id, { responsableId: null }); }
+  });
+
+  test('liste et fiche : même nombre d\'équipements liés pour une portée restreinte, nom d\'un équipement masqué non révélé', async () => {
+    const bat = await admin.ok('POST', '/api/secteurs', { nom: 'Bâtiment masque', code: 'BAT-MQ', type: 'batiment', parentId: maint.id });
+    // objet « local » : autre équipement masqué, avec un nom choisi par l'éditeur
+    const eqSg2 = srv.db.insert('equipements', { numero: 'EQ-SG-2', nom: 'Pompe confidentielle', secteurId: sg.id, etatCode: 'en_service', actif: true });
+    const p = await admin.ok('POST', '/api/plans', planSimple({ nom: 'Plan masque', secteurId: bat.id, objets: [machine('vis', { equipementId: eqMaint.id }), machine('cache', { equipementId: eqSg.id, x: 30, nom: 'Compresseur confidentiel' }), machine('local', { equipementId: eqSg2.id, x: 40, nom: 'Machine locale' })] }));
+    const rm = await utilisateur('rm_masque', { profilId: profil('Responsable maintenance'), porteeOverride: 'secteurs', secteurIds: [maint.id] });
+    const carte = (await rm.ok('GET', '/api/plans')).find((x) => x.id === p.id);
+    const fiche = await rm.get('/api/plans/' + p.id);
+    assert.equal(carte.nbLies, 1, 'la liste ne compte que les équipements visibles');
+    assert.equal(fiche.body.nbLies, 1);
+    assert.equal((await admin.ok('GET', '/api/plans/' + p.id)).nbLies, 3);
+    const cache = fiche.body.objets.find((o) => o.id === 'cache');
+    assert.equal(cache.equipementMasque, true);
+    assert.equal(cache.nom, '', 'désignation de l\'équipement masqué retirée');
+    assert.equal(cache.nomMasque, true);
+    assert.equal(fiche.body.objets.find((o) => o.id === 'local').nom, 'Machine locale', 'nom propre à l\'objet conservé');
+    assert.equal(fiche.brut.includes('Compresseur confidentiel'), false);
+    const ex = await rm.get(`/api/plans/${p.id}/export`);
+    assert.equal(ex.brut.includes('Compresseur confidentiel'), false, 'export JSON sans la désignation masquée');
+    // enregistrement par cet utilisateur : lien et nom d\'origine conservés
+    await rm.ok('PUT', '/api/plans/' + p.id, { version: fiche.body.version, objets: fiche.body.objets.map((o) => (o.id === 'vis' ? Object.assign({}, o, { x: 12 }) : o)) });
+    const stocke = srv.db.get('plans', p.id).objets.find((o) => o.id === 'cache');
+    assert.equal(stocke.equipementId, eqSg.id);
+    assert.equal(stocke.nom, 'Compresseur confidentiel');
+    // un nom choisi par l\'utilisateur remplace le nom masqué
+    await rm.ok('PUT', '/api/plans/' + p.id, { version: fiche.body.version + 1, objets: fiche.body.objets.map((o) => (o.id === 'cache' ? Object.assign({}, o, { nom: 'Compresseur n°2' }) : o)) });
+    assert.equal(srv.db.get('plans', p.id).objets.find((o) => o.id === 'cache').nom, 'Compresseur n°2');
   });
 
   // ----- Événements, notifications ------------------------------------------------------------

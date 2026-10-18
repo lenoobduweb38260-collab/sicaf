@@ -243,8 +243,14 @@ describe('Ordres de travail', () => {
     assert.equal((await techLimite.get(`/api/ot/${o.id}`)).body.actions.cloturer, false);
     config({ workflow: { autoriserTechnicienCloture: true } });
     assert.equal((await techLimite.get(`/api/ot/${o.id}`)).body.actions.cloturer, true);
-    const fini = await techLimite.ok('POST', `/api/ot/${o.id}/statut`, { statut: 'termine' });
+    // Un statut final de réalisation obéit aux mêmes règles que la clôture : compte rendu obligatoire
+    const sansRapport = await techLimite.post(`/api/ot/${o.id}/statut`, { statut: 'termine' });
+    assert.equal(sansRapport.status, 400);
+    assert.match(sansRapport.body.erreur, /compte rendu est obligatoire/);
+    assert.equal(srv.db.get('ot', o.id).statut, 'en_cours', 'statut inchangé');
+    const fini = await techLimite.ok('POST', `/api/ot/${o.id}/statut`, { statut: 'termine', rapport: 'Intervention terminée sans anomalie.' });
     assert.equal(fini.statut, 'termine');
+    assert.equal(fini.rapport, 'Intervention terminée sans anomalie.');
     assert.ok(fini.dateFin && fini.dateCloture);
     assert.equal(fini.cloturePar, uTechLimite.id);
     assert.equal(evts('ot:termine', o.id).length, 1);
@@ -391,8 +397,13 @@ describe('Ordres de travail', () => {
     assert.equal((await techLimite.put(`/api/ot/${o.id}/taches/0`, { fait: 'oui' })).status, 400);
     assert.equal((await techLimite.put(`/api/ot/${o.id}/taches/0`, { libelle: 'Renommage' })).status, 403, 'renommage réservé au droit modifier');
     assert.equal((await techLimite.put(`/api/ot/${o.id}/taches/7`, { fait: true })).status, 404);
-    r = await techLimite.ok('DELETE', `/api/ot/${o.id}/taches/1`);
+    // Retirer une étape de la gamme (copiée d'un plan) est réservé au droit « modifier », comme la renommer
+    assert.equal((await techLimite.del(`/api/ot/${o.id}/taches/1`)).status, 403, 'suppression réservée au droit modifier');
+    assert.equal(srv.db.get('ot', o.id).taches.length, 3);
+    assert.equal((await techLimite.get(`/api/ot/${o.id}`)).body.actions.modifier, false);
+    r = await resp.ok('DELETE', `/api/ot/${o.id}/taches/1`);
     assert.deepEqual(r.taches.map((t) => t.ordre), [1, 2]);
+    assert.ok(r.historique.some((h) => h.action === 'modification' && /Tâche supprimée.*Graisser les colonnes/.test(h.commentaire)), 'suppression tracée dans l\'historique');
     // Service ouvertsPour
     const ouverts = srv.ctx.services.ot.ouvertsPour({ planPreventifId: plan.id });
     assert.deepEqual(ouverts.map((x) => x.id), [o.id]);
@@ -548,10 +559,318 @@ describe('Ordres de travail', () => {
     assert.equal(encore.id, otId);
     // Une seconde création manuelle liée à la même demande est refusée
     assert.equal((await resp.post('/api/ot', { titre: 'Doublon', demandeId: d.id })).status, 400);
-    // Clôture de l'OT → clôture de la demande (option cloturerDemandeAvecOt)
+    // Clôture de l'OT → clôture de la demande (option cloturerDemandeAvecOt) ; le demandeur est prévenu une seule fois
+    const avantCloture = notifsDe(uDemandeur.id).length;
     await chefProd.ok('POST', `/api/ot/${otId}/cloturer`, { rapport: 'Palier resserré, bruit disparu.' });
     assert.equal(srv.db.get('demandes', d.id).statut, 'cloturee');
-    assert.ok(notifsDe(uDemandeur.id).some((n) => /OT .* terminé/.test(n.titre)), 'demandeur notifié de la fin de l\'intervention');
+    const nouvelles = notifsDe(uDemandeur.id).slice(avantCloture);
+    assert.equal(nouvelles.length, 1, `une seule notification de fin d'intervention : ${nouvelles.map((n) => n.titre).join(' | ')}`);
+    assert.match(nouvelles[0].titre, /Demande .* clôturée|OT .* terminé/);
+    // Sans clôture automatique de la demande, c'est l'OT qui prévient le demandeur
+    const d2 = await demandeur.ok('POST', '/api/demandes', { titre: 'Vibration anormale presse test', equipementId: presse.id, prioriteCode: 'normale', typeCode: 'correctif' });
+    const v2 = await chefProd.ok('POST', `/api/demandes/${d2.id}/valider`, {});
+    const otId2 = (v2.demande && v2.demande.otId) || v2.otId || (srv.db.get('demandes', d2.id) || {}).otId;
+    config({ workflow: { cloturerDemandeAvecOt: false } });
+    try {
+      const avant2 = notifsDe(uDemandeur.id).length;
+      await chefProd.ok('POST', `/api/ot/${otId2}/cloturer`, { rapport: 'Fixations resserrées.' });
+      const n2 = notifsDe(uDemandeur.id).slice(avant2);
+      assert.equal(n2.length, 1);
+      assert.match(n2[0].titre, /OT .* terminé/);
+      assert.equal(srv.db.get('demandes', d2.id).statut, 'convertie', 'demande non clôturée (option désactivée)');
+    } finally { config({ workflow: { cloturerDemandeAvecOt: true } }); }
+  });
+
+  test('création depuis une demande : demande visible et validée uniquement (la validation reste au module Demandes)', async () => {
+    // Demande d'un autre secteur (LOG), encore soumise : invisible pour le technicien PROD
+    const diLog = await admin.ok('POST', '/api/demandes', { titre: 'Fuite hydraulique mât (confidentiel LOG)', description: 'Détail réservé à la logistique', equipementId: chariot.id, prioriteCode: 'haute', typeCode: 'correctif' });
+    assert.equal(diLog.statut, 'soumise');
+    assert.equal((await techProd.get(`/api/demandes/${diLog.id}`)).status, 404);
+    const horsPortee = await techProd.post('/api/ot', { titre: 'OT pirate', demandeId: diLog.id, equipementId: null, secteurId: PROD, technicienId: uTechProd.id });
+    assert.equal(horsPortee.status, 400, 'demande hors périmètre refusée même en remplaçant équipement et secteur');
+    assert.match(horsPortee.body.erreur, /hors de votre périmètre/);
+    assert.ok(!JSON.stringify(horsPortee.body).includes('confidentiel'), 'aucune information de la demande ne fuit');
+    let d = srv.db.get('demandes', diLog.id);
+    assert.equal(d.statut, 'soumise');
+    assert.ok(d.otId == null && d.validateurId == null, 'demande intacte');
+    // Demande visible mais seulement soumise : un OT ne vaut pas validation
+    const diProd = await demandeur.ok('POST', '/api/demandes', { titre: 'Grincement presse (à valider)', equipementId: presse.id, prioriteCode: 'normale', typeCode: 'correctif' });
+    const soumise = await techProd.post('/api/ot', { titre: 'Intervention presse', demandeId: diProd.id });
+    assert.equal(soumise.status, 400);
+    assert.match(soumise.body.erreur, /Validée.*statut actuel : Soumise/);
+    assert.equal(srv.db.get('demandes', diProd.id).statut, 'soumise');
+    // Demande validée (sans OT automatique) : création manuelle acceptée, valideur conservé
+    config({ workflow: { otAutoDepuisDemande: false } });
+    try {
+      const v = await chefProd.ok('POST', `/api/demandes/${diProd.id}/valider`, {});
+      assert.equal(v.statut, 'validee');
+      const o = await techProd.ok('POST', '/api/ot', { titre: 'Intervention presse', demandeId: diProd.id });
+      assert.equal(o.demandeId, diProd.id);
+      assert.equal(o.equipementId, presse.id);
+      assert.equal(o.demande.numero, diProd.numero);
+      d = srv.db.get('demandes', diProd.id);
+      assert.equal(d.statut, 'convertie');
+      assert.equal(d.validateurId, uChefProd.id, 'le valideur reste celui de la validation');
+      assert.equal(d.otId, o.id);
+      // Demande refusée : aucun OT
+      const diRef = await demandeur.ok('POST', '/api/demandes', { titre: 'Demande refusée test', equipementId: presse.id, prioriteCode: 'basse', typeCode: 'correctif' });
+      await chefProd.ok('POST', `/api/demandes/${diRef.id}/refuser`, { motif: 'Hors maintenance' });
+      assert.equal((await chefProd.post('/api/ot', { titre: 'OT sur refus', demandeId: diRef.id })).status, 400);
+      assert.equal(srv.db.get('demandes', diRef.id).otId, null);
+      // Le service système (conversion par le module Demandes) reste inchangé
+      const diSys = await demandeur.ok('POST', '/api/demandes', { titre: 'Demande convertie par le service', equipementId: presse.id, prioriteCode: 'basse', typeCode: 'correctif' });
+      await chefProd.ok('POST', `/api/demandes/${diSys.id}/valider`, {});
+      const conv = await chefProd.ok('POST', `/api/demandes/${diSys.id}/convertir`, {});
+      assert.equal(conv.statut, 'convertie');
+      assert.ok(conv.otId != null);
+    } finally { config({ workflow: { otAutoDepuisDemande: true } }); }
+  });
+
+  test('création depuis un plan préventif : plan visible et actif, un seul OT ouvert, équipement du plan imposé', async () => {
+    const planLog = srv.db.insert('plansPreventifs', { numero: 'PP-T02', nom: 'VGP chariot LOG', description: 'Secret LOG', equipementId: chariot.id, secteurId: LOG, typeCode: 'reglementaire', prioriteCode: 'haute', periodicite: { type: 'mois', valeur: 12 }, prochaineEcheance: jourLocal(-30), derniereExecution: jourLocal(-395), gamme: [{ ordre: 1, libelle: 'Contrôle organisme agréé', duree: 2 }], pieces: [], actif: true });
+    assert.equal((await techProd.get(`/api/preventif/${planLog.id}`)).status, 404, 'plan hors périmètre');
+    const r = await techProd.post('/api/ot', { titre: 'OT bidon', planPreventifId: planLog.id, equipementId: null, secteurId: PROD, technicienId: uTechProd.id });
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /hors de votre périmètre/);
+    assert.ok(!JSON.stringify(r.body).includes('organisme agréé') && !JSON.stringify(r.body).includes('Secret LOG'), 'la gamme et la description du plan ne fuient pas');
+    assert.equal(srv.db.count('ot', (o) => o.planPreventifId === planLog.id), 0);
+    const avant = srv.db.get('plansPreventifs', planLog.id);
+    assert.equal(avant.prochaineEcheance, jourLocal(-30), 'échéance du plan intacte');
+    // Plan du secteur : l'équipement du plan est imposé (le corps ne peut ni l'effacer ni le remplacer)
+    const planProd = srv.db.insert('plansPreventifs', { numero: 'PP-T03', nom: 'Contrôle presse trimestriel', equipementId: presse.id, secteurId: PROD, typeCode: 'preventif', prioriteCode: 'normale', periodicite: { type: 'mois', valeur: 3 }, prochaineEcheance: jourLocal(5), gamme: [{ ordre: 1, libelle: 'Contrôle des sécurités', duree: 1 }], pieces: [], actif: true });
+    assert.equal((await techProd.post('/api/ot', { titre: 'Autre équipement', planPreventifId: planProd.id, equipementId: chariot.id })).status, 400);
+    const o = await techProd.ok('POST', '/api/ot', { titre: 'Contrôle presse', planPreventifId: planProd.id, equipementId: null, secteurId: null, technicienId: uTechProd.id });
+    assert.equal(o.equipementId, presse.id, 'équipement du plan repris');
+    assert.equal(o.secteurId, PROD);
+    assert.equal(o.taches.length, 1);
+    // Un seul OT ouvert par plan (comme la génération préventive)
+    const doublon = await techProd.post('/api/ot', { titre: 'Doublon', planPreventifId: planProd.id });
+    assert.equal(doublon.status, 400);
+    assert.match(doublon.body.erreur, /déjà ouvert/);
+    // Plan désactivé
+    srv.db.update('plansPreventifs', planProd.id, { actif: false });
+    await chefProd.ok('POST', `/api/ot/${o.id}/statut`, { statut: 'annule', commentaire: 'Test' });
+    const inactif = await techProd.post('/api/ot', { titre: 'Plan inactif', planPreventifId: planProd.id });
+    assert.equal(inactif.status, 400);
+    assert.match(inactif.body.erreur, /désactivé/);
+    // La génération système (service) n'est pas concernée par ces contrôles
+    const genere = srv.ctx.services.ot.creer({ planPreventifId: planProd.id }, null, { systeme: true, souple: true, source: 'plan' });
+    assert.equal(genere.planPreventifId, planProd.id);
+    srv.db.update('plansPreventifs', planProd.id, { actif: true });
+  });
+
+  test('portée « site » et « perso » en écriture : secteurs hors périmètre et sites en lecture seule refusés', async () => {
+    const siteB = await admin.ok('POST', '/api/secteurs', { nom: 'Usine B', code: 'USB', type: 'site' });
+    const atelierB = await admin.ok('POST', '/api/secteurs', { nom: 'Atelier B1', code: 'B1', type: 'atelier', parentId: siteB.id });
+    const siteC = await admin.ok('POST', '/api/secteurs', { nom: 'Usine C', code: 'USC', type: 'site' });
+    const atelierC = await admin.ok('POST', '/api/secteurs', { nom: 'Atelier C1', code: 'C1', type: 'atelier', parentId: siteC.id });
+    const profils = await admin.ok('GET', '/api/profils');
+    const chef = profils.find((x) => x.nom === 'Chef de secteur').id;
+    await admin.ok('POST', '/api/utilisateurs', { login: 'chefsite', nom: 'Site', prenom: 'Sam', profilId: chef, porteeOverride: 'site', secteurIds: [PROD], siteAcces: [{ siteId: siteB.id, mode: 'lecture' }], password: 'site1234', doitChangerMdp: false });
+    const cs = srv.client(); await cs.login('chefsite', 'site1234');
+    assert.equal((await cs.post('/api/ot', { titre: 'OT site lecture seule', secteurId: atelierB.id })).status, 403, 'site en lecture seule');
+    assert.equal((await cs.post('/api/ot', { titre: 'OT site inconnu', secteurId: atelierC.id })).status, 403, 'site sans accès');
+    const ok = await cs.ok('POST', '/api/ot', { titre: 'OT de mon site', secteurId: PROD });
+    assert.equal((await cs.put(`/api/ot/${ok.id}`, { secteurId: atelierB.id })).status, 403, 'déplacement vers un site en lecture seule');
+    assert.equal(srv.db.get('ot', ok.id).secteurId, PROD);
+    const eqB = srv.db.insert('equipements', { numero: 'EQ-B1', nom: 'Presse usine B', typeCode: 'machine', etatCode: 'en_service', criticiteCode: 'B', secteurId: atelierB.id, actif: true, documents: [], champs: {}, createdBy: 1 });
+    assert.equal((await cs.post('/api/ot', { titre: 'OT équipement lecture seule', equipementId: eqB.id })).status, 400, 'équipement d\'un site en lecture seule');
+    // Portée « perso » limitée à ses secteurs
+    const tech = profils.find((x) => x.nom === 'Technicien').id;
+    await admin.ok('POST', '/api/utilisateurs', { login: 'tperso2', nom: 'Perso', prenom: 'Paul', profilId: tech, porteeOverride: 'perso', secteurIds: [PROD], password: 'perso1234', doitChangerMdp: false });
+    const cp = srv.client(); await cp.login('tperso2', 'perso1234');
+    assert.equal((await cp.post('/api/ot', { titre: 'OT perso hors secteur', secteurId: LOG })).status, 403);
+    assert.equal((await cp.ok('POST', '/api/ot', { titre: 'OT perso dans son secteur', secteurId: PROD })).secteurId, PROD);
+  });
+
+  test('clôture sans démarrage : aucune date de début inventée (indicateurs de durée non faussés)', async () => {
+    const o = await resp.ok('POST', '/api/ot', { titre: 'Clôturé sans démarrer', equipementId: presse.id, technicienId: uTechProd.id, typeCode: 'correctif' });
+    const c = await techProd.ok('POST', `/api/ot/${o.id}/cloturer`, { rapport: 'Réparation faite dans la foulée.' });
+    assert.equal(c.statut, 'termine');
+    assert.equal(c.dateDebut, null, 'pas de date de début = date de fin');
+    assert.ok(c.avertissements.some((a) => /pas été démarré/.test(a)), 'l\'utilisateur est averti');
+    // Avec du temps saisi : la date (jour seul) du temps ne devient pas un horodatage de début à minuit
+    const o2 = await resp.ok('POST', '/api/ot', { titre: 'Clôturé avec temps sans démarrer', equipementId: presse.id, technicienId: uTechProd.id, typeCode: 'correctif' });
+    await techProd.ok('POST', `/api/ot/${o2.id}/temps`, { heures: 1.5 });
+    const c2 = await techProd.ok('POST', `/api/ot/${o2.id}/cloturer`, { rapport: 'Réglage effectué.' });
+    assert.equal(c2.dateDebut, null);
+    const c3 = await resp.ok('POST', `/api/ot/${(await resp.ok('POST', '/api/ot', { titre: 'Terminé par statut sans démarrer', equipementId: presse.id })).id}/statut`, { statut: 'termine', rapport: 'Fait.' });
+    assert.equal(c3.dateDebut, null);
+    // Un OT démarré garde son horodatage de début réel ; une date de début saisie explicitement est conservée
+    const o4 = await resp.ok('POST', '/api/ot', { titre: 'Démarré puis clôturé', equipementId: presse.id, technicienId: uTechProd.id });
+    const dem = await techProd.ok('POST', `/api/ot/${o4.id}/statut`, { statut: 'en_cours' });
+    const c4 = await techProd.ok('POST', `/api/ot/${o4.id}/cloturer`, { rapport: 'Terminé.' });
+    assert.equal(c4.dateDebut, dem.dateDebut);
+    const o5 = await resp.ok('POST', '/api/ot', { titre: 'Début saisi à la clôture', equipementId: presse.id });
+    const debut = new Date(Date.now() - 3600000).toISOString();
+    assert.equal((await resp.ok('POST', `/api/ot/${o5.id}/cloturer`, { rapport: 'Terminé.', dateDebut: debut })).dateDebut, debut);
+  });
+
+  test('temps passé pour autrui : une personne non affectée n\'est ajoutée qu\'avec le droit « affecter », de façon tracée', async () => {
+    const o = await resp.ok('POST', '/api/ot', { titre: 'Temps pour autrui', equipementId: presse.id, technicienId: uTechProd.id });
+    // Technicien (modifier, sans affecter) : pas d'affectation déguisée
+    const r = await techProd.post(`/api/ot/${o.id}/temps`, { heures: 2, userId: uTechLimite.id });
+    assert.equal(r.status, 403);
+    assert.match(r.body.erreur, /Affecter/);
+    assert.equal((await techProd.post(`/api/ot/${o.id}/temps`, { heures: 2, userId: uDemandeur.id })).status, 403);
+    assert.deepEqual(srv.db.get('ot', o.id).techniciens, [uTechProd.id]);
+    // Chef de secteur (affecter) : l'intervenant est contrôlé (accès aux OT, périmètre), ajouté, tracé et notifié
+    assert.equal((await chefProd.post(`/api/ot/${o.id}/temps`, { heures: 1, userId: uDemandeur.id })).status, 400, 'sans accès aux OT');
+    assert.equal((await chefProd.post(`/api/ot/${o.id}/temps`, { heures: 1, userId: uTechLog.id })).status, 400, 'hors du périmètre du chef');
+    const avant = notifsDe(uTechLimite.id).length;
+    const ok = await chefProd.ok('POST', `/api/ot/${o.id}/temps`, { heures: 1, userId: uTechLimite.id });
+    assert.ok(ok.techniciens.includes(uTechLimite.id));
+    assert.equal(ok.technicienId, uTechProd.id, 'le responsable ne change pas');
+    assert.ok(ok.historique.some((h) => h.action === 'affectation' && /Intervenant ajouté/.test(h.commentaire)));
+    assert.ok(srv.db.findOne('audit', (x) => x.entite === 'ot' && x.entiteId === o.id && x.action === 'affectation' && /saisie de temps/.test(x.details)));
+    assert.equal(notifsDe(uTechLimite.id).length, avant + 1, 'intervenant ajouté notifié');
+    // Déjà affecté : la saisie par un titulaire de « modifier » reste possible sans nouvelle affectation
+    const encore = await techProd.ok('POST', `/api/ot/${o.id}/temps`, { heures: 1, userId: uTechLimite.id });
+    assert.equal(encore.tempsPasse.length, 2);
+    assert.equal(encore.historique.filter((h) => h.action === 'affectation').length, 1);
+  });
+
+  test('statut final personnalisé : clôture complète, non supprimable, compté dans les terminés du mois', async () => {
+    const cfg = srv.db.getConfig();
+    const sauvegarde = JSON.parse(JSON.stringify(cfg.listes.statutsOT));
+    cfg.listes.statutsOT = sauvegarde.concat([{ code: 'receptionne', label: 'Réceptionné', couleur: '#0891b2', ordre: 7, final: true }]);
+    srv.db.setConfig(cfg);
+    try {
+      const o = await resp.ok('POST', '/api/ot', { titre: 'Réception personnalisée', equipementId: presse.id, technicienId: uTechProd.id });
+      await techProd.ok('POST', `/api/ot/${o.id}/temps`, { heures: 2 });
+      assert.equal((await resp.post(`/api/ot/${o.id}/statut`, { statut: 'receptionne' })).status, 400, 'compte rendu obligatoire');
+      const avantMois = (await resp.ok('GET', '/api/ot-compteurs')).terminesMois;
+      const r = await resp.ok('POST', `/api/ot/${o.id}/statut`, { statut: 'receptionne', rapport: 'Travaux réceptionnés.' });
+      assert.equal(r.statut, 'receptionne');
+      assert.equal(r.rapport, 'Travaux réceptionnés.');
+      assert.ok(r.dateFin && r.cloturePar);
+      assert.equal(evts('ot:termine', o.id).length, 1);
+      assert.equal(r.actions.supprimer, false);
+      assert.equal((await resp.del(`/api/ot/${o.id}`)).status, 400, 'OT terminé non supprimable');
+      assert.ok(srv.db.get('ot', o.id), 'toujours présent');
+      assert.equal((await resp.ok('GET', '/api/ot-compteurs')).terminesMois, avantMois + 1);
+    } finally {
+      const c2 = srv.db.getConfig(); c2.listes.statutsOT = sauvegarde; srv.db.setConfig(c2);
+    }
+  });
+
+  test('affectation : un intervenant hors du périmètre du planificateur est refusé, liste des intervenants filtrée', async () => {
+    const o = await chefProd.ok('POST', '/api/ot', { titre: 'Affectation périmètre', equipementId: presse.id });
+    const r = await chefProd.post(`/api/ot/${o.id}/affecter`, { technicienId: uTechLog.id });
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /hors de votre périmètre/);
+    assert.equal((await chefProd.put(`/api/ot/${o.id}`, { techniciens: [uTechLog.id] })).status, 400);
+    assert.equal((await chefProd.post('/api/ot', { titre: 'Création avec intervenant LOG', equipementId: presse.id, technicienId: uTechLog.id })).status, 400);
+    await chefProd.ok('POST', `/api/ot/${o.id}/affecter`, { technicienId: uTechProd.id });
+    // Le responsable maintenance (portée « tous ») peut affecter un technicien d'un autre secteur ; le chef le conserve ensuite
+    const a = await resp.ok('POST', `/api/ot/${o.id}/affecter`, { techniciens: [uTechProd.id, uTechLog.id] });
+    assert.ok(a.techniciens.includes(uTechLog.id));
+    const b = await chefProd.ok('POST', `/api/ot/${o.id}/affecter`, { techniciens: [uTechProd.id, uTechLog.id, uTechLimite.id] });
+    assert.ok(b.techniciens.includes(uTechLog.id), 'intervenant déjà affecté conservé');
+    const pourChef = (await chefProd.ok('GET', '/api/ot-techniciens')).map((t) => t.id);
+    assert.ok(pourChef.includes(uTechProd.id) && pourChef.includes(uChefProd.id));
+    assert.ok(!pourChef.includes(uTechLog.id), 'technicien d\'un autre secteur absent de la liste du chef');
+    const pourResp = (await resp.ok('GET', '/api/ot-techniciens')).map((t) => t.id);
+    assert.ok(pourResp.includes(uTechLog.id) && pourResp.includes(uTechProd.id));
+  });
+
+  test('export CSV : les listes de valeurs ne sont lues qu\'une fois par export', async () => {
+    const original = srv.ctx.liste;
+    let appels = 0;
+    srv.ctx.liste = function (...args) { appels++; return original.apply(this, args); };
+    try {
+      const r = await resp.get('/api/ot-export');
+      assert.equal(r.status, 200);
+      const lignes = r.body.split('\r\n').length - 1;
+      assert.ok(lignes >= 10, `${lignes} lignes exportées`);
+      assert.ok(appels <= 8, `${appels} lectures de listes pour ${lignes} lignes (lecture par ligne proscrite)`);
+    } finally { srv.ctx.liste = original; }
+  });
+
+  test('suppression : refusée tant que des factures ou commandes du module Achats sont imputées à l\'OT', async () => {
+    assert.ok(srv.ctx.services.achats && typeof srv.ctx.services.achats.facturesPourOt === 'function', 'service Achats présent');
+    const o = await resp.ok('POST', '/api/ot', { titre: 'OT avec facture', equipementId: presse.id });
+    const fournisseur = srv.db.insert('fournisseurs', { nom: 'Prestataire test', typeCode: 'prestataire', actif: true });
+    const facture = srv.db.insert('factures', { numero: 'FAC-T-0001', fournisseurId: fournisseur.id, secteurId: PROD, numeroFournisseur: 'PT-1', dateFacture: jourLocal(0), montantHT: 100, montantTVA: 20, montantTTC: 120, statut: 'recue', otId: o.id, lignes: [], createdBy: 1 });
+    assert.equal((await resp.ok('GET', `/api/ot/${o.id}`)).actions.supprimer, false);
+    const r = await resp.del(`/api/ot/${o.id}`);
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /1 facture/);
+    assert.ok(srv.db.get('ot', o.id));
+    assert.equal(srv.db.get('factures', facture.id).otId, o.id, 'imputation conservée');
+    srv.db.update('factures', facture.id, { statut: 'annulee' });
+    assert.equal((await resp.ok('GET', `/api/ot/${o.id}`)).actions.supprimer, true);
+    await resp.ok('DELETE', `/api/ot/${o.id}`);
+  });
+
+  test('duplication : un champ personnalisé rendu obligatoire après la création ne bloque pas la copie', async () => {
+    const source = await resp.ok('POST', '/api/ot', { titre: 'Source avant champ obligatoire', equipementId: presse.id });
+    const cfg = srv.db.getConfig();
+    const sauvegarde = JSON.parse(JSON.stringify(cfg.champsPersonnalises));
+    cfg.champsPersonnalises = Object.assign({}, cfg.champsPersonnalises, { ot: [{ cle: 'bon', label: 'N° de bon de travail', type: 'texte', obligatoire: true }] });
+    srv.db.setConfig(cfg);
+    try {
+      assert.equal((await resp.post('/api/ot', { titre: 'Création sans le champ', equipementId: presse.id })).status, 400, 'la création reste stricte');
+      const copie = await resp.ok('POST', `/api/ot/${source.id}/dupliquer`, { titre: 'Copie après champ obligatoire' });
+      assert.equal(copie.titre, 'Copie après champ obligatoire');
+      assert.equal(copie.champs.bon, null);
+      const m = await resp.ok('PUT', `/api/ot/${copie.id}`, { champs: { bon: 'BT-12' } });
+      assert.equal(m.champs.bon, 'BT-12');
+    } finally {
+      const c2 = srv.db.getConfig(); c2.champsPersonnalises = sauvegarde; srv.db.setConfig(c2);
+    }
+  });
+
+  test('lignes de temps, pièces, tâches, commentaires et documents : identifiant stable, suppression rejouée sans effet', async () => {
+    installerStock();
+    const o = await resp.ok('POST', '/api/ot', { titre: 'Lignes identifiées', equipementId: presse.id, technicienId: uTechProd.id, taches: ['Étape A', 'Étape B'] });
+    assert.ok(o.taches.every((t) => typeof t.uid === 'string' && !/^\d+$/.test(t.uid)));
+    let r = await techProd.ok('POST', `/api/ot/${o.id}/temps`, { heures: 1, commentaire: 'première' });
+    r = await techProd.ok('POST', `/api/ot/${o.id}/temps`, { heures: 2, commentaire: 'deuxième' });
+    r = await techProd.ok('POST', `/api/ot/${o.id}/temps`, { heures: 3, commentaire: 'troisième' });
+    const [t1, t2] = r.tempsPasse;
+    assert.ok(t1.uid && t2.uid && t1.uid !== t2.uid);
+    const d1 = await techProd.del(`/api/ot/${o.id}/temps/${t2.uid}`);
+    assert.equal(d1.status, 200);
+    assert.deepEqual(d1.body.tempsPasse.map((t) => t.commentaire), ['première', 'troisième']);
+    const rejouee = await techProd.del(`/api/ot/${o.id}/temps/${t2.uid}`);
+    assert.equal(rejouee.status, 404, 'la requête rejouée ne supprime pas la ligne suivante');
+    assert.deepEqual(srv.db.get('ot', o.id).tempsPasse.map((t) => t.commentaire), ['première', 'troisième']);
+    // Pièces : deux suppressions de la même ligne → un seul retour en stock
+    await techProd.ok('POST', `/api/ot/${o.id}/pieces`, { articleId: articleJoint.id, quantite: 1 });
+    const avecPieces = await techProd.ok('POST', `/api/ot/${o.id}/pieces`, { articleId: articleJoint.id, quantite: 2 });
+    const p1 = avecPieces.pieces[0];
+    const nbRetours = appelsStock.annuler.length;
+    const [s1, s2] = await Promise.all([techProd.del(`/api/ot/${o.id}/pieces/${p1.uid}`), techProd.del(`/api/ot/${o.id}/pieces/${p1.uid}`)]);
+    assert.deepEqual([s1.status, s2.status].sort(), [200, 404]);
+    assert.equal(appelsStock.annuler.length, nbRetours + 1, 'un seul retour en stock');
+    assert.equal(srv.db.get('ot', o.id).pieces.length, 1);
+    // Tâches et commentaires par identifiant ; l'index reste accepté
+    const coche = await techProd.ok('PUT', `/api/ot/${o.id}/taches/${o.taches[1].uid}`, { fait: true });
+    assert.equal(coche.taches[1].fait, true);
+    const com = await techProd.ok('POST', `/api/ot/${o.id}/commentaires`, { texte: 'Commentaire identifié' });
+    assert.ok(com.commentaires[0].uid);
+    assert.equal((await techProd.ok('DELETE', `/api/ot/${o.id}/commentaires/${com.commentaires[0].uid}`)).commentaires.length, 0);
+    assert.equal((await techProd.del(`/api/ot/${o.id}/taches/inconnu`)).status, 404);
+    const doc = await techProd.ok('POST', `/api/ot/${o.id}/documents`, { nom: 'photo.txt', type: 'text/plain', contenu: 'data:text/plain;base64,' + Buffer.from('Photo').toString('base64') });
+    assert.ok(doc.document.uid);
+    assert.equal((await techProd.get(`/api/ot/${o.id}/documents/${doc.document.uid}`)).body, 'Photo');
+    assert.equal((await techProd.get(`/api/ot/${o.id}/documents/0`)).body, 'Photo');
+  });
+
+  test('liste : lignes allégées (sans historique, temps, pièces, tâches, commentaires) ; fiche complète', async () => {
+    const liste = await resp.ok('GET', '/api/ot');
+    assert.ok(liste.length >= 10);
+    for (const o of liste) {
+      for (const k of ['historique', 'tempsPasse', 'pieces', 'taches', 'commentaires', 'documents', 'piecesPrevues']) assert.equal(o[k], undefined, `${k} absent des lignes de liste`);
+      for (const k of ['nbTaches', 'nbTachesFaites', 'nbPieces', 'nbCommentaires', 'nbDocuments', 'tempsTotal', 'coutTotal']) assert.equal(typeof o[k], 'number', k);
+      assert.ok(Array.isArray(o.techniciens));
+    }
+    const avecTemps = liste.find((o) => o.tempsTotal > 0);
+    assert.ok(avecTemps, 'un OT avec du temps saisi');
+    const fiche = await resp.ok('GET', `/api/ot/${avecTemps.id}`);
+    assert.ok(Array.isArray(fiche.tempsPasse) && fiche.tempsPasse.length >= 1);
+    assert.ok(Array.isArray(fiche.historique) && Array.isArray(fiche.taches) && Array.isArray(fiche.commentaires));
   });
 
   test('données de démonstration : réalistes et idempotentes', async () => {

@@ -1199,13 +1199,25 @@
   /** Lien vers une vue (hash). */
   function lien(href, label, opts = {}) { return el('a', { href, class: opts.classe, onclick: opts.onClic }, label); }
 
-  /** Graphique en barres très simple : [{label, valeur, couleur}] */
+  /**
+   * Graphique en barres très simple : [{ label, valeur, couleur, onClic }].
+   * Barres empilées : `opts.series` = [{ cle, label, couleur }] ; chaque donnée porte alors une valeur par clé
+   * (ex. { label: 'Jan', pieces: 120, mainOeuvre: 80 }) et une légende est ajoutée sous le graphique.
+   */
   function graphiqueBarres(donnees, opts = {}) {
-    const max = Math.max(1, ...donnees.map((d) => d.valeur));
-    return el('div', { class: 'graphique-barres', style: opts.hauteur ? { height: opts.hauteur + 'px' } : null }, donnees.map((d) => el('div', { class: 'barre', title: `${d.label} : ${formatNombre(d.valeur)}`, onclick: d.onClic },
-      el('span', { class: 'texte-gras', style: { color: 'var(--texte)' } }, formatNombre(d.valeur)),
-      el('div', { style: { height: Math.round((d.valeur / max) * 100) + '%', background: d.couleur || 'var(--primaire)' } }),
-      el('span', null, d.label))));
+    const series = Array.isArray(opts.series) && opts.series.length ? opts.series : null;
+    const valeurDe = (d, s) => Number(d[s.cle]) || 0;
+    const total = (d) => (series ? series.reduce((somme, s) => somme + valeurDe(d, s), 0) : Number(d.valeur) || 0);
+    const max = Math.max(1, ...donnees.map(total));
+    const barres = el('div', { class: 'graphique-barres', style: opts.hauteur ? { height: opts.hauteur + 'px' } : null }, donnees.map((d) => {
+      const t = total(d);
+      const titre = series ? `${d.label} : ${formatNombre(t)} (${series.map((s) => `${s.label} ${formatNombre(valeurDe(d, s))}`).join(', ')})` : `${d.label} : ${formatNombre(t)}`;
+      const pile = el('div', { class: series ? 'barre-pile' : null, style: { height: Math.round((t / max) * 100) + '%', background: series ? 'transparent' : (d.couleur || 'var(--primaire)') } },
+        series ? series.map((s) => (valeurDe(d, s) > 0 ? el('div', { title: `${s.label} : ${formatNombre(valeurDe(d, s))}`, style: { flex: String(valeurDe(d, s)), background: s.couleur || 'var(--primaire)' } }) : null)) : null);
+      return el('div', { class: 'barre', title: titre, onclick: d.onClic }, el('span', { class: 'texte-gras', style: { color: 'var(--texte)' } }, formatNombre(t)), pile, el('span', null, d.label));
+    }));
+    if (!series) return barres;
+    return el('div', { class: 'graphique' }, barres, el('div', { class: 'graphique-legende' }, series.map((s) => el('span', null, pastille(s.couleur || 'var(--primaire)'), s.label))));
   }
 
   /**

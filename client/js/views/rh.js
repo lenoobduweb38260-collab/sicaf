@@ -70,8 +70,13 @@
     document.head.appendChild(el('style', { id: 'style-vue-rh', text: `
       .rh-grille-kpi { display: grid; gap: 12px; margin-bottom: 16px; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
       .rh-grille-kpi.serre { grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); }
+      .rh-grille-kpi .kpi > div:last-child { min-width: 0; }
+      .rh-grille-kpi.serre .kpi-valeur { font-size: 19px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .rh-grille-kpi.tableau { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      @media (max-width: 1000px) { .rh-grille-kpi.tableau { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
       .rh-deux-colonnes { display: grid; gap: 16px; grid-template-columns: minmax(0, 1.65fr) minmax(300px, 1fr); align-items: start; }
-      @media (max-width: 1150px) { .rh-deux-colonnes { grid-template-columns: 1fr; } }
+      @media (max-width: 1400px) { .rh-deux-colonnes { grid-template-columns: 1fr; } }
+      [data-theme="sombre"] .badge.contour.rh-contour { color: var(--rh-contour-sombre) !important; }
       .rh-defilement { overflow: auto; border: 1px solid var(--bordure); border-radius: var(--rayon); background: var(--surface); max-height: calc(100vh - 290px); }
       .rh-matrice, .rh-cal { border-collapse: separate; border-spacing: 0; font-size: 12.5px; min-width: 100%; }
       .rh-matrice th, .rh-matrice td, .rh-cal th, .rh-cal td { border-bottom: 1px solid var(--bordure); border-right: 1px solid var(--bordure); background: var(--surface); }
@@ -80,17 +85,19 @@
       .rh-col-personne { position: sticky; left: 0; z-index: 1; text-align: left; min-width: 230px; max-width: 280px; padding: 6px 10px !important; }
       thead .rh-col-personne, tfoot .rh-col-personne { z-index: 3; }
       .rh-matrice td.rh-col-personne, .rh-matrice th.rh-col-personne, .rh-cal td.rh-col-personne, .rh-cal th.rh-col-personne { text-align: left; width: 250px; min-width: 250px; max-width: 250px; }
-      .rh-matrice th.rh-type { height: 172px; width: 46px; min-width: 46px; padding: 8px 2px; vertical-align: bottom; cursor: pointer; }
+      .rh-matrice th.rh-type { height: 132px; width: 46px; min-width: 46px; padding: 8px 2px; vertical-align: bottom; cursor: pointer; }
       .rh-matrice th.rh-type:hover, .rh-matrice th.rh-type.actif { background: var(--primaire-clair); color: var(--primaire); }
-      .rh-matrice th.rh-type > div { writing-mode: vertical-rl; transform: rotate(180deg); white-space: nowrap; margin: 0 auto; max-height: 158px; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 6px; }
-      .rh-matrice td { text-align: center; padding: 4px 3px; height: 40px; }
+      .rh-matrice th.rh-type > div { writing-mode: vertical-rl; transform: rotate(180deg); white-space: nowrap; margin: 0 auto; max-height: 118px; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 6px; }
+      .rh-matrice td { text-align: center; padding: 3px 3px; height: 32px; }
+      .rh-matrice td.rh-col-personne { padding: 3px 10px !important; }
+      .rh-matrice .rh-col-personne .cellule-principale, .rh-matrice .rh-col-personne .cellule-secondaire { line-height: 1.2; }
       .rh-matrice tbody tr:hover td { background: var(--surface-2); }
       .rh-cellule { display: inline-flex; align-items: center; justify-content: center; min-width: 40px; height: 24px; padding: 0 5px; border-radius: 6px; font-size: 11px; font-weight: 700; color: #fff; cursor: pointer; letter-spacing: .2px; }
       .rh-cellule:hover { filter: brightness(1.08); box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--bordure-2); }
       .rh-ajout { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 24px; border-radius: 6px; border: 1px dashed var(--bordure-2); color: var(--texte-2); background: transparent; cursor: pointer; opacity: 0; font-size: 15px; line-height: 1; padding: 0; }
       .rh-matrice tbody tr:hover .rh-ajout { opacity: .75; }
-      .rh-ajout:hover { opacity: 1 !important; color: var(--primaire); border-color: var(--primaire); }
-      .rh-cal th, .rh-cal td { padding: 0; min-width: 27px; width: 27px; text-align: center; }
+      .rh-ajout:hover, .rh-ajout:focus-visible { opacity: 1 !important; color: var(--primaire); border-color: var(--primaire); }
+      .rh-cal th, .rh-cal td { padding: 0; min-width: 24px; width: 24px; text-align: center; }
       .rh-cal thead th { height: 40px; font-size: 11px; line-height: 1.15; }
       .rh-cal thead th .rh-num { font-size: 12.5px; color: var(--texte); }
       .rh-cal td { height: 34px; }
@@ -128,8 +135,10 @@
   // ----- Utilitaires -------------------------------------------------------------------------------
   const can = (action) => GMAO.can(MODULE, action);
   const lectureSeule = (secteurId) => GMAO.siteLectureSeule(secteurId);
+  /** Le site affiché (en-tête) n'est pas accessible en lecture seule. */
+  const siteAffichableEnEcriture = () => !(GMAO.siteCourant() != null && lectureSeule(GMAO.siteCourant()));
   /** Création possible : droit rh › créer et site affiché (en-tête) non accessible en lecture seule. */
-  const peutCreer = () => can('creer') && !(GMAO.siteCourant() != null && lectureSeule(GMAO.siteCourant()));
+  const peutCreer = () => can('creer') && siteAffichableEnEcriture();
   /** Écriture possible sur cet enregistrement (droit, site non en lecture seule, portée serveur). */
   const ecriture = (action, rec) => can(action) && !(rec && lectureSeule(rec.secteurId)) && !(rec && rec.modifiable === false);
   function listeRh(nom) {
@@ -145,8 +154,33 @@
   function badgeRh(nom, code, opts) {
     if (code == null || code === '') return el('span', { class: 'texte-2' }, '—');
     const it = itemRh(nom, code);
-    return ui.badge(it ? it.label : String(code), (it && it.couleur) || '#6b7280', opts);
+    return (opts && opts.contour ? badgeContour : ui.badge)(it ? it.label : String(code), (it && it.couleur) || '#6b7280', opts);
   }
+  // Badges « contour » (texte coloré sur la surface) : en thème sombre, la teinte est éclaircie jusqu'à un contraste
+  // d'au moins 4,5:1 sur les surfaces du thème (fond, surface, surface-2), via une variable CSS lue par .rh-contour
+  const FONDS_SOMBRES = [[30, 41, 59], [15, 23, 42], [39, 52, 73]];
+  const hexRgb = (c) => { const m = /^#?([0-9a-f]{6})$/i.exec(String(c || '').trim()); if (!m) return null; const n = parseInt(m[1], 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
+  const luminance = (rgb) => { const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }; return 0.2126 * f(rgb[0]) + 0.7152 * f(rgb[1]) + 0.0722 * f(rgb[2]); };
+  const contraste = (a, b) => { const la = luminance(a); const lb = luminance(b); return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05); };
+  const cacheSombre = new Map();
+  function couleurSombre(coul) {
+    if (cacheSombre.has(coul)) return cacheSombre.get(coul);
+    const base = hexRgb(coul);
+    let res = base ? '#ffffff' : coul;
+    for (let f = 0; base && f <= 1.0001; f += 0.05) {
+      const rgb = base.map((v) => Math.round(v + (255 - v) * f));
+      if (FONDS_SOMBRES.every((fd) => contraste(rgb, fd) >= 4.6)) { res = `rgb(${rgb.join(',')})`; break; }
+    }
+    cacheSombre.set(coul, res);
+    return res;
+  }
+  function badgeContour(label, coul, opts) {
+    const b = ui.badge(label, coul || '#6b7280', Object.assign({}, opts, { contour: true }));
+    b.classList.add('rh-contour');
+    b.style.setProperty('--rh-contour-sombre', couleurSombre(coul || '#6b7280'));
+    return b;
+  }
+  const badgeListeContour = (nom, code, opts) => (code == null || code === '' ? el('span', { class: 'texte-2' }, '—') : badgeContour(ui.libelle(nom, code), ui.couleur(nom, code), opts));
   const optionsRh = (nom, vide) => { const o = listeRh(nom).map((x) => ({ value: x.code, label: x.label })); if (vide !== false) o.unshift({ value: '', label: vide || '— Choisir —' }); return o; };
   const badgeEtat = (etat, titre) => (ETATS[etat] ? ui.badge(ETATS[etat].label, ETATS[etat].couleur, { titre }) : el('span', { class: 'texte-2' }, '—'));
   const typeHab = (code) => GMAO.liste('typesHabilitation').find((t) => t.code === code) || null;
@@ -242,6 +276,13 @@
     const coul = etat === 'expiree' ? 'texte-danger texte-gras' : etat === 'bientot' ? 'texte-alerte texte-gras' : '';
     return el('div', null, el('div', { class: coul }, fmt(dateIso)), joursRestants != null ? el('div', { class: 'cellule-secondaire texte-2 texte-petit' }, relatifJours(joursRestants)) : null);
   }
+  /** Prochaine visite médicale à afficher : la visite déjà programmée, sinon l'échéance fixée lors de la dernière visite. */
+  function prochaineVisite(dv) {
+    if (!dv) return null;
+    if (dv.programmee) return { date: dv.programmee.date, etat: 'programmee', libelle: `Programmée le ${fmt(dv.programmee.date)}` };
+    if (dv.prochaineVisite) return { date: dv.prochaineVisite, etat: dv.etat || 'valide', libelle: fmt(dv.prochaineVisite) };
+    return { date: null, etat: null, libelle: `Non planifiée (dernière le ${fmt(dv.date)})` };
+  }
   function selectFiltre(options, valeur, titre, onChange) {
     const s = el('select', { title: titre, onchange: () => onChange(s.value) }, options.map((o) => el('option', { value: o.value, selected: String(o.value) === String(valeur) }, o.label)));
     return s;
@@ -252,6 +293,11 @@
     const out = [{ value: '', label: 'Tous les sites et services' }];
     if (sites.length > 1 && GMAO.siteCourant() == null) sites.forEach((s) => out.push({ value: 'site:' + s.id, label: `Site : ${s.nom}${s.mode === 'lecture' ? ' (lecture seule)' : ''}` }));
     return out.concat(ui.optionsSecteurs({ vide: false }).map((o) => ({ value: 'sect:' + o.value, label: o.label })));
+  }
+  /** Filtre site / service mémorisé : remis à zéro si son option n'existe plus (site changé dans l'en-tête). */
+  function filtreSiteService(f) {
+    if (f.siteService && !optionsSitesServices().some((o) => o.value === f.siteService)) f.siteService = '';
+    return f.siteService || '';
   }
   function paramsSiteService(v) {
     if (!v) return {};
@@ -280,6 +326,13 @@
     let tous = [];
     try { tous = await api.get('/api/rh/personnel'); } catch (e) { tous = []; }
     const lies = new Set(tous.filter((p) => p.userId != null && (!existant || p.id !== existant.id)).map((p) => Number(p.userId)));
+    const moi = GMAO.user ? Number(GMAO.user.id) : null;
+    // Comptes proposés : actifs (plus celui déjà enregistré, même désactivé, pour ne pas afficher un identifiant brut) ;
+    // lier sa propre fiche ou se désigner N+1 relève d'un autre gestionnaire (refusé par le serveur), sauf administrateur
+    const optionsComptes = (vide, deja, filtre) => ui.optionsUsers({ tousSites: true, inactifs: true, vide, filtre: (u) => (u.actif !== false || u.id === deja) && (u.id !== moi || GMAO.estAdmin() || u.id === deja) && filtre(u) })
+      .map((o) => { const u = o.value === '' ? null : ui.user(o.value); return u && u.actif === false ? Object.assign({}, o, { label: `${o.label} (désactivé)` }) : o; });
+    const userIdActuel = existant && existant.userId != null ? Number(existant.userId) : null;
+    const managerActuel = existant && existant.managerUserId != null ? Number(existant.managerUserId) : null;
     const suggestions = Array.from(new Set(tous.flatMap((p) => (p.competences || []).map((c) => c.libelle)))).sort((a, b) => a.localeCompare(b, 'fr'));
     let competences = ((existant && existant.competences) || []).map((c) => Object.assign({}, c));
     const gabarit = ((GMAO.config.numerotation || {}).mat) || 'MAT-{num:4}';
@@ -308,12 +361,12 @@
       { nom: 'prenom', label: 'Prénom', type: 'texte', maxLength: 100 },
       { nom: 'matricule', label: 'Matricule', type: 'texte', maxLength: 30, placeholder: creation ? 'Attribué automatiquement si vide' : '', aide: creation ? `Gabarit : ${gabarit} (ou matricule du compte GMAO lié).` : 'Doit rester unique.' },
       { nom: 'fonction', label: 'Fonction / poste', type: 'texte', maxLength: 150, placeholder: 'ex. Technicien de maintenance' },
-      { nom: 'userId', label: 'Compte GMAO lié', type: 'select', options: ui.optionsUsers({ tousSites: true, vide: '— Aucun compte —', filtre: (u) => !lies.has(u.id) || (existant && Number(existant.userId) === u.id) }),
+      { nom: 'userId', label: 'Compte GMAO lié', type: 'select', options: optionsComptes('— Aucun compte —', userIdActuel, (u) => !lies.has(u.id) || u.id === userIdActuel),
         aide: 'Permet à la personne de consulter « Mon dossier RH » et relie son activité de maintenance (OT, temps passé).',
         onChange: (v, f) => { if (!creation || !v) return; const u = ui.user(v); if (!u) return; if (!f.get('nom')) f.set('nom', u.nom || ''); if (!f.get('prenom')) f.set('prenom', u.prenom || ''); if (!f.get('fonction') && u.fonction) f.set('fonction', u.fonction); if (!f.get('managerUserId') && u.managerId != null) f.set('managerUserId', u.managerId); } },
       { type: 'separateur', label: 'Rattachement et contrat' },
       { nom: 'secteurId', label: 'Site / service', type: 'select', requis: true, options: ui.optionsSecteurs({ vide: '— Choisir —' }).filter((o) => o.value === '' || !lectureSeule(o.value)), aide: 'Détermine qui peut consulter la fiche (portée, multi-site).' },
-      { nom: 'managerUserId', label: 'Responsable hiérarchique (N+1)', type: 'select', options: ui.optionsUsers({ tousSites: true, vide: '— Aucun —' }), aide: 'Valide les demandes d\'absence de la personne.' },
+      { nom: 'managerUserId', label: 'Responsable hiérarchique (N+1)', type: 'select', options: optionsComptes('— Aucun —', managerActuel, () => true), aide: 'Valide les demandes d\'absence de la personne.' },
       { nom: 'typeContratCode', label: 'Type de contrat', type: 'select', liste: 'typesContrat', vide: false, requis: true },
       { nom: 'dateEntree', label: 'Date d\'entrée', type: 'date' },
       { nom: 'dateSortie', label: 'Date de sortie / fin de contrat', type: 'date', aide: 'Fin de CDD, de mission d\'intérim ou départ : une alerte est émise avant l\'échéance.' },
@@ -412,6 +465,10 @@
     const corps = el('div');
     let docs = h.documents || [];
     const modifiable = ecriture('modifier', h);
+    // La vue appelante n'est rafraîchie qu'à la fermeture (si la vue est toujours affichée) : la fenêtre reste ouverte
+    // entre deux ajouts (recto puis verso d'une carte, par exemple)
+    let modifie = false;
+    const hashInitial = location.hash;
     function dessiner() {
       ui.vider(corps);
       corps.appendChild(el('p', { class: 'texte-2', style: { marginTop: 0 } }, `${h.intitule} — ${h.personnelNom}. Pièces justificatives : PDF ou images, 5 Mo maximum par fichier.`));
@@ -423,20 +480,20 @@
         el('button', { type: 'button', class: 'btn btn-sm', onclick: () => api.telecharger(`/api/rh/habilitations/${h.id}/documents/${d.index}?telecharger=1`, d.nom).catch(erreur) }, icone('export'), 'Télécharger'),
         modifiable ? el('button', { type: 'button', class: 'btn btn-sm btn-icone texte-danger', title: 'Supprimer', onclick: async () => {
           if (!(await ui.confirm({ titre: 'Supprimer la pièce jointe', message: `Supprimer « ${d.nom} » ?`, okLabel: 'Supprimer', danger: true }))) return;
-          try { const r = await api.del(`/api/rh/habilitations/${h.id}/documents/${d.index}`); docs = r.documents; dessiner(); toast('Pièce jointe supprimée', 'succes'); if (apres) apres(); } catch (e) { erreur(e); }
+          try { const r = await api.del(`/api/rh/habilitations/${h.id}/documents/${d.index}`); docs = r.documents; modifie = true; dessiner(); toast('Pièce jointe supprimée', 'succes'); } catch (e) { erreur(e); }
         } }, icone('supprimer')) : null))));
       if (modifiable) {
         const input = el('input', { type: 'file', accept: 'image/*,application/pdf', style: { display: 'none' }, onchange: async () => {
           const f = input.files && input.files[0];
           if (!f) return;
           if (f.size > TAILLE_MAX_DOC) { toast('Fichier trop volumineux (5 Mo maximum)', 'erreur'); return; }
-          try { const contenu = await ui.lireFichier(f); const r = await api.post(`/api/rh/habilitations/${h.id}/documents`, { nom: f.name, type: f.type, contenu }); docs = r.documents; dessiner(); toast('Pièce jointe ajoutée', 'succes'); if (apres) apres(); } catch (e) { erreur(e); }
+          try { const contenu = await ui.lireFichier(f); const r = await api.post(`/api/rh/habilitations/${h.id}/documents`, { nom: f.name, type: f.type, contenu }); docs = r.documents; modifie = true; dessiner(); toast('Pièce jointe ajoutée', 'succes'); } catch (e) { erreur(e); }
         } });
         corps.appendChild(el('div', { class: 'mt' }, input, ui.bouton('Ajouter une pièce jointe', { icone: 'plus', classe: 'btn-primaire btn-sm', onClic: () => input.click() })));
       }
     }
     dessiner();
-    ui.modal({ titre: 'Pièces justificatives', taille: 'large', contenu: corps, boutons: [{ label: 'Fermer' }] });
+    ui.modal({ titre: 'Pièces justificatives', taille: 'large', contenu: corps, boutons: [{ label: 'Fermer' }], onFermer: () => { if (modifie && apres && location.hash === hashInitial) apres(); } });
   }
 
   /** Visite médicale : uniquement date, type, aptitude et aménagement de poste (aucune donnée médicale). */
@@ -464,6 +521,21 @@
         toast(`Visite du ${fmt(res.date)} enregistrée`, 'succes');
         if (options.apres) options.apres(res);
       },
+    });
+  }
+
+  /** Détail d'une visite en consultation (sans droit de modification sur la fiche). */
+  function ouvrirDetailVisite(v) {
+    ui.modal({
+      titre: `Visite médicale — ${v.personnelNom || ''}`, taille: 'petite',
+      contenu: frag(
+        el('div', { class: 'inline mb', style: { gap: '8px' } }, badgeRh('typesVisiteMedicale', v.type, { contour: true }), badgeRh('aptitudesMedicales', v.aptitude)),
+        ui.details([
+          { label: 'Date', valeur: `${fmt(v.date)}${v.date > ui.aujourdhui() ? ' (programmée)' : ''}` },
+          { label: 'Aménagement de poste', valeur: v.restrictions },
+          { label: 'Prochaine visite', valeur: v.prochaineVisite ? frag(fmt(v.prochaineVisite), ' ', v.etat && v.etat !== 'remplacee' ? badgeEtat(v.etat) : null) : '' },
+        ])),
+      boutons: [{ label: 'Fermer' }],
     });
   }
 
@@ -514,6 +586,8 @@
     majCalcul(m.form);
   }
 
+  /** Modification proposée : demande en attente, ou absence validée pour un valideur (sinon la validation serait à refaire). */
+  const absenceModifiable = (a) => ecriture('modifier', a) && (a.statut === 'demandee' || (a.statut === 'validee' && a.peutValider));
   async function deciderAbsence(a, decision, apres) {
     try {
       if (decision === 'valider') {
@@ -545,12 +619,11 @@
       actions.push({ label: 'Refuser', classe: 'btn-danger', icone: 'fermer', onClic: () => { deciderAbsence(a, 'refuser', apres); } });
       actions.push({ label: 'Valider', classe: 'btn-ok', icone: 'check', onClic: () => { deciderAbsence(a, 'valider', apres); } });
     }
-    if (ecriture('modifier', a) && (a.statut === 'demandee' || a.statut === 'validee')) {
-      actions.unshift({ label: 'Annuler l\'absence', icone: 'fermer', gauche: true, onClic: () => { annulerAbsence(a, apres); } });
-      actions.unshift({ label: 'Modifier', icone: 'modifier', gauche: true, onClic: () => { ouvrirAbsence(a, { apres }); } });
-    }
+    if (ecriture('modifier', a) && (a.statut === 'demandee' || a.statut === 'validee')) actions.unshift({ label: 'Annuler l\'absence', icone: 'fermer', gauche: true, onClic: () => { annulerAbsence(a, apres); } });
+    if (absenceModifiable(a)) actions.unshift({ label: 'Modifier', icone: 'modifier', gauche: true, onClic: () => { ouvrirAbsence(a, { apres }); } });
     ui.modal({
-      titre: `Absence — ${a.personnelNom}`, taille: 'petite',
+      // Taille standard dès que plusieurs actions sont proposées (sinon les boutons passent sur deux lignes)
+      titre: `Absence — ${a.personnelNom}`, taille: actions.length > 1 ? undefined : 'petite',
       contenu: frag(
         el('div', { class: 'inline mb', style: { gap: '8px' } }, ui.badge(a.typeLibelle, a.typeCouleur), badgeRh('statutsAbsence', a.statut)),
         ui.details([
@@ -698,7 +771,7 @@
     const cont = el('div');
     const temporaires = t.effectifs.parContrat.filter((c) => ['cdd', 'interim', 'apprentissage', 'stage'].includes(c.code)).reduce((s, c) => s + c.n, 0);
     const moisLib = `${MOIS[Number(t.mois.slice(5, 7)) - 1]} ${t.mois.slice(0, 4)}`;
-    cont.appendChild(el('div', { class: 'rh-grille-kpi' },
+    cont.appendChild(el('div', { class: 'rh-grille-kpi tableau' },
       ui.kpi({ label: 'Effectif actif', valeur: t.effectifs.total, icone: 'utilisateurs', detail: temporaires ? `dont ${temporaires} contrat(s) temporaire(s)` : `${t.effectifs.avecCompte} avec un compte GMAO`, onClic: () => nav.activer('personnel') }),
       ui.kpi({ label: 'Absents aujourd\'hui', valeur: t.absentsAujourdhui.length, icone: 'calendrier', couleur: '#0891b2', detail: t.effectifs.total ? `${ui.formatNombre((t.absentsAujourdhui.length / t.effectifs.total) * 100, 0)} % de l'effectif` : '', onClic: () => nav.activer('absences') }),
       ui.kpi({ label: `Absentéisme (${moisLib})`, valeur: `${ui.formatNombre(t.absenteisme.taux, 1)} %`, icone: 'rapports', couleur: t.absenteisme.taux > 5 ? '#dc2626' : t.absenteisme.taux > 3 ? '#f59e0b' : '#16a34a', detail: `${jours(t.absenteisme.joursAbsenteisme)} sur ${ui.formatNombre(t.absenteisme.joursTheoriques)} j théoriques` }),
@@ -720,7 +793,7 @@
       colonnes: [
         { cle: 'dateEcheance', label: 'Échéance', largeur: '110px', rendu: (x) => echeance(x.dateEcheance, x.joursRestants, x.etat), valeurTri: (x) => x.dateEcheance },
         { cle: 'personnelNom', label: 'Personne', rendu: (x) => personneCellule(x.personnelNom, [x.fonction, x.secteurNom].filter(Boolean).join(' · '), 26, 230) },
-        { cle: 'libelle', label: 'Objet', rendu: (x) => el('div', null, ui.badge(LIB_CAT[x.categorie], COUL_CAT[x.categorie], { contour: true }),
+        { cle: 'libelle', label: 'Objet', rendu: (x) => el('div', null, badgeContour(LIB_CAT[x.categorie], COUL_CAT[x.categorie]),
           el('div', { style: { marginTop: '3px' } }, x.categorie === 'habilitation' ? x.intitule || x.libelle : x.categorie === 'contrat' ? `Contrat ${x.libelle}` : x.libelle),
           x.categorie === 'visite' && x.dateDerniere ? el('div', { class: 'cellule-secondaire texte-2 texte-petit' }, `Dernière visite le ${fmt(x.dateDerniere)}`) : null), valeurTri: (x) => x.categorie + (x.libelle || '') },
         { cle: 'etat', label: 'État / action', rendu: (x) => el('div', null,
@@ -738,7 +811,7 @@
     }
     for (const [cle, label, n] of filtres) groupe.appendChild(el('button', { type: 'button', class: 'btn btn-sm', dataset: { cle }, onclick: () => { memo.alertes = cle; filtrerAlertes(); } }, label, el('span', { class: 'badge', style: { marginLeft: '4px' } }, String(n))));
     filtrerAlertes();
-    const parSite = al.parSite.length > 1 ? el('div', { class: 'inline mb', style: { gap: '8px', flexWrap: 'wrap' } }, al.parSite.map((s) => ui.badge(`${s.siteNom} : ${s.total} alerte(s)${s.expirees ? ` dont ${s.expirees} échue(s)` : ''}`, s.expirees ? '#dc2626' : '#f59e0b', { contour: true }))) : null;
+    const parSite = al.parSite.length > 1 ? el('div', { class: 'inline mb', style: { gap: '8px', flexWrap: 'wrap' } }, al.parSite.map((s) => badgeContour(`${s.siteNom} : ${s.total} alerte(s)${s.expirees ? ` dont ${s.expirees} échue(s)` : ''}`, s.expirees ? '#dc2626' : '#f59e0b'))) : null;
     const carteAlertes = ui.carte(`Alertes et échéances (${toutes.length})`, frag(parSite, el('div', { class: 'texte-2 texte-petit mb' }, `Habilitations et visites échues ou arrivant à échéance sous ${al.joursAlerte} jours (paramètre « alerte avant échéance » de la configuration RH), fins de contrat.`), tableAlertes.el), { actions: groupe });
 
     // Absents du jour
@@ -775,6 +848,7 @@
   // ====================================================================================================
   async function ongletPersonnel() {
     const f = memo.personnel;
+    filtreSiteService(f);
     const cont = el('div');
     const params = () => Object.assign({ typeContratCode: f.typeContratCode, actif: f.actif === 'tous' ? '' : f.actif, habilitationTypeCode: f.habilitationTypeCode }, paramsSiteService(f.siteService));
     const compteur = el('span', { class: 'texte-2 texte-petit' });
@@ -784,12 +858,12 @@
       colonnes: [
         { cle: 'nom', label: 'Personne', rendu: (p) => personneCellule(p.nomComplet, [p.matricule, p.fonction].filter(Boolean).join(' · '), 30, 230), valeurTri: (p) => `${p.nom} ${p.prenom}`.toLowerCase(), exportValeur: (p) => p.nomComplet },
         { cle: 'secteurChemin', label: 'Service', rendu: (p) => el('div', { style: { maxWidth: '180px' } }, el('div', null, secteurCellule(p.secteurId, p.secteurNom)), p.siteNom && p.siteNom !== p.secteurNom ? el('div', { class: 'cellule-secondaire texte-2 texte-petit', style: { paddingLeft: '16px' } }, p.siteNom) : null), valeurTri: (p) => p.secteurChemin || '', exportValeur: (p) => p.secteurChemin },
-        { cle: 'typeContratCode', label: 'Contrat', rendu: (p) => el('div', null, ui.badgeListe('typesContrat', p.typeContratCode, { contour: true }), p.dateSortie ? el('div', { class: 'cellule-secondaire texte-2 texte-petit', style: { marginTop: '2px' } }, `jusqu'au ${fmt(p.dateSortie)}`) : null), exportValeur: (p) => ui.libelle('typesContrat', p.typeContratCode) },
+        { cle: 'typeContratCode', label: 'Contrat', rendu: (p) => el('div', null, badgeListeContour('typesContrat', p.typeContratCode), p.dateSortie ? el('div', { class: 'cellule-secondaire texte-2 texte-petit', style: { marginTop: '2px' } }, `jusqu'au ${fmt(p.dateSortie)}`) : null), exportValeur: (p) => ui.libelle('typesContrat', p.typeContratCode) },
         { cle: 'dateEntree', label: 'Entrée', rendu: (p) => (p.dateEntree ? el('div', { style: { whiteSpace: 'nowrap' } }, fmt(p.dateEntree), el('div', { class: 'cellule-secondaire texte-2 texte-petit' }, anciennete(p.ancienneteMois))) : el('span', { class: 'texte-2' }, '—')), valeurTri: (p) => p.dateEntree || '', exportValeur: (p) => fmt(p.dateEntree) },
         { cle: 'habilitationsResume', label: 'Habilitations', rendu: (p) => resumeHabilitations(p.habilitationsResume), valeurTri: (p) => -((p.habilitationsResume.expirees * 1000) + (p.habilitationsResume.bientot * 100) + p.habilitationsResume.valides), exportValeur: (p) => `${p.habilitationsResume.valides} valides / ${p.habilitationsResume.bientot} à renouveler / ${p.habilitationsResume.expirees} expirées` },
-        { cle: 'derniereVisite', label: 'Prochaine visite', rendu: (p) => (p.derniereVisite && p.derniereVisite.prochaineVisite ? el('div', null, badgeEtat(p.derniereVisite.etat || 'valide'), el('div', { class: 'cellule-secondaire texte-2 texte-petit', style: { marginTop: '2px' }, title: 'Prochaine visite' }, fmt(p.derniereVisite.prochaineVisite))) : p.derniereVisite ? el('span', { class: 'texte-2 texte-petit' }, `le ${fmt(p.derniereVisite.date)}`) : el('span', { class: 'texte-2' }, '—')), valeurTri: (p) => (p.derniereVisite && p.derniereVisite.prochaineVisite) || '9999', exportValeur: (p) => (p.derniereVisite ? fmt(p.derniereVisite.prochaineVisite) : '') },
+        { cle: 'derniereVisite', label: 'Prochaine visite', rendu: (p) => { const pv = prochaineVisite(p.derniereVisite); if (!pv) return el('span', { class: 'texte-2' }, '—'); if (!pv.date) return el('span', { class: 'texte-2 texte-petit' }, pv.libelle); return el('div', null, badgeEtat(pv.etat), el('div', { class: 'cellule-secondaire texte-2 texte-petit', style: { marginTop: '2px' }, title: pv.etat === 'programmee' ? 'Visite programmée' : 'Échéance de la prochaine visite' }, fmt(pv.date))); }, valeurTri: (p) => { const pv = prochaineVisite(p.derniereVisite); return (pv && pv.date) || '9999'; }, exportValeur: (p) => { const pv = prochaineVisite(p.derniereVisite); return pv && pv.date ? fmt(pv.date) : ''; } },
         { cle: 'userLogin', label: 'Compte', aligner: 'centre', rendu: (p) => (p.userLogin ? el('span', { title: `Compte GMAO : ${p.userLogin}`, style: { color: 'var(--primaire)' } }, iconeDim('utilisateur', 17)) : el('span', { class: 'texte-2', title: 'Aucun compte GMAO lié' }, '—')), exportValeur: (p) => p.userLogin || '' },
-        { cle: 'presence', label: 'Présence', rendu: (p) => (p.actif === false ? ui.badge('Inactif', '#6b7280') : p.absentAujourdhui ? ui.badge(ui.libelle('typesAbsence', p.absentAujourdhui.typeCode), ui.couleur('typesAbsence', p.absentAujourdhui.typeCode), { titre: `Absent ${periode(p.absentAujourdhui.dateDebut, p.absentAujourdhui.dateFin, p.absentAujourdhui.demiJournee)}` }) : ui.badge('Présent', '#16a34a', { contour: true })), valeurTri: (p) => (p.actif === false ? 2 : p.absentAujourdhui ? 1 : 0), exportValeur: (p) => (p.actif === false ? 'Inactif' : p.absentAujourdhui ? 'Absent' : 'Présent') },
+        { cle: 'presence', label: 'Présence', rendu: (p) => (p.actif === false ? ui.badge('Inactif', '#6b7280') : p.absentAujourdhui ? ui.badge(ui.libelle('typesAbsence', p.absentAujourdhui.typeCode), ui.couleur('typesAbsence', p.absentAujourdhui.typeCode), { titre: `Absent ${periode(p.absentAujourdhui.dateDebut, p.absentAujourdhui.dateFin, p.absentAujourdhui.demiJournee)}` }) : badgeContour('Présent', '#16a34a')), valeurTri: (p) => (p.actif === false ? 2 : p.absentAujourdhui ? 1 : 0), exportValeur: (p) => (p.actif === false ? 'Inactif' : p.absentAujourdhui ? 'Absent' : 'Présent') },
       ],
       actions: [
         { icone: 'modifier', titre: 'Modifier', visible: (p) => ecriture('modifier', p), onClic: (p) => ouvrirFormulairePersonnel(p, { apres: charger }) },
@@ -833,7 +907,8 @@
       try { const n = memo.modeHab === 'matrice' ? await rendreMatrice() : await rendreListeHabilitations(); ui.vider(zone); zone.appendChild(n); } catch (e) { ui.vider(zone); zone.appendChild(ui.alerte('Erreur : ' + e.message, 'danger')); }
     }
     cont.appendChild(el('div', { class: 'barre-outils' }, groupe, el('span', { class: 'texte-2 texte-petit' }, 'Qui peut intervenir sur quoi : habilitations électriques, CACES, travail en hauteur, SST…'), el('span', { class: 'espace' }),
-      boutonExport('habilitations', () => ({ actif: '1' })),
+      // L'export reprend les filtres affichés : état et type en mode liste, site / service en mode matrice
+      boutonExport('habilitations', () => (memo.modeHab === 'liste' ? { etat: memo.habListe.etat || undefined, typeCode: memo.habListe.typeCode || undefined, actif: '1' } : Object.assign({ actif: '1' }, paramsSiteService(memo.matrice.siteService)))),
       peutCreer() ? ui.bouton('Nouvelle habilitation', { icone: 'plus', classe: 'btn-primaire btn-sm', onClic: () => ouvrirHabilitation(null, { apres: basculer }) }) : null));
     cont.appendChild(zone);
     await basculer();
@@ -841,6 +916,7 @@
 
     async function rendreMatrice() {
       const fm = memo.matrice;
+      filtreSiteService(fm);
       const out = el('div');
       const m = await api.get('/api/rh/matrice', paramsSiteService(fm.siteService));
       const corps = el('div');
@@ -876,13 +952,14 @@
         const tbody = el('tbody');
         for (const p of lignes) {
           const tr = el('tr');
-          tr.appendChild(el('td', { class: 'rh-col-personne' }, el('a', { href: '#/rh/' + p.id + '?onglet=habilitations', style: { color: 'inherit', textDecoration: 'none', display: 'block' } }, personneCellule(p.nomComplet, [p.fonction, p.secteurNom].filter(Boolean).join(' · '), 28, 228))));
+          tr.appendChild(el('td', { class: 'rh-col-personne' }, el('a', { href: '#/rh/' + p.id + '?onglet=habilitations', style: { color: 'inherit', textDecoration: 'none', display: 'block' } }, personneCellule(p.nomComplet, [p.fonction, p.secteurNom].filter(Boolean).join(' · '), 24, 228))));
           for (const t of types) {
             const c = p.cellules[t.code];
             const td = el('td');
             if (c) {
               const titre = `${t.label}\n${c.intitule || ''}\nObtenue le ${fmt(c.dateObtention)}\n${c.dateExpiration ? `Expire le ${fmt(c.dateExpiration)} (${relatifJours(c.joursRestants)})` : 'Sans échéance'}`;
-              td.appendChild(el('span', { class: 'rh-cellule', style: { background: ETATS[c.etat].couleur }, title: titre, role: 'button', tabindex: 0, onclick: () => ouvrirHabilitationParId(c.id, basculer) }, c.dateExpiration ? moisAnnee(c.dateExpiration) : '∞'));
+              const ouvrir = () => ouvrirHabilitationParId(c.id, basculer);
+              td.appendChild(el('span', { class: 'rh-cellule', style: { background: ETATS[c.etat].couleur }, title: titre, role: 'button', tabindex: 0, onclick: ouvrir, onkeydown: (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); ouvrir(); } } }, c.dateExpiration ? moisAnnee(c.dateExpiration) : '∞'));
             } else if (peutCreer() && !lectureSeule(p.secteurId) && p.modifiable !== false) {
               td.appendChild(el('button', { type: 'button', class: 'rh-ajout', title: `Saisir « ${t.label} » pour ${p.nomComplet}`, onclick: () => ouvrirHabilitation(null, { personnelId: p.id, personnelNom: p.nomComplet, typeCode: t.code, apres: basculer }) }, '+'));
             }
@@ -1015,6 +1092,7 @@
   // ====================================================================================================
   async function ongletAbsences(nav) {
     const fa = memo.absences;
+    filtreSiteService(fa);
     if (!fa.mois) fa.mois = ui.aujourdhui().slice(0, 7);
     const cont = el('div');
     const zoneValider = el('div');
@@ -1112,8 +1190,8 @@
       ui.vider(zoneListe);
       zoneListe.appendChild(ui.carte(`Absences du mois (${absences.length})`, ui.table({
         lignes: absences, compact: true, recherche: absences.length > 8 ? 'Rechercher…' : false, triInitial: { cle: 'dateDebut', sens: 'asc' }, vide: 'Aucune absence sur la période',
-        onClic: (a) => ouvrirDetailAbsence(a, recharger), ligneClasse: (a) => (a.statut === 'demandee' ? '' : ''),
-        exportCsv: `absences-${fa.mois}.csv`,
+        // Pas d'export de ce tableau dans le navigateur : l'export CSV du mois passe par le serveur (droit rh › exporter, journalisé)
+        onClic: (a) => ouvrirDetailAbsence(a, recharger),
         colonnes: [
           { cle: 'personnelNom', label: 'Personne', rendu: (a) => el('span', { class: 'cellule-principale' }, a.personnelNom), exportValeur: (a) => a.personnelNom },
           { cle: 'typeCode', label: 'Type', rendu: (a) => ui.badge(a.typeLibelle, a.typeCouleur), exportValeur: (a) => a.typeLibelle },
@@ -1125,7 +1203,7 @@
         ],
         actions: [
           { icone: 'check', titre: 'Valider', classe: 'texte-ok', visible: (a) => a.peutDecider, onClic: (a) => deciderAbsence(a, 'valider', recharger) },
-          { icone: 'modifier', titre: 'Modifier', visible: (a) => ecriture('modifier', a) && (a.statut === 'demandee' || a.statut === 'validee'), onClic: (a) => ouvrirAbsence(a, { apres: recharger }) },
+          { icone: 'modifier', titre: 'Modifier', visible: absenceModifiable, onClic: (a) => ouvrirAbsence(a, { apres: recharger }) },
           { icone: 'fermer', titre: 'Annuler l\'absence', visible: (a) => ecriture('modifier', a) && (a.statut === 'demandee' || a.statut === 'validee'), onClic: (a) => annulerAbsence(a, recharger) },
           { icone: 'supprimer', titre: 'Supprimer', classe: 'texte-danger', visible: (a) => ecriture('supprimer', a), onClic: (a) => supprimerAbsence(a, recharger) },
         ],
@@ -1145,7 +1223,8 @@
         el('label', { class: 'inline' }, cbAttente, 'Inclure les demandes en attente'),
         el('label', { class: 'inline' }, cbTous, 'Afficher tout le personnel'),
         el('span', { class: 'espace' }),
-        boutonExport('absences', () => Object.assign({ du: fa.mois + '-01', au: ajouterJours(ajouterMois(fa.mois + '-01', 1), -1) }, paramsSiteService(fa.siteService))),
+        // L'export reprend les filtres du calendrier : période, site / service, type et statuts affichés
+        boutonExport('absences', () => Object.assign({ du: fa.mois + '-01', au: ajouterJours(ajouterMois(fa.mois + '-01', 1), -1), typeCode: fa.typeCode || undefined, statut: fa.attente ? 'validee,demandee' : 'validee' }, paramsSiteService(fa.siteService))),
         peutCreer() ? ui.bouton('Nouvelle absence', { icone: 'plus', classe: 'btn-primaire btn-sm', onClic: () => ouvrirAbsence(null, { apres: recharger }) }) : null),
       legende, el('div', { class: 'mt' }, zoneCal)));
     cont.appendChild(zoneListe);
@@ -1159,7 +1238,7 @@
   function ongletIdentite(p, recharger) {
     const cont = el('div');
     const urgence = p.contactUrgence || {};
-    const contrat = el('span', null, ui.badgeListe('typesContrat', p.typeContratCode, { contour: true }));
+    const contrat = el('span', null, badgeListeContour('typesContrat', p.typeContratCode));
     cont.appendChild(el('div', { class: 'grille grille-2' },
       ui.carte('Identité et contrat', ui.details([
         { label: 'Matricule', valeur: el('code', null, p.matricule) },
@@ -1200,10 +1279,14 @@
   function ongletHabilitationsPersonne(p, recharger) {
     const cont = el('div');
     const habs = p.habilitations || [];
+    // Recyclage : l'habilitation la plus urgente (expirée, puis à renouveler, par échéance) est présélectionnée
+    const urgence = { expiree: 0, bientot: 1 };
+    const aRecycler = habs.filter((h) => h.etat in urgence).sort((a, b) => urgence[a.etat] - urgence[b.etat] || String(a.dateExpiration || '9999').localeCompare(String(b.dateExpiration || '9999')))[0] || habs.find((h) => h.etat !== 'remplacee');
+    const recyclage = (h) => ouvrirFormation(null, { personnelIds: [p.id], habilitationTypeCode: h ? h.typeCode : '', apres: recharger });
     cont.appendChild(el('div', { class: 'barre-outils' },
       el('span', { class: 'texte-2' }, `${habs.filter((h) => h.etat !== 'remplacee').length} habilitation(s) en cours · alerte ${joursAlerte()} jours avant l'échéance`),
       el('span', { class: 'espace' }),
-      ecriture('creer', p) ? ui.bouton('Inscrire à un recyclage', { icone: 'diplome', classe: 'btn-sm', onClic: () => ouvrirFormation(null, { personnelIds: [p.id], apres: recharger }) }) : null,
+      ecriture('creer', p) ? ui.bouton('Inscrire à un recyclage', { icone: 'diplome', classe: 'btn-sm', onClic: () => recyclage(aRecycler) }) : null,
       ecriture('creer', p) ? ui.bouton('Nouvelle habilitation', { icone: 'plus', classe: 'btn-primaire btn-sm', onClic: () => ouvrirHabilitation(null, { personnelId: p.id, personnelNom: p.nomComplet, apres: recharger }) }) : null));
     if (!habs.length) { cont.appendChild(ui.vide('Aucune habilitation enregistrée', 'diplome')); return cont; }
     cont.appendChild(ui.table({
@@ -1220,6 +1303,7 @@
       ],
       actions: [
         { icone: 'piece_jointe', titre: 'Pièces justificatives', onClic: (h) => ouvrirDocumentsHabilitation(h, recharger) },
+        { icone: 'diplome', titre: 'Planifier un recyclage', visible: (h) => ecriture('creer', p) && h.etat !== 'remplacee', onClic: (h) => recyclage(h) },
         { icone: 'modifier', titre: 'Modifier', visible: (h) => ecriture('modifier', h), onClic: (h) => ouvrirHabilitation(h, { apres: recharger }) },
         { icone: 'supprimer', titre: 'Supprimer', classe: 'texte-danger', visible: (h) => ecriture('supprimer', h), onClic: (h) => supprimerHabilitation(h, recharger) },
       ],
@@ -1227,7 +1311,9 @@
     const historique = habs.filter((h) => (h.historique || []).length);
     if (historique.length) {
       cont.appendChild(ui.carte('Historique des renouvellements', el('ul', { class: 'chronologie' }, historique.flatMap((h) => h.historique.slice().reverse().map((x) => el('li', null,
-        el('div', null, el('strong', null, h.intitule), ` : obtenue le ${fmt(x.dateObtention)}${x.dateExpiration ? `, valable jusqu'au ${fmt(x.dateExpiration)}` : ''}${x.organisme ? ' — ' + x.organisme : ''}`),
+        el('div', null, el('strong', null, h.intitule), ` : obtenue le ${fmt(x.dateObtention)}${x.dateExpiration ? `, valable jusqu'au ${fmt(x.dateExpiration)}` : ''}${x.organisme ? ' — ' + x.organisme : ''}${x.numero ? ` — n° ${x.numero}` : ''}`),
+        // Pièces de la période renouvelée (archivées avec elle)
+        (x.documents || []).length ? el('div', { class: 'inline texte-petit', style: { gap: '10px', flexWrap: 'wrap', marginTop: '3px' } }, x.documents.map((d) => el('a', { href: `/api/rh/habilitations/${h.id}/historique/${x.rang}/documents/${d.index}`, target: '_blank', rel: 'noopener', title: `${tailleLisible(d.taille)} · ${fmt(d.date)}` }, icone('piece_jointe'), d.nom))) : null,
         el('div', { class: 'chrono-date' }, `Renouvelée le ${ui.formatDate(x.remplaceeLe)}`))))), { classe: 'mt' }));
     }
     return cont;
@@ -1261,16 +1347,18 @@
     const cont = el('div');
     const vs = p.visites || [];
     cont.appendChild(ui.alerte('Données sensibles : seules la date, le type de visite et l\'avis d\'aptitude sont conservés (aucune information ni document médical).', 'info'));
+    const pv = prochaineVisite(p.derniereVisite);
     cont.appendChild(el('div', { class: 'barre-outils' },
-      p.derniereVisite && p.derniereVisite.prochaineVisite ? el('span', null, 'Prochaine visite : ', el('strong', null, fmt(p.derniereVisite.prochaineVisite)), ' ', badgeEtat(p.derniereVisite.etat || 'valide')) : el('span', { class: 'texte-2' }, 'Aucune prochaine visite planifiée'),
+      pv && pv.date ? el('span', null, 'Prochaine visite : ', el('strong', null, fmt(pv.date)), ' ', badgeEtat(pv.etat)) : el('span', { class: 'texte-2' }, pv ? `Aucune prochaine visite planifiée (dernière le ${fmt(p.derniereVisite.date)})` : 'Aucune prochaine visite planifiée'),
       el('span', { class: 'espace' }),
       ecriture('creer', p) ? ui.bouton('Nouvelle visite', { icone: 'plus', classe: 'btn-primaire btn-sm', onClic: () => ouvrirVisite(null, { personnelId: p.id, personnelNom: p.nomComplet, apres: recharger }) }) : null));
     if (!vs.length) { cont.appendChild(ui.vide('Aucune visite médicale enregistrée', 'info')); return cont; }
     cont.appendChild(ui.table({
       lignes: vs, recherche: false, pagination: false, ligneClasse: (v) => (v.etat === 'remplacee' ? 'inactif' : ''), triInitial: { cle: 'date', sens: 'desc' },
-      onClic: (v) => (ecriture('modifier', v) ? ouvrirVisite(v, { apres: recharger }) : null),
+      // En consultation, la ligne ouvre le détail de la visite (comme les habilitations)
+      onClic: (v) => (ecriture('modifier', v) ? ouvrirVisite(v, { apres: recharger }) : ouvrirDetailVisite(v)),
       colonnes: [
-        { cle: 'date', label: 'Date', rendu: (v) => el('div', null, fmt(v.date), v.date > ui.aujourdhui() ? el('div', { class: 'cellule-secondaire texte-petit', style: { color: 'var(--primaire)' } }, 'programmée') : null), valeurTri: (v) => v.date },
+        { cle: 'date', label: 'Date', rendu: (v) => el('div', null, fmt(v.date), v.date > ui.aujourdhui() ? el('div', { class: 'cellule-secondaire texte-petit', style: { color: 'var(--lien)' } }, 'programmée') : null), valeurTri: (v) => v.date },
         { cle: 'type', label: 'Type', rendu: (v) => badgeRh('typesVisiteMedicale', v.type, { contour: true }) },
         { cle: 'aptitude', label: 'Aptitude', rendu: (v) => badgeRh('aptitudesMedicales', v.aptitude) },
         { cle: 'restrictions', label: 'Aménagement de poste', rendu: (v) => el('span', { class: 'texte-petit' }, v.restrictions || '') },
@@ -1312,7 +1400,7 @@
       ],
       actions: [
         { icone: 'check', titre: 'Valider', classe: 'texte-ok', visible: (a) => a.peutDecider, onClic: (a) => deciderAbsence(a, 'valider', recharger) },
-        { icone: 'modifier', titre: 'Modifier', visible: (a) => ecriture('modifier', a) && (a.statut === 'demandee' || a.statut === 'validee'), onClic: (a) => ouvrirAbsence(a, { apres: recharger }) },
+        { icone: 'modifier', titre: 'Modifier', visible: absenceModifiable, onClic: (a) => ouvrirAbsence(a, { apres: recharger }) },
         { icone: 'fermer', titre: 'Annuler l\'absence', visible: (a) => ecriture('modifier', a) && (a.statut === 'demandee' || a.statut === 'validee'), onClic: (a) => annulerAbsence(a, recharger) },
         { icone: 'supprimer', titre: 'Supprimer', classe: 'texte-danger', visible: (a) => ecriture('supprimer', a), onClic: (a) => supprimerAbsence(a, recharger) },
       ],
@@ -1384,7 +1472,7 @@
     const recharger = () => GMAO.navigate(location.hash.split('?')[0] === '#/rh/' + p.id ? location.hash : '#/rh/' + p.id);
     const r = p.habilitationsResume;
     container.appendChild(ui.pageEntete({
-      titre: frag(p.nomComplet, ' ', ui.badgeListe('typesContrat', p.typeContratCode, { contour: true }), p.actif === false ? frag(' ', ui.badge('Inactif', '#6b7280')) : null, p.absentAujourdhui ? frag(' ', ui.badge(`Absent : ${ui.libelle('typesAbsence', p.absentAujourdhui.typeCode)}`, ui.couleur('typesAbsence', p.absentAujourdhui.typeCode))) : null),
+      titre: frag(p.nomComplet, ' ', badgeListeContour('typesContrat', p.typeContratCode), p.actif === false ? frag(' ', ui.badge('Inactif', '#6b7280')) : null, p.absentAujourdhui ? frag(' ', ui.badge(`Absent : ${ui.libelle('typesAbsence', p.absentAujourdhui.typeCode)}`, ui.couleur('typesAbsence', p.absentAujourdhui.typeCode))) : null),
       icone: 'rh',
       filAriane: [{ label: GMAO.moduleLabel(MODULE), href: '#/rh' }, { label: 'Personnel', href: '#/rh?onglet=personnel' }, { label: p.nomComplet }],
       sousTitre: [p.matricule, p.fonction, p.secteurChemin].filter(Boolean).join(' · '),
@@ -1399,11 +1487,12 @@
     if (p.actif === false) container.appendChild(ui.alerte('Cette fiche est désactivée : la personne ne fait plus partie de l\'effectif (historique conservé).', 'alerte'));
     if (r.expirees) container.appendChild(ui.alerte(`${r.expirees} habilitation(s) expirée(s) : la personne ne doit plus intervenir sous ces habilitations tant qu'elles ne sont pas renouvelées.`, 'danger'));
     const v = p.derniereVisite;
+    const pv = prochaineVisite(v);
     const st = p.statistiques || {};
     container.appendChild(el('div', { class: 'rh-grille-kpi serre' },
       ui.kpi({ label: 'Habilitations valides', valeur: r.valides, icone: 'diplome', couleur: '#16a34a', detail: `${r.total} en cours` }),
       ui.kpi({ label: 'À renouveler / expirées', valeur: `${r.bientot} / ${r.expirees}`, icone: 'alerte', couleur: r.expirees ? '#dc2626' : r.bientot ? '#f59e0b' : '#16a34a', detail: `alerte ${joursAlerte()} j avant l'échéance` }),
-      ui.kpi({ label: 'Prochaine visite médicale', valeur: v && v.prochaineVisite ? fmt(v.prochaineVisite) : '—', icone: 'info', couleur: v && v.etat === 'expiree' ? '#dc2626' : v && v.etat === 'bientot' ? '#f59e0b' : '#8b5cf6', detail: v ? `${v.etat === 'expiree' ? 'Échue · ' : v.etat === 'bientot' ? 'À programmer · ' : ''}${libelleRh('aptitudesMedicales', v.aptitude)} · visite du ${fmt(v.date)}` : 'aucune visite' }),
+      ui.kpi({ label: 'Prochaine visite médicale', valeur: pv && pv.date ? fmt(pv.date) : '—', icone: 'info', couleur: pv && pv.etat === 'expiree' ? '#dc2626' : pv && pv.etat === 'bientot' ? '#f59e0b' : '#8b5cf6', detail: v ? `${pv.etat === 'programmee' ? 'Programmée · ' : pv.etat === 'expiree' ? 'Échue · ' : pv.etat === 'bientot' ? 'À programmer · ' : !pv.date ? 'Non planifiée · ' : ''}${libelleRh('aptitudesMedicales', v.aptitude)} · visite du ${fmt(v.date)}` : 'aucune visite' }),
       ui.kpi({ label: `Absences ${st.annee || ''}`, valeur: jours(st.joursAbsenceAnnee || 0), icone: 'calendrier', couleur: '#0891b2', detail: 'jours ouvrés validés' }),
       p.activite && p.activite.compteLie ? ui.kpi({ label: 'Maintenance (12 mois)', valeur: ui.formatDuree(p.activite.heures12Mois) || '0 h', icone: 'ot', couleur: '#f59e0b', detail: `${p.activite.nbOt} OT · ${p.activite.nbOtOuverts} en cours` }) : null));
     container.appendChild(ui.onglets([
@@ -1446,7 +1535,7 @@
             el('div', { class: 'texte-2 texte-petit', style: { marginTop: '2px' } }, [`Matricule ${p.matricule}`, ui.libelle('typesContrat', p.typeContratCode), p.dateEntree ? `entrée le ${fmt(p.dateEntree)}` : '', p.managerNom ? `responsable : ${p.managerNom}` : ''].filter(Boolean).join(' · '))),
           el('div', { class: 'inline', style: { gap: '6px', flexWrap: 'wrap' } },
             ui.badge(`${r.valides} habilitation(s) valide(s)`, ETATS.valide.couleur), r.bientot ? ui.badge(`${r.bientot} à renouveler`, ETATS.bientot.couleur) : null, r.expirees ? ui.badge(`${r.expirees} expirée(s)`, ETATS.expiree.couleur) : null,
-            p.derniereVisite && p.derniereVisite.prochaineVisite ? ui.badge(`Prochaine visite : ${fmt(p.derniereVisite.prochaineVisite)}`, '#8b5cf6', { contour: true }) : null)));
+            (() => { const pv = prochaineVisite(p.derniereVisite); return pv && pv.date ? badgeContour(pv.etat === 'programmee' ? `Visite ${pv.libelle.toLowerCase()}` : `Prochaine visite : ${pv.libelle}`, '#8b5cf6') : null; })())));
       }
       const items = [];
       if (d.aValider.length) {
@@ -1533,7 +1622,7 @@
       sousTitre: 'Personnel, habilitations, formations, visites médicales et absences — multi-site',
       actions: [
         ui.bouton('Mon dossier RH', { icone: 'utilisateur', onClic: () => GMAO.ouvrirMonDossierRH() }),
-        can('modifier') ? ui.bouton('Vérifier les échéances', { icone: 'cloche', titre: 'Contrôle immédiat des échéances (habilitations, visites) et envoi des notifications — effectué automatiquement chaque jour', onClic: async () => {
+        can('modifier') && siteAffichableEnEcriture() ? ui.bouton('Vérifier les échéances', { icone: 'cloche', titre: 'Contrôle immédiat des échéances (habilitations, visites) de votre périmètre et envoi des notifications — effectué automatiquement chaque jour pour l\'ensemble', onClic: async () => {
           try { const r = await api.post('/api/rh/verifier-echeances', {}); toast(`Vérification effectuée : ${r.expirees} expirée(s), ${r.bientot} à renouveler, ${r.visites} visite(s) échue(s) — ${r.notifications} notification(s) envoyée(s)`, r.notifications ? 'alerte' : 'succes', 6000); GMAO.majNotifications && GMAO.majNotifications(); } catch (e) { erreur(e); }
         } }) : null,
         peutCreer() ? ui.bouton('Nouvelle personne', { icone: 'plus', classe: 'btn-primaire', onClic: () => ouvrirFormulairePersonnel(null) }) : null,

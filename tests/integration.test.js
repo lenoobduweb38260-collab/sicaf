@@ -419,6 +419,67 @@ test.describe('Intégration des modules métier', () => {
     }
   });
 
+  test('OT ↔ demandes / préventif : la création manuelle d\'un OT ne contourne ni la validation des DI ni la portée des plans', async () => {
+    // Demande d'un secteur hors du périmètre de jbernard (PROD / LOG) : QUAL
+    const qual = db.findOne('secteurs', (s) => s.code === 'QUAL');
+    const di = await c.mdupont.ok('POST', '/api/demandes', { titre: 'Hotte du laboratoire bruyante (test d\'intégration)', description: 'Détail réservé à la qualité', secteurId: qual.id, prioriteCode: 'normale', typeCode: 'correctif' });
+    assert.equal(di.statut, 'soumise');
+    assert.equal((await c.jbernard.get(`/api/demandes/${di.id}`)).status, 404, 'demande invisible pour jbernard');
+    const prod = db.findOne('secteurs', (s) => s.code === 'PROD');
+    const r = await c.jbernard.post('/api/ot', { titre: 'Contrôle hotte', demandeId: di.id, equipementId: null, secteurId: prod.id, technicienId: u.jbernard.id });
+    assert.equal(r.status, 400, 'création refusée');
+    assert.ok(!JSON.stringify(r.body).includes('réservé à la qualité'), 'la demande ne fuit pas');
+    const apres = db.get('demandes', di.id);
+    assert.equal(apres.statut, 'soumise', 'la demande n\'est pas validée en douce');
+    assert.equal(apres.otId, null);
+    assert.equal(apres.validateurId, null);
+    // Demande visible mais seulement soumise : elle doit passer par la validation (N+1) avant tout OT
+    const diProd = await c.spetit.ok('POST', '/api/demandes', { titre: 'Voyant de défaut allumé (test d\'intégration)', equipementId: etat.eq.id, prioriteCode: 'normale', typeCode: 'correctif' });
+    assert.equal((await c.jbernard.post('/api/ot', { titre: 'Voyant', demandeId: diProd.id })).status, 400);
+    assert.equal(db.get('demandes', diProd.id).statut, 'soumise');
+    assert.equal((await c.pmartin.ok('POST', `/api/demandes/${diProd.id}/valider`, {})).statut, 'convertie', 'la validation par le N+1 reste la voie normale');
+
+    // Plan préventif d'un autre secteur (SG) : ni OT manuel, ni échéance repoussée
+    const plan = db.findOne('plansPreventifs', (p) => p.actif !== false && p.periodicite && p.periodicite.type !== 'compteur' && p.secteurId != null && ![prod.id, db.findOne('secteurs', (s) => s.code === 'LOG').id].includes(p.secteurId));
+    assert.ok(plan, 'plan hors du périmètre de jbernard');
+    assert.equal((await c.jbernard.get(`/api/preventif/${plan.id}`)).status, 404);
+    const echeance = plan.prochaineEcheance;
+    const rp = await c.jbernard.post('/api/ot', { titre: 'Filtres CTA', planPreventifId: plan.id, equipementId: null, secteurId: prod.id, technicienId: u.jbernard.id });
+    assert.equal(rp.status, 400);
+    assert.ok(!JSON.stringify(rp.body).includes((plan.gamme || [{ libelle: '§' }])[0].libelle), 'la gamme du plan ne fuit pas');
+    assert.equal(db.get('plansPreventifs', plan.id).prochaineEcheance, echeance, 'échéance intacte');
+    assert.equal(db.count('ot', (o) => o.planPreventifId === plan.id && o.createdBy === u.jbernard.id), 0);
+  });
+
+  test('OT ↔ demandes : le demandeur n\'est prévenu qu\'une fois de la fin de l\'intervention', async () => {
+    const di = await c.spetit.ok('POST', '/api/demandes', { titre: 'Capot de protection desserré — notification unique', equipementId: etat.eq.id, prioriteCode: 'normale', typeCode: 'securite' });
+    const val = await c.pmartin.ok('POST', `/api/demandes/${di.id}/valider`, {});
+    assert.equal(val.statut, 'convertie');
+    const avant = db.count('notifications', (n) => n.userId === u.spetit.id);
+    await c.mdupont.ok('POST', `/api/ot/${val.otId}/cloturer`, { rapport: 'Capot refixé.' });
+    assert.equal(db.get('demandes', di.id).statut, 'cloturee');
+    const nouvelles = db.list('notifications', (n) => n.userId === u.spetit.id).slice(avant);
+    assert.equal(nouvelles.length, 1, `notifications reçues : ${nouvelles.map((n) => n.titre).join(' | ')}`);
+    assert.match(nouvelles[0].titre, /Demande .* clôturée/);
+  });
+
+  test('OT ↔ achats : un OT auquel une facture est imputée ne peut pas être supprimé', async () => {
+    const four = db.findOne('fournisseurs', (f) => f.actif !== false);
+    assert.ok(four, 'fournisseur de démonstration');
+    const o = await c.mdupont.ok('POST', '/api/ot', { titre: 'Prestation externe facturée (test d\'intégration)', equipementId: etat.eq.id, typeCode: 'correctif' });
+    const f = await c.mdupont.ok('POST', '/api/factures', { fournisseurId: four.id, secteurId: o.secteurId, numeroFournisseur: 'INT-OT-1', dateFacture: jour(0), montantHT: 250, otId: o.id, objet: 'Dépannage' });
+    assert.equal(f.otId, o.id);
+    const couts = await c.mdupont.ok('GET', `/api/achats/couts-ot/${o.id}`);
+    assert.ok(couts.factures.some((x) => x.id === f.id));
+    const r = await c.mdupont.del(`/api/ot/${o.id}`);
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /facture/);
+    assert.ok(db.get('ot', o.id), 'OT conservé');
+    assert.equal((await c.mdupont.ok('GET', `/api/factures/${f.id}`)).otNumero, o.numero, 'lien facture → OT conservé');
+    assert.equal((await c.mdupont.ok('GET', `/api/ot/${o.id}`)).actions.supprimer, false);
+    await c.mdupont.ok('POST', `/api/ot/${o.id}/statut`, { statut: 'annule', commentaire: 'Prestation annulée' });
+  });
+
   test('planning ↔ OT : replanification (droit planning.modifier), statut planifié, notification', async () => {
     const o = etat.otPerso;
     assert.ok(o, 'OT du test précédent');

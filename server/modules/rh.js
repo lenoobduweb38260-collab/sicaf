@@ -17,7 +17,7 @@
  * Services publiés : ctx.services.rh = {
  *   absencesEntre(du, au, { secteurIds, userIds, statuts }), habilitationsValides(userId, date),
  *   estAbsent(userId, date), absenceDe(userId, date), habilitationValide(userId, typeCode, date),
- *   personnelDeUser(userId), verifierEcheances(options) }
+ *   personnelDeUser(userId), verifierEcheances({ date, personnelIds }) }
  * Événements émis : 'rh:absenceDemandee', 'rh:absenceValidee', 'rh:absenceRefusee', 'rh:absenceAnnulee',
  *   'rh:habilitationExpiree', 'rh:habilitationBientotExpiree', 'rh:formationRealisee'.
  */
@@ -119,7 +119,10 @@ function prochainOuvre(iso) { let d = iso; while (!estOuvre(d)) d = ajouterJours
 const arrondi = (n, dec = 2) => { const f = 10 ** dec; return Math.round((Number(n) || 0) * f) / f; };
 
 function csvEscape(v) {
-  const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
+  let s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
+  // Texte commençant par = + - @ (ou tabulation, retour chariot) : apostrophe en tête pour qu'un tableur ne
+  // l'interprète jamais comme une formule ; les nombres (même négatifs) restent des nombres
+  if (typeof v !== 'number' && /^[=+\-@\t\r]/.test(s) && !/^[-+]?\d[\d\s  .,]*$/.test(s)) s = "'" + s;
   return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 const nombreCsv = (n) => (n == null || n === '' ? '' : String(n).replace('.', ','));
@@ -146,6 +149,7 @@ function register(ctx) {
   function libelle(nomListe, code) { const it = itemListe(nomListe, code); return it ? it.label : (code == null ? '' : String(code)); }
   function couleurListe(nomListe, code) { const it = itemListe(nomListe, code); return (it && it.couleur) || '#6b7280'; }
   const can = (req, module, action) => !!(req.perms && perms.can(req.perms, module, action));
+  const estAdmin = (req) => !!(req.perms && req.perms.estAdmin);
   const nomPersonne = (p) => (p ? `${p.prenom || ''} ${p.nom || ''}`.trim() : '');
   /** Une absence de ce type rend-elle la personne indisponible ? (une astreinte, non) */
   function typeRendAbsent(code) {
@@ -287,6 +291,11 @@ function register(ctx) {
     if (!liste || !liste.length) return null;
     return liste.find((v) => v.date <= ref) || liste[0];
   }
+  /** Visite déjà programmée (la plus proche à venir), ou null. */
+  function visiteProgrammee(liste, ref) {
+    if (!liste || !liste.length) return null;
+    return liste.filter((v) => v.date > ref).sort((a, b) => String(a.date).localeCompare(String(b.date)))[0] || null;
+  }
   function etatVisite(v, idx) {
     if (!v || !v.prochaineVisite) return null;
     const aVenir = (idx.visites.get(Number(v.personnelId)) || []).find((x) => x.date > idx.ref && x.date >= (v.date || ''));
@@ -311,6 +320,7 @@ function register(ctx) {
     const siteId = perms.siteDuSecteur(db, p.secteurId, idx.secteurs);
     const abs = idx.absJour.get(p.id);
     const v = visiteReference(idx.visites.get(p.id), idx.ref);
+    const programmee = visiteProgrammee(idx.visites.get(p.id), idx.ref);
     const secteur = p.secteurId != null ? idx.secteurs.get(Number(p.secteurId)) : null;
     return Object.assign(sortiePersonnel(req, p), {
       nomComplet: nomPersonne(p),
@@ -321,14 +331,15 @@ function register(ctx) {
       managerId, managerNom: nomUser(managerId, idx.users),
       habilitationsResume: resumeHab,
       absentAujourdhui: abs ? { id: abs.id, typeCode: abs.typeCode, dateDebut: abs.dateDebut, dateFin: abs.dateFin, demiJournee: abs.demiJournee || null } : null,
-      derniereVisite: v ? { id: v.id, date: v.date, type: v.type, aptitude: v.aptitude, prochaineVisite: v.prochaineVisite || null, etat: etatVisite(v, idx) } : null,
+      // `programmee` : visite à venir déjà fixée (prioritaire sur l'échéance calculée de la dernière visite)
+      derniereVisite: v ? { id: v.id, date: v.date, type: v.type, aptitude: v.aptitude, prochaineVisite: v.prochaineVisite || null, etat: etatVisite(v, idx), programmee: programmee ? { id: programmee.id, date: programmee.date, type: programmee.type } : null } : null,
       ancienneteMois: p.dateEntree && p.dateEntree <= idx.ref ? Math.max(0, Math.floor(joursEntre(p.dateEntree, (p.dateSortie && p.dateSortie < idx.ref) ? p.dateSortie : idx.ref) / 30.4375)) : null,
       modifiable: modifiable(req, p),
     });
   }
 
   function enrichirHabilitation(req, h, idx, persMap) {
-    const { documents, ...reste } = h;
+    const { documents, historique, ...reste } = h;
     const p = persMap ? persMap.get(Number(h.personnelId)) : db.get(PERS, h.personnelId);
     const type = ctx.liste('typesHabilitation').find((t) => t.code === h.typeCode);
     const etat = etatHabilitation(h, idx);
@@ -338,6 +349,8 @@ function register(ctx) {
       typeLibelle: type ? type.label : h.typeCode, typeCouleur: (type && type.couleur) || '#6b7280', dureeMois: type && type.dureeMois != null ? Number(type.dureeMois) : null,
       personnelNom: nomPersonne(p), matricule: p ? p.matricule : '', personnelActif: p ? p.actif !== false : false,
       documents: (documents || []).map(resumeDoc), nbDocuments: (documents || []).length,
+      // Périodes précédentes : leurs pièces justificatives sont résumées (contenu servi par la route dédiée)
+      historique: (historique || []).map((x, rang) => Object.assign({}, x, { rang, documents: (x.documents || []).map(resumeDoc) })),
       modifiable: modifiable(req, h),
     });
   }
@@ -360,14 +373,18 @@ function register(ctx) {
     if (a.demiJournee) return estOuvre(d) ? 0.5 : 0;
     return joursOuvres(d, f);
   }
-  function peutDecider(req, a, p, users) {
-    if (!a || a.statut !== 'demandee' || !p) return false;
-    if (Number(p.userId) === req.user.id && !(req.perms && req.perms.estAdmin)) return false;
+  /** L'utilisateur a-t-il le pouvoir de validation sur les absences de cette personne (N+1, ou valideur RH dans sa portée) ? */
+  function peutValider(req, p, users) {
+    if (!p) return false;
+    if (p.userId != null && Number(p.userId) === req.user.id && !estAdmin(req)) return false;
     if (managerDe(p, users) === req.user.id) return true;
-    if (!can(req, MODULE, 'valider') || !modifiable(req, a)) return false;
+    if (!can(req, MODULE, 'valider') || !modifiable(req, p)) return false;
     const wf = ctx.config().workflow || {};
-    if (wf.validerParSuperieurUniquement && !(req.perms && req.perms.estAdmin) && managerDe(p, users) != null) return false;
+    if (wf.validerParSuperieurUniquement && !estAdmin(req) && managerDe(p, users) != null) return false;
     return true;
+  }
+  function peutDecider(req, a, p, users) {
+    return !!a && a.statut === 'demandee' && peutValider(req, p, users);
   }
   function enrichirAbsence(req, a, idx, persMap) {
     const p = persMap ? persMap.get(Number(a.personnelId)) : db.get(PERS, a.personnelId);
@@ -381,6 +398,7 @@ function register(ctx) {
       demandeurNom: nomUser(a.demandeurUserId, users), valideurNom: nomUser(a.valideurUserId, users),
       managerId: managerDe(p, users), managerNom: nomUser(managerDe(p, users), users),
       peutDecider: peutDecider(req, a, p, users),
+      peutValider: peutValider(req, p, users),
       modifiable: modifiable(req, a),
     });
   }
@@ -546,6 +564,8 @@ function register(ctx) {
       user = db.get('users', userId);
       if (!user) throw new HttpError(400, 'Compte GMAO introuvable');
       if (db.findOne(PERS, (x) => x.userId != null && Number(x.userId) === userId && (!existant || x.id !== existant.id))) throw new HttpError(400, 'Ce compte GMAO est déjà lié à une autre fiche du personnel');
+      // Lier une fiche à son propre compte est réservé à un autre gestionnaire (sinon : délier, s'auto-valider une absence, relier)
+      if (userId === req.user.id && !estAdmin(req) && !(existant && Number(existant.userId) === userId)) throw new HttpError(403, 'Vous ne pouvez pas lier une fiche du personnel à votre propre compte : demandez-le à un autre gestionnaire');
     }
     out.userId = userId;
     const depuisCompte = (cle, v) => ((v == null || v === '') && user && !existant ? user[cle] : v);
@@ -573,6 +593,8 @@ function register(ctx) {
     if (managerUserId != null) {
       if (!db.get('users', managerUserId)) throw new HttpError(400, 'Responsable (N+1) introuvable');
       if (userId != null && managerUserId === userId) throw new HttpError(400, 'Une personne ne peut pas être son propre responsable');
+      // Le N+1 décide des absences sans droit RH : on ne se désigne pas soi-même (hors administrateur)
+      if (managerUserId === req.user.id && !estAdmin(req) && !(existant && Number(existant.managerUserId) === managerUserId)) throw new HttpError(403, 'Vous ne pouvez pas vous désigner responsable (N+1) d\'une personne : demandez-le à un autre gestionnaire');
     }
     out.managerUserId = managerUserId;
 
@@ -707,6 +729,8 @@ function register(ctx) {
 
   router.put('/api/rh/personnel/:id', async (req) => {
     const existant = ctx.getVisible(req, PERS, req.params.id);
+    // Sa propre fiche (compte lié, N+1, contrat, coût…) relève d'un autre gestionnaire
+    if (existant.userId != null && Number(existant.userId) === req.user.id && !estAdmin(req)) throw new HttpError(403, 'Votre propre fiche du personnel ne peut être modifiée que par un autre gestionnaire');
     const data = validerPersonnel(req, req.body, existant);
     const p = db.update(PERS, existant.id, data);
     if (Number(existant.secteurId) !== Number(p.secteurId)) propagerSecteur(p.id, p.secteurId);
@@ -715,6 +739,8 @@ function register(ctx) {
     if (existant.actif === false && p.actif !== false) changements.push('réactivation');
     if (Number(existant.secteurId) !== Number(p.secteurId)) changements.push(`mutation vers ${(db.get('secteurs', p.secteurId) || {}).nom || ''}`);
     if ((existant.coutHoraire ?? null) !== (p.coutHoraire ?? null)) changements.push('coût horaire');
+    if ((existant.userId ?? null) !== (p.userId ?? null)) changements.push(`compte lié : ${nomUser(existant.userId) || 'aucun'} → ${nomUser(p.userId) || 'aucun'}`);
+    if ((existant.managerUserId ?? null) !== (p.managerUserId ?? null)) changements.push(`responsable (N+1) : ${nomUser(existant.managerUserId) || 'aucun'} → ${nomUser(p.managerUserId) || 'aucun'}`);
     ctx.audit(req, 'modification', PERS, p.id, `Fiche du personnel ${p.matricule} ${nomPersonne(p)}${changements.length ? ' (' + changements.join(', ') + ')' : ''}`);
     return dossier(req, p);
   }, { perm: [MODULE, 'modifier'] });
@@ -851,14 +877,24 @@ function register(ctx) {
     return { ok: true, documents: h.documents.map(resumeDoc) };
   }, { perm: [MODULE, 'modifier'] });
 
-  function indexDoc(req, h) {
+  function indexDoc(req, docs) {
     const i = Number(req.params.index);
-    if (!Number.isInteger(i) || i < 0 || i >= (h.documents || []).length) throw new HttpError(404, 'Document introuvable');
+    if (!Number.isInteger(i) || i < 0 || i >= (docs || []).length) throw new HttpError(404, 'Document introuvable');
     return i;
   }
   router.get('/api/rh/habilitations/:id/documents/:index', async (req, res) => {
     const h = ctx.getVisible(req, HAB, req.params.id);
-    const doc = h.documents[indexDoc(req, h)];
+    servirDocument(req, res, h.documents[indexDoc(req, h.documents)]);
+  }, { perm: [MODULE, 'voir'] });
+  // Pièces d'une période précédente (archivées lors d'un renouvellement par formation)
+  router.get('/api/rh/habilitations/:id/historique/:rang/documents/:index', async (req, res) => {
+    const h = ctx.getVisible(req, HAB, req.params.id);
+    const rang = Number(req.params.rang);
+    const entree = Number.isInteger(rang) && rang >= 0 ? (h.historique || [])[rang] : null;
+    if (!entree) throw new HttpError(404, 'Période introuvable dans l\'historique');
+    servirDocument(req, res, entree.documents[indexDoc(req, entree.documents)]);
+  }, { perm: [MODULE, 'voir'] });
+  function servirDocument(req, res, doc) {
     const m = /^data:([^;,]*)(?:;[^,]*)?;base64,(.*)$/s.exec(doc.contenu || '');
     if (!m) throw new HttpError(500, 'Document corrompu');
     const buf = Buffer.from(m[2], 'base64');
@@ -874,11 +910,11 @@ function register(ctx) {
       'Cache-Control': 'private, no-store',
     });
     res.end(buf);
-  }, { perm: [MODULE, 'voir'] });
+  }
 
   router.delete('/api/rh/habilitations/:id/documents/:index', async (req) => {
     const existant = ctx.getVisible(req, HAB, req.params.id);
-    const i = indexDoc(req, existant);
+    const i = indexDoc(req, existant.documents);
     const docs = existant.documents.slice();
     const [sup] = docs.splice(i, 1);
     const h = db.update(HAB, existant.id, { documents: docs });
@@ -917,12 +953,16 @@ function register(ctx) {
   router.get('/api/rh/habilitations-technicien/:userId', async (req) => {
     const uid = idRef(req.params.userId, 'Utilisateur');
     const soi = uid === req.user.id;
+    const voirRh = can(req, MODULE, 'voir');
     const metier = ['ot', 'planning', 'preventif', 'demandes'].some((m) => can(req, m, 'voir'));
-    if (!soi && !metier && !can(req, MODULE, 'voir')) throw new HttpError(403, 'Droit insuffisant : consultation des habilitations');
+    if (!soi && !metier && !voirRh) throw new HttpError(403, 'Droit insuffisant : consultation des habilitations');
     const date = dateISO(req.query.date, 'Date') || aujourdhui();
     const p = personnelDeUser(uid);
-    if (p && !soi && !metier && !ctx.canSee(req, p)) throw new HttpError(404, 'Personne introuvable');
-    const habilitations = p ? habilitationsValides(uid, date) : [];
+    // Portée et site choisi dans l'en-tête : toujours contrôlés, quel que soit le droit métier (sauf pour soi-même)
+    if (p && !soi && !ctx.canSee(req, p)) throw new HttpError(404, 'Personne introuvable');
+    let habilitations = p ? habilitationsValides(uid, date) : [];
+    // Sans droit RH, ni numéro de titre ni organisme (informations du dossier individuel)
+    if (!soi && !voirRh) habilitations = habilitations.map(({ numero, organisme, ...h }) => h);
     return { userId: uid, personnelId: p ? p.id : null, nom: p ? nomPersonne(p) : ctx.nomUser(uid), date, habilitations, typeCodes: Array.from(new Set(habilitations.map((h) => h.typeCode))) };
   });
 
@@ -980,8 +1020,9 @@ function register(ctx) {
     const dateExpiration = expirationParDefaut(typeCode, dateObtention);
     if (courante) {
       if (courante.dateObtention && courante.dateObtention >= dateObtention) return { habilitation: courante, action: 'inchangee' };
-      const historique = (courante.historique || []).concat([{ dateObtention: courante.dateObtention, dateExpiration: courante.dateExpiration || null, organisme: courante.organisme || '', numero: courante.numero || '', formationId: courante.formationId || null, remplaceeLe: new Date().toISOString() }]).slice(-50);
-      const h = db.update(HAB, courante.id, { dateObtention, dateExpiration, expirationCalculee: !!dateExpiration, organisme: organisme || courante.organisme || '', numero: '', formationId: formation.id, historique, alertes: {}, secteurId: personne.secteurId });
+      // Les pièces de la période renouvelée (attestation, titre…) sont archivées avec elle : la nouvelle période repart sans pièce
+      const historique = (courante.historique || []).concat([{ dateObtention: courante.dateObtention, dateExpiration: courante.dateExpiration || null, organisme: courante.organisme || '', numero: courante.numero || '', formationId: courante.formationId || null, documents: courante.documents || [], remplaceeLe: new Date().toISOString() }]).slice(-50);
+      const h = db.update(HAB, courante.id, { dateObtention, dateExpiration, expirationCalculee: !!dateExpiration, organisme: organisme || courante.organisme || '', numero: '', formationId: formation.id, documents: [], historique, alertes: {}, secteurId: personne.secteurId });
       ctx.audit(req, 'renouvellement', HAB, h.id, `${h.intitule} — ${nomPersonne(personne)} renouvelée par la formation « ${formation.intitule} » (${courante.dateExpiration || 'sans échéance'} → ${dateExpiration || 'sans échéance'})`);
       return { habilitation: h, action: 'renouvelee' };
     }
@@ -1008,6 +1049,9 @@ function register(ctx) {
     }
     const generees = [];
     if (f.habilitationTypeCode) {
+      // Les habilitations sont écrites sur le site de chaque présent : il doit être modifiable par l'utilisateur
+      const refuses = presents.map((pid) => db.get(PERS, pid)).filter((p) => p && !modifiable(req, p));
+      if (refuses.length) throw new HttpError(403, `Habilitation impossible pour ${refuses.map(nomPersonne).join(', ')} : site en lecture seule ou hors de votre portée. Retirez ces personnes des présents ou faites saisir leur habilitation par leur site.`);
       for (const pid of presents) {
         const p = db.get(PERS, pid);
         if (!p) continue;
@@ -1056,6 +1100,13 @@ function register(ctx) {
     const existant = ctx.getVisible(req, FOR, req.params.id);
     const data = validerFormation(req, req.body, existant);
     if (existant.statut === 'realisee' && data.statut !== 'realisee') throw new HttpError(400, 'Une formation réalisée ne peut plus être replanifiée ni annulée');
+    if (existant.statut === 'realisee') {
+      // Les habilitations générées dépendent des dates, du type visé et des participants : figés une fois la formation réalisée
+      const fige = [['dateDebut', 'ses dates'], ['dateFin', 'ses dates'], ['habilitationTypeCode', 'l\'habilitation visée']].find(([k]) => (existant[k] || null) !== (data[k] || null));
+      if (fige) throw new HttpError(400, `Une formation réalisée ne peut plus changer ${fige[1]} : les habilitations générées en dépendent (traçabilité)`);
+      const ids = (l) => JSON.stringify((l || []).map(Number).sort((a, b) => a - b));
+      if (ids(existant.personnelIds) !== ids(data.personnelIds)) throw new HttpError(400, 'Les participants d\'une formation réalisée ne peuvent plus être modifiés : les habilitations générées en dépendent (traçabilité)');
+    }
     if (existant.statut === 'annulee' && data.statut === 'realisee') throw new HttpError(400, 'Une formation annulée ne peut pas être déclarée réalisée : replanifiez-la d\'abord');
     const realiser = existant.statut !== 'realisee' && data.statut === 'realisee';
     if (realiser && data.dateFin > aujourdhui()) throw new HttpError(400, 'Une formation ne peut être déclarée réalisée qu\'à partir de sa date de fin');
@@ -1255,10 +1306,27 @@ function register(ctx) {
     const existant = ctx.getVisible(req, ABS, req.params.id);
     if (existant.statut === 'annulee' || existant.statut === 'refusee') throw new HttpError(400, 'Une absence annulée ou refusée ne peut plus être modifiée');
     const p = db.get(PERS, existant.personnelId);
+    if (existant.statut === 'validee' && p && p.userId != null && Number(p.userId) === req.user.id && !estAdmin(req)) throw new HttpError(403, 'Vous ne pouvez pas modifier votre propre absence validée : annulez-la puis faites une nouvelle demande');
     const data = validerAbsence(req.body, existant, p);
     verifierChevauchement(data, existant.id);
+    // Période, type ou demi-journée d'une absence validée modifiés : la validation est à refaire, sauf par un valideur
+    const periodeChangee = existant.statut === 'validee' && ['typeCode', 'dateDebut', 'dateFin', 'demiJournee'].some((k) => (existant[k] || null) !== (data[k] || null));
+    const revalidee = periodeChangee && peutValider(req, p);
+    const aValider = periodeChangee && !revalidee;
+    if (revalidee) Object.assign(data, { valideurUserId: req.user.id, dateValidation: new Date().toISOString() });
+    if (aValider) Object.assign(data, { statut: 'demandee', valideurUserId: null, dateValidation: null, motifDecision: '' });
     const a = db.update(ABS, existant.id, data);
-    ctx.audit(req, 'modification', ABS, a.id, `Absence ${periode(a)} — ${nomPersonne(p)}${existant.dateDebut !== a.dateDebut || existant.dateFin !== a.dateFin ? ` (était ${periode(existant)})` : ''}`);
+    const etait = existant.dateDebut !== a.dateDebut || existant.dateFin !== a.dateFin ? ` (était ${periode(existant)})` : '';
+    ctx.audit(req, aValider ? 'statut' : 'modification', ABS, a.id, `Absence ${periode(a)} — ${nomPersonne(p)}${etait}${revalidee ? ', validation renouvelée' : aValider ? ` : ${libelle('statutsAbsence', 'validee')} → ${libelle('statutsAbsence', 'demandee')}` : ''}`);
+    const lib = libelle('typesAbsence', a.typeCode) || a.typeCode;
+    if (aValider) {
+      if (p.userId != null) notifier([p.userId], { titre: 'Absence à revalider', message: `${lib} ${periode(a)} — modifiée par ${ctx.nomUser(req.user.id)} : votre absence doit être validée de nouveau`, type: 'alerte' }, `#/rh/${p.id}?onglet=absences`, req.user.id);
+      informerValideurs(req, a, p);
+      ctx.emit('rh:absenceDemandee', { absence: a, personnel: p });
+    } else if (revalidee) {
+      if (p.userId != null) notifier([p.userId], { titre: 'Absence modifiée', message: `${lib} ${periode(a)} — modifiée et validée par ${ctx.nomUser(req.user.id)}`, type: 'info' }, `#/rh/${p.id}?onglet=absences`, req.user.id);
+      ctx.emit('rh:absenceValidee', { absence: a, personnel: p, userId: p.userId != null ? Number(p.userId) : null, valideurUserId: req.user.id });
+    }
     return enrichirAbsence(req, a, index());
   }, { perm: [MODULE, 'modifier'] });
 
@@ -1562,12 +1630,15 @@ function register(ctx) {
     const jours = cfgRh().alerteJoursAvantEcheance;
     const resultat = { date: ref, expirees: 0, bientot: 0, visites: 0, notifications: 0 };
     const persMap = mapPersonnel();
+    // `options.personnelIds` (Set) : traitement limité à ces personnes (déclenchement manuel dans une portée)
+    const cible = options.personnelIds instanceof Set ? options.personnelIds : null;
+    const concerne = (p) => !!p && p.actif !== false && (!cible || cible.has(p.id));
     const habs = db.list(HAB);
     const courantes = habilitationsCourantes(habs);
     const fr = (d) => String(d).split('-').reverse().join('/');
     for (const h of habs) {
       const p = persMap.get(Number(h.personnelId));
-      if (!p || p.actif === false || courantes.get(cleHab(h)) !== h.id || !h.dateExpiration) continue;
+      if (!concerne(p) || courantes.get(cleHab(h)) !== h.id || !h.dateExpiration) continue;
       const etat = etatEcheance(h.dateExpiration, ref, jours);
       const deja = h.alertes || {};
       if (etat === 'valide' || deja[etat] === h.dateExpiration) continue;
@@ -1585,7 +1656,7 @@ function register(ctx) {
     const idx = index(ref);
     for (const [pid, liste] of idx.visites) {
       const p = persMap.get(pid);
-      if (!p || p.actif === false) continue;
+      if (!concerne(p)) continue;
       const v = visiteReference(liste, ref);
       if (!v || !v.prochaineVisite || etatVisite(v, idx) !== 'expiree' || (v.alertes || {}).expiree === v.prochaineVisite) continue;
       db.update(VIS, v.id, { alertes: Object.assign({}, v.alertes || {}, { expiree: v.prochaineVisite }) });
@@ -1595,7 +1666,9 @@ function register(ctx) {
     return resultat;
   }
   router.post('/api/rh/verifier-echeances', async (req) => {
-    const r = verifierEcheances();
+    // Déclenchement manuel : limité aux personnes de la portée de l'utilisateur (sites en lecture seule exclus) ;
+    // le contrôle quotidien automatique couvre l'ensemble
+    const r = verifierEcheances({ personnelIds: new Set(ctx.scope(req, db.list(PERS)).map((p) => p.id)) });
     ctx.audit(req, 'generation', HAB, null, `Vérification des échéances RH : ${r.expirees} expirée(s), ${r.bientot} à renouveler, ${r.visites} visite(s) échue(s)`);
     return r;
   }, { perm: [MODULE, 'modifier'] });
@@ -1705,10 +1778,14 @@ function outilsSeed(ctx) {
   const matricule = () => { for (let i = 0; i < 1000; i++) { const n = db.nextNumber('mat', gabarit); if (!db.findOne(PERS, (x) => x.matricule === n)) return n; } return 'MAT-' + Date.now(); };
   const types = new Map((db.getConfig().listes.typesHabilitation || []).map((t) => [t.code, t]));
   const createur = admin ? admin.id : null;
-  const personne = (o) => db.insert(PERS, Object.assign({
-    matricule: matricule(), userId: null, managerUserId: null, fonction: '', typeContratCode: 'cdi', dateEntree: null, dateSortie: null, telephone: '', email: '',
-    contactUrgence: { nom: '', telephone: '' }, coutHoraire: null, competences: [], notes: '', actif: true, champs: {}, createdBy: createur,
-  }, o));
+  const personne = (o) => {
+    // Un compte n'est lié qu'à une seule fiche : une fiche déjà rattachée à ce compte est réutilisée telle quelle
+    if (o.userId != null) { const deja = db.findOne(PERS, (x) => x.userId != null && Number(x.userId) === Number(o.userId)); if (deja) return deja; }
+    return db.insert(PERS, Object.assign({
+      matricule: matricule(), userId: null, managerUserId: null, fonction: '', typeContratCode: 'cdi', dateEntree: null, dateSortie: null, telephone: '', email: '',
+      contactUrgence: { nom: '', telephone: '' }, coutHoraire: null, competences: [], notes: '', actif: true, champs: {}, createdBy: createur,
+    }, o));
+  };
   const habilitation = (p, typeCode, exp, o = {}) => {
     const t = types.get(typeCode);
     const mois = t && Number(t.dureeMois) > 0 ? Number(t.dureeMois) : 36;

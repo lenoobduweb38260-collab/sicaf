@@ -23,8 +23,10 @@
  *
  * Portée : un plan est visible en consultation par toute personne ayant accès à au moins un secteur
  * de sa zone (ex. un chef de secteur Production voit le plan de son site) ; il n'est modifiable que
- * par un utilisateur dont la portée d'écriture couvre le secteur du plan (site / bâtiment).
- * Les équipements liés non visibles par l'utilisateur sont masqués (aucune fuite d'information).
+ * par un utilisateur dont la portée d'écriture couvre le secteur du plan (site / bâtiment) ; un plan
+ * sans secteur (plan général) n'est créé, modifié ou supprimé qu'avec la portée « tous ».
+ * Les équipements liés non visibles par l'utilisateur sont masqués (lien, désignation reprise dans le
+ * nom de l'objet) et le nombre d'équipements liés ne compte que les équipements visibles.
  *
  * Services publiés : ctx.services.plans.{ localiser(equipementId, req?), get(id), objetsLies(planId) }
  * Événements émis  : 'plan:cree' ({ plan }), 'plan:modifie' ({ plan, ancien }), 'plan:supprime' ({ plan })
@@ -114,9 +116,14 @@ function register(ctx) {
     if (!accessibles.size) return false;
     return perms.secteursDescendants(db, [sid]).some((id) => accessibles.has(Number(id)));
   }
-  /** Plan modifiable (portée d'écriture couvrant le secteur du plan, hors sites en lecture seule). */
+  /**
+   * Plan modifiable : portée d'écriture couvrant le secteur du plan (site / bâtiment), hors sites en lecture seule
+   * et hors du filtre de site courant. Un plan sans secteur (plan général) n'est modifiable, comme à sa création,
+   * qu'avec la portée « tous » ; en portée « perso », l'auteur garde la main sur son plan tant que son secteur
+   * reste dans sa portée d'écriture (un site passé en lecture seule la lui retire).
+   */
   function peutEcrire(req, plan) {
-    return !!plan && ctx.canSee(Object.assign({}, req, { ecriture: true }), plan) && (plan.secteurId == null || secteurEcrivable(req, plan.secteurId) || req.perms.portee === 'perso');
+    return !!plan && ctx.canSee(Object.assign({}, req, { ecriture: true }), plan) && secteurEcrivable(req, plan.secteurId);
   }
   function lectureSeule(req, plan) {
     const p = req.perms || {};
@@ -203,11 +210,31 @@ function register(ctx) {
     const { image, ...reste } = plan.fond;
     return Object.assign(reste, { imageUrl: urlFond(plan) });
   }
-  function statistiques(objets) {
+  function statistiques(objets, nbLies) {
     const parType = {};
-    let nbLies = 0;
-    for (const o of objets || []) { parType[o.type] = (parType[o.type] || 0) + 1; if (o.equipementId != null) nbLies += 1; }
+    for (const o of objets || []) parType[o.type] = (parType[o.type] || 0) + 1;
     return { nbObjets: (objets || []).length, parType, nbLies };
+  }
+  /** Nombre de liens vers des équipements visibles par la requête (les équipements masqués ne sont pas comptés, ni révélés). */
+  function nbLiesVisibles(req, plan) {
+    let n = 0;
+    for (const o of plan.objets || []) {
+      if (o.equipementId == null) continue;
+      const eq = db.get('equipements', o.equipementId);
+      if (eq && voirEquipement(req, eq, false)) n += 1;
+    }
+    return n;
+  }
+  /**
+   * Le nom d'un objet lié à un équipement masqué reprend-il la désignation ou le numéro de cet équipement ?
+   * (la vue recopie la désignation au moment du lien : elle ne doit pas être révélée avec l'objet)
+   */
+  function nomReveleEquipement(o) {
+    const eq = o.equipementId == null ? null : db.get('equipements', o.equipementId);
+    const nomObjet = String(o.nom || '').trim().toLowerCase();
+    if (!eq || !nomObjet) return false;
+    const nomEq = String(eq.nom || '').trim().toLowerCase(), numero = String(eq.numero || '').trim().toLowerCase();
+    return (nomEq && nomObjet === nomEq) || (numero.length >= 3 && nomObjet.includes(numero));
   }
   /** Aperçu géométrique allégé (miniature de la liste) : 800 objets au plus, triés par emprise. */
   function apercu(plan) {
@@ -249,7 +276,7 @@ function register(ctx) {
     };
   }
   function resume(req, plan) {
-    return Object.assign(entete(req, plan), statistiques(plan.objets), { fond: !!plan.fond, apercu: apercu(plan) });
+    return Object.assign(entete(req, plan), statistiques(plan.objets, nbLiesVisibles(req, plan)), { fond: !!plan.fond, apercu: apercu(plan) });
   }
   /** Fiche complète : objets enrichis (équipements visibles) ; équipements non visibles masqués. */
   function detail(req, plan) {
@@ -259,7 +286,11 @@ function register(ctx) {
       if (o.equipementId != null) {
         const info = infos.get(Number(o.equipementId));
         if (info) r.equipement = info;
-        else { r.equipementId = null; r.equipementMasque = true; }
+        else {
+          r.equipementId = null; r.equipementMasque = true;
+          // le nom de l'objet ne doit pas révéler l'équipement masqué (il est rétabli à l'enregistrement, voir validerObjets)
+          if (nomReveleEquipement(o)) { r.nom = ''; r.nomMasque = true; }
+        }
       }
       if (o.secteurId != null) {
         const s = secteur(o.secteurId);
@@ -267,7 +298,7 @@ function register(ctx) {
       }
       return r;
     });
-    return Object.assign(entete(req, plan), statistiques(plan.objets), { fond: fondPublic(plan), objets });
+    return Object.assign(entete(req, plan), statistiques(plan.objets, objets.filter((o) => o.equipement).length), { fond: fondPublic(plan), objets });
   }
 
   // ----- Validation -------------------------------------------------------------------------
@@ -374,7 +405,9 @@ function register(ctx) {
 
   /**
    * Valide la liste d'objets.
-   * opts : { req, niveaux, siteId, anciens (Map id → objet stocké), tolerant (import : liens invalides retirés), rapport }
+   * opts : { req, niveaux, siteId, anciens (Map id → objet stocké), recontroler (liens inchangés revérifiés : changement
+   *          de site), tolerant (import : liens invalides retirés), rapport }
+   * Une erreur de validation porte l'identifiant de l'objet fautif dans `details.objetId` (sélection dans l'éditeur).
    */
   function validerObjets(liste, opts) {
     if (!Array.isArray(liste)) throw new HttpError(400, 'La liste des objets est invalide');
@@ -387,18 +420,18 @@ function register(ctx) {
     const rapport = opts.rapport || { liensRetires: 0, liensConserves: 0 };
 
     const equipementAutorise = (id, ancien) => {
-      if (ancien && Number(ancien.equipementId) === id) return true; // lien inchangé (établi par une personne habilitée)
+      if (!opts.recontroler && ancien && Number(ancien.equipementId) === id) return true; // lien inchangé (établi par une personne habilitée)
       if (cacheEq.has(id)) return cacheEq.get(id);
       const eq = db.get('equipements', id);
       let r = true;
-      if (!eq) r = 'introuvable';
-      else if (!voirEquipement(opts.req, eq, true)) r = 'hors de votre portée (ou site en lecture seule)';
+      // même message qu'un équipement inexistant ou hors de portée : la validation ne révèle pas l'existence d'un équipement invisible
+      if (!eq || !voirEquipement(opts.req, eq, true)) r = 'introuvable ou hors de votre portée (ou site en lecture seule)';
       else if (opts.siteId != null && eq.secteurId != null && siteDe(eq.secteurId) != null && siteDe(eq.secteurId) !== opts.siteId) r = 'appartient à un autre site';
       cacheEq.set(id, r);
       return r;
     };
     const secteurAutorise = (id, ancien) => {
-      if (ancien && Number(ancien.secteurId) === id) return true;
+      if (!opts.recontroler && ancien && Number(ancien.secteurId) === id) return true;
       if (cacheSect.has(id)) return cacheSect.get(id);
       const s = db.get('secteurs', id);
       let r = true;
@@ -409,7 +442,7 @@ function register(ctx) {
       return r;
     };
 
-    return liste.map((o, i) => {
+    const validerUn = (o, i) => {
       if (!o || typeof o !== 'object' || Array.isArray(o)) throw new HttpError(400, `Objet n°${i + 1} invalide`);
       const pre = `Objet n°${i + 1}${o.nom ? ` (« ${String(o.nom).slice(0, 40)} »)` : ''}`;
       if (!TYPES.includes(o.type)) throw erreur(pre, `type inconnu « ${o.type} »`);
@@ -428,6 +461,7 @@ function register(ctx) {
       if (!niveauxIds.has(niveauId)) throw erreur(pre, `niveau inconnu « ${niveauId} »`);
       out.niveauId = niveauId;
       out.nom = texte(o.nom, 120, 'Le nom', pre);
+      if (!out.nom && o.nomMasque && ancien && ancien.equipementId != null && !opts.recontroler) out.nom = String(ancien.nom || ''); // nom masqué (équipement hors de portée) conservé
       out.x = nombre(o.x, -BORNE, BORNE, 'La position x (m)', undefined, pre);
       out.y = nombre(o.y, -BORNE, BORNE, 'La position y (m)', undefined, pre);
       out.z = nombre(o.z, -100, 500, 'L\'élévation (m)', 0, pre);
@@ -474,7 +508,7 @@ function register(ctx) {
       // Lien vers un équipement
       if (TYPES_LIES_EQUIPEMENT.includes(o.type)) {
         let eqId = o.equipementId == null || o.equipementId === '' ? null : Number(o.equipementId);
-        if (eqId == null && o.equipementMasque && ancien && ancien.equipementId != null) eqId = Number(ancien.equipementId); // lien masqué conservé
+        if (eqId == null && o.equipementMasque && ancien && ancien.equipementId != null && !opts.recontroler) eqId = Number(ancien.equipementId); // lien masqué conservé
         if (eqId != null) {
           if (!Number.isInteger(eqId) || eqId <= 0) throw erreur(pre, 'équipement lié invalide');
           const ok = equipementAutorise(eqId, ancien);
@@ -498,11 +532,17 @@ function register(ctx) {
           if (ok !== true) {
             if (!opts.tolerant) throw erreur(pre, `le secteur lié (n°${sid}) ${ok}`);
             rapport.liensRetires += 1; sid = null;
-          }
+          } else rapport.liensConserves += 1;
         }
         out.secteurId = sid;
       }
       return out;
+    };
+    return liste.map((o, i) => {
+      try { return validerUn(o, i); } catch (e) {
+        if (e instanceof HttpError && e.status === 400 && e.details === undefined) e.details = { objetId: o && typeof o === 'object' && o.id != null ? String(o.id) : null, index: i };
+        throw e;
+      }
     });
   }
 
@@ -524,8 +564,10 @@ function register(ctx) {
 
     let secteurId = body.secteurId === undefined ? (existant ? existant.secteurId : null) : (body.secteurId == null || body.secteurId === '' ? null : Number(body.secteurId));
     if (secteurId != null) {
-      if (!Number.isInteger(secteurId) || !db.get('secteurs', secteurId)) throw new HttpError(400, 'Site ou bâtiment invalide');
+      if (!Number.isInteger(secteurId)) throw new HttpError(400, 'Site ou bâtiment invalide');
+      // le secteur n'est contrôlé que s'il change : un plan dont le secteur a disparu reste modifiable (et peut être déplacé)
       const change = !existant || Number(existant.secteurId) !== secteurId;
+      if (change && !db.get('secteurs', secteurId)) throw new HttpError(400, 'Site ou bâtiment invalide');
       if (change && !secteurEcrivable(req, secteurId)) throw new HttpError(403, 'Vous ne pouvez créer ou déplacer un plan que dans vos propres sites / secteurs (hors sites en lecture seule)');
     } else if (req.perms.portee !== 'tous') {
       throw new HttpError(400, 'Le site ou bâtiment du plan est obligatoire');
@@ -542,7 +584,7 @@ function register(ctx) {
     if (body.objets !== undefined || siteChange || (existant && body.niveaux !== undefined)) {
       // objets fournis, ou revalidation nécessaire (changement de site : liens à recontrôler ; niveaux modifiés)
       const src = body.objets !== undefined ? body.objets : (existant ? existant.objets : []);
-      out.objets = validerObjets(src, { req, niveaux: out.niveaux, siteId, anciens: siteChange ? null : anciens, tolerant: !!options.tolerant, rapport: options.rapport });
+      out.objets = validerObjets(src, { req, niveaux: out.niveaux, siteId, anciens, recontroler: !!siteChange, tolerant: !!options.tolerant, rapport: options.rapport });
     } else {
       out.objets = existant ? existant.objets : [];
     }
@@ -673,6 +715,7 @@ function register(ctx) {
     Object.assign(data, { numero: genererNumero(), createdBy: req.user.id, updatedBy: req.user.id, version: 1 });
     const plan = db.insert(ENTITE, data);
     ctx.audit(req, 'duplication', ENTITE, plan.id, `Plan ${plan.numero} ${plan.nom} (copie de ${source.numero})`);
+    notifierCreation(req, plan);
     ctx.emit('plan:cree', { plan, source });
     return Object.assign(detail(req, plan), { rapport });
   }, { perm: [ENTITE, 'creer'] });
@@ -692,7 +735,8 @@ function register(ctx) {
       const c = Object.assign({}, o);
       if (c.equipementId != null) {
         const info = infos.get(Number(c.equipementId));
-        if (info) c.equipementRef = { numero: info.numero, nom: info.nom }; else c.equipementId = null;
+        if (info) c.equipementRef = { numero: info.numero, nom: info.nom };
+        else { if (nomReveleEquipement(c)) c.nom = ''; c.equipementId = null; }
       }
       if (c.secteurId != null) { const s = secteur(c.secteurId); c.secteurRef = s ? { code: s.code || '', nom: s.nom } : null; }
       return c;

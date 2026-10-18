@@ -71,7 +71,9 @@ function register(ctx) {
     if (parentId == null && (!existant || existant.parentId != null)) throw new HttpError(403, RESERVE);
     const typeAvant = existant ? existant.type : null;
     if ((type === 'site' || typeAvant === 'site') && type !== typeAvant) throw new HttpError(403, RESERVE);
-    for (const id of [existant ? existant.id : null, parentId]) {
+    // Le secteur lui-même, et le parent (à la création, ou quand il change : renommer son secteur ne demande pas son parent)
+    const parentControle = !existant || (parentId == null ? null : Number(parentId)) !== (existant.parentId == null ? null : Number(existant.parentId));
+    for (const id of [existant ? existant.id : null, parentControle ? parentId : null]) {
       if (id != null && !req.perms.secteurIds.includes(Number(id))) throw new HttpError(403, 'Ce secteur est hors de votre périmètre');
     }
   }
