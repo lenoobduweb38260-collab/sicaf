@@ -20,6 +20,8 @@ function configParDefaut() {
       messageAccueil: '',
       heuresParJour: 8,
       tauxHoraire: 45,
+      // Espace total des pièces jointes (photos, documents), en Mo : au-delà, les nouvelles pièces sont refusées
+      quotaPiecesJointesMo: 400,
     },
     securite: {
       longueurMinMdp: 10, complexite: true, refuserCourants: true, interdireIdentifiant: true, forcerChangementMdpInitial: true, dureeSessionHeures: 12, inactiviteMinutes: 60, notifierBlocages: true,
@@ -58,12 +60,12 @@ function configParDefaut() {
     journal: {
       notifications: true,
       profilsNotifies: null, // null = profils « Responsable maintenance » et « Pôle informatique » (renseigné au premier démarrage)
-      actions: ['creation', 'suppression', 'desactivation', 'restauration', 'import', 'reinitialisation_mdp', 'demande_reinitialisation_mdp', 'recuperation_urgence'],
+      actions: ['creation', 'suppression', 'desactivation', 'restauration', 'import', 'reinitialisation_mdp', 'demande_reinitialisation_mdp', 'recuperation_urgence', 'reinitialisation_double_auth', 'desactivation_double_auth'],
       entites: [],           // vide = toutes les entités
     },
     sauvegardes: {
       automatique: true, frequenceHeures: 24, heure: '22:00', conserverLocal: 30, compresser: true, chiffrer: false,
-      destinations: [], cleReception: '', accepterReception: false,
+      destinations: [], cleReception: '', accepterReception: false, conserverRecues: 10, nomServeur: '',
     },
     modules,
     profils: { triParSecteur: true, grouperParSecteur: true, afficherNiveau: true },
@@ -205,11 +207,51 @@ function configParDefaut() {
       typesAbsence: [
         { code: 'conges', label: 'Congés payés', couleur: '#16a34a', ordre: 1 },
         { code: 'rtt', label: 'RTT', couleur: '#0891b2', ordre: 2 },
-        { code: 'maladie', label: 'Arrêt maladie', couleur: '#dc2626', ordre: 3 },
+        { code: 'maladie', label: 'Arrêt maladie', couleur: '#dc2626', ordre: 3, absenteisme: true },
         { code: 'formation', label: 'Formation', couleur: '#8b5cf6', ordre: 4 },
-        { code: 'accident', label: 'Accident du travail', couleur: '#b91c1c', ordre: 5 },
-        { code: 'astreinte', label: 'Astreinte', couleur: '#f59e0b', ordre: 6 },
-        { code: 'autre', label: 'Autre absence', couleur: '#6b7280', ordre: 7 },
+        { code: 'accident', label: 'Accident du travail', couleur: '#b91c1c', ordre: 5, absenteisme: true },
+        { code: 'astreinte', label: 'Astreinte', couleur: '#f59e0b', ordre: 6, absent: false },
+        { code: 'autre', label: 'Autre absence', couleur: '#6b7280', ordre: 7, absenteisme: true },
+      ],
+      // Ressources humaines : statuts (codes du circuit, seuls libellés et couleurs se modifient), visites médicales
+      statutsAbsence: [
+        { code: 'demandee', label: 'En attente de validation', couleur: '#f59e0b', ordre: 1 },
+        { code: 'validee', label: 'Validée', couleur: '#16a34a', ordre: 2 },
+        { code: 'refusee', label: 'Refusée', couleur: '#dc2626', ordre: 3 },
+        { code: 'annulee', label: 'Annulée', couleur: '#9ca3af', ordre: 4 },
+      ],
+      statutsFormation: [
+        { code: 'planifiee', label: 'Planifiée', couleur: '#2563eb', ordre: 1 },
+        { code: 'realisee', label: 'Réalisée', couleur: '#16a34a', ordre: 2 },
+        { code: 'annulee', label: 'Annulée', couleur: '#9ca3af', ordre: 3 },
+      ],
+      typesVisiteMedicale: [
+        { code: 'embauche', label: 'Visite d\'embauche (VIP)', couleur: '#2563eb', ordre: 1 },
+        { code: 'periodique', label: 'Visite périodique', couleur: '#0891b2', ordre: 2 },
+        { code: 'reprise', label: 'Visite de reprise', couleur: '#8b5cf6', ordre: 3 },
+        { code: 'autre', label: 'Autre visite', couleur: '#6b7280', ordre: 4 },
+      ],
+      aptitudesMedicales: [
+        { code: 'apte', label: 'Apte', couleur: '#16a34a', ordre: 1 },
+        { code: 'apte_restrictions', label: 'Apte avec restrictions', couleur: '#f59e0b', ordre: 2 },
+        { code: 'inapte', label: 'Inapte', couleur: '#dc2626', ordre: 3 },
+        { code: 'en_attente', label: 'En attente', couleur: '#6b7280', ordre: 4 },
+      ],
+      // Étiquettes & inventaire : statuts des inventaires (codes du circuit)
+      statutsInventaire: [
+        { code: 'en_cours', label: 'En cours', couleur: '#f59e0b', ordre: 1, final: false },
+        { code: 'valide', label: 'Validé', couleur: '#16a34a', ordre: 2, final: true },
+        { code: 'annule', label: 'Annulé', couleur: '#6b7280', ordre: 3, final: true },
+      ],
+      // Achats : modes de paiement des factures
+      modesPaiement: [
+        { code: 'virement', label: 'Virement bancaire', ordre: 1 },
+        { code: 'prelevement', label: 'Prélèvement', ordre: 2 },
+        { code: 'cheque', label: 'Chèque', ordre: 3 },
+        { code: 'lcr', label: 'Effet de commerce (LCR)', ordre: 4 },
+        { code: 'carte', label: 'Carte bancaire', ordre: 5 },
+        { code: 'compensation', label: 'Compensation avec un avoir', ordre: 6 },
+        { code: 'autre', label: 'Autre', ordre: 7 },
       ],
       typesContrat: [
         { code: 'cdi', label: 'CDI', ordre: 1 }, { code: 'cdd', label: 'CDD', ordre: 2 }, { code: 'interim', label: 'Intérim', ordre: 3 },
@@ -251,7 +293,7 @@ function configParDefaut() {
         { code: 'inconnue', label: 'Inconnue', ordre: 6 },
       ],
     },
-    champsPersonnalises: { equipements: [], ot: [], demandes: [], articles: [], fournisseurs: [], utilisateurs: [], personnel: [], commandes: [], factures: [], visites: [] },
+    champsPersonnalises: { equipements: [], ot: [], demandes: [], plansPreventifs: [], articles: [], fournisseurs: [], utilisateurs: [], personnel: [], commandes: [], factures: [], visites: [] },
   };
 }
 
@@ -290,7 +332,9 @@ function profilsParDefaut() {
     },
     {
       nom: 'Demandeur', description: 'Signale les pannes et suit ses demandes', niveau: 5, estAdmin: false, portee: 'perso', couleur: '#6b7280', systeme: true,
-      permissions: set(vide(), { dashboard: ['voir'], demandes: ['voir', 'creer', 'modifier'], equipements: ['voir'], plans: ['voir'] }),
+      // Sans « Modifier » : ce droit est celui des encadrants (désigner le demandeur, dater, modifier une demande validée) ;
+      // le demandeur modifie sa propre demande tant qu'elle est soumise
+      permissions: set(vide(), { dashboard: ['voir'], demandes: ['voir', 'creer'], equipements: ['voir'], plans: ['voir'] }),
     },
     {
       nom: 'Responsable qualité', description: 'Organise les audits clients, certifications et visites du site ; suit les constats et les plans d\'actions', niveau: 2, estAdmin: false, portee: 'site', couleur: '#7c3aed', systeme: true,
@@ -377,6 +421,27 @@ function seed(db, options = {}) {
       db.setConfig(cfgM);
     }
     migrations.journalMotsDePasse = true;
+    db.touch();
+  }
+  // Bases antérieures : réinitialisation et désactivation de la double authentification notifiées comme les
+  // réinitialisations de mot de passe (une seule fois)
+  if (!migrations.journalDoubleAuth) {
+    const cfgD = db.getConfig();
+    const actions = cfgD.journal && Array.isArray(cfgD.journal.actions) ? cfgD.journal.actions : null;
+    if (actions && actions.includes('reinitialisation_mdp')) {
+      for (const a of ['reinitialisation_double_auth', 'desactivation_double_auth']) if (!actions.includes(a)) actions.push(a);
+      db.setConfig(cfgD);
+    }
+    migrations.journalDoubleAuth = true;
+    db.touch();
+  }
+  // Bases antérieures : le profil fourni « Demandeur » perd « Demandes › Modifier » (droit d'encadrant), une seule fois
+  if (!migrations.demandeurSansModifier) {
+    for (const p of db.list('profils', (x) => x.systeme && x.nom === 'Demandeur' && !x.estAdmin)) {
+      const d = p.permissions && p.permissions.demandes;
+      if (d && d.modifier) db.update('profils', p.id, { permissions: Object.assign({}, p.permissions, { demandes: Object.assign({}, d, { modifier: false }) }) });
+    }
+    migrations.demandeurSansModifier = true;
     db.touch();
   }
 

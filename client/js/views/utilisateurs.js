@@ -307,6 +307,7 @@
     const m = ui.modal({ titre: 'Réinitialiser le mot de passe', classe: 'modal-reinit', contenu: frag(
       el('p', null, 'Compte de ', el('strong', null, nomComplet(u)), ` (identifiant « ${u.login} »)`),
       demande ? ui.alerte(`Demande faite depuis l'écran de connexion ${ui.relatif(demande.derniereDemande)} (poste ${adresse(demande.ip)})${demande.repetitions > 1 ? `, ${demande.repetitions} fois` : ''} : elle sera marquée comme traitée.`, 'info') : null,
+      demande && demande.nbPostes > 1 ? ui.alerte(`Attention : cette demande a été faite depuis ${demande.nbPostes} postes différents. Vérifiez l'identité de la personne avant de lui remettre un code ou un mot de passe.`, 'alerte') : null,
       el('div', { class: 'choix-liste', role: 'radiogroup', 'aria-label': 'Mode de réinitialisation' },
         choix('code', 'Code de réinitialisation', `L'utilisateur choisit lui-même son nouveau mot de passe depuis l'écran de connexion. Code à usage unique, valable ${duree(Number(sc.dureeCodeReinitialisationMinutes) || 60)} ; son mot de passe actuel reste valable d'ici là.`, true),
         choix('temporaire', 'Mot de passe temporaire', 'À changer à la première connexion. Ses sessions ouvertes sont fermées immédiatement.'),
@@ -372,8 +373,13 @@
     const colDemande = { cle: 'derniereDemande', label: 'Demande', rendu: (d) => el('div', null,
       el('div', { title: ui.formatDateHeure(d.derniereDemande) }, ui.relatif(d.derniereDemande), d.repetitions > 1 ? frag(' ', ui.badge(`${d.repetitions} demandes`, '#f59e0b')) : null),
       el('div', { class: 'cellule-secondaire' }, d.repetitions > 1 ? `première le ${ui.formatDateHeure(d.createdAt)}` : ui.formatDateHeure(d.createdAt))) };
-    const colPoste = { cle: 'ip', label: 'Poste', rendu: (d) => el('div', { title: d.poste || '' }, el('div', null, adresse(d.ip)), el('div', { class: 'cellule-secondaire' }, resumePoste(d.poste))) };
-    const colMessage = { cle: 'message', label: 'Message', tri: false, rendu: (d) => (d.message ? el('div', { class: 'message-demande' }, d.message) : el('span', { class: 'texte-2' }, '—')) };
+    // Poste et message d'origine ; demandes suivantes venues d'autres postes signalées (vérifier l'identité du demandeur)
+    const autresProvenances = (d) => (d.provenances || []).filter((p) => p.ip !== d.ip || p.message);
+    const colPoste = { cle: 'ip', label: 'Poste', rendu: (d) => el('div', { title: d.poste || '' }, el('div', null, adresse(d.ip)), el('div', { class: 'cellule-secondaire' }, resumePoste(d.poste)),
+      d.nbPostes > 1 ? el('div', { title: (d.provenances || []).map((p) => `${ui.formatDateHeure(p.date)} : ${adresse(p.ip)}`).join('\n') }, ui.badge(`${d.nbPostes} postes différents`, '#dc2626')) : null) };
+    const colMessage = { cle: 'message', label: 'Message', tri: false, rendu: (d) => el('div', null,
+      d.message ? el('div', { class: 'message-demande' }, d.message) : el('span', { class: 'texte-2' }, '—'),
+      autresProvenances(d).map((p) => el('div', { class: 'cellule-secondaire message-demande' }, `${ui.formatDateHeure(p.date)}, poste ${adresse(p.ip)}${p.message ? ' : ' + p.message : ''}`))) };
 
     function utilisateurDe(d) {
       return utilisateursCharges.find((x) => x.id === d.userId) || (GMAO.refs.users || []).find((x) => x.id === d.userId) || { id: d.userId, login: d.login, nom: d.nom };

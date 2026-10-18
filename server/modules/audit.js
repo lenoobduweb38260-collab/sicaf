@@ -4,8 +4,13 @@
  */
 const nom = 'Audit';
 
+/**
+ * Cellule CSV : guillemets si nécessaire ; une valeur texte qui commence par = + - @ (ou une tabulation, un retour
+ * chariot) est précédée d'une apostrophe pour qu'un tableur ne l'interprète pas comme une formule.
+ */
 function csvEscape(v) {
-  const s = v == null ? '' : String(v);
+  let s = v == null ? '' : String(v);
+  if (typeof v !== 'number' && /^[=+\-@\t\r]/.test(s) && !/^[-+]?\d[\d\s.,]*$/.test(s)) s = "'" + s;
   return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
@@ -35,15 +40,18 @@ function register(ctx) {
       lignes: rows.slice(0, limite),
       entites: Array.from(new Set(db.list('audit').map((r) => r.entite))).sort(),
       actions: Array.from(new Set(db.list('audit').map((r) => r.action))).sort(),
-      // Libellés des actions du cœur (connexions, mots de passe, double authentification…)
+      // Libellés des actions et des éléments (connexions, mots de passe, modules…)
       libellesActions: Object.assign({}, ctx.libellesActions || {}),
+      libellesEntites: Object.assign({}, ctx.libellesEntites || {}),
     };
   }, { perm: ['audit', 'voir'] });
 
   router.get('/api/audit/export', async (req, res) => {
     const rows = filtrer(req);
     const lignes = ['﻿Date;Utilisateur;Action;Entité;Identifiant;Détails;IP'];
-    for (const r of rows) lignes.push([r.date, r.userNom, r.action, r.entite, r.entiteId, r.details, r.ip].map(csvEscape).join(';'));
+    const action = (c) => (ctx.libellesActions || {})[c] || c;
+    const entite = (c) => (ctx.libellesEntites || {})[c] || c;
+    for (const r of rows) lignes.push([r.date, r.userNom, action(r.action), entite(r.entite), r.entiteId, r.details, r.ip].map(csvEscape).join(';'));
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="journal-audit.csv"' });
     res.end(lignes.join('\r\n'));
   }, { perm: ['audit', 'exporter'] });

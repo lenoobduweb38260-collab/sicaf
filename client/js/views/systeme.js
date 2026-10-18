@@ -7,6 +7,9 @@
   'use strict';
   const { el, icone, toast, erreur, frag } = ui;
   const peutModifier = () => GMAO.can('systeme', 'modifier');
+  /** Restaurer, importer ou exporter toute la base : réservé aux utilisateurs qui ont accès à tous les sites. */
+  const accesGlobal = () => !!(GMAO.perms && (GMAO.perms.estAdmin || GMAO.perms.portee === 'tous'));
+  const peutRemplacerBase = () => peutModifier() && accesGlobal();
 
   // ----- Onglet Sauvegardes -------------------------------------------------
   function ongletSauvegardes(cont) {
@@ -15,17 +18,28 @@
       let infos = { sauvegardes: [], dossier: '' };
       try { infos = await api.get('/api/sauvegardes'); } catch (e) { erreur(e); }
       const tableau = ui.table({ colonnes: [{ cle: 'nom', label: 'Fichier' }, { cle: 'date', label: 'Date', type: 'datetime' }, { cle: 'taille', label: 'Taille', rendu: (s) => ui.formatNombre(s.taille / 1024, 0) + ' Ko', aligner: 'droite' }], lignes: infos.sauvegardes, recherche: false, pagination: false, vide: 'Aucune sauvegarde (une sauvegarde quotidienne est créée automatiquement au démarrage)',
-        actions: [{ icone: 'rafraichir', titre: 'Restaurer cette sauvegarde', visible: () => peutModifier(), onClic: async (s) => {
-          if (!(await ui.confirm({ titre: 'Restaurer', message: `Remplacer toutes les données actuelles par la sauvegarde « ${s.nom} » ? Une copie de l'état actuel sera faite avant.`, okLabel: 'Restaurer', danger: true }))) return;
-          try { await api.post('/api/sauvegardes/restaurer', { nom: s.nom }); toast('Sauvegarde restaurée', 'succes'); await GMAO.refresh(false); rendre(); } catch (e) { erreur(e); }
+        actions: [{ icone: 'rafraichir', titre: 'Restaurer cette sauvegarde', visible: () => peutRemplacerBase(), onClic: async (s) => {
+          if (!(await ui.confirm({ titre: 'Restaurer', message: `Remplacer toutes les données actuelles (tous les sites) par la sauvegarde « ${s.nom} » ? Une copie de l'état actuel sera faite avant ; les paramètres de sauvegarde de ce serveur sont conservés et les autres utilisateurs devront se reconnecter.`, okLabel: 'Restaurer', danger: true }))) return;
+          try {
+            const r = await api.post('/api/sauvegardes/restaurer', { nom: s.nom });
+            toast('Sauvegarde restaurée', 'succes');
+            if (r && r.sessionConservee === false) { setTimeout(() => location.reload(), 800); return; }
+            await GMAO.refresh(false); rendre();
+          } catch (e) { erreur(e); }
         } }] });
       const inputImport = el('input', { type: 'file', accept: '.json,application/json', class: 'masque' });
       inputImport.addEventListener('change', async () => {
         const f = inputImport.files && inputImport.files[0]; if (!f) return;
         try {
           const txt = await ui.lireFichier(f, true);
-          const data = JSON.parse(txt);
-          if (!(await ui.confirm({ titre: 'Importer', message: 'Remplacer TOUTES les données actuelles par le contenu de ce fichier ? Une sauvegarde sera faite avant. Vous devrez vous reconnecter.', okLabel: 'Importer', danger: true }))) return;
+          let data;
+          try { data = JSON.parse(txt); } catch (e) { throw new Error('Fichier illisible : un export JSON de la GMAO est attendu'); }
+          // Contrôle du fichier par le serveur et aperçu de son contenu avant de remplacer quoi que ce soit
+          const apercu = await api.post('/api/import?apercu=1', data);
+          const v = apercu.volumes || {};
+          const resume = [['users', 'utilisateurs'], ['equipements', 'équipements'], ['demandes', 'demandes'], ['ot', 'ordres de travail'], ['articles', 'articles'], ['plansPreventifs', 'plans préventifs']]
+            .map(([k, l]) => `${v[k] || 0} ${l}`).join(', ');
+          if (!(await ui.confirm({ titre: 'Importer', message: `Ce fichier contient ${resume}${apercu.date ? ` (export du ${ui.formatDateHeure(apercu.date)})` : ''}. Remplacer TOUTES les données actuelles (tous les sites) par son contenu ? Une sauvegarde sera faite avant ; les paramètres de sauvegarde de ce serveur sont conservés. Vous devrez vous reconnecter.`, okLabel: 'Importer', danger: true }))) return;
           await api.post('/api/import', data);
           toast('Import terminé, reconnectez-vous', 'succes');
           setTimeout(() => location.reload(), 800);
@@ -35,8 +49,9 @@
         el('p', { class: 'texte-2 texte-petit' }, `Dossier : ${infos.dossier || '—'}. Copiez ce dossier sur un autre support pour une sauvegarde externe.`),
         el('div', { class: 'barre-outils' },
           peutModifier() ? ui.bouton('Créer une sauvegarde maintenant', { icone: 'sauvegarde', classe: 'btn-primaire', onClic: async () => { try { await api.post('/api/sauvegardes'); toast('Sauvegarde créée', 'succes'); rendre(); } catch (e) { erreur(e); } } }) : null,
-          peutModifier() ? ui.bouton('Exporter toutes les données (JSON)', { icone: 'export', onClic: () => api.telecharger('/api/export').catch(erreur) }) : null,
-          peutModifier() ? ui.bouton('Importer un fichier d\'export', { icone: 'import', onClic: () => inputImport.click() }) : null, inputImport),
+          peutRemplacerBase() ? ui.bouton('Exporter toutes les données (JSON)', { icone: 'export', titre: 'Export complet, pièces jointes comprises, sans les secrets des sauvegardes', onClic: () => api.telecharger('/api/export').catch(erreur) }) : null,
+          peutRemplacerBase() ? ui.bouton('Importer un fichier d\'export', { icone: 'import', onClic: () => inputImport.click() }) : null, inputImport),
+        peutModifier() && !accesGlobal() ? el('p', { class: 'texte-2 texte-petit' }, 'Restaurer, importer ou exporter toute la base concerne tous les sites : réservé aux utilisateurs qui ont accès à tous les sites.') : null,
         tableau.el)));
       // Sauvegardes avancées (destinations multiples, autres sites) fournies par client/js/lib/sauvegardes-ui.js
       if (typeof GMAO.rendreSauvegardesAvancees === 'function') {
@@ -63,6 +78,8 @@
         { label: 'Version GMAO', valeur: s.version }, { label: 'Node.js', valeur: s.node }, { label: 'Plateforme', valeur: s.plateforme },
         { label: 'Dossier des données', valeur: el('code', null, s.dossierDonnees) }, { label: 'Fichier de données', valeur: el('code', null, s.fichierDonnees) }, { label: 'Taille', valeur: ui.formatNombre(s.taille / 1024, 0) + ' Ko' },
         { label: 'Démarré le', valeur: ui.formatDateHeure(s.demarrage) }, { label: 'Modules serveur', valeur: (s.modulesServeur || []).join(', ') },
+        s.piecesJointes ? { label: 'Pièces jointes', valeur: `${ui.formatNombre(s.piecesJointes.taille / (1024 * 1024), 1)} Mo utilisés sur ${ui.formatNombre(s.piecesJointes.quotaMo, 0)} Mo` } : null,
+        s.piecesJointes && s.piecesJointes.dossier ? { label: 'Dossier des pièces jointes', valeur: el('code', null, s.piecesJointes.dossier) } : null,
       ], { colonnes: 2 })));
       cont.appendChild(ui.carte('Contenu de la base', el('div', { class: 'tableau-conteneur' }, el('table', { class: 'tableau tableau-compact' }, el('thead', null, el('tr', null, el('th', null, 'Collection'), el('th', { class: 'num' }, 'Éléments'))), el('tbody', null, s.collections.map((c) => el('tr', null, el('td', null, c.nom), el('td', { class: 'num' }, String(c.nombre)))))))));
     }).catch((e) => { ui.vider(cont); cont.appendChild(ui.alerte(e.message, 'danger')); });

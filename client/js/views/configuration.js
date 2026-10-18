@@ -23,6 +23,12 @@
     { cle: 'typesHabilitation', label: 'RH : habilitations et certifications', couleur: true, duree: true },
     { cle: 'typesAbsence', label: 'RH : types d\'absence', couleur: true },
     { cle: 'typesContrat', label: 'RH : types de contrat' },
+    { cle: 'statutsAbsence', label: 'RH : statuts des absences', couleur: true },
+    { cle: 'statutsFormation', label: 'RH : statuts des formations', couleur: true },
+    { cle: 'typesVisiteMedicale', label: 'RH : types de visite médicale', couleur: true },
+    { cle: 'aptitudesMedicales', label: 'RH : aptitudes médicales', couleur: true },
+    { cle: 'statutsInventaire', label: 'Inventaires : statuts', couleur: true, final: true },
+    { cle: 'modesPaiement', label: 'Achats : modes de paiement' },
     { cle: 'statutsCommande', label: 'Achats : statuts des commandes', couleur: true, final: true },
     { cle: 'statutsFacture', label: 'Achats : statuts des factures', couleur: true, final: true },
     { cle: 'categoriesDepense', label: 'Achats : catégories de dépense', couleur: true },
@@ -32,7 +38,7 @@
     { cle: 'statutsAction', label: 'Audits : statuts des actions', couleur: true, final: true },
   ];
   const ENTITES_CHAMPS = [
-    { cle: 'equipements', label: 'Équipements' }, { cle: 'ot', label: 'Ordres de travail' }, { cle: 'demandes', label: 'Demandes d\'intervention' },
+    { cle: 'equipements', label: 'Équipements' }, { cle: 'ot', label: 'Ordres de travail' }, { cle: 'demandes', label: 'Demandes d\'intervention' }, { cle: 'plansPreventifs', label: 'Plans de maintenance préventive' },
     { cle: 'articles', label: 'Articles (stock)' }, { cle: 'fournisseurs', label: 'Fournisseurs' }, { cle: 'utilisateurs', label: 'Utilisateurs' },
     { cle: 'personnel', label: 'Personnel (RH)' }, { cle: 'commandes', label: 'Commandes fournisseurs' }, { cle: 'factures', label: 'Factures' }, { cle: 'visites', label: 'Audits & visites' },
   ];
@@ -74,6 +80,9 @@
       { nom: 'general.heuresParJour', label: 'Heures de travail par jour', type: 'nombre', min: 1, max: 24 },
       { nom: 'general.tauxHoraire', label: 'Taux horaire main d\'œuvre (pour les coûts)', type: 'nombre', min: 0 },
       { nom: 'general.messageAccueil', label: 'Message affiché sur la page de connexion', type: 'texte_long', lignes: 2 },
+      { type: 'separateur', label: 'Pièces jointes' },
+      { nom: 'general.quotaPiecesJointesMo', label: 'Espace réservé aux pièces jointes (Mo)', type: 'nombre', min: 50, max: 4000, step: 1,
+        aide: 'Photos et documents joints à toutes les fiches (base64 compris), de 50 à 4000 Mo. Au-delà, les nouvelles pièces jointes sont refusées avec un message. Une limite plus haute allonge les sauvegardes et augmente la mémoire utilisée par le serveur.' },
       { type: 'separateur', label: 'Sécurité' },
       { nom: 'securite.longueurMinMdp', label: 'Longueur minimale des mots de passe', type: 'nombre', min: 8, max: 64 },
       { nom: 'securite.inactiviteMinutes', label: 'Déconnexion après inactivité (minutes)', type: 'nombre', min: 5, max: 1440 },
@@ -116,6 +125,7 @@
     ], valeurs: {
       'societe.nom': c.societe.nom, 'societe.slogan': c.societe.slogan, 'societe.adresse': c.societe.adresse, 'societe.telephone': c.societe.telephone, 'societe.email': c.societe.email, 'societe.logo': c.societe.logo,
       'general.couleurPrincipale': c.general.couleurPrincipale, 'general.theme': c.general.theme, 'general.formatDate': c.general.formatDate, 'general.devise': c.general.devise, 'general.lignesParPage': c.general.lignesParPage, 'general.heuresParJour': c.general.heuresParJour, 'general.tauxHoraire': c.general.tauxHoraire, 'general.messageAccueil': c.general.messageAccueil,
+      'general.quotaPiecesJointesMo': c.general.quotaPiecesJointesMo == null ? 400 : c.general.quotaPiecesJointesMo,
       'securite.longueurMinMdp': c.securite.longueurMinMdp, 'securite.forcerChangementMdpInitial': c.securite.forcerChangementMdpInitial,
       'securite.inactiviteMinutes': c.securite.inactiviteMinutes, 'securite.dureeSessionHeures': c.securite.dureeSessionHeures, 'securite.complexite': c.securite.complexite,
       'securite.refuserCourants': c.securite.refuserCourants, 'securite.interdireIdentifiant': c.securite.interdireIdentifiant, 'securite.notifierBlocages': c.securite.notifierBlocages,
@@ -233,7 +243,7 @@
             el('button', { class: 'btn btn-icone btn-sm', title: 'Ajouter un sous-secteur', onclick: () => formulaireSecteur({ parentId: s.id, nom: '', couleur: s.couleur, actif: true, ordre: 0, type: s.type === 'site' ? 'service' : 'zone' }) }, icone('plus')),
             el('button', { class: 'btn btn-icone btn-sm', title: 'Modifier', onclick: () => formulaireSecteur(s) }, icone('modifier')),
             el('button', { class: 'btn btn-icone btn-sm texte-danger', title: 'Supprimer', onclick: async () => {
-              if (!(await ui.confirm({ titre: 'Supprimer le secteur', message: `Supprimer « ${s.nom} » ? Les éléments rattachés seront détachés.`, okLabel: 'Supprimer', danger: true }))) return;
+              if (!(await ui.confirm({ titre: 'Supprimer le secteur', message: `Supprimer « ${s.nom} » ? Les éléments qui y sont rattachés (équipements, interventions, articles, plans…) seront rattachés à ${s.parentNom ? `« ${s.parentNom} »` : 'aucun secteur'} ; les utilisateurs perdront ce secteur.`, okLabel: 'Supprimer', danger: true }))) return;
               try { await api.del(`/api/secteurs/${s.id}?forcer=1`); toast('Secteur supprimé', 'succes'); await GMAO.refresh(false); rendre(); } catch (e) { erreur(e); }
             } }, icone('supprimer'))) : null));
         construire(s.enfants || [], niveau + 1);
@@ -254,17 +264,21 @@
     ['demande_reinitialisation_mdp', 'Demandes de réinitialisation (mot de passe oublié)'], ['code_reinitialisation_mdp', 'Codes de réinitialisation créés'],
     ['reinitialisation_mdp_code', 'Mots de passe réinitialisés avec un code'], ['reinitialisation_mdp_autonome', 'Mots de passe réinitialisés avec l\'application d\'authentification'],
     ['recuperation_urgence', 'Récupérations d\'urgence d\'un compte'],
+    ['reinitialisation_double_auth', 'Réinitialisations de la double authentification'], ['desactivation_double_auth', 'Désactivations de la double authentification'],
+    ['blocage', 'Blocages après des échecs répétés'],
   ];
   const ENTITES_JOURNAL = [
     ['users', 'Utilisateurs'], ['profils', 'Profils'], ['secteurs', 'Secteurs & sites'], ['configuration', 'Configuration'], ['equipements', 'Équipements'],
     ['plans', 'Plans 3D'], ['demandes', 'Demandes'], ['ot', 'Ordres de travail'], ['plansPreventifs', 'Préventif'], ['articles', 'Stock'],
-    ['inventaires', 'Inventaires'], ['fournisseurs', 'Fournisseurs'], ['commandes', 'Commandes'], ['factures', 'Factures'], ['personnel', 'Personnel (RH)'], ['visites', 'Audits & visites'],
+    ['inventaires', 'Inventaires'], ['fournisseurs', 'Fournisseurs'], ['commandes', 'Commandes'], ['factures', 'Factures'], ['personnel', 'Personnel (RH)'],
+    ['habilitations', 'Habilitations'], ['formations', 'Formations'], ['visitesMedicales', 'Visites médicales'], ['absences', 'Absences'], ['visites', 'Audits & visites'], ['sauvegardes', 'Sauvegardes'],
   ];
   function ongletJournal() {
     const j = config.journal || {};
     const f = ui.form({ colonnes: 1, champs: [
       { nom: 'notifications', label: 'Notifier les rôles responsables des événements du journal d\'activité', type: 'interrupteur', valeur: j.notifications !== false },
-      { nom: 'profilsNotifies', label: 'Profils notifiés', type: 'cases', options: GMAO.refs.profils.filter((p) => p.actif !== false).sort((a, b) => a.niveau - b.niveau).map((p) => ({ value: p.id, label: `${p.nom} (niveau ${p.niveau})`, couleur: p.couleur })), valeur: j.profilsNotifies || [], aide: 'Chaque utilisateur actif de ces profils reçoit la notification (sauf l\'auteur de l\'action).' },
+      { nom: 'profilsNotifies', label: 'Profils notifiés', type: 'cases', options: GMAO.refs.profils.filter((p) => p.actif !== false).sort((a, b) => a.niveau - b.niveau).map((p) => ({ value: p.id, label: `${p.nom} (niveau ${p.niveau})${p.accesJournal === false ? ' — sans accès au journal : non notifié' : ''}`, couleur: p.couleur })), valeur: j.profilsNotifies || [],
+        aide: 'Chaque utilisateur actif de ces profils reçoit la notification (sauf l\'auteur de l\'action), à condition d\'avoir accès au Journal d\'activité et de pouvoir consulter l\'élément concerné (portée, sites) : le texte de la notification reprend les détails du journal.' },
       { nom: 'actions', label: 'Actions notifiées', type: 'cases', options: ACTIONS_JOURNAL.map(([v, l]) => ({ value: v, label: l })), valeur: j.actions || [] },
       { nom: 'entites', label: 'Limiter à ces éléments (aucune case = tous)', type: 'cases', options: ENTITES_JOURNAL.map(([v, l]) => ({ value: v, label: l })), valeur: j.entites || [] },
     ] });
@@ -278,9 +292,17 @@
     let courante = LISTES[0].cle;
     const select = el('select', { onchange: () => { courante = select.value; rendreListe(); } }, LISTES.map((l) => el('option', { value: l.cle }, l.label)));
     const zone = el('div');
-    function rendreListe() {
+    async function rendreListe() {
       const def = LISTES.find((l) => l.cle === courante);
       const items = (config.listes[courante] || []).slice().sort((a, b) => (a.ordre || 0) - (b.ordre || 0)).map((x) => Object.assign({}, x));
+      // Codes déjà enregistrés (techniques, stables), codes utilisés par des éléments, codes du circuit d'un module
+      const enregistres = new Set(items.map((x) => x.code));
+      let infos = { usages: {}, proteges: [], finalFige: false };
+      try { infos = await api.get(`/api/configuration/listes/${encodeURIComponent(courante)}/usages`); } catch (e) { /* liste affichée sans ces indications */ }
+      if (def.cle !== courante) return; // autre liste choisie entre-temps
+      const proteges = new Set(infos.proteges || []);
+      const nonSupprimable = (it) => enregistres.has(it.code) && (proteges.has(it.code) || !!(infos.usages || {})[it.code]);
+      const raison = (it) => (proteges.has(it.code) ? 'Statut du circuit de travail du module : ni supprimable ni renommable' : `Utilisé par ${((infos.usages || {})[it.code] || {}).detail || 'des éléments'} : ni supprimable ni renommable`);
       ui.vider(zone);
       const corps = el('div', { class: 'liste-editable' });
       const colonnes = ['28px', '140px', '1fr'].concat(def.couleur ? ['60px'] : [], def.final ? ['70px'] : [], def.delai ? ['110px'] : [], def.duree ? ['120px'] : [], ['36px']);
@@ -291,10 +313,13 @@
         corps.querySelectorAll('.ligne:not(:first-child)').forEach((x) => x.remove());
         lignes.length = 0;
         items.forEach((it, i) => {
-          const l = { it, code: el('input', { type: 'text', value: it.code, disabled: !peutModifier() }), label: el('input', { type: 'text', value: it.label, disabled: !peutModifier() }), couleur: def.couleur ? el('input', { type: 'color', value: it.couleur || '#6b7280', disabled: !peutModifier() }) : null, final: def.final ? el('input', { type: 'checkbox', checked: !!it.final, disabled: !peutModifier() }) : null, delai: def.delai ? el('input', { type: 'number', value: it.delaiHeures || 0, disabled: !peutModifier() }) : null, duree: def.duree ? el('input', { type: 'number', value: it.dureeMois || 0, min: 0, disabled: !peutModifier() }) : null };
+          // Code déjà enregistré : affiché en lecture seule (les données y font référence)
+          const codeFige = enregistres.has(it.code) && it.code !== '';
+          const finalFige = codeFige && ((infos.finalFige && proteges.has(it.code)) || !!(infos.usages || {})[it.code]);
+          const l = { it, code: el('input', { type: 'text', value: it.code, disabled: !peutModifier(), readOnly: codeFige, title: codeFige ? 'Code technique enregistré : non modifiable (le libellé, la couleur et l\'ordre le sont)' : '' }), label: el('input', { type: 'text', value: it.label, disabled: !peutModifier() }), couleur: def.couleur ? el('input', { type: 'color', value: it.couleur || '#6b7280', disabled: !peutModifier() }) : null, final: def.final ? el('input', { type: 'checkbox', checked: !!it.final, disabled: !peutModifier() || finalFige, title: finalFige ? 'Caractère final non modifiable : statut du circuit ou utilisé par des éléments' : '' }) : null, delai: def.delai ? el('input', { type: 'number', value: it.delaiHeures || 0, disabled: !peutModifier() }) : null, duree: def.duree ? el('input', { type: 'number', value: it.dureeMois || 0, min: 0, disabled: !peutModifier() }) : null };
           lignes.push(l);
           const monter = el('button', { class: 'btn btn-icone btn-sm', title: 'Monter', type: 'button', disabled: i === 0 || !peutModifier(), onclick: () => { lire(); [items[i - 1], items[i]] = [items[i], items[i - 1]]; construire(); } }, icone('haut'));
-          corps.appendChild(el('div', { class: 'ligne', style: { gridTemplateColumns: colonnes.join(' ') } }, monter, l.code, l.label, l.couleur, l.final ? el('div', { class: 'texte-centre' }, l.final) : null, l.delai, l.duree, el('button', { class: 'btn btn-icone btn-sm texte-danger', type: 'button', title: 'Supprimer', disabled: !peutModifier(), onclick: () => { lire(); items.splice(i, 1); construire(); } }, icone('supprimer'))));
+          corps.appendChild(el('div', { class: 'ligne', style: { gridTemplateColumns: colonnes.join(' ') } }, monter, l.code, l.label, l.couleur, l.final ? el('div', { class: 'texte-centre' }, l.final) : null, l.delai, l.duree, el('button', { class: 'btn btn-icone btn-sm texte-danger', type: 'button', title: nonSupprimable(it) ? raison(it) : 'Supprimer', disabled: !peutModifier() || nonSupprimable(it), onclick: () => { lire(); items.splice(i, 1); construire(); } }, icone('supprimer'))));
         });
       };
       const lire = () => { lignes.forEach((l, i) => { l.it.code = l.code.value; l.it.label = l.label.value; if (l.couleur) l.it.couleur = l.couleur.value; if (l.final) l.it.final = l.final.checked; if (l.delai) l.it.delaiHeures = Number(l.delai.value) || 0; if (l.duree) l.it.dureeMois = Number(l.duree.value) || 0; l.it.ordre = i + 1; }); };
@@ -307,7 +332,7 @@
     }
     rendreListe();
     cont.appendChild(ui.carte('Listes de valeurs', frag(
-      el('p', { class: 'texte-2 texte-petit' }, 'Statuts, types, priorités… Tout est modifiable : code technique (stable, utilisé dans les données), libellé affiché, couleur, ordre. Un statut « final » clôture l\'élément.'),
+      el('p', { class: 'texte-2 texte-petit' }, 'Statuts, types, priorités… Le libellé affiché, la couleur et l\'ordre sont toujours modifiables. Le code technique d\'une valeur enregistrée est figé (les données y font référence) ; une valeur encore utilisée ou un statut du circuit d\'un module ne peut pas être supprimé. Un statut « final » clôture l\'élément.'),
       el('div', { class: 'barre-outils' }, select, el('span', { class: 'espace' }), peutModifier() ? ui.bouton('Rétablir toutes les listes par défaut', { icone: 'rafraichir', onClic: async () => { if (!(await ui.confirm({ titre: 'Rétablir', message: 'Remplacer toutes les listes par les valeurs d\'origine ?', danger: true, okLabel: 'Rétablir' }))) return; try { config = await api.post('/api/configuration/reinitialiser/listes'); await GMAO.refresh(false); toast('Listes rétablies', 'succes'); rendreListe(); } catch (e) { erreur(e); } } }) : null),
       zone)));
     return cont;
@@ -347,6 +372,53 @@
     return cont;
   }
 
+  // ----- Onglet Options des modules -----------------------------------------
+  /** Réglages des modules sans écran propre (plans 3D, achats, RH, audits & visites) : valeurs typées, codes en listes. */
+  function ongletOptionsModules() {
+    const c = config;
+    const pl = c.plans || {}; const ac = c.achats || {}; const rh = c.rh || {}; const vi = c.visites || {};
+    const f = ui.form({ champs: [
+      { type: 'separateur', label: 'Plans 3D' },
+      { nom: 'plans.uniteAffichage', label: 'Unité d\'affichage des cotes', type: 'select', options: [{ value: 'm', label: 'Mètres (m)' }, { value: 'cm', label: 'Centimètres (cm)' }, { value: 'mm', label: 'Millimètres (mm)' }] },
+      { nom: 'plans.couleurParDefaut', label: 'Couleur des machines par défaut', type: 'select', options: [{ value: 'etat', label: 'Selon l\'état de l\'équipement' }, { value: 'ot', label: 'Selon les interventions en cours' }, { value: 'criticite', label: 'Selon la criticité' }, { value: 'secteur', label: 'Selon le secteur' }, { value: 'origine', label: 'Couleur d\'origine de l\'objet' }] },
+      { nom: 'plans.grilleM', label: 'Pas de la grille (m)', type: 'nombre', min: 0.01, max: 100, step: 0.01 },
+      { nom: 'plans.afficherEtiquettes', label: 'Afficher les étiquettes des objets', type: 'booleen', sansDecalage: true },
+      { type: 'separateur', label: 'Achats & factures' },
+      { nom: 'achats.tauxTVA', label: 'Taux de TVA par défaut (%)', type: 'nombre', min: 0, max: 100, step: 0.1 },
+      { nom: 'achats.seuilValidationHT', label: 'Validation des commandes au-delà de (HT)', type: 'nombre', min: 0, step: 1 },
+      { nom: 'achats.delaiPaiementJours', label: 'Délai de paiement (jours)', type: 'nombre', min: 0, max: 365, step: 1 },
+      { nom: 'achats.alerteEcheanceJours', label: 'Alerte avant l\'échéance d\'une facture (jours)', type: 'nombre', min: 0, max: 365, step: 1 },
+      { nom: 'achats.entreeStockAReception', label: 'Entrer les articles en stock à la réception', type: 'booleen', sansDecalage: true },
+      { type: 'separateur', label: 'Ressources humaines' },
+      { nom: 'rh.alerteJoursAvantEcheance', label: 'Alerte avant l\'échéance d\'une habilitation ou d\'une visite (jours)', type: 'nombre', min: 0, max: 730, step: 1 },
+      { nom: 'rh.heuresHebdo', label: 'Durée hebdomadaire du travail (heures)', type: 'nombre', min: 1, max: 80, step: 0.5 },
+      { nom: 'rh.afficherAbsencesPlanning', label: 'Afficher les absences dans le planning', type: 'booleen', sansDecalage: true },
+      { type: 'separateur', label: 'Audits & visites' },
+      { nom: 'visites.rappelJoursAvant', label: 'Rappel avant une visite (jours)', type: 'nombre', min: 0, max: 60, step: 1 },
+      { nom: 'visites.conserverVisiteursJours', label: 'Conservation du registre des visiteurs (jours)', type: 'nombre', min: 1, max: 3650, step: 1 },
+      { nom: 'visites.accompagnementObligatoire', label: 'Accompagnement des visiteurs obligatoire', type: 'booleen', sansDecalage: true },
+      { nom: 'visites.badgeAvecCodeBarre', label: 'Code-barres sur les badges visiteurs', type: 'booleen', sansDecalage: true },
+      { nom: 'visites.demanderPieceIdentite', label: 'Demander une pièce d\'identité à l\'accueil', type: 'booleen', sansDecalage: true },
+      { nom: 'visites.charteSecurite', label: 'Consignes de sécurité remises aux visiteurs', type: 'texte_long', lignes: 3 },
+    ], valeurs: {
+      'plans.uniteAffichage': pl.uniteAffichage || 'm', 'plans.couleurParDefaut': pl.couleurParDefaut || 'etat', 'plans.grilleM': pl.grilleM, 'plans.afficherEtiquettes': pl.afficherEtiquettes !== false,
+      'achats.tauxTVA': ac.tauxTVA, 'achats.seuilValidationHT': ac.seuilValidationHT, 'achats.delaiPaiementJours': ac.delaiPaiementJours, 'achats.alerteEcheanceJours': ac.alerteEcheanceJours, 'achats.entreeStockAReception': ac.entreeStockAReception !== false,
+      'rh.alerteJoursAvantEcheance': rh.alerteJoursAvantEcheance, 'rh.heuresHebdo': rh.heuresHebdo, 'rh.afficherAbsencesPlanning': rh.afficherAbsencesPlanning !== false,
+      'visites.rappelJoursAvant': vi.rappelJoursAvant, 'visites.conserverVisiteursJours': vi.conserverVisiteursJours, 'visites.accompagnementObligatoire': vi.accompagnementObligatoire !== false,
+      'visites.badgeAvecCodeBarre': vi.badgeAvecCodeBarre !== false, 'visites.demanderPieceIdentite': !!vi.demanderPieceIdentite, 'visites.charteSecurite': vi.charteSecurite || '',
+    } });
+    const btn = ui.bouton('Enregistrer', { classe: 'btn-primaire', icone: 'check', disabled: !peutModifier(), onClic: async () => {
+      if (!f.valider()) return;
+      const d = {};
+      for (const [k, val] of Object.entries(f.valeurs())) {
+        if (val === null || val === '') continue; // champ vidé : réglage inchangé
+        const [a, b] = k.split('.'); d[a] = d[a] || {}; d[a][b] = val;
+      }
+      await enregistrer(d, 'Options des modules enregistrées');
+    } });
+    return ui.carte('Options des modules', frag(el('p', { class: 'texte-2 texte-petit' }, 'Réglages propres aux modules Plans 3D, Achats & factures, Ressources humaines et Audits & visites. Les étiquettes et l\'inventaire se règlent dans leur propre écran.'), f.el, el('div', { class: 'mt texte-droite' }, btn)));
+  }
+
   // ----- Onglet Numérotation ------------------------------------------------
   function ongletNumerotation() {
     const n = config.numerotation;
@@ -380,6 +452,7 @@
         { cle: 'secteurs', label: 'Secteurs & sites', icone: 'site', rendu: (c) => { ongletSecteurs(c); } },
         { cle: 'listes', label: 'Listes de valeurs', icone: 'filtre', rendu: () => ongletListes() },
         { cle: 'champs', label: 'Champs personnalisés', icone: 'modifier', rendu: () => ongletChamps() },
+        { cle: 'options', label: 'Options des modules', icone: 'engrenage', rendu: () => ongletOptionsModules() },
         { cle: 'numerotation', label: 'Numérotation', icone: 'ot', rendu: () => ongletNumerotation() },
         { cle: 'journal', label: 'Journal & notifications', icone: 'cloche', rendu: () => ongletJournal() },
       ], { hash: true }).el);

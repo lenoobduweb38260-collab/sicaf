@@ -96,7 +96,8 @@
     svg.setAttribute('stroke-linecap', 'round');
     svg.setAttribute('stroke-linejoin', 'round');
     svg.setAttribute('aria-hidden', 'true');
-    if (classe) svg.setAttribute('class', classe);
+    // Classe « icone » : taille par défaut (1em) hors des contextes qui la fixent (boutons, menus, arbre…)
+    svg.setAttribute('class', 'icone' + (classe ? ' ' + classe : ''));
     svg.innerHTML = ICONES[nom] || ICONES.info;
     return svg;
   }
@@ -122,7 +123,13 @@
       for (const [k, v] of Object.entries(attrs)) {
         if (v === null || v === undefined || v === false) continue;
         if (k === 'class' || k === 'className') e.className = v;
-        else if (k === 'style' && typeof v === 'object') Object.assign(e.style, v);
+        else if (k === 'style' && typeof v === 'object') {
+          // Propriétés personnalisées (« --kpi-couleur ») : setProperty, que Object.assign ignorerait
+          for (const [p, val] of Object.entries(v)) {
+            if (val === null || val === undefined) continue;
+            if (p.startsWith('--')) e.style.setProperty(p, String(val)); else e.style[p] = val;
+          }
+        }
         else if (k === 'html') e.innerHTML = v;
         else if (k === 'text') e.textContent = v;
         else if (k === 'dataset') Object.assign(e.dataset, v);
@@ -148,6 +155,9 @@
   function parseDate(v) {
     if (!v) return null;
     if (v instanceof Date) return isNaN(v) ? null : v;
+    // Date seule « AAAA-MM-JJ » : jour du calendrier local (et non minuit UTC, qui reculerait d'un jour à l'ouest de Greenwich)
+    const m = typeof v === 'string' ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(v) : null;
+    if (m) { const j = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])); return isNaN(j) ? null : j; }
     const d = new Date(v);
     return isNaN(d) ? null : d;
   }
@@ -416,7 +426,11 @@
 
   // ----- Modales ------------------------------------------------------------
   const modales = [];
-  function modal({ titre, contenu, boutons, taille, onFermer, fermable = true, classe } = {}) {
+  /**
+   * Fenêtre modale. `modifie()` (facultatif) : vrai si une saisie serait perdue ; une fermeture par le fond ou par
+   * Échap demande alors confirmation (les boutons Fermer / Annuler restent des choix explicites).
+   */
+  function modal({ titre, contenu, boutons, taille, onFermer, fermable = true, classe, modifie } = {}) {
     const corps = el('div', { class: 'modal-corps' });
     append(corps, typeof contenu === 'function' ? contenu() : contenu);
     const pied = el('div', { class: 'modal-pied' });
@@ -429,6 +443,17 @@
         fond.remove();
         const i = modales.indexOf(api); if (i >= 0) modales.splice(i, 1);
         if (onFermer) onFermer(resultat);
+      },
+      /** Fermeture implicite (fond, Échap) : confirmation si la saisie en cours serait perdue. */
+      async fermerSiPossible() {
+        if (api._confirmation) return;
+        if (typeof modifie === 'function' && modifie()) {
+          api._confirmation = true;
+          const ok = await confirm({ titre: 'Abandonner la saisie ?', message: 'Les informations saisies dans cette fenêtre seront perdues.', okLabel: 'Abandonner', annulerLabel: 'Continuer la saisie', danger: true });
+          api._confirmation = false;
+          if (!ok) return;
+        }
+        api.fermer();
       },
       setTitre(t) { titreEl.textContent = t; },
       setBoutons(bs) { vider(pied); construireBoutons(bs); },
@@ -454,7 +479,7 @@
     construireBoutons(boutons);
     if (fermable) {
       fond.addEventListener('mousedown', (ev) => { if (ev.target === fond) api._fermerSurFond = true; else api._fermerSurFond = false; });
-      fond.addEventListener('mouseup', (ev) => { if (ev.target === fond && api._fermerSurFond) api.fermer(); });
+      fond.addEventListener('mouseup', (ev) => { if (ev.target === fond && api._fermerSurFond) api.fermerSiPossible(); });
     }
     document.body.appendChild(fond);
     modales.push(api);
@@ -464,7 +489,7 @@
     return api;
   }
   document.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape' && modales.length) { const m = modales[modales.length - 1]; if (m.boite.querySelector('.modal-entete .btn-icone')) m.fermer(); }
+    if (ev.key === 'Escape' && modales.length) { const m = modales[modales.length - 1]; if (m.boite.querySelector('.modal-entete .btn-icone')) m.fermerSiPossible(); }
   });
   /** Ferme toutes les modales ouvertes (changement de vue). */
   function fermerModales() { modales.slice().forEach((m) => { if (m.fermable !== false) m.fermer(); }); }
@@ -599,10 +624,15 @@
         const originaux = new Map(); // valeur affichée (chaîne) -> valeur d'origine (nombre, etc.)
         const remplir = (opts) => {
           vider(sel); originaux.clear();
+          const groupes = new Map(); // option.groupe → <optgroup>
           for (const o of optionsNormalisees(opts, def)) {
             const s = o.value == null ? '' : String(o.value);
             originaux.set(s, o.value == null ? '' : o.value);
-            sel.appendChild(el('option', { value: s, disabled: o.disabled }, o.label));
+            const opt = el('option', { value: s, disabled: o.disabled }, o.label);
+            if (o.groupe) {
+              if (!groupes.has(o.groupe)) { const g = el('optgroup', { label: String(o.groupe) }); groupes.set(o.groupe, g); sel.appendChild(g); }
+              groupes.get(o.groupe).appendChild(opt);
+            } else sel.appendChild(opt);
           }
         };
         remplir(def.options);
@@ -723,8 +753,15 @@
   /** Modale contenant un formulaire. onSubmit(valeurs, modal, form) ; retourner false pour laisser ouvert. */
   function formModal({ titre, champs, valeurs, colonnes = 2, taille, onSubmit, submitLabel = 'Enregistrer', annulerLabel = 'Annuler', boutonsSupp = [], apres, avant, onFermer } = {}) {
     const f = form({ champs, valeurs, colonnes });
+    // Saisie en cours : modification faite par l'utilisateur et valeurs différentes de celles d'origine
+    let touche = false;
+    const marquer = (ev) => { if (ev.isTrusted) touche = true; };
+    f.el.addEventListener('input', marquer);
+    f.el.addEventListener('change', marquer);
+    const lire = () => { try { return JSON.stringify(f.valeurs()); } catch (e) { return ''; } };
+    const initiales = lire();
     const m = modal({
-      titre, taille, onFermer,
+      titre, taille, onFermer, modifie: () => touche && lire() !== initiales,
       contenu: frag(avant || null, f.el, apres || null),
       boutons: [
         ...boutonsSupp.map((b) => Object.assign({}, b, { onClic: b.onClic ? (mm, btn) => b.onClic(f, mm, btn) : undefined })),
@@ -784,6 +821,9 @@
    * ui.table({ colonnes:[{cle,label,rendu(row),tri,classe,aligner,valeurTri(row)}], lignes, cleId, onClic(row), actions:[{icone,label,titre,onClic(row),visible(row),classe}],
    *   recherche:true|'placeholder', tailleParPage, pagination, vide, triInitial:{cle,sens}, groupe:{cle(row),label(val),ordre(a,b)}, ligneClasse(row), compact, exportCsv:'nom.csv', outils:[Node], selection:bool })
    */
+  /** Comparaison alphabétique française (accents, casse et nombres dans le texte : « Électrovanne » avant « Zone », « 2 » avant « 10 »). */
+  const collation = new Intl.Collator('fr', { numeric: true, sensitivity: 'base' });
+
   function table(options) {
     const o = Object.assign({ cleId: 'id', recherche: true, pagination: true, tailleParPage: ((G().config || {}).general || {}).lignesParPage || 25, vide: 'Aucun élément à afficher' }, options);
     let lignes = (o.lignes || []).slice();
@@ -846,6 +886,8 @@
             if (va === vb) return 0;
             if (va === '' || va == null) return 1;
             if (vb === '' || vb == null) return -1;
+            // Textes : ordre alphabétique français (accents, nombres dans le texte) ; sinon comparaison directe
+            if (typeof va === 'string' && typeof vb === 'string') return collation.compare(va, vb) * sens;
             return (va < vb ? -1 : 1) * sens;
           });
         }
@@ -960,7 +1002,11 @@
       filtrees: lignesFiltrees,
       rendre,
       selection() { return Array.from(selection); },
-      viderSelection() { selection.clear(); rendre(); },
+      viderSelection() { selection.clear(); rendre(); if (o.onSelection) o.onSelection(api.selection()); },
+      /** Sélection pilotée de l'extérieur : identifiants (valeurs de `cleId`). */
+      setSelection(ids) { selection.clear(); (ids || []).forEach((id) => selection.add(id)); rendre(); if (o.onSelection) o.onSelection(api.selection()); },
+      /** Sélectionne toutes les lignes affichées par la recherche (toutes les pages). */
+      selectionnerTout() { lignesFiltrees().forEach((r) => selection.add(r[o.cleId])); rendre(); if (o.onSelection) o.onSelection(api.selection()); },
       setGroupe(g) { o.groupe = g || null; rendre(); },
       setTri(t) { tri = t || null; rendre(); },
       rechercher(txt) { filtre = String(txt || '').toLowerCase(); if (inputRecherche) inputRecherche.value = txt || ''; page = 1; rendre(); },
@@ -971,7 +1017,13 @@
 
   function exportCsv(nom, colonnes, lignes) {
     const sep = ';';
-    const escCsv = (v) => { const s = texteDe(v).replace(/\r?\n/g, ' '); return /[";\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    const escCsv = (v) => {
+      let s = texteDe(v).replace(/\r?\n/g, ' ');
+      // Texte commençant par = + - @ (ou tabulation, retour chariot) : apostrophe en tête, pour qu'un tableur
+      // ne l'interprète jamais comme une formule (les nombres, même négatifs, restent des nombres)
+      if (typeof v !== 'number' && /^[=+\-@\t\r]/.test(s) && !/^[-+]?\d[\d\s\u00a0\u202f.,]*$/.test(s)) s = "'" + s;
+      return /[";\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
     const cols = colonnes.filter((c) => c.export !== false);
     const out = ['﻿' + cols.map((c) => escCsv(c.label)).join(sep)];
     for (const r of lignes) {
@@ -1090,13 +1142,23 @@
       if (opts.hash) { const h = location.hash.split('?')[0]; history.replaceState(null, '', h + '?onglet=' + actif); }
     }
     items.forEach((it) => {
-      const b = el('button', { type: 'button', dataset: { cle: it.cle }, onclick: () => activer(it.cle) }, it.icone ? icone(it.icone) : null, it.label, it.badge != null ? el('span', { class: 'badge' }, String(it.badge)) : null);
+      const b = el('button', { type: 'button', dataset: { cle: it.cle }, onclick: () => activer(it.cle) }, it.icone ? icone(it.icone) : null, it.label, it.badge != null && it.badge !== '' && it.badge !== 0 ? el('span', { class: 'badge' }, String(it.badge)) : null);
       boutons[it.cle] = b; barre.appendChild(b);
     });
     let initial = opts.actif;
     if (!initial && opts.hash) { const q = new URLSearchParams((location.hash.split('?')[1] || '')); initial = q.get('onglet'); }
     activer(initial || (items[0] && items[0].cle));
-    return { el: cont, activer, get actif() { return actif; }, setBadge(cle, v) { const b = boutons[cle]; if (!b) return; let bd = b.querySelector('.badge'); if (!bd) { bd = el('span', { class: 'badge' }); b.appendChild(bd); } bd.textContent = String(v); } };
+    return {
+      el: cont, activer, get actif() { return actif; },
+      /** Badge d'un onglet ; vide, nul ou 0 : badge retiré. */
+      setBadge(cle, v) {
+        const b = boutons[cle]; if (!b) return;
+        let bd = b.querySelector('.badge');
+        if (v === null || v === undefined || v === '' || v === 0 || v === '0') { if (bd) bd.remove(); return; }
+        if (!bd) { bd = el('span', { class: 'badge' }); b.appendChild(bd); }
+        bd.textContent = String(v);
+      },
+    };
   }
 
   /** Arbre : noeuds [{ id, label, enfants:[], icone, compteur, ... }] */
@@ -1109,7 +1171,7 @@
       for (const n of liste) {
         const enfants = (opts.enfants ? opts.enfants(n) : n.enfants) || [];
         const li = el('li', { class: niveau >= (opts.niveauReplie == null ? 99 : opts.niveauReplie) && enfants.length ? 'replie' : '' });
-        const bascule = el('span', { class: 'bascule' + (enfants.length ? '' : ' vide') }, enfants.length ? '▼' : '');
+        const bascule = el('span', { class: 'bascule' + (enfants.length ? '' : ' sans-enfant') }, enfants.length ? '▼' : '');
         const id = opts.cle ? opts.cle(n) : n.id;
         const noeud = el('div', { class: 'noeud' + (selectionne === id ? ' actif' : ''), dataset: { id } }, bascule, opts.icone ? icone(opts.icone(n)) : null, opts.couleur && opts.couleur(n) ? pastille(opts.couleur(n)) : null, el('span', { class: 'noeud-label' }, opts.label ? opts.label(n) : n.label || n.nom), opts.compteur && opts.compteur(n) != null ? el('span', { class: 'noeud-compteur' }, String(opts.compteur(n))) : null);
         bascule.addEventListener('click', (ev) => { ev.stopPropagation(); li.classList.toggle('replie'); bascule.textContent = li.classList.contains('replie') ? '▶' : '▼'; });

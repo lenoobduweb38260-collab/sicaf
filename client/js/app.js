@@ -31,6 +31,23 @@
 
     registerView(cle, def) { this.vues[cle] = Object.assign({ cle }, def); },
 
+    /**
+     * Fonctions appelées à chaque connexion (après l'amorçage, avant l'affichage de la première vue) : les modules
+     * peuvent y initialiser leurs compteurs du menu. Appelée aussitôt si un utilisateur est déjà connecté.
+     */
+    _surConnexion: [],
+    onConnexion(fn) {
+      if (typeof fn !== 'function') return;
+      this._surConnexion.push(fn);
+      if (this.user && !this.changementMdpRequis()) { try { fn(this.user); } catch (e) { console.error(e); } }
+    },
+    /** Sortie de la vue affichée (changement de vue, déconnexion) : appelle son crochet `quitter()` s'il existe. */
+    _quitterVue() {
+      const def = this._vueDef;
+      this._vueDef = null;
+      if (def && typeof def.quitter === 'function') { try { def.quitter(); } catch (e) { console.error(e); } }
+    },
+
     can(module, action) {
       action = action || 'voir';
       return !!(this.perms && this.perms.modules && this.perms.modules[module] && this.perms.modules[module][action]);
@@ -88,6 +105,7 @@
     },
 
     async deconnexion() {
+      GMAO._quitterVue();
       try { await api.post('/api/auth/logout'); } catch (e) { /* ignore */ }
       GMAO.user = null; GMAO.perms = null;
       GMAO._badges = {}; // compteurs du menu propres à la session
@@ -110,12 +128,14 @@
         expire: `Votre mot de passe a expiré${sc.expirationMdpJours ? ` (il doit être changé tous les ${sc.expirationMdpJours} jours)` : ''} : choisissez-en un nouveau pour continuer.`,
         administrateur: 'Votre mot de passe a été défini par un administrateur : choisissez un nouveau mot de passe personnel avant de continuer.',
       };
+      // Mot de passe actuel : toujours demandé, sauf changement imposé dès l'ouverture de la session (il vient d'être saisi)
+      const ancienRequis = !force || etat.ancienRequis !== false;
       const f = ui.form({ colonnes: 1, champs: [
-        force ? null : { nom: 'ancien', label: 'Mot de passe actuel', type: 'mdp', requis: true },
+        ancienRequis ? { nom: 'ancien', label: 'Mot de passe actuel', type: 'mdp', requis: true } : null,
         { nom: 'nouveau', label: 'Nouveau mot de passe', type: 'mdp', requis: true },
         { nom: 'confirmation', label: 'Confirmer le nouveau mot de passe', type: 'mdp', requis: true, valider: (v, vals) => (v !== vals.nouveau ? 'Les mots de passe ne correspondent pas' : '') },
       ] });
-      if (!force) f.controles.ancien.input.setAttribute('autocomplete', 'current-password');
+      if (ancienRequis) f.controles.ancien.input.setAttribute('autocomplete', 'current-password');
       f.controles.nouveau.input.setAttribute('autocomplete', 'new-password');
       f.controles.confirmation.input.setAttribute('autocomplete', 'new-password');
       const regles = ui.reglesMdp(f.controles.nouveau.input, {
@@ -172,6 +192,8 @@
       }
       GMAO.route = { module, params: parts.slice(1), query };
       const vue = GMAO.vues[module];
+      // Vue précédente : libération de ses ressources (écouteurs, caméra, minuteries) avant d'afficher la suivante
+      GMAO._quitterVue();
       ui.fermerModales();
       ui.vider(contenu);
       if (GMAO.changementMdpRequis()) {
@@ -202,6 +224,7 @@
       const conteneur = el('div', { class: 'vue', dataset: { module } });
       contenu.appendChild(conteneur);
       GMAO._vueCourante = module;
+      GMAO._vueDef = vue;
       try {
         const r = vue.rendu(conteneur, { params: GMAO.route.params, query });
         if (r && typeof r.then === 'function') {
@@ -240,6 +263,30 @@
   }
   function assombrir(hex, f) { const [r, g, b] = hexToRgb(hex).map((c) => Math.max(0, Math.round(c * (1 - f)))); return `rgb(${r},${g},${b})`; }
 
+  /** Luminance relative (WCAG) d'une couleur [r, g, b]. */
+  function luminance(rgb) {
+    const c = rgb.map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4); });
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  }
+  function contraste(a, b) { const la = luminance(a), lb = luminance(b); return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05); }
+  /**
+   * Couleur des liens et des éléments actifs : la couleur principale, éclaircie (thème sombre) ou assombrie (thème
+   * clair) juste assez pour un contraste d'au moins 4,5:1 sur les fonds de l'application (lisibilité des textes).
+   */
+  function couleurLien(couleur, theme) {
+    const fonds = theme === 'sombre' ? [[30, 41, 59], [15, 23, 42], [39, 52, 73]] : [[255, 255, 255], [243, 244, 246], [249, 250, 251]];
+    const vers = theme === 'sombre' ? 255 : 0;
+    const base = hexToRgb(couleur);
+    // Fond « --primaire-clair » (élément actif d'un arbre, groupe de boutons) posé sur la surface
+    const alpha = theme === 'sombre' ? 0.28 : 0.14;
+    fonds.push(fonds[0].map((v, i) => Math.round(base[i] * alpha + v * (1 - alpha))));
+    for (let f = 0; f <= 1.0001; f += 0.05) {
+      const rgb = base.map((v) => Math.round(v + (vers - v) * f));
+      if (fonds.every((fd) => contraste(rgb, fd) >= 4.6)) return `rgb(${rgb.join(',')})`;
+    }
+    return theme === 'sombre' ? '#ffffff' : '#000000';
+  }
+
   function appliquerTheme() {
     const pref = (GMAO.user && GMAO.user.preferences && GMAO.user.preferences.theme) || ((GMAO.config.general || {}).theme) || 'clair';
     let theme = pref;
@@ -251,6 +298,7 @@
     root.setProperty('--primaire', couleur);
     root.setProperty('--primaire-fonce', assombrir(couleur, 0.15));
     root.setProperty('--primaire-clair', theme === 'sombre' ? `rgba(${r},${g},${b},0.28)` : `rgba(${r},${g},${b},0.14)`);
+    root.setProperty('--lien', couleurLien(couleur, theme));
   }
 
   function chargerScript(src) {
@@ -630,6 +678,7 @@
     majNotifications();
     if (GMAO._notifTimer) clearInterval(GMAO._notifTimer);
     GMAO._notifTimer = setInterval(majNotifications, 60000);
+    if (!GMAO.changementMdpRequis()) for (const fn of GMAO._surConnexion) { try { fn(GMAO.user); } catch (e) { console.error(e); } }
   }
 
   /** Sélecteur de site (multi-site) : affiché dès qu'au moins un site est accessible. */
@@ -1018,7 +1067,9 @@
       liste.appendChild(el('div', { class: 'notif-item' + (n.lu ? '' : ' non-lue'), onclick: async () => {
         try { await api.post('/api/notifications/lues', { ids: [n.id] }); } catch (e) { /* ignore */ }
         fermerMenus(); majNotifications();
-        if (n.lien) GMAO.navigate(n.lien);
+        // Lien d'action « #/mon-dossier-rh » : dossier RH personnel (fenêtre de la vue RH), sinon navigation
+        if (n.lien === '#/mon-dossier-rh' && typeof GMAO.ouvrirMonDossierRH === 'function') GMAO.ouvrirMonDossierRH();
+        else if (n.lien) GMAO.navigate(n.lien);
       } }, el('div', { class: 'notif-titre' }, n.titre), el('div', { class: 'notif-message' }, n.message), el('div', { class: 'notif-date' }, ui.relatif(n.date))));
     }
     const menu = el('div', { class: 'menu-deroulant notif-panneau', onclick: (ev) => ev.stopPropagation() },

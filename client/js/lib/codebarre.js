@@ -7,7 +7,8 @@
  *   CodeBarre.valeurs('ART-0001')        → [104, 33, 50, 52, 13, 99, 0, 1, 20, 106]
  *   CodeBarre.decoderLigne(luminances)   → 'ART-0001' | null
  *   CodeBarre.decoderImage(imageData)    → 'ART-0001' | null (plusieurs lignes, vote majoritaire)
- *   const stop = CodeBarre.ecouterDouchette((code) => …)  ;  stop()
+ *   const stop = CodeBarre.ecouterDouchette((code) => …, { actif: () => true })  ;  stop()
+ *   const frappe = CodeBarre.suivreFrappe(champ) ; frappe.rapide() (saisie à la vitesse d'une douchette ?)
  *   const cam = await CodeBarre.camera(videoEl, (code) => …) ;  cam.arreter()
  *   CodeBarre.bip(true) / CodeBarre.bip(false)
  *
@@ -456,7 +457,8 @@
   /**
    * Écoute les saisies très rapides terminées par Entrée (douchette en émulation clavier) quand le
    * focus n'est PAS dans un champ de saisie. Retourne une fonction de désinscription.
-   * options : { delaiMaxMs: 35, longueurMin: 3, delaiFinMs: 100, touchesFin: ['Enter'], cible: document }
+   * options : { delaiMaxMs: 35, longueurMin: 3, delaiFinMs: 100, touchesFin: ['Enter'], cible: document,
+   *             actif: () => boolean }  (actif faux : aucune touche interceptée, par exemple module désactivé)
    */
   function ecouterDouchette(callback, options) {
     const o = Object.assign({ delaiMaxMs: 35, longueurMin: 3, delaiFinMs: 100, touchesFin: ['Enter'] }, options || {});
@@ -466,6 +468,11 @@
     let tampon = '';
     let dernier = 0;
     function surTouche(ev) {
+      if (typeof o.actif === 'function') {
+        let actif = false;
+        try { actif = !!o.actif(); } catch (e) { actif = false; }
+        if (!actif) { tampon = ''; return; }
+      }
       if (estChampSaisie(ev.target) || (typeof document !== 'undefined' && estChampSaisie(document.activeElement))) { tampon = ''; return; }
       const altGr = typeof ev.getModifierState === 'function' && ev.getModifierState('AltGraph');
       if ((ev.ctrlKey || ev.metaKey || ev.altKey) && !altGr) { tampon = ''; return; }
@@ -489,6 +496,43 @@
     }
     cible.addEventListener('keydown', surTouche, true);
     return () => cible.removeEventListener('keydown', surTouche, true);
+  }
+
+  /**
+   * Suit la frappe dans un champ de saisie pour distinguer une douchette (caractères espacés de moins
+   * de delaiMaxMs) d'une saisie au clavier ou d'un collage. rapide() : la valeur actuelle du champ
+   * a-t-elle été entièrement tapée à la vitesse d'une douchette ? Retourne { rapide, reinitialiser, arreter }.
+   * options : { delaiMaxMs: 35, longueurMin: 3 }
+   */
+  function suivreFrappe(champ, options) {
+    const o = Object.assign({ delaiMaxMs: 35, longueurMin: 3 }, options || {});
+    const maintenant = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
+    let instants = [];
+    let valeurSuivie = '';
+    function surTouche(ev) {
+      if (!ev || !ev.key) return;
+      if (ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey) {
+        // Champ vidé ou modifié autrement que par la frappe (collage, correction) : nouvelle saisie
+        if (String(champ.value || '') !== valeurSuivie) instants = [];
+        instants.push(maintenant());
+        valeurSuivie = String(champ.value || '') + ev.key;
+      } else if (['Backspace', 'Delete'].includes(ev.key) || ev.ctrlKey || ev.metaKey) {
+        instants = [];
+        valeurSuivie = null;
+      }
+    }
+    if (champ && champ.addEventListener) champ.addEventListener('keydown', surTouche);
+    return {
+      rapide() {
+        const v = String((champ && champ.value) || '').trim();
+        if (valeurSuivie == null || String((champ && champ.value) || '') !== valeurSuivie) return false;
+        if (v.length < o.longueurMin || instants.length < o.longueurMin) return false;
+        for (let i = 1; i < instants.length; i++) if (instants[i] - instants[i - 1] > o.delaiMaxMs) return false;
+        return true;
+      },
+      reinitialiser() { instants = []; valeurSuivie = ''; },
+      arreter() { if (champ && champ.removeEventListener) champ.removeEventListener('keydown', surTouche); },
+    };
   }
 
   // ----- Caméra ---------------------------------------------------------------------------------
@@ -611,6 +655,6 @@
     START_A, START_B, START_C, STOP, CODE_A, CODE_B, CODE_C, FNC1, SHIFT, LONGUEUR_MAX,
     translitterer, preparer, estEncodable, encoder, valeurs, modules, svg, controle,
     decoderLigne, decoderImage, interpreter,
-    ecouterDouchette, estChampSaisie, camera, bip,
+    ecouterDouchette, suivreFrappe, estChampSaisie, camera, bip,
   };
 });

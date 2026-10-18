@@ -81,9 +81,10 @@ describe('Demandes d\'intervention', () => {
     assert.equal((await demandeur.post('/api/demandes', { titre: 'Test secteur', secteurId: 99999 })).status, 400, 'secteur inconnu');
     const reforme = srv.db.findOne('equipements', (e) => e.numero === 'EQ-T003');
     assert.equal((await demandeur.post('/api/demandes', { titre: 'Test réformé', equipementId: reforme.id })).status, 400, 'équipement inactif refusé');
-    const r = await demandeur.post('/api/demandes', { titre: 'Pour un autre', demandeurId: uChefProd.id });
-    assert.equal(r.status, 200, 'le demandeur (droit modifier) peut désigner un autre demandeur');
-    assert.equal(r.body.demandeurId, uChefProd.id);
+    assert.equal((await demandeur.post('/api/demandes', { titre: 'Pour un autre', demandeurId: uChefProd.id })).status, 403, 'le profil Demandeur (sans droit modifier) ne désigne pas un autre demandeur');
+    const r = await chefProd.post('/api/demandes', { titre: 'Pour un autre', demandeurId: uDemandeur.id });
+    assert.equal(r.status, 200, 'un encadrant (droit modifier) peut désigner un autre demandeur');
+    assert.equal(r.body.demandeurId, uDemandeur.id);
     await admin.ok('DELETE', '/api/demandes/' + r.body.id);
     const t = await techMaint.post('/api/demandes', { titre: 'Pour un autre (technicien)', demandeurId: uChefProd.id });
     assert.equal(t.status, 403, 'sans le droit modifier, impossible de créer au nom d\'un autre');
@@ -212,8 +213,9 @@ describe('Demandes d\'intervention', () => {
     assert.ok(evenements.some((e) => e.evt === 'demande:convertie' && e.id === di1.id));
     assert.equal((await chefProd.post('/api/demandes/' + di1.id + '/valider')).status, 400, 'déjà validée');
     assert.equal((await admin.del('/api/demandes/' + di1.id)).status, 400, 'suppression refusée : OT lié');
-    assert.equal((await demandeur.put('/api/demandes/' + di1.id, { titre: 'Fuite d\'huile sur la presse 250 t (complément)' })).status, 200, 'le profil Demandeur possède le droit modifier : modification possible tant que la demande n\'est pas finale');
-    assert.equal((await demandeur.put('/api/demandes/' + di1.id, { equipementId: null })).status, 400, 'mais l\'équipement ne change plus après validation');
+    assert.equal((await demandeur.put('/api/demandes/' + di1.id, { titre: 'Fuite d\'huile sur la presse 250 t (complément)' })).status, 403, 'le profil Demandeur (sans droit modifier) ne modifie plus sa demande une fois validée');
+    assert.equal((await chefProd.put('/api/demandes/' + di1.id, { titre: 'Fuite d\'huile sur la presse 250 t (complément)' })).status, 200, 'un encadrant (droit modifier) la modifie tant qu\'elle n\'est pas finale');
+    assert.equal((await chefProd.put('/api/demandes/' + di1.id, { equipementId: null })).status, 400, 'mais l\'équipement ne change plus après validation');
     const tech = await techMaint.ok('POST', '/api/demandes', { titre: 'Demande technicien validée', equipementId: presse.id });
     await chefProd.ok('POST', '/api/demandes/' + tech.id + '/valider');
     assert.equal((await techMaint.put('/api/demandes/' + tech.id, { titre: 'Après validation' })).status, 403, 'sans droit modifier, le créateur ne modifie plus après validation');

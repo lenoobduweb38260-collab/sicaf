@@ -30,6 +30,15 @@ function register(ctx) {
   }
   const mdp = () => ctx.motsDePasse;
   const gerable = (req, u) => !!u && perms.canManageUser(req.perms, db.get('profils', u.profilId));
+  /**
+   * Prise en main d'un compte (mot de passe, code de réinitialisation, double authentification) : niveau hiérarchique
+   * inférieur, et aucun droit individuel, portée, secteur ou accès à un site que le gestionnaire ne pourrait pas accorder.
+   */
+  function exigerPriseEnMain(req, cible, quoi) {
+    if (!gerable(req, cible)) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
+    const d = perms.depassementsGestion(db, req.perms, cible);
+    if (d.length) throw new HttpError(403, `Ce compte dispose de droits que vous ne pouvez pas accorder (${d.join(' ; ')}) : seul un gestionnaire qui les possède, ou un administrateur, peut ${quoi}.`);
+  }
 
   /** Utilisateur visible ou 404. */
   function getVisible(req, id, ecriture) {
@@ -181,6 +190,7 @@ function register(ctx) {
     if (body.password) {
       // Son propre mot de passe se change avec l'ancien (et l'historique) : « Changer mon mot de passe »
       if (existant.id === req.user.id) throw new HttpError(400, 'Pour votre propre compte, utilisez « Changer mon mot de passe » dans le menu de votre compte');
+      exigerPriseEnMain(req, existant, 'définir son mot de passe');
       const pwd = String(body.password);
       const err = auth.validerMotDePasse(pwd, db.getConfig(), { login: data.login });
       if (err) throw new HttpError(400, err);
@@ -237,7 +247,7 @@ function register(ctx) {
     const b = req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body) ? req.body : {};
     const existant = getVisible(req, req.params.id, true);
     if (existant.id === req.user.id) throw new HttpError(400, 'Pour votre propre compte, utilisez « Changer mon mot de passe » dans le menu de votre compte');
-    if (!gerable(req, existant)) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
+    exigerPriseEnMain(req, existant, 'réinitialiser son mot de passe');
     if (existant.actif === false) throw new HttpError(400, 'Ce compte est désactivé : réactivez-le avant de réinitialiser son mot de passe');
     const mode = b.mode == null || b.mode === '' ? 'temporaire' : b.mode;
     if (!['code', 'temporaire'].includes(mode)) throw new HttpError(400, 'Mode de réinitialisation invalide (code ou temporaire)');
@@ -268,7 +278,8 @@ function register(ctx) {
   /** Annulation du code de réinitialisation d'un compte (avant qu'il ne soit utilisé). */
   router.delete('/api/utilisateurs/:id/code-reinitialisation', async (req) => {
     const existant = getVisible(req, req.params.id, true);
-    if (existant.id !== req.user.id && !gerable(req, existant)) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
+    if (existant.id === req.user.id) throw new HttpError(400, 'Un code de réinitialisation de votre propre compte ne peut être annulé que par le pôle informatique (ou il s\'annule en changeant votre mot de passe)');
+    exigerPriseEnMain(req, existant, 'annuler son code de réinitialisation');
     if (!mdp().annulerCode(existant.id)) throw new HttpError(400, 'Aucun code de réinitialisation actif pour ce compte');
     ctx.audit(req, 'annulation_code_reinitialisation', 'users', existant.id, `Code de réinitialisation de ${existant.login} annulé`);
     return { ok: true };
@@ -287,6 +298,9 @@ function register(ctx) {
       id: d.id, userId: d.userId, login: u ? u.login : d.login, nom: u ? ctx.nomUser(u.id) : d.login, profilNom: profil ? profil.nom : '',
       message: d.message || '', ip: d.ip || '', poste: d.poste || '', repetitions: Number(d.repetitions) || 1, createdAt: d.createdAt, derniereDemande: d.derniereDemande || d.createdAt,
       statut: d.statut,
+      // Demandes suivantes (adresse, poste, message, date) ; plusieurs postes différents : vérifier l'identité du demandeur
+      provenances: (Array.isArray(d.provenances) ? d.provenances : []).map((p) => ({ ip: p.ip || '', poste: p.poste || '', message: p.message || '', date: p.date || null })),
+      nbPostes: Number(d.nbPostes) || 1,
     };
     if (d.statut !== 'en_attente') Object.assign(out, { mode: d.mode || null, traiteePar: d.traiteePar == null ? null : d.traiteePar, traiteeParNom: d.traiteePar == null ? '' : ctx.nomUser(d.traiteePar), traiteeLe: d.traiteeLe || null, motifRejet: d.motifRejet || '' });
     return out;
@@ -335,7 +349,7 @@ function register(ctx) {
   router.post('/api/utilisateurs/:id/2fa/reinitialiser', async (req) => {
     const existant = getVisible(req, req.params.id, true);
     if (existant.id === req.user.id) throw new HttpError(400, 'Pour votre propre compte, utilisez « Double authentification » dans le menu de votre compte');
-    if (!perms.canManageUser(req.perms, db.get('profils', existant.profilId))) throw new HttpError(403, 'Niveau hiérarchique insuffisant');
+    exigerPriseEnMain(req, existant, 'réinitialiser sa double authentification');
     const avant = existant.deuxFacteurs || {};
     if (!avant.actif && !avant.secretEnAttente) throw new HttpError(400, 'La double authentification n\'est pas configurée pour cet utilisateur');
     db.update('users', existant.id, { deuxFacteurs: { actif: false, reinitialiseLe: new Date().toISOString(), reinitialisePar: req.user.id }, codesSecours: [] });

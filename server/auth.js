@@ -178,6 +178,16 @@ class Sessions {
     return 0;
   }
 
+  /** Quota atteint (sans rien enregistrer) : secondes avant la prochaine demande permise, 0 si le quota n'est pas atteint. */
+  quotaAtteint(cle, max, fenetreMs) {
+    const q = this.quotas.get(cle);
+    if (!q) return 0;
+    const now = Date.now();
+    const recents = q.instants.filter((t) => t > now - fenetreMs);
+    if (recents.length < max) return 0;
+    return Math.max(1, Math.ceil((recents[recents.length - max] + fenetreMs - now) / 1000));
+  }
+
   /** Limitation des tentatives : retourne le nombre de secondes de blocage restantes (0 si libre). */
   blocage(cle) {
     const t = this.tentatives.get(cle);

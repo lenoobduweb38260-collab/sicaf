@@ -169,3 +169,269 @@ describe('Noyau : authentification, profils, utilisateurs, hiérarchie, configur
     assert.equal((await c.get('/api/auth/me')).status, 401);
   });
 });
+
+describe('Listes de valeurs : codes conservés et cohérence avec les données', () => {
+  let srv, admin;
+  before(async () => { srv = await demarrer(); admin = srv.client(); await admin.login('admin', 'admin'); });
+  after(async () => { await srv.stop(); });
+  const liste = (nom) => srv.db.getConfig().listes[nom];
+
+  test('enregistrer une liste conserve la casse des codes existants (criticités A, B, C)', async () => {
+    const eq = srv.db.insert('equipements', { numero: 'EQ-L1', nom: 'Presse', criticiteCode: 'A', actif: true });
+    const items = liste('criticites').map((x) => (x.code === 'C' ? Object.assign({}, x, { couleur: '#000000' }) : x));
+    const cfg = await admin.ok('PUT', '/api/configuration', { listes: { criticites: items } });
+    assert.deepEqual(cfg.listes.criticites.map((x) => x.code), ['A', 'B', 'C'], 'codes existants inchangés');
+    assert.equal(cfg.listes.criticites.find((x) => x.code === 'C').couleur, '#000000');
+    // Un nouveau code est normalisé (minuscules)
+    const cfg2 = await admin.ok('PUT', '/api/configuration', { listes: { criticites: items.concat([{ code: 'D Nouveau', label: 'D' }]) } });
+    assert.equal(cfg2.listes.criticites[3].code, 'd_nouveau');
+    assert.equal(srv.db.get('equipements', eq.id).criticiteCode, 'A');
+  });
+
+  test('un code utilisé par des éléments ne peut être ni supprimé, ni renommé, ni changer de caractère final', async () => {
+    srv.db.insert('ot', { numero: 'OT-L1', titre: 'Graissage', statut: 'termine' });
+    srv.db.insert('equipements', { numero: 'EQ-L2', nom: 'Compresseur', typeCode: 'machine', actif: true });
+    const statuts = liste('statutsOT');
+    // « termine » renommé « cloture » : refusé (les OT clôturés redeviendraient ouverts)
+    let r = await admin.put('/api/configuration', { listes: { statutsOT: statuts.map((x) => (x.code === 'termine' ? Object.assign({}, x, { code: 'cloture' }) : x)) } });
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /termine/);
+    // Libellé et couleur modifiables
+    const ok = await admin.ok('PUT', '/api/configuration', { listes: { statutsOT: statuts.map((x) => (x.code === 'termine' ? Object.assign({}, x, { label: 'Réalisé', couleur: '#15803d' }) : x)) } });
+    assert.equal(ok.listes.statutsOT.find((x) => x.code === 'termine').label, 'Réalisé');
+    // Type d'équipement utilisé : suppression refusée, avec le nombre d'éléments
+    r = await admin.put('/api/configuration', { listes: { typesEquipement: liste('typesEquipement').filter((x) => x.code !== 'machine') } });
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /1 équipement/);
+    // Code personnalisé utilisé : son caractère final ne change pas
+    await admin.ok('PUT', '/api/configuration', { listes: { statutsOT: liste('statutsOT').concat([{ code: 'archive', label: 'Archivé', final: true }]) } });
+    srv.db.insert('ot', { numero: 'OT-L2', titre: 'Ancien', statut: 'archive' });
+    r = await admin.put('/api/configuration', { listes: { statutsOT: liste('statutsOT').map((x) => (x.code === 'archive' ? Object.assign({}, x, { final: false }) : x)) } });
+    assert.equal(r.status, 400);
+    // Valeur non utilisée : suppression permise
+    await admin.ok('PUT', '/api/configuration', { listes: { typesEquipement: liste('typesEquipement').filter((x) => x.code !== 'vehicule') } });
+    assert.equal(liste('typesEquipement').some((x) => x.code === 'vehicule'), false);
+    // Les usages sont consultables pour l'écran des listes
+    const u = await admin.ok('GET', '/api/configuration/listes/statutsOT/usages');
+    assert.equal(u.usages.termine.total, 1);
+    assert.ok(u.proteges.includes('termine') && u.proteges.includes('annule'));
+  });
+
+  test('statuts du circuit protégés ; au moins un statut final (et, pour les OT, autre qu\'une annulation)', async () => {
+    const statuts = liste('statutsDemande');
+    let r = await admin.put('/api/configuration', { listes: { statutsDemande: statuts.filter((x) => x.code !== 'convertie') } });
+    assert.equal(r.status, 400, 'statut du circuit non supprimable même inutilisé');
+    r = await admin.put('/api/configuration', { listes: { statutsDemande: statuts.map((x) => (x.code === 'cloturee' ? Object.assign({}, x, { final: false }) : x)) } });
+    assert.equal(r.status, 400, 'caractère final du circuit figé');
+    r = await admin.put('/api/configuration', { listes: { priorites: [{ code: 'x', label: 'X', final: false }] } });
+    assert.equal(r.status, 400, 'aucun statut final');
+    assert.match(r.body.erreur, /au moins un statut final/);
+    // Rétablir les listes par défaut conserve les codes personnalisés encore utilisés
+    await admin.ok('POST', '/api/configuration/reinitialiser/listes');
+    assert.ok(liste('statutsOT').some((x) => x.code === 'archive'), 'code utilisé conservé');
+    assert.ok(liste('typesEquipement').some((x) => x.code === 'vehicule'), 'valeurs par défaut rétablies');
+    assert.equal(liste('criticites').some((x) => x.code === 'd_nouveau'), false, 'code inutilisé retiré');
+  });
+});
+
+describe('Profils fournis : le Demandeur n\'a pas les droits d\'un encadrant', () => {
+  test('profil Demandeur sans Demandes › Modifier, base existante corrigée une seule fois', async () => {
+    const { profilsParDefaut, seed } = require('../server/seed');
+    const dem = profilsParDefaut().find((p) => p.nom === 'Demandeur');
+    assert.equal(dem.permissions.demandes.modifier, false);
+    assert.equal(dem.permissions.demandes.creer, true);
+    const { Db } = require('../server/db');
+    const db = new Db(require('os').tmpdir(), { inMemory: true }).load();
+    seed(db);
+    const p = db.findOne('profils', (x) => x.nom === 'Demandeur');
+    // Base antérieure : droit présent, migration pas encore passée
+    db.update('profils', p.id, { permissions: Object.assign({}, p.permissions, { demandes: Object.assign({}, p.permissions.demandes, { modifier: true }) }) });
+    delete db.data.meta.migrations.demandeurSansModifier;
+    seed(db);
+    assert.equal(db.get('profils', p.id).permissions.demandes.modifier, false, 'droit retiré du profil fourni');
+    // Un choix ultérieur du pôle informatique est respecté
+    db.update('profils', p.id, { permissions: Object.assign({}, p.permissions, { demandes: Object.assign({}, p.permissions.demandes, { modifier: true }) }) });
+    seed(db);
+    assert.equal(db.get('profils', p.id).permissions.demandes.modifier, true);
+  });
+});
+
+describe('Import, export et restauration de la base', () => {
+  let srv, admin, info, dir, profils;
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  before(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gmao-import-'));
+    srv = await demarrer({ inMemory: false, dataDir: dir, saveDelay: 0 });
+    admin = srv.client(); await admin.login('admin', 'admin');
+    profils = await admin.ok('GET', '/api/profils');
+    const secteurs = await admin.ok('GET', '/api/secteurs');
+    await admin.ok('POST', '/api/utilisateurs', { login: 'infosite', nom: 'Info site', profilId: profils.find((p) => p.nom === 'Pôle informatique').id, porteeOverride: 'site', secteurIds: [secteurs.find((s) => s.code === 'PROD').id], password: 'info1234', doitChangerMdp: false });
+    info = srv.client(); await info.login('infosite', 'info1234');
+    const cfg = srv.db.getConfig();
+    cfg.sauvegardes = Object.assign({}, cfg.sauvegardes, { motDePasseChiffrement: 'Secret-Chiffrement-42', cleReception: 'sha256:cle-reception', cleReceptionDate: '2026-01-01', destinations: [{ id: 1, nom: 'Valréas', type: 'serveur', cle: 'CLE-DE-VALREAS', secteurId: null }] });
+    srv.db.setConfig(cfg);
+    srv.db.insert('equipements', { numero: 'EQ-I1', nom: 'Presse à importer', actif: true });
+  });
+  after(async () => { await srv.stop(); fs.rmSync(dir, { recursive: true, force: true }); });
+
+  test('export : complet, sans les secrets des sauvegardes ni les codes de réinitialisation, réservé à l\'accès tous sites', async () => {
+    const r = await admin.get('/api/export');
+    assert.equal(r.status, 200);
+    for (const secret of ['Secret-Chiffrement-42', 'CLE-DE-VALREAS', 'cle-reception']) assert.equal(JSON.stringify(r.body).includes(secret), false, secret);
+    assert.ok(r.body.collections.equipements.some((e) => e.numero === 'EQ-I1'));
+    assert.deepEqual(r.body.config.sauvegardes.destinations, []);
+    assert.equal((await info.get('/api/export')).status, 403, 'utilisateur limité à son site');
+  });
+
+  test('import : fichier mal formé ou partiel refusé sans rien remplacer ; aperçu ; réservé à l\'accès tous sites', async () => {
+    const base = (await admin.get('/api/export')).body;
+    for (const [corps, motif] of [
+      [{ collections: 'x' }, /collections absentes/],
+      [{ collections: { ot: [] } }, /« users » est absente/],
+      [Object.assign({}, base, { collections: Object.assign({}, base.collections, { equipements: [{ nom: 'sans id' }] }) }), /sans identifiant valide/],
+      [Object.assign({}, base, { collections: Object.assign({}, base.collections, { users: base.collections.users.map((u) => Object.assign({}, u, { actif: false })) }) }), /administrateur actif/],
+    ]) {
+      const r = await admin.post('/api/import', corps);
+      assert.equal(r.status, 400, JSON.stringify(r.body));
+      assert.match(r.body.erreur, motif);
+    }
+    assert.equal(srv.db.count('equipements', (e) => e.numero === 'EQ-I1'), 1, 'base intacte');
+    assert.equal((await admin.get('/api/auth/me')).status, 200, 'session conservée');
+    const apercu = await admin.ok('POST', '/api/import?apercu=1', base);
+    assert.equal(apercu.apercu, true);
+    assert.equal(apercu.volumes.equipements, 1);
+    assert.equal((await info.post('/api/import', base)).status, 403, 'utilisateur limité à son site');
+  });
+
+  test('import valide : base remplacée, copie préalable, paramètres de sauvegarde de ce serveur conservés', async () => {
+    const base = (await admin.get('/api/export')).body;
+    base.collections.equipements.push({ id: 999, numero: 'EQ-I2', nom: 'Importé', actif: true });
+    const r = await admin.ok('POST', '/api/import', base);
+    assert.equal(r.volumes.equipements, 2);
+    assert.equal(srv.db.count('equipements'), 2);
+    const s = srv.db.getConfig().sauvegardes;
+    assert.equal(s.motDePasseChiffrement, 'Secret-Chiffrement-42', 'mot de passe de chiffrement conservé');
+    assert.equal(s.destinations.length, 1, 'destinations conservées');
+    assert.ok(fs.readdirSync(path.join(dir, 'backups')).some((f) => /avant-import/.test(f)));
+    admin = srv.client(); await admin.login('admin', 'admin');
+    info = srv.client(); await info.login('infosite', 'info1234');
+  });
+
+  test('restauration (sauvegardes du dossier) : nom invalide ou inconnu → 400 / 404, accès tous sites, secrets conservés', async () => {
+    assert.equal((await admin.post('/api/sauvegardes/restaurer', { nom: '../../../etc/passwd' })).status, 400);
+    assert.equal((await admin.post('/api/sauvegardes/restaurer', { nom: { a: 1 } })).status, 400);
+    assert.equal((await admin.post('/api/sauvegardes/restaurer', { nom: 'inexistant.json' })).status, 404);
+    // Copie sans secrets (comme celles du module sauvegardes) dans le dossier des sauvegardes
+    const exp = (await admin.get('/api/export')).body;
+    fs.writeFileSync(path.join(dir, 'backups', 'gmao-copie-sans-secrets.json'), JSON.stringify(exp));
+    fs.writeFileSync(path.join(dir, 'backups', 'gmao-illisible.json'), '{ pas du json');
+    assert.equal((await admin.post('/api/sauvegardes/restaurer', { nom: 'gmao-illisible.json' })).status, 400);
+    assert.equal((await info.post('/api/sauvegardes/restaurer', { nom: 'gmao-copie-sans-secrets.json' })).status, 403, 'utilisateur limité à son site');
+    const r = await admin.ok('POST', '/api/sauvegardes/restaurer', { nom: 'gmao-copie-sans-secrets.json' });
+    assert.equal(r.sessionConservee, true);
+    const s = srv.db.getConfig().sauvegardes;
+    assert.equal(s.motDePasseChiffrement, 'Secret-Chiffrement-42');
+    assert.equal(s.destinations.length, 1);
+    assert.equal((await info.get('/api/auth/me')).status, 401, 'autres sessions fermées');
+  });
+});
+
+describe('Pièces jointes volumineuses : hors du fichier principal, quota global', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const { Db, SEUIL_PIECE } = require('../server/db');
+
+  test('écrites à part une seule fois, relues au redémarrage, comprises dans l\'export ; écriture en échec sans arrêt du serveur', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gmao-pieces-'));
+    try {
+      const db = new Db(dir, { saveDelay: 0, log: () => {} }).load();
+      const photo = 'data:image/jpeg;base64,' + 'Q'.repeat(SEUIL_PIECE + 10);
+      const e = db.insert('equipements', { nom: 'Presse', documents: [{ nom: 'photo.jpg', contenu: photo }, { nom: 'note.txt', contenu: 'data:text/plain;base64,QQ==' }] });
+      db.insert('demandes', { titre: 'Même photo', pieceJointes: [{ nom: 'photo.jpg', contenu: photo }] });
+      db.saveNow();
+      const brut = fs.readFileSync(path.join(dir, 'gmao.json'), 'utf8');
+      assert.ok(brut.length < 20000, 'fichier principal sans le contenu des photos');
+      assert.ok(brut.includes('data:text/plain;base64,QQ=='), 'petites pièces conservées dans le fichier');
+      assert.equal(fs.readdirSync(path.join(dir, 'pieces')).length, 1, 'contenu identique écrit une seule fois');
+      assert.equal(db.taillePieces(), photo.length);
+      assert.equal(db.taillePiecesNouvelles({ a: photo }), 0, 'pièce déjà présente');
+      assert.equal(db.taillePiecesNouvelles({ a: photo + 'x' }), photo.length + 1);
+      const db2 = new Db(dir).load();
+      assert.equal(db2.get('equipements', e.id).documents[0].contenu, photo, 'relue au redémarrage');
+      const morceaux = [];
+      await db2.exporterParMorceaux((t) => { morceaux.push(t); });
+      assert.equal(JSON.parse(morceaux.join('')).collections.equipements[0].documents[0].contenu, photo, 'export autonome');
+      assert.equal(db2.exportAll().collections.demandes[0].pieceJointes[0].contenu, photo);
+      // Référence forgée vers un fichier hors du dossier des pièces : jamais lue
+      db2.importAll({ collections: { users: [], equipements: [{ id: 1, documents: [{ contenu: { $pieceGmao: '../gmao.json', octets: 1 } }] }] } });
+      assert.equal(db2.get('equipements', 1).documents[0].contenu, '');
+      // Écriture impossible (dossier remplacé par un fichier) : erreur signalée, données conservées, aucune exception
+      const db3 = new Db(path.join(dir, 'gmao.json'), { saveDelay: 1, log: () => {} });
+      let signalee = null;
+      db3.onErreurEcriture = (err) => { signalee = err; };
+      db3.insert('ot', { titre: 'En mémoire' });
+      await new Promise((r) => setTimeout(r, 50));
+      assert.ok(signalee, 'erreur d\'écriture signalée');
+      assert.equal(db3.count('ot'), 1);
+      clearTimeout(db3._timer);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('quota global : au-delà, les nouvelles pièces jointes sont refusées (413) avec un message', async () => {
+    const srv = await demarrer();
+    try {
+      const admin = srv.client(); await admin.login('admin', 'admin');
+      const cfg = srv.db.getConfig(); cfg.general.quotaPiecesJointesMo = 50; srv.db.setConfig(cfg);
+      // 50 Mo déjà occupés par des pièces jointes
+      const gros = 'data:application/pdf;base64,' + 'A'.repeat(50 * 1024 * 1024);
+      srv.db.insert('equipements', { nom: 'Archives', documents: [{ nom: 'plans.pdf', contenu: gros }] });
+      const photo = 'data:image/png;base64,' + 'B'.repeat(SEUIL_PIECE);
+      const r = await admin.put('/api/configuration', { societe: { logo: photo } });
+      assert.equal(r.status, 413);
+      assert.match(r.body.erreur, /Espace réservé aux pièces jointes plein/);
+      assert.equal((await admin.put('/api/configuration', { societe: { slogan: 'Sans pièce jointe' } })).status, 200, 'requêtes sans pièce jointe acceptées');
+      const sys = await admin.ok('GET', '/api/systeme');
+      assert.equal(sys.piecesJointes.quotaMo, 50);
+      assert.equal((await admin.put('/api/configuration', { general: { quotaPiecesJointesMo: 10 } })).status, 400, 'borne minimale');
+    } finally { await srv.stop(); }
+  });
+});
+
+describe('Options des modules : valeurs permises et bornes', () => {
+  let srv, admin;
+  before(async () => { srv = await demarrer(); admin = srv.client(); await admin.login('admin', 'admin'); });
+  after(async () => { await srv.stop(); });
+
+  test('codes inconnus, valeurs hors bornes et oui / non mal typés refusés ; valeurs correctes enregistrées', async () => {
+    for (const [corps, motif] of [
+      [{ plans: { uniteAffichage: 'km' } }, /plans\.uniteAffichage/],
+      [{ plans: { couleurParDefaut: '#ff0000' } }, /plans\.couleurParDefaut/],
+      [{ inventaire: { modeScan: 'rafale' } }, /inventaire\.modeScan/],
+      [{ etiquettes: { format: 'a3-inconnu' } }, /etiquettes\.format/],
+      [{ visites: { rappelJoursAvant: 90 } }, /entre 0 et 60/],
+      [{ visites: { conserverVisiteursJours: 0 } }, /entre 1 et 3650/],
+      [{ achats: { entreeStockAReception: 'false' } }, /oui \/ non/],
+    ]) {
+      const r = await admin.put('/api/configuration', corps);
+      assert.equal(r.status, 400, JSON.stringify(corps));
+      assert.match(r.body.erreur, motif);
+    }
+    const c = await admin.ok('PUT', '/api/configuration', { plans: { uniteAffichage: 'cm', couleurParDefaut: 'criticite', grilleM: 0.25 }, visites: { rappelJoursAvant: 5 }, achats: { entreeStockAReception: false } });
+    assert.equal(c.plans.uniteAffichage, 'cm');
+    assert.equal(c.plans.grilleM, 0.25);
+    assert.equal(c.visites.rappelJoursAvant, 5);
+    assert.equal(c.achats.entreeStockAReception, false);
+  });
+
+  test('nouvelles listes et entités par défaut (statuts RH et d\'inventaire, modes de paiement, plans préventifs)', async () => {
+    const c = await admin.ok('GET', '/api/configuration');
+    for (const l of ['statutsAbsence', 'statutsFormation', 'typesVisiteMedicale', 'aptitudesMedicales', 'statutsInventaire', 'modesPaiement']) assert.ok(c.listes[l].length > 0, l);
+    assert.ok(Array.isArray(c.champsPersonnalises.plansPreventifs));
+    assert.equal((await admin.put('/api/configuration', { listes: { statutsAbsence: c.listes.statutsAbsence.filter((x) => x.code !== 'refusee') } })).status, 400, 'codes du circuit RH figés');
+    const lib = await admin.ok('PUT', '/api/configuration', { listes: { statutsAbsence: c.listes.statutsAbsence.map((x) => Object.assign({}, x, { label: x.label + ' (RH)' })) } });
+    assert.match(lib.listes.statutsAbsence[0].label, /\(RH\)$/);
+  });
+});

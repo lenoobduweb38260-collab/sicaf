@@ -57,6 +57,13 @@
   const signe = (n) => (n == null ? '—' : `${Number(n) > 0 ? '+' : ''}${ui.formatNombre(n)}`);
   const montantSigne = (n) => (n == null ? '—' : `${Number(n) > 0 ? '+' : ''}${ui.formatMontant(n)}`);
   const classeEcart = (n) => (Number(n) > 0 ? 'inv-ecart-pos' : (Number(n) < 0 ? 'inv-ecart-neg' : ''));
+  /** Quantité de référence de l'écart (stock au comptage, stock actuel d'une ligne à compter), sinon théorique de l'ouverture. */
+  const theorique = (l) => (l.quantiteReference != null ? l.quantiteReference : l.quantiteTheorique);
+  function celluleTheorique(l) {
+    const t = theorique(l);
+    if (l.quantiteTheorique == null || Number(l.quantiteTheorique) === Number(t)) return qte(t);
+    return el('span', { class: 'inline', title: `${l.compte ? 'Stock au moment du comptage' : 'Stock actuel'} : ${qte(t)} — à l'ouverture de l'inventaire : ${qte(l.quantiteTheorique)}` }, qte(t), iconeDim('info', 12, 'var(--texte-2)'));
+  }
   const lienVue = (href, label) => el('a', { href, onclick: (ev) => ev.stopPropagation() }, label);
   function iconeDim(nom, taille, couleur) { const ic = icone(nom); Object.assign(ic.style, { width: taille + 'px', height: taille + 'px', flexShrink: 0, color: couleur || 'currentColor' }); return ic; }
   function barreProgression(pct, couleur) {
@@ -156,6 +163,10 @@ table.tableau tr.inv-selectionnee td{background:var(--primaire-clair)}
 .inv-test-douchette input{margin-top:8px;font-family:Consolas,"Courier New",monospace;font-size:16px}
 .inv-cellule-code{font-weight:600;font-family:Consolas,"Courier New",monospace;font-size:13px;white-space:nowrap}
 .inv-kpi-masque .kpi-valeur{font-size:16px}
+.kpi.inv-kpi-texte>div:last-child{min-width:0}
+.kpi.inv-kpi-texte .kpi-valeur{font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.inv-chevauchement{margin-top:6px;color:var(--alerte);font-size:12.5px}
+.inv-autres-inv{margin-top:10px;font-size:13px;color:var(--alerte);font-weight:600}
 .inv-perimetre{background:var(--surface-2);border:1px solid var(--bordure);border-radius:8px;padding:10px 12px;font-size:13px}
 .inv-perimetre strong{font-size:15px}
 .inv-recap-chiffres{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px}
@@ -205,6 +216,43 @@ table.tableau tr.inv-selectionnee td{background:var(--primaire-clair)}
   }
   const mm = (n) => `${Math.round(Number(n) * 100) / 100}mm`;
   const borne = (v, min, max) => Math.max(min, Math.min(max, v));
+  /** Unités de mesure (quantité non dénombrable) : pas une étiquette par unité de stock. */
+  const UNITES_MESURE = new Set(['m', 'mm', 'cm', 'km', 'm2', 'm²', 'm3', 'm³', 'l', 'ml', 'cl', 'dl', 'kg', 'g', 'mg', 't', 'h', 'min']);
+  const SEUIL_ETIQUETTES = 100;
+
+  /** Libellés des informations d'étiquette (alerte « ne tient pas sur ce format »). */
+  const LIBELLES_DETAILS = { emplacement: ['emplacement', 'localisation'], referenceFournisseur: ['référence fournisseur', 'n° de série'], unite: ['unité', 'unité'], categorie: ['catégorie', 'type'], prix: ['prix unitaire', 'prix unitaire'], secteur: ['secteur / magasin', 'secteur'] };
+  /**
+   * Détails d'une étiquette répartis en lignes : une ou deux lignes selon la hauteur. Retourne
+   * { lignes (textes), nbDet (lignes affichées), omis (clés des informations qui ne tiennent pas) }.
+   */
+  function detailsEtiquette(it, f, o) {
+    const c = o.contenu;
+    const pad = borne(Math.min(f.l, f.h) * 0.07, 1.2, 3.2);
+    const fsPetit = borne(borne(f.h * 0.085, 2.0, 4.6) * 0.74, 1.65, 3.2);
+    const eq = it.type === 'equipement';
+    const det = [];
+    if (c.emplacement && it.emplacement) det.push(['emplacement', (eq ? '' : 'Empl. ') + it.emplacement]);
+    if (c.referenceFournisseur && it.referenceFournisseur) det.push(['referenceFournisseur', (eq ? 'N° série ' : 'Réf. ') + it.referenceFournisseur]);
+    if (c.unite && it.uniteLibelle) det.push(['unite', 'Unité : ' + it.uniteLibelle]);
+    if (c.categorie && (it.categorieLibelle || it.typeLibelle)) det.push(['categorie', it.categorieLibelle || it.typeLibelle]);
+    if (c.prix && !eq && Number(it.prixUnitaire) > 0) det.push(['prix', ui.formatMontant(it.prixUnitaire)]);
+    if (c.secteur && it.secteurNom) det.push(['secteur', it.secteurNom]);
+    const groupes = [];
+    if (det.length) {
+      const parLigne = Math.max(6, (f.l - 2 * pad) / (fsPetit * 0.5));
+      let cur = null;
+      for (const [cle, texte] of det) {
+        const essai = cur ? cur.texte + ' · ' + texte : texte;
+        if (cur && essai.length > parLigne) { groupes.push(cur); cur = { texte, cles: [cle] }; } else if (cur) { cur.texte = essai; cur.cles.push(cle); } else cur = { texte, cles: [cle] };
+      }
+      if (cur) groupes.push(cur);
+    }
+    const nbDet = Math.min(groupes.length, f.h >= 30 ? 2 : 1);
+    const omis = [];
+    for (const g of groupes.slice(nbDet)) omis.push(...g.cles);
+    return { lignes: groupes.map((g) => g.texte), nbDet, omis };
+  }
 
   /** HTML d'une étiquette (dimensions en millimètres). */
   function htmlEtiquette(it, f, o) {
@@ -228,22 +276,7 @@ table.tableau tr.inv-selectionnee td{background:var(--primaire-clair)}
       blocs.push(`<div class="et-des" style="font-size:${mm(fs)}">${esc(it.designation)}</div>`);
       hTexte += fs * 1.16 * nb + 0.45;
     }
-    const det = [];
-    if (c.emplacement && it.emplacement) det.push((eq ? '' : 'Empl. ') + it.emplacement);
-    if (c.referenceFournisseur && it.referenceFournisseur) det.push((eq ? 'N° série ' : 'Réf. ') + it.referenceFournisseur);
-    if (c.unite && it.uniteLibelle) det.push('Unité : ' + it.uniteLibelle);
-    if (c.categorie && (it.categorieLibelle || it.typeLibelle)) det.push(it.categorieLibelle || it.typeLibelle);
-    if (c.prix && !eq && Number(it.prixUnitaire) > 0) det.push(ui.formatMontant(it.prixUnitaire));
-    if (c.secteur && it.secteurNom) det.push(it.secteurNom);
-    // Détails : une ou deux lignes selon la place
-    const lignesDet = [];
-    if (det.length) {
-      const parLigne = Math.max(6, largeurUtile / (fsPetit * 0.5));
-      let cur = '';
-      for (const d of det) { const essai = cur ? cur + ' · ' + d : d; if (essai.length > parLigne && cur) { lignesDet.push(cur); cur = d; } else cur = essai; }
-      if (cur) lignesDet.push(cur);
-    }
-    const nbDet = Math.min(lignesDet.length, H >= 30 ? 2 : 1);
+    const { lignes: lignesDet, nbDet } = detailsEtiquette(it, f, o);
     hTexte += nbDet ? (fsPetit * 1.2 * nbDet + 0.45) : 0;
     let cb = '';
     let dense = false;
@@ -356,9 +389,15 @@ ${CSS_ETIQUETTES}
   let scanLocal = null;
   function definirScanLocal(elAncre, fn) { scanLocal = { el: elAncre, fn }; }
 
+  /** Module « Étiquettes & inventaire » actif dans la configuration ? */
+  const moduleActif = () => { const m = typeof GMAO.moduleDef === 'function' ? GMAO.moduleDef(MODULE) : null; return !!(m && m.actif); };
+  const scanLocalActif = () => !!(scanLocal && scanLocal.el && scanLocal.el.isConnected);
+  /** L'écoute de la douchette n'intercepte des touches que si elle peut servir (module actif, connecté). */
+  const ecouteActive = () => !!(GMAO.user && GMAO.perms) && moduleActif() && (scanLocalActif() || cfgInv().scanGlobal !== false);
+
   async function scanGlobal(code) {
-    if (!GMAO.user || !GMAO.perms) return;
-    if (scanLocal && scanLocal.el && scanLocal.el.isConnected) { scanLocal.fn(code); return; }
+    if (!GMAO.user || !GMAO.perms || !moduleActif()) return;
+    if (scanLocalActif()) { scanLocal.fn(code); return; }
     scanLocal = null;
     if (cfgInv().scanGlobal === false) return;
     if (document.querySelector('.modal-fond')) return; // pas de navigation sous une fenêtre ouverte
@@ -374,7 +413,7 @@ ${CSS_ETIQUETTES}
     }
   }
   if (CB() && !window.__gmaoDouchetteInventaire) {
-    window.__gmaoDouchetteInventaire = CB().ecouterDouchette((code) => { scanGlobal(code); }, { delaiMaxMs: 35, longueurMin: 3 });
+    window.__gmaoDouchetteInventaire = CB().ecouterDouchette((code) => { scanGlobal(code); }, { delaiMaxMs: 35, longueurMin: 3, actif: ecouteActive });
   }
 
   /** Lecture par caméra dans une fenêtre modale ; onCode(code) à la première lecture. */
@@ -538,10 +577,32 @@ ${CSS_ETIQUETTES}
         outils: [
           ui.bouton('Tout sélectionner', { icone: 'check', classe: 'btn-sm', onClic: () => { for (const it of etatEt.lignes) if (!selection().has(it.id)) selection().set(it.id, { it, n: 1 }); majSelection(true); } }),
           ui.bouton('Vider la sélection', { icone: 'fermer', classe: 'btn-sm', onClic: () => { selection().clear(); majSelection(true); } }),
-          etatEt.source === 'articles' ? ui.bouton('1 étiquette par pièce en stock', { icone: 'stock', classe: 'btn-sm', titre: 'Nombre d\'exemplaires = quantité en stock (articles sélectionnés, 500 au maximum)', onClic: () => { if (!selection().size) { toast('Sélectionnez d\'abord des articles', 'alerte'); return; } for (const x of selection().values()) x.n = borne(Math.round(Number(x.it.quantite) || 1), 1, 500); majSelection(true); } }) : null,
+          etatEt.source === 'articles' ? ui.bouton('1 étiquette par pièce en stock', { icone: 'stock', classe: 'btn-sm', titre: 'Nombre d\'exemplaires = quantité en stock pour les articles gérés à l\'unité ou au lot (500 au maximum) ; 1 étiquette pour les articles au litre, au mètre, au kilo…', onClic: () => unParPiece() }) : null,
         ],
       });
       zoneTable.appendChild(table.el);
+    }
+    /**
+     * Une étiquette par pièce : seulement pour les articles dénombrables (unité, lot…). Les articles gérés
+     * en mesure (litre, mètre, kilo…) gardent une étiquette ; confirmation au-delà de SEUIL_ETIQUETTES.
+     */
+    async function unParPiece() {
+      if (!selection().size) { toast('Sélectionnez d\'abord des articles', 'alerte'); return; }
+      const propositions = [];
+      let enMesure = 0;
+      for (const x of selection().values()) {
+        const mesure = UNITES_MESURE.has(String(x.it.uniteCode || '').toLowerCase());
+        if (mesure) enMesure++;
+        propositions.push([x, mesure ? 1 : borne(Math.round(Number(x.it.quantite) || 1), 1, 500)]);
+      }
+      const total = propositions.reduce((s, [, n]) => s + n, 0);
+      if (total > SEUIL_ETIQUETTES) {
+        const ok = await ui.confirm({ titre: 'Nombre d\'étiquettes', message: `${pluriel(total, 'étiquette')} vont être préparées pour ${pluriel(propositions.length, 'article')}. Continuer ?`, okLabel: 'Préparer les étiquettes', annulerLabel: 'Retour' });
+        if (!ok) return;
+      }
+      for (const [x, n] of propositions) x.n = n;
+      majSelection(true);
+      if (enMesure) toast(`${pluriel(enMesure, 'article géré', 'articles gérés')} au litre, au mètre, au kilo… : 1 étiquette conservée`, 'info');
     }
     function majSelection(rerendre) {
       const n = selection().size;
@@ -627,8 +688,20 @@ ${CSS_ETIQUETTES}
       } catch (e) { erreur(e); }
     }
 
+    // Aperçu : la barre de navigation est construite une seule fois (seuls son libellé et l'état des
+    // boutons changent), pour qu'un clic ne soit pas perdu quand une saisie validée à la perte du
+    // focus reconstruit l'aperçu entre l'appui et le relâchement du bouton.
+    const apercuHaut = el('div');
+    const apercuCadre = el('div');
+    const navLibelle = el('span');
+    const btnPrecedente = ui.bouton('Précédente', { icone: 'fleche_gauche', classe: 'btn-sm', onClic: () => { if (etatEt.page > 0) { etatEt.page--; majApercu(); } } });
+    const btnSuivante = ui.bouton('Suivante', { icone: 'fleche_droite', classe: 'btn-sm', onClic: () => { etatEt.page++; majApercu(); } });
+    const navApercu = el('div', { class: 'inv-apercu-nav' }, btnPrecedente, navLibelle, btnSuivante);
+    const apercuNote = el('div', { class: 'texte-2 texte-petit mt' });
+    zoneApercu.append(apercuHaut, apercuCadre, navApercu, apercuNote);
     function majApercu() {
-      ui.vider(zoneApercu);
+      ui.vider(apercuHaut);
+      ui.vider(apercuCadre);
       const f = format(o.format, o.formatPersonnalise);
       const items = itemsAImprimer();
       const exemple = !items.length;
@@ -637,24 +710,30 @@ ${CSS_ETIQUETTES}
       const total = construirePlanches(liste, f, Object.assign(optionsRendu(), { apercu: true, pagesMax: 0 }));
       etatEt.page = borne(etatEt.page, 0, Math.max(0, total.nbPages - 1));
       const { el: cadre, r } = apercuPlanche(liste, f, Object.assign(optionsRendu(), { page: etatEt.page }), largeur);
-      zoneApercu.appendChild(el('div', { class: 'inv-resume-impression' },
+      apercuHaut.appendChild(el('div', { class: 'inv-resume-impression' },
         el('div', null, el('div', { class: 'v' }, exemple ? '0' : ui.formatNombre(total.nbEtiquettes)), el('div', { class: 'l' }, 'Étiquettes')),
         el('div', null, el('div', { class: 'v' }, exemple ? '0' : ui.formatNombre(total.nbPages)), el('div', { class: 'l' }, f.rouleau ? 'Étiquettes (rouleau)' : 'Planches')),
         el('div', null, el('div', { class: 'v' }, `${ui.formatNombre(f.l)} × ${ui.formatNombre(f.h)}`), el('div', { class: 'l' }, 'Millimètres'))));
-      if (exemple) zoneApercu.appendChild(ui.alerte('Aperçu d\'exemple : sélectionnez des éléments dans la liste pour préparer l\'impression.', 'info'));
+      if (exemple) apercuHaut.appendChild(ui.alerte('Aperçu d\'exemple : sélectionnez des éléments dans la liste pour préparer l\'impression.', 'info'));
       const pb = controleFormat(f);
-      if (pb) zoneApercu.appendChild(ui.alerte(pb, 'alerte'));
-      if (r.nbDenses) zoneApercu.appendChild(ui.alerte('Certains codes sont trop longs pour la largeur de l\'étiquette (barres très fines, lecture difficile) : choisissez un format plus large.', 'alerte'));
-      zoneApercu.appendChild(el('div', { class: 'inv-apercu' }, cadre));
-      if (total.nbPages > 1) {
-        zoneApercu.appendChild(el('div', { class: 'inv-apercu-nav' },
-          ui.bouton('Précédente', { icone: 'fleche_gauche', classe: 'btn-sm', disabled: etatEt.page <= 0, onClic: () => { etatEt.page--; majApercu(); } }),
-          el('span', null, `${f.rouleau ? 'Étiquette' : 'Planche'} ${etatEt.page + 1} / ${total.nbPages}`),
-          ui.bouton('Suivante', { icone: 'fleche_droite', classe: 'btn-sm', disabled: etatEt.page >= total.nbPages - 1, onClic: () => { etatEt.page++; majApercu(); } })));
+      if (pb) apercuHaut.appendChild(ui.alerte(pb, 'alerte'));
+      if (r.nbDenses) apercuHaut.appendChild(ui.alerte('Certains codes sont trop longs pour la largeur de l\'étiquette (barres très fines, lecture difficile) : choisissez un format plus large.', 'alerte'));
+      // Informations cochées qui ne tiennent pas sur le format choisi
+      const omis = new Set();
+      for (const x of liste) for (const k of detailsEtiquette(x.it, f, optionsRendu()).omis) omis.add(k);
+      if (omis.size) {
+        const eq = etatEt.source === 'equipements';
+        const noms = Array.from(omis).map((k) => (LIBELLES_DETAILS[k] || [k, k])[eq ? 1 : 0]);
+        apercuHaut.appendChild(ui.alerte(`Faute de place, ${noms.length > 1 ? 'ces informations cochées ne sont pas imprimées' : 'cette information cochée n\'est pas imprimée'} sur ${exemple ? 'l\'étiquette d\'exemple' : 'certaines étiquettes'} : ${noms.join(', ')}. Choisissez un format plus grand ou décochez des informations.`, 'alerte'));
       }
-      zoneApercu.appendChild(el('div', { class: 'texte-2 texte-petit mt' }, f.rouleau
+      apercuCadre.appendChild(el('div', { class: 'inv-apercu' }, cadre));
+      navApercu.style.display = total.nbPages > 1 ? '' : 'none';
+      navLibelle.textContent = `${f.rouleau ? 'Étiquette' : 'Planche'} ${etatEt.page + 1} / ${total.nbPages}`;
+      btnPrecedente.disabled = etatEt.page <= 0;
+      btnSuivante.disabled = etatEt.page >= total.nbPages - 1;
+      apercuNote.textContent = f.rouleau
         ? 'Rouleau : une étiquette par page. Dans le pilote de l\'imprimante thermique, choisissez le même format d\'étiquette.'
-        : 'Imprimez en « Taille réelle / 100 % », sans marges. Les cases hachurées correspondent aux étiquettes déjà utilisées.'));
+        : 'Imprimez en « Taille réelle / 100 % », sans marges. Les cases hachurées correspondent aux étiquettes déjà utilisées.';
     }
 
     // Initialisation
@@ -684,21 +763,29 @@ ${CSS_ETIQUETTES}
   async function ouvrirNouvelInventaire() {
     let refs = { zones: [], emplacements: [], fournisseurs: [] };
     try { refs = await api.get('/api/inventaire/references'); } catch (e) { /* listes vides */ }
-    const tous = (GMAO.perms || {}).portee === 'tous';
-    const optsSecteurs = ui.optionsSecteurs({ vide: tous ? '— Tous les sites —' : false }).filter((x) => x.value === '' || !GMAO.siteLectureSeule(x.value));
-    const defaut = GMAO.siteCourant() || (tous ? '' : ((GMAO.user.secteurIds || []).find((s) => optsSecteurs.some((o) => o.value === Number(s))) || (optsSecteurs[0] || {}).value || ''));
+    // Site / magasin obligatoire : il fixe qui voit l'inventaire et les articles inventoriés (jamais
+    // « tous les sites »). Par défaut : le site affiché, sinon le site de rattachement, sinon le premier site.
+    const optsSecteurs = ui.optionsSecteurs({ vide: false }).filter((x) => !GMAO.siteLectureSeule(x.value));
+    const refSecteur = (id) => ((GMAO.refs || {}).secteurs || []).find((s) => s.id === Number(id)) || null;
+    const proposable = (id) => id != null && optsSecteurs.some((o) => o.value === Number(id));
+    const sitesUtilisateur = (GMAO.user.secteurIds || []).map((s) => (refSecteur(s) || {}).siteId).filter((id) => id != null);
+    const defaut = [GMAO.siteCourant(), ...sitesUtilisateur, ...(GMAO.user.secteurIds || []), ...optsSecteurs.filter((o) => (refSecteur(o.value) || {}).type === 'site').map((o) => o.value), (optsSecteurs[0] || {}).value]
+      .find((id) => proposable(id));
     const apercu = el('div', { class: 'inv-perimetre' }, ui.chargement('Calcul du périmètre…'));
     let jeton = 0;
+    const lireApercu = (v) => api.get('/api/inventaires-apercu', { secteurId: v.secteurId || '', emplacement: v.emplacement || '', categorieCode: v.categorieCode || '', fournisseurId: v.fournisseurId || '', magasinId: v.magasinId || '' });
+    const texteChevauchements = (liste) => liste.map((c) => `${pluriel(c.nbArticles, 'article')} déjà dans ${c.numero} — ${c.nom}`).join(' ; ');
     const majApercu = ui.debounce(async (f) => {
       const n = ++jeton;
       const v = f.valeurs();
       try {
-        const r = await api.get('/api/inventaires-apercu', { secteurId: v.secteurId || '', emplacement: v.emplacement || '', categorieCode: v.categorieCode || '', fournisseurId: v.fournisseurId || '', magasinId: v.magasinId || '' });
+        const r = await lireApercu(v);
         if (n !== jeton) return;
         ui.vider(apercu);
         if (!r.nbArticles) { apercu.appendChild(el('span', { class: 'texte-danger' }, 'Aucun article actif ne correspond à ce périmètre.')); return; }
         apercu.append(el('div', null, el('strong', null, pluriel(r.nbArticles, 'article')), ' à compter', r.valeurTheorique > 0 ? ` · valeur théorique ${ui.formatMontant(r.valeurTheorique)}` : ''),
-          el('div', { class: 'texte-2 texte-petit', style: { marginTop: '4px' } }, r.exemples.map((x) => `${x.code} ${x.designation}`).join(' · ') + (r.nbArticles > r.exemples.length ? ' …' : '')));
+          el('div', { class: 'texte-2 texte-petit', style: { marginTop: '4px' } }, r.exemples.map((x) => `${x.code} ${x.designation}`).join(' · ') + (r.nbArticles > r.exemples.length ? ' …' : '')),
+          (r.chevauchements || []).length ? el('div', { class: 'inv-chevauchement' }, iconeDim('alerte', 13), ` Inventaire en cours sur les mêmes articles : ${texteChevauchements(r.chevauchements)}.`) : null);
       } catch (e) { if (n === jeton) { ui.vider(apercu); apercu.appendChild(el('span', { class: 'texte-danger' }, e.message)); } }
     }, 300);
     const imposeAveugle = cfgInv().aveugle && !can('valider');
@@ -706,7 +793,7 @@ ${CSS_ETIQUETTES}
       titre: 'Nouvel inventaire', taille: 'large', submitLabel: 'Ouvrir l\'inventaire',
       champs: [
         { nom: 'nom', label: 'Nom de l\'inventaire', type: 'texte', requis: true, pleineLargeur: true, placeholder: 'ex. Inventaire tournant — allée A' },
-        { nom: 'secteurId', label: 'Site / magasin', type: 'select', options: optsSecteurs, requis: !tous, aide: tous ? 'Détermine qui voit l\'inventaire (portée, multi-site).' : 'Obligatoire : un de vos secteurs.', onChange: (v, f) => majApercu(f) },
+        { nom: 'secteurId', label: 'Site / magasin', type: 'select', options: optsSecteurs, requis: true, aide: 'Détermine qui voit l\'inventaire et les articles inventoriés : ceux de ce site ou de ce secteur (sous-secteurs compris) et les articles sans magasin.', onChange: (v, f) => majApercu(f) },
         { nom: 'aveugle', label: 'Comptage à l\'aveugle', type: 'interrupteur', valeur: !!cfgInv().aveugle, disabled: imposeAveugle, aide: 'Les compteurs ne voient ni les quantités théoriques ni les écarts (seuls les valideurs les voient).' },
         { type: 'separateur', label: 'Périmètre : articles actifs à compter' },
         { nom: 'emplacement', label: 'Emplacement (début du libellé)', type: 'texte', placeholder: 'ex. Magasin central — A', suggestions: (refs.zones || []).concat(refs.emplacements || []), aide: 'Inclut tous les emplacements qui commencent par ce texte. Vide : tout le magasin.', onInput: (v, f) => majApercu(f), onChange: (v, f) => majApercu(f) },
@@ -716,12 +803,19 @@ ${CSS_ETIQUETTES}
         { type: 'html', rendu: () => apercu },
         { nom: 'commentaire', label: 'Commentaire', type: 'texte_long', lignes: 2, placeholder: 'Consignes aux compteurs, motif de l\'inventaire…' },
       ],
-      valeurs: { nom: `Inventaire du ${ui.formatDate(new Date())}`, secteurId: defaut, aveugle: !!cfgInv().aveugle },
+      valeurs: { nom: `Inventaire du ${ui.formatDate(new Date())}`, secteurId: defaut == null ? '' : defaut, aveugle: !!cfgInv().aveugle },
       onSubmit: async (v) => {
         const body = { nom: v.nom, secteurId: v.secteurId === '' ? null : v.secteurId, aveugle: !!v.aveugle, commentaire: v.commentaire || '', filtres: { emplacement: v.emplacement || '', categorieCode: v.categorieCode || null, fournisseurId: v.fournisseurId === '' ? null : v.fournisseurId, secteurId: v.magasinId === '' ? null : v.magasinId } };
+        // Articles déjà en cours d'inventaire : confirmation explicite avant d'en ouvrir un second
+        const ap = await lireApercu(v);
+        if ((ap.chevauchements || []).length) {
+          const ok = await ui.confirm({ titre: 'Articles déjà en cours d\'inventaire', message: `${texteChevauchements(ap.chevauchements)}. Ces articles seront comptés dans deux inventaires en cours. Ouvrir quand même ce nouvel inventaire ?`, okLabel: 'Ouvrir quand même', annulerLabel: 'Revenir au formulaire' });
+          if (!ok) return false;
+        }
         const r = await api.post('/api/inventaires', body);
         toast(`Inventaire ${r.numero} ouvert : ${pluriel(r.lignes.length, 'article')} à compter`, 'succes');
-        if (r.chevauchements && r.chevauchements.length) toast(`Attention : ${r.chevauchements.map((c) => `${pluriel(c.nbArticles, 'article')} déjà dans ${c.numero}`).join(', ')} (inventaire en cours)`, 'alerte', 8000);
+        // Inventaire ouvert entre-temps sur les mêmes articles (non signalé par la confirmation)
+        if (!(ap.chevauchements || []).length && r.chevauchements && r.chevauchements.length) toast(`Attention : ${r.chevauchements.map((c) => `${pluriel(c.nbArticles, 'article')} déjà dans ${c.numero}`).join(', ')} (inventaire en cours)`, 'alerte', 8000);
         GMAO.navigate('#/inventaire/' + r.id);
       },
     });
@@ -736,6 +830,9 @@ ${CSS_ETIQUETTES}
     while (change) { change = false; for (const s of all) if (s.parentId != null && out.has(Number(s.parentId)) && !out.has(s.id)) { out.add(s.id); change = true; } }
     return out;
   }
+
+  /** Indicateur dont la valeur est un texte (numéro) : une seule ligne, police réduite, texte complet en info-bulle. */
+  function kpiTexte(k, titre) { k.classList.add('inv-kpi-texte'); if (titre) k.title = titre; return k; }
 
   function rendreInventaires() {
     const racine = el('div');
@@ -768,7 +865,7 @@ ${CSS_ETIQUETTES}
       const rd = dernier ? dernier.resume || {} : {};
       zoneKpi.append(
         ui.kpi({ label: 'Inventaires en cours', valeur: enCours.length, icone: 'codebarre', couleur: '#f59e0b', detail: enCours.length ? `${pluriel(restant, 'article')} restant à compter` : 'aucun comptage en cours', onClic: () => { memo.statut = 'en_cours'; selStatut.value = 'en_cours'; filtrer(); } }),
-        ui.kpi({ label: 'Dernier inventaire validé', valeur: dernier ? dernier.numero : '—', icone: 'check', couleur: '#16a34a', detail: dernier ? `${ui.formatDate(dernier.dateValidation)} · ${dernier.nom}` : 'aucun inventaire validé', onClic: dernier ? () => GMAO.navigate('#/inventaire/' + dernier.id) : null }),
+        kpiTexte(ui.kpi({ label: 'Dernier inventaire validé', valeur: dernier ? dernier.numero : '—', icone: 'check', couleur: '#16a34a', detail: dernier ? `${ui.formatDate(dernier.dateValidation)} · ${dernier.nom}` : 'aucun inventaire validé', onClic: dernier ? () => GMAO.navigate('#/inventaire/' + dernier.id) : null }), dernier ? dernier.numero : ''),
         ui.kpi({ label: 'Écarts du dernier inventaire', valeur: dernier && !dernier.masque ? montantSigne(rd.valeurEcart || 0) : '—', icone: 'euro', couleur: dernier && (rd.valeurEcart || 0) < 0 ? '#dc2626' : '#2563eb', detail: dernier && !dernier.masque ? `${pluriel(rd.nbEcarts || 0, 'article')} en écart sur ${ui.formatNombre(rd.nbLignes || 0)}` : (dernier ? 'comptage à l\'aveugle' : '') }),
         ui.kpi({ label: `Écarts valorisés ${annee}`, valeur: montantSigne(Math.round(valeurAnnee * 100) / 100), icone: 'rapports', couleur: valeurAnnee < 0 ? '#dc2626' : '#16a34a', detail: `${pluriel(deLAnnee.length, 'inventaire validé', 'inventaires validés')} cette année` }));
     }
@@ -788,7 +885,7 @@ ${CSS_ETIQUETTES}
         colonnes, lignes: filtrees(), recherche: 'Rechercher un inventaire…', onClic: (r) => GMAO.navigate('#/inventaire/' + r.id),
         triInitial: { cle: 'dateOuverture', sens: 'desc' }, exportCsv: can('exporter') ? `inventaires-${ui.aujourdhui()}.csv` : null,
         ligneClasse: (r) => (r.statut === 'annule' ? 'inactif' : ''),
-        vide: 'Aucun inventaire. Ouvrez un premier inventaire pour compter le magasin avec la douchette.',
+        vide: can('creer') ? 'Aucun inventaire. Ouvrez un premier inventaire pour compter le magasin avec la douchette.' : 'Aucun inventaire dans votre périmètre. Les inventaires sont ouverts par un responsable : ceux qui concernent vos secteurs apparaîtront ici.',
         outils: [selStatut, selSecteur],
       });
       zoneTable.appendChild(table.el);
@@ -811,7 +908,8 @@ ${CSS_ETIQUETTES}
     const enCours = inv.statut === 'en_cours';
     const masque = !!inv.masque;
     const etat = { historique: [], segment: prefs.get('segment', 'toutes'), mode: prefs.get('modeScan', inv.config && inv.config.modeScan ? inv.config.modeScan : modeScanDefaut()), enAttente: null };
-    if (!['toutes', 'non_comptees', 'ecarts', 'hors', 'mouvements'].includes(etat.segment) || (masque && etat.segment === 'ecarts')) etat.segment = 'toutes';
+    // Segment mémorisé sur le poste ; « mouvements » dépend de l'inventaire : il n'est pas repris
+    if (!['toutes', 'non_comptees', 'ecarts', 'hors'].includes(etat.segment) || (masque && etat.segment === 'ecarts')) etat.segment = 'toutes';
     if (!['quantite', 'unitaire'].includes(etat.mode)) etat.mode = 'quantite';
     const recharger = () => GMAO.rendre();
 
@@ -822,7 +920,7 @@ ${CSS_ETIQUETTES}
       icone: 'codebarre', sousTitre,
       filAriane: [{ label: GMAO.moduleLabel(MODULE), href: '#/inventaire' }, { label: 'Inventaires', href: '#/inventaire?onglet=inventaires' }, { label: inv.numero }],
       actions: [
-        ui.bouton('Feuille de comptage', { icone: 'imprimer', onClic: () => imprimerFeuille(inv) }),
+        enCours ? ui.bouton('Feuille de comptage', { icone: 'imprimer', onClic: () => imprimerFeuille(inv) }) : ui.bouton('État d\'inventaire', { icone: 'imprimer', onClic: () => imprimerEtat(inv) }),
         d.exporter ? ui.bouton('Exporter CSV', { icone: 'export', onClic: async () => { try { await api.telecharger(`/api/inventaires/${inv.id}/export`); toast('Export CSV téléchargé', 'succes'); } catch (e) { erreur(e); } } }) : null,
         d.modifier ? ui.bouton('Modifier', { icone: 'modifier', onClic: () => modifierInventaire(inv, recharger) }) : null,
         d.annuler ? ui.bouton('Annuler l\'inventaire', { icone: 'fermer', onClic: () => annulerInventaire(inv, recharger) }) : null,
@@ -835,6 +933,7 @@ ${CSS_ETIQUETTES}
     if (inv.statut === 'valide') container.appendChild(ui.alerte(frag(el('strong', null, `Inventaire validé le ${ui.formatDateHeure(inv.dateValidation)} par ${inv.valideParNom || '—'}. `), `${pluriel((inv.mouvementIds || []).length, 'mouvement')} d'inventaire enregistré${(inv.mouvementIds || []).length > 1 ? 's' : ''} dans le stock${masque ? '' : ` · écart total ${montantSigne((inv.resume || {}).valeurEcart || 0)}`}${inv.nonComptesAZero ? ' · articles non comptés mis à zéro' : ''}.`), 'ok'));
     if (inv.statut === 'annule') container.appendChild(ui.alerte(frag(el('strong', null, `Inventaire annulé le ${ui.formatDateHeure(inv.dateAnnulation)} par ${inv.annuleParNom || '—'}. `), inv.motifAnnulation ? `Motif : ${inv.motifAnnulation}. ` : '', 'Aucun mouvement de stock n\'a été enregistré.'), 'info'));
     if (enCours && d.lectureSeule) container.appendChild(ui.alerte('Ce site vous est accessible en lecture seule : consultation uniquement.', 'info'));
+    if (inv.lignesHorsPortee) container.appendChild(ui.alerte(`${pluriel(inv.lignesHorsPortee, 'article')} de cet inventaire ${inv.lignesHorsPortee > 1 ? 'relèvent' : 'relève'} de secteurs hors de votre périmètre : ${inv.lignesHorsPortee > 1 ? 'ils ne sont pas affichés' : 'il n\'est pas affiché'}.`, 'info'));
     const zoneAlerteMvts = el('div');
     container.appendChild(zoneAlerteMvts);
     if (inv.commentaire) container.appendChild(el('div', { class: 'texte-2 mb', style: { whiteSpace: 'pre-wrap', fontSize: '13px' } }, iconeDim('commentaire', 14), ' ', inv.commentaire));
@@ -899,7 +998,9 @@ ${CSS_ETIQUETTES}
       segs.push(['hors', 'Hors périmètre', L.filter((l) => l.horsPerimetre).length]);
       const nbMv = L.filter((l) => l.nbMouvementsDepuis > 0).length;
       if (nbMv && enCours) segs.push(['mouvements', 'Mouvements depuis l\'ouverture', nbMv]);
-      for (const [cleSeg, label, n] of segs) zoneSegments.appendChild(el('button', { type: 'button', class: 'btn btn-sm' + (etat.segment === cleSeg ? ' actif' : ''), dataset: { segment: cleSeg }, onclick: () => { etat.segment = cleSeg; prefs.set('segment', cleSeg); majSegments(); table.maj(lignesSegment()); } }, label, el('span', { class: 'badge', style: { marginLeft: '4px' } }, String(n))));
+      // Segment sans bouton affiché (ex. plus de mouvements) : retour à « Toutes »
+      if (!segs.some(([c]) => c === etat.segment)) etat.segment = 'toutes';
+      for (const [cleSeg, label, n] of segs) zoneSegments.appendChild(el('button', { type: 'button', class: 'btn btn-sm' + (etat.segment === cleSeg ? ' actif' : ''), dataset: { segment: cleSeg }, onclick: () => { etat.segment = cleSeg; if (cleSeg !== 'mouvements') prefs.set('segment', cleSeg); majSegments(); table.maj(lignesSegment()); } }, label, el('span', { class: 'badge', style: { marginLeft: '4px' } }, String(n))));
     }
     function colonnesLignes() {
       const valide = inv.statut === 'valide';
@@ -909,7 +1010,7 @@ ${CSS_ETIQUETTES}
         { cle: 'designation', label: 'Désignation', rendu: (l) => frag(el('div', { class: 'cellule-principale' }, l.designation || '—'), l.horsPerimetre ? ui.badge('Hors périmètre', '#f59e0b') : null, !l.existe ? ui.badge('Article supprimé', '#dc2626') : null, l.misAZero ? ui.badge('Mis à zéro', '#6b7280') : null), exportValeur: (l) => l.designation },
         { cle: 'uniteCode', label: 'Unité', rendu: (l) => l.uniteLibelle || l.uniteCode || '' },
       ];
-      if (!masque) cols.push({ cle: 'quantiteTheorique', label: 'Théorique', aligner: 'droite', rendu: (l) => qte(l.quantiteTheorique), valeurTri: (l) => Number(l.quantiteTheorique) || 0, exportValeur: (l) => l.quantiteTheorique });
+      if (!masque) cols.push({ cle: 'quantiteReference', label: 'Théorique', aligner: 'droite', rendu: (l) => celluleTheorique(l), valeurTri: (l) => Number(theorique(l)) || 0, exportValeur: (l) => theorique(l) });
       cols.push({ cle: 'quantiteComptee', label: 'Compté', aligner: 'droite', valeurTri: (l) => (l.quantiteComptee == null ? -1 : Number(l.quantiteComptee)), rendu: (l) => (l.quantiteComptee == null ? el('span', { class: 'texte-2' }, l.misAZero ? '0' : '—') : el('strong', null, qte(l.quantiteComptee))), exportValeur: (l) => (l.quantiteComptee == null ? '' : l.quantiteComptee) });
       if (!masque) {
         cols.push({ cle: 'ecart', label: 'Écart', aligner: 'droite', valeurTri: (l) => (l.ecart == null ? 0 : Number(l.ecart)), rendu: (l) => (l.ecart == null ? el('span', { class: 'texte-2' }, '—') : el('span', { class: classeEcart(l.ecart) }, signe(l.ecart))), exportValeur: (l) => (l.ecart == null ? '' : l.ecart) });
@@ -926,11 +1027,11 @@ ${CSS_ETIQUETTES}
         tailleParPage: 50, triInitial: { cle: 'emplacement', sens: 'asc' },
         exportCsv: d.exporter ? `${inv.numero}-lignes.csv` : null,
         vide: etat.segment === 'toutes' ? 'Aucune ligne' : 'Aucune ligne dans cette sélection',
-        onClic: d.compter ? (l) => selectionnerLigne(l, 'remplacer') : null,
+        onClic: d.compter ? (l) => { if (l.modifiable !== false) selectionnerLigne(l, 'remplacer'); } : null,
         ligneClasse: (l) => (etat.dernierArticle === l.articleId ? 'inv-flash' : '') + (!l.existe ? ' inactif' : ''),
         actions: d.compter ? [
-          { icone: 'modifier', titre: 'Corriger la quantité comptée', onClic: (l) => selectionnerLigne(l, 'remplacer') },
-          { icone: 'supprimer', titre: 'Annuler le comptage de cet article', visible: (l) => l.quantiteComptee != null, onClic: (l) => annulerComptage(l) },
+          { icone: 'modifier', titre: 'Corriger la quantité comptée', visible: (l) => l.modifiable !== false, onClic: (l) => selectionnerLigne(l, 'remplacer') },
+          { icone: 'supprimer', titre: 'Annuler le comptage de cet article', visible: (l) => l.quantiteComptee != null && l.modifiable !== false, onClic: (l) => annulerComptage(l) },
         ] : null,
       });
       zoneTable.appendChild(table.el);
@@ -953,7 +1054,7 @@ ${CSS_ETIQUETTES}
       ui.vider(zoneAlerteMvts);
       const nbMv = (inv.lignes || []).filter((l) => l.nbMouvementsDepuis > 0).length;
       if (enCours && nbMv) {
-        zoneAlerteMvts.appendChild(ui.alerte(frag(el('strong', null, `Des mouvements de stock ont eu lieu depuis l'ouverture sur ${pluriel(nbMv, 'article')}. `), 'La validation fixe le stock à la quantité comptée : vérifiez que ces comptages tiennent compte des entrées et sorties effectuées pendant l\'inventaire. ', el('a', { href: '#', onclick: (ev) => { ev.preventDefault(); etat.segment = 'mouvements'; majSegments(); table.maj(lignesSegment()); } }, 'Voir les articles concernés')), 'alerte'));
+        zoneAlerteMvts.appendChild(ui.alerte(frag(el('strong', null, `Des mouvements de stock ont eu lieu depuis l'ouverture sur ${pluriel(nbMv, 'article')}. `), 'L\'écart de chaque article est calculé sur le stock au moment de son comptage, et la validation conserve les entrées et sorties enregistrées après le comptage. ', el('a', { href: '#', onclick: (ev) => { ev.preventDefault(); etat.segment = 'mouvements'; majSegments(); table.maj(lignesSegment()); } }, 'Voir les articles concernés')), 'info'));
       }
     }
 
@@ -972,10 +1073,11 @@ ${CSS_ETIQUETTES}
       }
       return null;
     }
-    function remplacerLigne(l) {
+    /** Remplace (ou ajoute) une ligne dans l'état local ; sansSurligner : mise à jour silencieuse. */
+    function remplacerLigne(l, sansSurligner) {
       const i = (inv.lignes || []).findIndex((x) => x.articleId === l.articleId);
       if (i >= 0) inv.lignes[i] = l; else inv.lignes.push(l);
-      etat.dernierArticle = l.articleId;
+      if (!sansSurligner) etat.dernierArticle = l.articleId;
     }
     function ajouterHisto(type, texteHtml, detail) {
       etat.historique.unshift({ type, texte: texteHtml, detail, date: new Date() });
@@ -992,7 +1094,7 @@ ${CSS_ETIQUETTES}
           el('span', { class: 'h-heure' }, ui.formatHeure(h.date))));
       }
     }
-    function annulerAttente() { etat.enAttente = null; if (zoneCarte && zoneCarte.querySelector('.attente')) ui.vider(zoneCarte); }
+    function annulerAttente() { etat.enAttente = null; if (zoneCarte && zoneCarte.querySelector('.attente, .horsp')) ui.vider(zoneCarte); }
 
     function carteLigne(l, opts = {}) {
       const u = l.uniteLibelle || unite(l.uniteCode) || '';
@@ -1001,22 +1103,54 @@ ${CSS_ETIQUETTES}
       carte.appendChild(el('div', { class: 'inv-art-titre' }, l.designation || l.code, l.horsPerimetre ? ui.badge(opts.nouvelle ? 'Hors périmètre : sera ajouté' : 'Hors périmètre', '#f59e0b') : null));
       carte.appendChild(el('div', { class: 'inv-art-sous' }, [l.code, l.emplacement, u].filter(Boolean).join(' · ')));
       const chiffres = el('div', { class: 'inv-chiffres' });
-      if (!masque && l.quantiteTheorique !== undefined) chiffres.appendChild(el('div', { class: 'inv-chiffre' }, el('div', { class: 'v' }, qte(l.quantiteTheorique, l.uniteCode)), el('div', { class: 'l' }, 'Théorique')));
+      if (!masque && theorique(l) !== undefined) chiffres.appendChild(el('div', { class: 'inv-chiffre', title: l.compte ? 'Stock système au moment du comptage' : 'Stock système actuel' }, el('div', { class: 'v' }, qte(theorique(l), l.uniteCode)), el('div', { class: 'l' }, 'Théorique')));
       chiffres.appendChild(el('div', { class: 'inv-chiffre' }, el('div', { class: 'v' }, l.quantiteComptee == null ? '—' : qte(l.quantiteComptee, l.uniteCode)), el('div', { class: 'l' }, opts.saisie ? 'Déjà compté' : 'Compté')));
       if (!masque && l.ecart != null && !opts.saisie) chiffres.appendChild(el('div', { class: 'inv-chiffre' }, el('div', { class: 'v ' + classeEcart(l.ecart) }, signe(l.ecart)), el('div', { class: 'l' }, 'Écart')));
       if (l.dernierComptage) chiffres.appendChild(el('div', { class: 'inv-chiffre' }, el('div', { class: 'v', style: { fontSize: '14px', fontWeight: '600' } }, l.dernierCompteurNom || '—'), el('div', { class: 'l' }, `Dernier comptage ${ui.relatif(l.dernierComptage)}`)));
       if (l.nbMouvementsDepuis) chiffres.appendChild(el('div', { class: 'inv-chiffre' }, el('div', { class: 'v texte-alerte' }, String(l.nbMouvementsDepuis)), el('div', { class: 'l' }, 'Mouvements depuis l\'ouverture')));
       carte.appendChild(chiffres);
+      // Article déjà présent dans un autre inventaire en cours
+      if ((opts.autres || []).length) carte.appendChild(el('div', { class: 'inv-autres-inv' }, iconeDim('alerte', 14), ` Également dans ${opts.autres.map((i) => `${i.numero} — ${i.nom}`).join(', ')} (inventaire en cours) : cet article sera compté dans deux inventaires.`));
       return carte;
     }
 
-    function afficherSaisie(l, { nouvelle = false, modeDefaut } = {}) {
+    /** Ligne à jour depuis le serveur (comptage d'un autre poste compris) : par code ou par article. */
+    async function ligneServeur(requete) {
+      const r = await api.get(`/api/inventaires/${inv.id}/resoudre`, requete);
+      if (!r.nouvelle) {
+        const locale = (inv.lignes || []).find((x) => x.articleId === r.ligne.articleId);
+        const change = !locale || locale.quantiteComptee !== r.ligne.quantiteComptee;
+        remplacerLigne(r.ligne, true);
+        if (change) majTout();
+      }
+      return r;
+    }
+    function carteRefus(titre, message) {
+      ui.vider(zoneCarte);
+      zoneCarte.appendChild(el('div', { class: 'inv-carte-article erreur' }, el('div', { class: 'inv-art-titre' }, iconeDim('alerte', 20, 'var(--danger)'), titre), el('div', { class: 'inv-art-sous' }, message)));
+    }
+
+    /**
+     * Carte de saisie d'une ligne. opts : nouvelle (article hors périmètre), modeDefaut, quantite (valeur
+     * proposée), autres (autres inventaires en cours). Un code scanné dans le champ quantité (douchette :
+     * frappe très rapide, code d'un article de l'inventaire, texte non numérique) est traité comme un scan.
+     */
+    function afficherSaisie(l, { nouvelle = false, modeDefaut, quantite, autres } = {}) {
+      if (l.modifiable === false) {
+        bip(false);
+        etat.enAttente = null;
+        carteRefus(`${l.code} — ${l.designation || ''}`, 'Cet article relève d\'un site ou d\'un secteur que vous ne pouvez pas modifier (accès en lecture seule) : comptage impossible.');
+        focusScan();
+        return;
+      }
       etat.enAttente = { ligne: l, nouvelle };
       ui.vider(zoneCarte);
-      const carte = carteLigne(l, { saisie: true, nouvelle });
+      const carte = carteLigne(l, { saisie: true, nouvelle, autres });
       const dejaCompte = l.quantiteComptee != null;
       let mode = modeDefaut || (dejaCompte ? 'ajouter' : 'remplacer');
       const champQte = el('input', { type: 'text', inputmode: 'decimal', class: 'inv-qte', id: 'inv-quantite', autocomplete: 'off', placeholder: '0', 'aria-label': 'Quantité comptée' });
+      if (quantite != null) champQte.value = String(quantite);
+      const frappe = CB() ? CB().suivreFrappe(champQte, { delaiMaxMs: 35, longueurMin: 3 }) : { rapide: () => false };
       const total = el('div', { class: 'inv-total' });
       const groupeMode = el('div', { class: 'btn-groupe' });
       const majMode = () => {
@@ -1032,15 +1166,40 @@ ${CSS_ETIQUETTES}
         total.append('Quantité comptée après validation : ', el('strong', null, qte(res, l.uniteCode)));
       };
       champQte.addEventListener('input', majTotal);
+      /** Nouveau scan reçu dans le champ quantité : l'article en attente n'est pas compté. */
+      const nouveauScan = (brut) => { toast(`Quantité non saisie pour ${l.code} : nouveau scan pris en compte`, 'alerte'); etat.enAttente = null; traiterCode(brut); };
+      let envoi = false;
       const valider = async () => {
+        if (envoi) return;
         const brut = champQte.value.trim();
-        const q = /^\d{7,}$/.test(brut) ? null : lireQte();
-        if (q == null) {
-          // Un code scanné par erreur dans le champ quantité : nouveau scan, sans compter l'article en attente
-          if (brut && (/[a-z]/i.test(brut) || /^\d{7,}$/.test(brut))) { toast(`Quantité non saisie pour ${l.code} : nouveau scan pris en compte`, 'alerte'); etat.enAttente = null; traiterCode(brut); return; }
-          bip(false); champQte.select(); return;
-        }
-        await enregistrer({ articleId: l.articleId, quantite: q, mode: dejaCompte ? mode : 'remplacer' }, l);
+        const q = lireQte();
+        const autreLigne = brut ? trouverLocal(brut) : null;
+        // Douchette (frappe très rapide) ou texte qui n'est pas une quantité : c'est un code
+        if (brut && (q == null || frappe.rapide())) { nouveauScan(brut); return; }
+        if (q == null) { bip(false); champQte.select(); return; }
+        envoi = true;
+        try {
+          // Quantité saisie au clavier qui est aussi le code d'un article de l'inventaire
+          if (autreLigne && autreLigne.articleId !== l.articleId && brut.length >= 3) {
+            if (document.activeElement) document.activeElement.blur();
+            const quantiteVoulue = await ui.confirm({ titre: 'Quantité ou code d\'article ?', message: `« ${brut} » est aussi le code de l'article ${autreLigne.code} — ${autreLigne.designation}. S'agit-il de la quantité comptée pour ${l.code} ?`, okLabel: `Compter ${qte(q, l.uniteCode)}`, annulerLabel: `Ouvrir ${autreLigne.code}` });
+            if (!quantiteVoulue) { nouveauScan(brut); return; }
+          }
+          // Quantité invraisemblable : confirmation
+          const ref = masque ? null : theorique(l);
+          const limite = ref == null ? 9999 : Math.max(99, 10 * Number(ref));
+          const resultat = mode === 'ajouter' && dejaCompte ? Number(l.quantiteComptee) + q : q;
+          if (resultat > limite) {
+            if (document.activeElement) document.activeElement.blur();
+            const ok = await ui.confirm({ titre: 'Quantité inhabituelle', message: `${qte(resultat, l.uniteCode)} pour ${l.code} — ${l.designation}${ref == null ? '' : ` (stock théorique ${qte(ref, l.uniteCode)})`}. Confirmez-vous cette quantité ?`, okLabel: 'Confirmer la quantité', annulerLabel: 'Corriger' });
+            if (!ok) { if (champQte.isConnected) { champQte.focus(); champQte.select(); } return; }
+          }
+          const modeEnvoi = dejaCompte ? mode : 'remplacer';
+          const body = { articleId: l.articleId, quantite: q, mode: modeEnvoi };
+          // Quantité connue de ce poste : le serveur signale un comptage fait entre-temps sur un autre poste
+          if (modeEnvoi === 'remplacer' && !nouvelle) body.quantitePrecedente = l.quantiteComptee == null ? null : l.quantiteComptee;
+          await enregistrer(body, l);
+        } finally { envoi = false; }
       };
       champQte.addEventListener('keydown', (ev) => {
         if (ev.key === 'Enter') { ev.preventDefault(); valider(); }
@@ -1048,11 +1207,12 @@ ${CSS_ETIQUETTES}
       });
       majMode();
       majTotal();
-      carte.appendChild(el('div', { class: 'inv-saisie' }, champQte, groupeMode, ui.bouton('Valider', { icone: 'check', classe: 'btn-primaire', onClic: valider }), ui.bouton('Annuler', { onClic: () => { annulerAttente(); focusScan(); } })));
+      carte.appendChild(el('div', { class: 'inv-saisie' }, champQte, groupeMode, ui.bouton('Valider', { icone: 'check', classe: 'btn-primaire', onClic: valider }), ui.bouton('Annuler la saisie', { onClic: () => { annulerAttente(); focusScan(); } })));
       carte.appendChild(total);
       zoneCarte.appendChild(carte);
       champQte.focus();
-      setTimeout(() => { if (champQte.isConnected && document.activeElement !== champQte && etat.enAttente && etat.enAttente.ligne === l) champQte.focus(); }, 0);
+      if (quantite != null) champQte.select();
+      setTimeout(() => { if (champQte.isConnected && document.activeElement !== champQte && etat.enAttente && etat.enAttente.ligne === l && !document.querySelector('.modal-fond')) champQte.focus(); }, 0);
     }
 
     async function enregistrer(body, ligneAvant) {
@@ -1063,43 +1223,53 @@ ${CSS_ETIQUETTES}
         etat.enAttente = null;
         bip(true);
         ui.vider(zoneCarte);
-        zoneCarte.appendChild(carteLigne(r.ligne, {}));
+        zoneCarte.appendChild(carteLigne(r.ligne, { autres: r.autresInventaires }));
         const ajout = body.mode === 'ajouter';
         const quantiteTexte = qte(r.ligne.quantiteComptee, r.ligne.uniteCode);
         ajouterHisto('ok', `${r.ligne.code} — ${r.ligne.designation}`, `${ajout ? `+${ui.formatNombre(body.quantite == null ? 1 : body.quantite)} → ${quantiteTexte}` : (r.quantitePrecedente != null ? `corrigé : ${qte(r.quantitePrecedente)} → ${quantiteTexte}` : `compté : ${quantiteTexte}`)}${r.nouvelle ? ' · ajouté hors périmètre' : ''}`);
-        if (r.nouvelle) toast(`${r.ligne.code} ajouté à l'inventaire (hors périmètre)`, 'alerte');
+        if (r.nouvelle) toast(`${r.ligne.code} ajouté à l'inventaire (hors périmètre)${(r.autresInventaires || []).length ? ` ; également dans ${r.autresInventaires.map((i) => i.numero).join(', ')} (en cours)` : ''}`, 'alerte');
         majTout();
       } catch (e) {
         bip(false);
+        // Comptage fait entre-temps sur un autre poste : la ligne à jour est réaffichée avec le choix Ajouter / Remplacer
+        if (e && e.status === 409 && e.details && e.details.ligne && ligneAvant) {
+          remplacerLigne(e.details.ligne);
+          majTout();
+          ajouterHisto('info', `${ligneAvant.code} — ${ligneAvant.designation}`, e.message);
+          toast(e.message, 'alerte', 8000);
+          afficherSaisie(e.details.ligne, { modeDefaut: 'ajouter', quantite: body.quantite });
+          return;
+        }
         ajouterHisto('erreur', ligneAvant ? `${ligneAvant.code} — ${ligneAvant.designation}` : (body.code || 'Scan'), e.message);
-        if (!ligneAvant) { ui.vider(zoneCarte); zoneCarte.appendChild(el('div', { class: 'inv-carte-article erreur' }, el('div', { class: 'inv-art-titre' }, iconeDim('alerte', 20, 'var(--danger)'), 'Scan refusé'), el('div', { class: 'inv-art-sous' }, e.message))); } else erreur(e);
-      } finally { focusScan(); }
+        if (!ligneAvant) carteRefus('Scan refusé', e.message); else erreur(e);
+      } finally { if (!etat.enAttente) focusScan(); }
     }
 
     async function traiterCode(code) {
       if (!enCours || !d.compter) return;
       if (etat.mode === 'unitaire') { await enregistrer({ code, mode: 'ajouter', quantite: 1 }, null); return; }
-      const local = trouverLocal(code);
-      if (local) { afficherSaisie(local); return; }
       try {
-        const r = await api.get(`/api/inventaires/${inv.id}/resoudre`, { code });
+        // Toujours la ligne à jour du serveur : un collègue peut l'avoir comptée depuis l'ouverture de l'écran
+        const r = await ligneServeur({ code });
         if (r.nouvelle) bip(true);
-        afficherSaisie(r.ligne, { nouvelle: r.nouvelle });
+        afficherSaisie(r.ligne, { nouvelle: r.nouvelle, autres: r.autresInventaires });
       } catch (e) {
         bip(false);
         ajouterHisto('erreur', code, e.message);
-        ui.vider(zoneCarte);
-        zoneCarte.appendChild(el('div', { class: 'inv-carte-article erreur' }, el('div', { class: 'inv-art-titre' }, iconeDim('alerte', 20, 'var(--danger)'), `Code « ${code} » non reconnu`), el('div', { class: 'inv-art-sous' }, e.message)));
+        carteRefus(`Code « ${code} » non reconnu`, e.message);
         focusScan();
       }
     }
-    function selectionnerLigne(l, mode) {
-      if (!d.compter) return;
-      afficherSaisie(l, { modeDefaut: l.quantiteComptee != null ? mode : 'remplacer' });
+    async function selectionnerLigne(l, mode) {
+      if (!d.compter || l.modifiable === false) return;
+      let ligne = l;
+      let autres;
+      try { const r = await ligneServeur({ articleId: l.articleId }); ligne = r.ligne; autres = r.autresInventaires; } catch (e) { erreur(e); return; }
+      afficherSaisie(ligne, { modeDefaut: ligne.quantiteComptee != null ? mode : 'remplacer', autres });
       zoneCarte.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
     async function annulerComptage(l) {
-      const ok = await ui.confirm({ titre: 'Annuler le comptage', message: `Annuler le comptage de ${l.code} — ${l.designation}${l.horsPerimetre ? ' (la ligne hors périmètre sera retirée)' : ''} ?`, okLabel: 'Annuler le comptage', danger: true });
+      const ok = await ui.confirm({ titre: 'Annuler le comptage', message: `Annuler le comptage de ${l.code} — ${l.designation}${l.horsPerimetre ? ' (la ligne hors périmètre sera retirée)' : ''} ?`, okLabel: 'Annuler le comptage', annulerLabel: 'Conserver le comptage', danger: true });
       if (!ok) { focusScan(); return; }
       try {
         const r = await api.del(`/api/inventaires/${inv.id}/lignes/${l.articleId}/comptage`);
@@ -1109,6 +1279,28 @@ ${CSS_ETIQUETTES}
         toast('Comptage annulé', 'succes');
         majTout();
       } catch (e) { erreur(e); } finally { focusScan(); }
+    }
+
+    // Rafraîchissement des indicateurs et des lignes (comptages des autres postes) : toutes les
+    // 30 secondes quand la page est visible, et au retour sur la fenêtre.
+    if (enCours) {
+      let rafraichissement = false;
+      const rafraichir = async () => {
+        if (!container.isConnected) { arreterRafraichissement(); return; }
+        if (rafraichissement || document.visibilityState === 'hidden' || document.querySelector('.modal-fond')) return;
+        rafraichissement = true;
+        try {
+          const frais = await api.get('/api/inventaires/' + inv.id, null, { silent401: true });
+          if (!container.isConnected || frais.statut !== inv.statut) return;
+          inv.lignes = frais.lignes || [];
+          inv.resume = frais.resume;
+          majTout();
+        } catch (e) { /* nouvel essai au prochain passage */ } finally { rafraichissement = false; }
+      };
+      const minuterie = setInterval(rafraichir, 30000);
+      const surFocus = () => rafraichir();
+      window.addEventListener('focus', surFocus);
+      function arreterRafraichissement() { clearInterval(minuterie); window.removeEventListener('focus', surFocus); }
     }
 
     // Le champ de scan reste actif : clic dans le vide → retour au champ
@@ -1146,17 +1338,21 @@ ${CSS_ETIQUETTES}
   }
 
   async function annulerInventaire(inv, apres) {
-    const motif = await ui.prompt({ titre: `Annuler l'inventaire ${inv.numero}`, message: 'Les comptages sont conservés pour consultation, mais aucun mouvement de stock ne sera enregistré.', label: 'Motif de l\'annulation', type: 'texte', requis: false, okLabel: 'Annuler l\'inventaire' });
-    if (motif === null) return;
-    try {
-      await api.post(`/api/inventaires/${inv.id}/annuler`, { motif: motif || '' });
-      toast(`Inventaire ${inv.numero} annulé`, 'succes');
-      apres();
-    } catch (e) { erreur(e); }
+    // Libellés distincts : « Retour » ferme la fenêtre, « Annuler l'inventaire » exécute l'action
+    ui.formModal({
+      titre: `Annuler l'inventaire ${inv.numero}`, taille: 'petite', colonnes: 1, submitLabel: 'Annuler l\'inventaire', annulerLabel: 'Retour',
+      avant: el('p', null, 'Les comptages sont conservés pour consultation, mais aucun mouvement de stock ne sera enregistré. Cette opération est définitive.'),
+      champs: [{ nom: 'motif', label: 'Motif de l\'annulation', type: 'texte', placeholder: 'ex. Comptage à refaire', pleineLargeur: true }],
+      onSubmit: async (v) => {
+        await api.post(`/api/inventaires/${inv.id}/annuler`, { motif: v.motif || '' });
+        toast(`Inventaire ${inv.numero} annulé`, 'succes');
+        apres();
+      },
+    });
   }
 
   async function supprimerInventaire(inv) {
-    const ok = await ui.confirm({ titre: 'Supprimer l\'inventaire', message: `Supprimer définitivement l'inventaire ${inv.numero} — ${inv.nom} et ses ${pluriel((inv.lignes || []).length, 'ligne')} ? Aucun mouvement de stock n'est concerné.`, okLabel: 'Supprimer', danger: true });
+    const ok = await ui.confirm({ titre: 'Supprimer l\'inventaire', message: `Supprimer définitivement l'inventaire ${inv.numero} — ${inv.nom} et ses ${pluriel((inv.lignes || []).length, 'ligne')} ? Aucun mouvement de stock n'est concerné.`, okLabel: 'Supprimer', annulerLabel: 'Conserver l\'inventaire', danger: true });
     if (!ok) return;
     try {
       await api.del('/api/inventaires/' + inv.id);
@@ -1165,14 +1361,17 @@ ${CSS_ETIQUETTES}
     } catch (e) { erreur(e); }
   }
 
-  /** Récapitulatif des écarts et confirmation de la validation. */
+  /**
+   * Récapitulatif des écarts et confirmation de la validation. Écart d'une ligne comptée : quantité
+   * comptée moins le stock au moment du comptage ; une ligne mise à zéro part du stock actuel.
+   */
   function ouvrirValidation(inv, apres) {
     const L = inv.lignes || [];
     const comptees = L.filter((l) => l.quantiteComptee != null);
     const nonComptees = L.filter((l) => l.quantiteComptee == null && l.existe !== false);
     const ecarts = comptees.filter((l) => Number(l.ecart) !== 0).sort((a, b) => Math.abs(Number(b.valeurEcart) || 0) - Math.abs(Number(a.valeurEcart) || 0));
     const valeurComptes = comptees.reduce((s, l) => s + (Number(l.valeurEcart) || 0), 0);
-    const valeurZero = nonComptees.reduce((s, l) => s - Math.max(0, Number(l.quantiteTheorique) || 0) * (Number(l.prixUnitaire) || 0), 0);
+    const valeurZero = nonComptees.reduce((s, l) => s - Math.max(0, Number(theorique(l)) || 0) * (Number(l.prixUnitaire) || 0), 0);
     const nbMv = L.filter((l) => l.nbMouvementsDepuis > 0).length;
     let zero = !!((inv.config || {}).nonComptesAZero);
     const chiffres = el('div', { class: 'inv-recap-chiffres' });
@@ -1183,26 +1382,26 @@ ${CSS_ETIQUETTES}
       const nbMvts = comptees.length + (zero ? nonComptees.length : 0);
       chiffres.append(
         el('div', null, el('div', { class: 'v' }, `${ui.formatNombre(comptees.length)} / ${ui.formatNombre(L.length)}`), el('div', { class: 'l' }, 'Articles comptés')),
-        el('div', null, el('div', { class: 'v' }, ui.formatNombre(ecarts.length + (zero ? nonComptees.filter((l) => Number(l.quantiteTheorique) > 0).length : 0))), el('div', { class: 'l' }, 'Articles en écart')),
+        el('div', null, el('div', { class: 'v' }, ui.formatNombre(ecarts.length + (zero ? nonComptees.filter((l) => Number(theorique(l)) > 0).length : 0))), el('div', { class: 'l' }, 'Articles en écart')),
         el('div', null, el('div', { class: 'v ' + classeEcart(total) }, montantSigne(Math.round(total * 100) / 100)), el('div', { class: 'l' }, 'Valeur des écarts')),
         el('div', null, el('div', { class: 'v' }, ui.formatNombre(nbMvts)), el('div', { class: 'l' }, 'Mouvements de stock')));
     };
     caseZero.addEventListener('change', () => { zero = caseZero.checked; majChiffres(); });
     majChiffres();
     const tableEcarts = ecarts.length ? el('div', { class: 'tableau-conteneur', style: { maxHeight: '300px', overflowY: 'auto' } }, el('table', { class: 'tableau tableau-compact' },
-      el('thead', null, el('tr', null, el('th', null, 'Code'), el('th', null, 'Désignation'), el('th', { class: 'num' }, 'Théorique'), el('th', { class: 'num' }, 'Compté'), el('th', { class: 'num' }, 'Écart'), el('th', { class: 'num' }, 'Valeur'))),
-      el('tbody', null, ecarts.map((l) => el('tr', null, el('td', { class: 'inv-cellule-code' }, l.code), el('td', null, l.designation, l.nbMouvementsDepuis ? el('span', { title: 'Mouvements de stock depuis l\'ouverture', style: { marginLeft: '6px' } }, iconeDim('alerte', 13, 'var(--alerte)')) : null), el('td', { class: 'num' }, qte(l.quantiteTheorique)), el('td', { class: 'num' }, qte(l.quantiteComptee)), el('td', { class: 'num ' + classeEcart(l.ecart) }, signe(l.ecart)), el('td', { class: 'num ' + classeEcart(l.valeurEcart) }, montantSigne(l.valeurEcart)))))))
+      el('thead', null, el('tr', null, el('th', null, 'Code'), el('th', null, 'Désignation'), el('th', { class: 'num', title: 'Stock système au moment du comptage' }, 'Théorique'), el('th', { class: 'num' }, 'Compté'), el('th', { class: 'num' }, 'Écart'), el('th', { class: 'num' }, 'Valeur'))),
+      el('tbody', null, ecarts.map((l) => el('tr', null, el('td', { class: 'inv-cellule-code' }, l.code), el('td', null, l.designation, l.nbMouvementsDepuis ? el('span', { title: 'Mouvements de stock depuis l\'ouverture', style: { marginLeft: '6px' } }, iconeDim('alerte', 13, 'var(--alerte)')) : null), el('td', { class: 'num' }, qte(theorique(l))), el('td', { class: 'num' }, qte(l.quantiteComptee)), el('td', { class: 'num ' + classeEcart(l.ecart) }, signe(l.ecart)), el('td', { class: 'num ' + classeEcart(l.valeurEcart) }, montantSigne(l.valeurEcart)))))))
       : ui.alerte('Aucun écart sur les articles comptés : le stock correspond aux quantités théoriques.', 'ok');
     ui.modal({
       titre: `Valider l'inventaire ${inv.numero}`, taille: 'large',
       contenu: frag(
         chiffres,
-        nbMv ? ui.alerte(`${pluriel(nbMv, 'article')} ${nbMv > 1 ? 'ont' : 'a'} eu des mouvements de stock depuis l'ouverture : la validation fixera leur stock à la quantité comptée.`, 'alerte') : null,
+        nbMv ? ui.alerte(`${pluriel(nbMv, 'article')} ${nbMv > 1 ? 'ont' : 'a'} eu des mouvements de stock depuis l'ouverture : les entrées et sorties enregistrées après le comptage sont conservées, seul l'écart constaté au comptage est appliqué.`, 'info') : null,
         el('h3', { class: 'mt' }, `Écarts constatés (${ecarts.length})`),
         tableEcarts,
         el('div', { class: 'mt' }, el('label', { class: 'inline', for: 'inv-zero', style: { cursor: nonComptees.length ? 'pointer' : 'default' } }, caseZero,
           nonComptees.length ? `Mettre à zéro les ${pluriel(nonComptees.length, 'article non compté', 'articles non comptés')} (écart ${montantSigne(Math.round(valeurZero * 100) / 100)})` : 'Tous les articles ont été comptés')),
-        el('p', { class: 'texte-2 texte-petit mt' }, 'La validation enregistre un mouvement d\'inventaire pour chaque article retenu : le stock est fixé à la quantité comptée. Cette opération est définitive.')),
+        el('p', { class: 'texte-2 texte-petit mt' }, 'La validation enregistre un mouvement d\'inventaire pour chaque article retenu : l\'écart constaté au comptage est appliqué au stock, sans annuler les entrées et sorties enregistrées depuis. Cette opération est définitive.')),
       boutons: [
         { label: 'Retour au comptage' },
         { label: 'Valider l\'inventaire', icone: 'check', classe: 'btn-ok', onClic: async () => {
@@ -1214,23 +1413,59 @@ ${CSS_ETIQUETTES}
     });
   }
 
+  /** En-tête commun des documents imprimés d'un inventaire. */
+  function enteteImpression(inv, lignesSupp) {
+    const r = inv.resume || {};
+    const cbHtml = CB() ? (() => { try { return CB().svg(inv.numero, { hauteur: 10, largeurModule: 0.33, unite: 'mm', texteVisible: false, fond: 'none' }); } catch (e) { return ''; } })() : '';
+    return `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:20px">
+      <dl><dt>Inventaire</dt><dd><strong>${esc(inv.numero)}</strong> — ${esc(inv.nom)}</dd><dt>Site / magasin</dt><dd>${esc(inv.secteurId != null ? ui.cheminSecteur(inv.secteurId) || inv.secteurNom : 'Tous les sites')}</dd>
+      <dt>Périmètre</dt><dd>${esc((inv.filtresLibelles || []).join(', ') || 'Tout le magasin')}</dd><dt>Ouvert le</dt><dd>${esc(ui.formatDateHeure(inv.dateOuverture))} par ${esc(inv.createdByNom || '')}</dd>
+      ${(lignesSupp || []).map(([dt, dd]) => `<dt>${esc(dt)}</dt><dd>${esc(dd)}</dd>`).join('')}
+      <dt>Articles</dt><dd>${r.nbLignes || 0} (${r.nbComptees || 0} comptés)${inv.aveugle ? ' — comptage à l\'aveugle' : ''}${inv.lignesHorsPortee ? ` — ${inv.lignesHorsPortee} hors de votre périmètre, non imprimés` : ''}</dd></dl>
+      <div style="text-align:center">${cbHtml}<div style="font-family:Consolas,monospace;font-size:11px">${esc(inv.numero)}</div></div></div>`;
+  }
+  const trierLignes = (inv) => (inv.lignes || []).slice().sort((a, b) => String(a.emplacement || '').localeCompare(String(b.emplacement || ''), 'fr', { numeric: true }) || String(a.code).localeCompare(String(b.code), 'fr', { numeric: true }));
+
   /** Feuille de comptage imprimable (avec codes-barres) ; quantités théoriques omises en mode aveugle. */
   function imprimerFeuille(inv) {
     const avecTheo = !inv.aveugle && !inv.masque;
     const cbHtml = (code, h, x) => { try { return CB() ? CB().svg(code, { hauteur: h, largeurModule: x, unite: 'mm', texteVisible: false, fond: 'none' }) : ''; } catch (e) { return ''; } };
-    const lignes = (inv.lignes || []).slice().sort((a, b) => String(a.emplacement || '').localeCompare(String(b.emplacement || ''), 'fr', { numeric: true }) || String(a.code).localeCompare(String(b.code), 'fr', { numeric: true }));
-    const r = inv.resume || {};
-    const html = `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:20px">
-      <dl><dt>Inventaire</dt><dd><strong>${esc(inv.numero)}</strong> — ${esc(inv.nom)}</dd><dt>Site / magasin</dt><dd>${esc(inv.secteurId != null ? ui.cheminSecteur(inv.secteurId) || inv.secteurNom : 'Tous les sites')}</dd>
-      <dt>Périmètre</dt><dd>${esc((inv.filtresLibelles || []).join(', ') || 'Tout le magasin')}</dd><dt>Ouvert le</dt><dd>${esc(ui.formatDateHeure(inv.dateOuverture))} par ${esc(inv.createdByNom || '')}</dd>
-      <dt>Articles</dt><dd>${r.nbLignes || 0} (${r.nbComptees || 0} déjà comptés)${inv.aveugle ? ' — comptage à l\'aveugle' : ''}</dd></dl>
-      <div style="text-align:center">${cbHtml(inv.numero, 10, 0.33)}<div style="font-family:Consolas,monospace;font-size:11px">${esc(inv.numero)}</div></div></div>
+    const lignes = trierLignes(inv);
+    const html = `${enteteImpression(inv)}
       <h2>Lignes à compter</h2>
       <table><thead><tr><th>Emplacement</th><th>Code</th><th>Désignation</th><th>Unité</th>${avecTheo ? '<th style="text-align:right">Théorique</th>' : ''}<th style="width:22mm">Compté</th><th style="width:40mm">Observations</th></tr></thead><tbody>
-      ${lignes.map((l) => `<tr style="page-break-inside:avoid"><td>${esc(l.emplacement || '')}</td><td style="white-space:nowrap">${cbHtml(l.code, 6, 0.25)}<div style="font-family:Consolas,monospace;font-size:11px">${esc(l.code)}</div></td><td>${esc(l.designation || '')}${l.horsPerimetre ? ' <span class="badge">hors périmètre</span>' : ''}</td><td>${esc(l.uniteLibelle || l.uniteCode || '')}</td>${avecTheo ? `<td style="text-align:right">${esc(qte(l.quantiteTheorique))}</td>` : ''}<td>${l.quantiteComptee != null ? `<span style="color:#666;font-size:10px">déjà : ${esc(qte(l.quantiteComptee))}</span>` : ''}</td><td></td></tr>`).join('')}
+      ${lignes.map((l) => `<tr style="page-break-inside:avoid"><td>${esc(l.emplacement || '')}</td><td style="white-space:nowrap">${cbHtml(l.code, 6, 0.25)}<div style="font-family:Consolas,monospace;font-size:11px">${esc(l.code)}</div></td><td>${esc(l.designation || '')}${l.horsPerimetre ? ' <span class="badge">hors périmètre</span>' : ''}</td><td>${esc(l.uniteLibelle || l.uniteCode || '')}</td>${avecTheo ? `<td style="text-align:right">${esc(qte(theorique(l)))}</td>` : ''}<td>${l.quantiteComptee != null ? `<span style="color:#666;font-size:10px">déjà : ${esc(qte(l.quantiteComptee))}</span>` : ''}</td><td></td></tr>`).join('')}
       </tbody></table>
       <div class="signature"><div>Compté par (nom, date, signature)</div><div>Contrôlé par (nom, date, signature)</div></div>`;
     ui.imprimer(`Feuille de comptage ${inv.numero}`, html);
+  }
+
+  /**
+   * État d'un inventaire validé ou annulé (procès-verbal) : quantités, écarts constatés, écarts appliqués
+   * au stock, totaux, validation ou annulation, signatures. Quantités et écarts omis en mode aveugle.
+   */
+  function imprimerEtat(inv) {
+    const valide = inv.statut === 'valide';
+    const masque = !!inv.masque;
+    const r = inv.resume || {};
+    const lignes = trierLignes(inv);
+    const supp = valide
+      ? [['Validé le', `${ui.formatDateHeure(inv.dateValidation)} par ${inv.valideParNom || '—'}`], ['Mouvements de stock', `${(inv.mouvementIds || []).length}${inv.nonComptesAZero ? ' (articles non comptés mis à zéro)' : ''}`]]
+      : [['Annulé le', `${ui.formatDateHeure(inv.dateAnnulation)} par ${inv.annuleParNom || '—'}`], ['Motif', inv.motifAnnulation || '—'], ['Stock', 'aucun mouvement enregistré']];
+    const totaux = masque ? '' : `<h2>Synthèse</h2><table><tbody>
+      <tr><th>Articles comptés</th><td>${esc(`${ui.formatNombre(r.nbComptees || 0)} / ${ui.formatNombre(r.nbLignes || 0)}`)}</td><th>Articles en écart</th><td>${esc(`${ui.formatNombre(r.nbEcarts || 0)} (${ui.formatNombre(r.nbEcartsPositifs || 0)} en plus, ${ui.formatNombre(r.nbEcartsNegatifs || 0)} en moins)`)}</td></tr>
+      <tr><th>${valide ? 'Valeur des écarts appliqués' : 'Valeur des écarts constatés'}</th><td>${esc(montantSigne(r.valeurEcart || 0))}</td><th>Valeur absolue des écarts</th><td>${esc(ui.formatMontant(r.valeurEcartAbsolue || 0))}</td></tr>
+      </tbody></table>`;
+    const num = 'style="text-align:right;white-space:nowrap"';
+    const html = `${enteteImpression(inv, supp)}
+      <h1 style="font-size:16px;margin:10px 0 0">${valide ? 'État d\'inventaire validé' : 'État d\'inventaire annulé'}</h1>
+      ${totaux}
+      <h2>Lignes de l'inventaire</h2>
+      <table><thead><tr><th>Emplacement</th><th>Code</th><th>Désignation</th><th>Unité</th>${masque ? '' : `<th ${num}>Théorique</th>`}<th ${num}>Compté</th>${masque ? '' : `<th ${num}>Écart</th><th ${num}>Valeur</th>`}${valide && !masque ? `<th ${num}>Écart appliqué</th>` : ''}</tr></thead><tbody>
+      ${lignes.map((l) => `<tr style="page-break-inside:avoid"><td>${esc(l.emplacement || '')}</td><td style="white-space:nowrap;font-family:Consolas,monospace">${esc(l.code)}</td><td>${esc(l.designation || '')}${l.horsPerimetre ? ' <span class="badge">hors périmètre</span>' : ''}${l.misAZero ? ' <span class="badge">mis à zéro</span>' : ''}${l.ignoree ? ' <span class="badge">article supprimé</span>' : ''}</td><td>${esc(l.uniteLibelle || l.uniteCode || '')}</td>${masque ? '' : `<td ${num}>${esc(qte(theorique(l)))}</td>`}<td ${num}>${esc(l.quantiteComptee != null ? qte(l.quantiteComptee) : (l.misAZero ? '0' : '—'))}</td>${masque ? '' : `<td ${num}>${esc(l.ecart == null ? '—' : signe(l.ecart))}</td><td ${num}>${esc(l.valeurEcart == null ? '—' : montantSigne(l.valeurEcart))}</td>`}${valide && !masque ? `<td ${num}>${esc(l.ecartApplique == null ? '—' : signe(l.ecartApplique))}</td>` : ''}</tr>`).join('')}
+      </tbody></table>
+      <div class="signature"><div>${valide ? 'Validé par' : 'Annulé par'} (nom, date, signature)</div><div>Contrôlé par (nom, date, signature)</div></div>`;
+    ui.imprimer(`État d'inventaire ${inv.numero}`, html);
   }
 
   // =====================================================================================

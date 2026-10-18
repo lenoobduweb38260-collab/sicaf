@@ -106,7 +106,7 @@ describe('Configuration « sécurité » et bases existantes', () => {
     assert.equal(s.expirationMdpJours, 0);
     assert.equal(s.rappelExpirationJours, 14);
     assert.equal(s.historiqueMdp, 5);
-    assert.deepEqual(db.getConfig().journal.actions, ['creation', 'reinitialisation_mdp', 'demande_reinitialisation_mdp', 'recuperation_urgence']);
+    assert.deepEqual(db.getConfig().journal.actions, ['creation', 'reinitialisation_mdp', 'demande_reinitialisation_mdp', 'recuperation_urgence', 'reinitialisation_double_auth', 'desactivation_double_auth']);
     assert.ok(Array.isArray(db.data.collections.demandesMdp), 'collection des demandes créée');
     // Un retrait ultérieur par le pôle informatique est respecté
     const cfg = db.getConfig(); cfg.journal.actions = ['creation']; db.setConfig(cfg);
@@ -258,7 +258,10 @@ describe('Mots de passe (API)', () => {
     assert.equal(titulaire[0].type, 'info');
     assert.match(titulaire[0].message, /a été faite le \d{2}\/\d{2}\/\d{4} à \d{2}:\d{2} depuis le poste 127\.0\.0\.1/);
     assert.match(titulaire[0].message, /Si vous n'en êtes pas à l'origine, prévenez le pôle informatique/);
-    assert.ok(journal('demande_reinitialisation_mdp').some((a) => a.userId === user('oubli1').id), 'journal attribué au compte concerné');
+    // Demande anonyme : le compte concerné est l'élément du journal, jamais l'auteur
+    const entrees = journal('demande_reinitialisation_mdp').filter((a) => a.entiteId === user('oubli1').id);
+    assert.ok(entrees.length >= 1, 'journal rattaché au compte concerné');
+    assert.ok(entrees.every((a) => a.userId === null && a.userNom === 'Non connecté'), 'demande anonyme : pas attribuée au titulaire');
   });
 
   test('répétitions : la demande en attente est mise à jour, notifications au plus toutes les 30 minutes', async () => {
@@ -268,7 +271,9 @@ describe('Mots de passe (API)', () => {
     let d = demandeDe('oubli1');
     assert.equal(d.id, avant.id);
     assert.equal(d.repetitions, 4);
-    assert.equal(d.message, 'Toujours bloqué');
+    assert.equal(d.message, 'Je ne retrouve plus mon mot de passe', 'message d\'origine conservé');
+    assert.equal(d.ip, avant.ip, 'adresse d\'origine conservée');
+    assert.equal(d.provenances[d.provenances.length - 1].message, 'Toujours bloqué', 'nouvelle demande ajoutée aux provenances');
     assert.ok(d.derniereDemande >= avant.derniereDemande);
     assert.equal(srv.db.count('demandesMdp', (x) => x.login === 'oubli1'), 1, 'pas de doublon');
     const titre = (n) => n.titre === 'Demande de réinitialisation de mot de passe';
@@ -278,7 +283,7 @@ describe('Mots de passe (API)', () => {
     await oubli('oubli1');
     d = demandeDe('oubli1');
     assert.equal(d.repetitions, 5);
-    assert.equal(d.message, 'Toujours bloqué', 'message conservé si la nouvelle demande n\'en contient pas');
+    assert.equal(d.message, 'Je ne retrouve plus mon mot de passe', 'message d\'origine conservé');
     const n = notifs('admin', titre);
     assert.equal(n.length, 2);
     assert.match(n[n.length - 1].message, /5 demandes/);
@@ -297,9 +302,10 @@ describe('Mots de passe (API)', () => {
     assert.equal((await srv.client().post('/api/auth/mot-de-passe-oublie', { login: { $ne: 1 } })).status, 400);
     await oubli('oubli1', '<b>Urgent</b>\u0007‮' + 'é'.repeat(400));
     const d = demandeDe('oubli1');
-    assert.equal(d.message.length, 300);
-    assert.ok(d.message.startsWith('<b>Urgent</b>'), 'conservé tel quel comme texte (jamais interprété)');
-    assert.ok(!/[\u0007‮]/.test(d.message), 'caractères de contrôle retirés');
+    const message = d.provenances[d.provenances.length - 1].message;
+    assert.equal(message.length, 300);
+    assert.ok(message.startsWith('<b>Urgent</b>'), 'conservé tel quel comme texte (jamais interprété)');
+    assert.ok(!/[\u0007‮]/.test(message), 'caractères de contrôle retirés');
     reinitialiserCompteurs();
   });
 
@@ -342,7 +348,7 @@ describe('Mots de passe (API)', () => {
     assert.equal((await (await connecte('resp')).get('/api/utilisateurs-demandes-mdp')).status, 403, 'consultation seule des comptes');
     assert.equal((await (await connecte('tech')).get('/api/utilisateurs-demandes-mdp')).status, 403);
     const d = (await info.ok('GET', '/api/utilisateurs-demandes-mdp')).find((x) => x.login === 'techc');
-    assert.deepEqual(Object.keys(d).sort(), ['createdAt', 'derniereDemande', 'id', 'ip', 'login', 'message', 'nom', 'poste', 'profilNom', 'repetitions', 'statut', 'userId']);
+    assert.deepEqual(Object.keys(d).sort(), ['createdAt', 'derniereDemande', 'id', 'ip', 'login', 'message', 'nbPostes', 'nom', 'poste', 'profilNom', 'provenances', 'repetitions', 'statut', 'userId']);
     assert.equal(d.profilNom, 'Technicien');
     assert.equal(d.nom, 'P TECHC');
     assert.equal(d.statut, 'en_attente');
@@ -954,7 +960,8 @@ describe('Changement de mot de passe imposé par le serveur', () => {
   test('mot de passe initial : seules les routes d\'authentification répondent avant le changement', async () => {
     const admin = srv.client();
     const b = await admin.login('admin', 'admin');
-    assert.deepEqual(b.motDePasse, { doitChanger: true, raison: 'initial', dateMdp: null, expireLe: null, joursRestants: null, rappel: false });
+    // Changement imposé dès l'ouverture de la session : le mot de passe actuel vient d'être saisi, il n'est pas redemandé
+    assert.deepEqual(b.motDePasse, { doitChanger: true, raison: 'initial', dateMdp: null, expireLe: null, joursRestants: null, rappel: false, ancienRequis: false });
     for (const url of ['/api/equipements', '/api/notifications', '/api/utilisateurs', '/api/configuration', '/api/utilisateurs-demandes-mdp']) {
       const r = await admin.get(url);
       assert.equal(r.status, 403, url);

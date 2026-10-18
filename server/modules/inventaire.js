@@ -5,9 +5,17 @@
  *  - Résolution d'un code scanné (GET /api/codes/:code) : article (code, référence fournisseur,
  *    champ codeBarre), équipement, OT, demande d'intervention, inventaire — selon les droits et la portée.
  *  - Inventaires (collection « inventaires ») : ouverture avec instantané des quantités théoriques des
- *    articles actifs visibles du périmètre (catégorie, préfixe d'emplacement, fournisseur, magasin),
- *    comptages au scanner (ajouter / remplacer), articles hors périmètre, mode aveugle, validation
+ *    articles actifs modifiables du périmètre (site ou secteur de l'inventaire, catégorie, préfixe
+ *    d'emplacement, fournisseur, magasin), comptages au scanner (ajouter / remplacer, contrôle d'un
+ *    comptage concurrent), articles hors périmètre du même site / secteur, mode aveugle, validation
  *    (mouvements d'inventaire via ctx.services.stock.inventorier), annulation, suppression, export CSV.
+ *  - Écarts : chaque comptage mémorise le stock système du moment (stockAuComptage) ; l'écart d'une
+ *    ligne est « compté − stock au comptage ». La validation applique cet écart : les entrées et sorties
+ *    enregistrées après le comptage sont conservées, et le résumé validé reprend les écarts appliqués.
+ *  - Portée : un inventaire est visible selon son secteur ; un inventaire sans secteur (« tous les
+ *    sites », installations antérieures) n'est visible qu'en portée « tous » dès qu'il existe plusieurs
+ *    sites. Chaque ligne n'est montrée que si son article est visible, et ne se compte ou ne se valide
+ *    que si son article est modifiable par l'utilisateur.
  *  - Données d'étiquettes (GET /api/etiquettes/donnees) pour l'impression des étiquettes d'articles
  *    et des étiquettes d'immobilisation des équipements.
  *
@@ -47,8 +55,14 @@ const vrai = (v) => v === true || v === 1 || ['1', 'true', 'oui', 'on'].includes
 const frNombre = (n) => String(arrondi(n, 3)).replace('.', ',');
 const BOM = String.fromCharCode(0xfeff);
 
+/**
+ * Cellule CSV : point-virgule, guillemets et retours à la ligne protégés. Un texte qui commence par
+ * = + - @ (ou une tabulation) serait interprété comme une formule par le tableur : il est préfixé
+ * d'une apostrophe. Les nombres (« -3 », « -17,8 ») restent des nombres.
+ */
 function csvEscape(v) {
-  const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
+  let s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
+  if (/^[=+\-@\t\r]/.test(s) && !/^[-+]?\d+(,\d+)?$/.test(s)) s = '\'' + s;
   return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 const csvNombre = (n) => (n == null || n === '' ? '' : String(arrondi(n, 4)).replace('.', ','));
@@ -57,6 +71,17 @@ const csvNombre = (n) => (n == null || n === '' ? '' : String(arrondi(n, 4)).rep
 function controleCode(code) {
   if (!CodeBarre) return { encodable: true, erreur: null };
   try { CodeBarre.preparer(code); return { encodable: true, erreur: null }; } catch (e) { return { encodable: false, erreur: e.message }; }
+}
+
+/**
+ * Écart d'une ligne pour une quantité comptée : écart réellement appliqué au stock une fois l'inventaire
+ * validé, sinon quantité comptée moins le stock système au moment du comptage (à défaut, moins la
+ * quantité théorique de l'ouverture).
+ */
+function ecartLigne(l, compte) {
+  if (l.ecartApplique != null) return num(l.ecartApplique);
+  const ref = l.quantiteComptee != null && l.stockAuComptage != null ? l.stockAuComptage : l.quantiteTheorique;
+  return compte - num(ref);
 }
 
 /**
@@ -77,7 +102,8 @@ function calculerResume(lignes, options) {
     const compte = l.quantiteComptee != null ? num(l.quantiteComptee) : (zero ? 0 : null);
     if (compte == null) continue;
     r.valeurComptee += compte * pu;
-    const e = arrondi(compte - theo);
+    if (l.ignoree) continue; // article supprimé avant la validation : aucun mouvement
+    const e = arrondi(ecartLigne(l, compte));
     if (e !== 0) {
       r.nbEcarts++;
       if (e > 0) r.nbEcartsPositifs++; else r.nbEcartsNegatifs++;
@@ -178,6 +204,69 @@ function register(ctx) {
   }
   /** Article visible en écriture (comptage / inventaire) : les sites en lecture seule sont exclus. */
   const articleModifiable = (req, a) => !!a && perms.canSeeRecord(req.perms, req.user, a, { ecriture: true });
+  /** Article consultable (sites en lecture seule compris). */
+  const articleVisible = (req, a) => !!a && perms.canSeeRecord(req.perms, req.user, a);
+  const sansSecteur = (a) => a.secteurId == null || a.secteurId === '';
+
+  // ----- Portée des inventaires et de leurs lignes ---------------------------------------------
+  const plusieursSites = () => perms.sites(db).length > 1;
+  /**
+   * Inventaire visible : règle de portée commune, sauf pour un inventaire sans secteur (« tous les
+   * sites ») qui, dès qu'il existe plusieurs sites, n'est visible qu'en portée « tous » : il peut porter
+   * sur les articles de chaque site.
+   */
+  function inventaireVisible(req, inv, ecriture) {
+    if (!inv) return false;
+    if (inv.secteurId == null && req.perms.portee !== 'tous' && plusieursSites()) return false;
+    return perms.canSeeRecord(req.perms, req.user, inv, { ecriture: ecriture === undefined ? !!req.ecriture : ecriture });
+  }
+  function scopeInventaires(req, rows, ecriture) {
+    const plusieurs = plusieursSites();
+    const o = { ecriture: ecriture === undefined ? !!req.ecriture : ecriture };
+    return (rows || []).filter((i) => !(i.secteurId == null && req.perms.portee !== 'tous' && plusieurs) && perms.canSeeRecord(req.perms, req.user, i, o));
+  }
+  /** Inventaire visible ou 404 (403 si son site n'est accessible qu'en lecture pendant une modification). */
+  function getInventaire(req, id) {
+    const inv = ctx.getVisible(req, ENTITE, id);
+    if (!inventaireVisible(req, inv, false)) throw new HttpError(404, 'Élément introuvable');
+    return inv;
+  }
+  /** Secteurs couverts par un inventaire (son secteur et ses descendants) ; null : tous. */
+  const secteursInventaire = (inv) => (inv.secteurId == null ? null : new Set(perms.secteursDescendants(db, [Number(inv.secteurId)])));
+  /** Un article relève-t-il du site / secteur de l'inventaire ? (les articles sans magasin sont communs) */
+  function dansSecteurInventaire(inv, a, ids) {
+    if (inv.secteurId == null || sansSecteur(a)) return true;
+    return (ids || secteursInventaire(inv)).has(Number(a.secteurId));
+  }
+  const carteArticles = (ids) => new Map(db.list('articles', (a) => !ids || ids.has(a.id)).map((a) => [a.id, a]));
+  /**
+   * Lignes consultables par l'utilisateur : celles dont l'article est visible selon sa portée et le site
+   * affiché (la ligne d'un article supprimé reste affichée). En portée « tous » sans site choisi : toutes.
+   */
+  function lignesVisibles(req, inv, articles) {
+    const lignes = inv.lignes || [];
+    if (req.perms.portee === 'tous' && !Array.isArray(req.perms.siteFiltre)) return lignes;
+    const carte = articles || carteArticles(new Set(lignes.map((l) => Number(l.articleId))));
+    return lignes.filter((l) => { const a = carte.get(Number(l.articleId)); return !a || articleVisible(req, a); });
+  }
+  /**
+   * Résumé vu par l'utilisateur : celui de l'inventaire, ou recalculé sur ses seules lignes visibles.
+   * Inventaire validé : toujours recalculé sur les écarts appliqués (validations antérieures comprises).
+   */
+  function resumeVisible(req, inv, articles) {
+    const toutes = inv.lignes || [];
+    const visibles = lignesVisibles(req, inv, articles);
+    const valide = inv.statut === 'valide';
+    const masquees = toutes.length - visibles.length;
+    if (!masquees && !valide && inv.resume) return { resume: inv.resume, visibles, masquees };
+    return { resume: calculerResume(visibles, { nonComptesAZero: valide && !!inv.nonComptesAZero }), visibles, masquees };
+  }
+  /** Autres inventaires en cours, visibles par l'utilisateur, qui contiennent un article. */
+  function autresInventairesEnCours(req, articleId, saufId) {
+    return scopeInventaires(req, db.list(ENTITE, (i) => i.statut === 'en_cours' && i.id !== saufId && (i.lignes || []).some((l) => Number(l.articleId) === Number(articleId))), false)
+      .map((i) => ({ id: i.id, numero: i.numero, nom: i.nom }));
+  }
+  const moduleActif = () => { const m = (ctx.config().modules || {})[MODULE]; return !(m && m.actif === false); };
 
   // ----- Résolution d'un code scanné -------------------------------------------------------
   const CHAMPS_CODE = [['code', 'code'], ['referenceFournisseur', 'referenceFournisseur'], ['codeBarre', 'codeBarre']];
@@ -194,8 +283,7 @@ function register(ctx) {
 
   function inventairesEnCours(req, articleId) {
     if (!can(req, 'voir')) return [];
-    return ctx.scope(req, db.list(ENTITE, (i) => i.statut === 'en_cours' && (i.lignes || []).some((l) => Number(l.articleId) === Number(articleId))))
-      .map((i) => ({ id: i.id, numero: i.numero, nom: i.nom }));
+    return autresInventairesEnCours(req, articleId, null);
   }
 
   /** Résolution d'un code (null si rien de visible ne correspond). */
@@ -254,7 +342,7 @@ function register(ctx) {
       }
     }
     if (can(req, 'voir')) {
-      const i = ctx.scope(req, db.list(ENTITE)).find((x) => cleCode(x.numero) === k);
+      const i = scopeInventaires(req, db.list(ENTITE)).find((x) => cleCode(x.numero) === k);
       if (i) {
         return {
           type: 'inventaire', id: i.id, code: i.numero, correspondance: 'numero', libelle: i.nom || '', sousTitre: `${i.numero} · ${libelleStatut(i.statut)}`, lien: `#/inventaire/${i.id}`,
@@ -266,6 +354,10 @@ function register(ctx) {
   }
 
   async function routeCode(req, code) {
+    if (!moduleActif()) {
+      const m = perms.modulesConfigures(ctx.config()).find((x) => x.key === MODULE);
+      throw new HttpError(403, `Le module « ${m ? m.label : nom} » est désactivé : la lecture des codes-barres n'est pas disponible`);
+    }
     const c = texte(code, 'Code', { requis: true, max: 200 });
     const r = resoudreCode(req, c);
     if (!r) throw new HttpError(404, `Aucun élément accessible ne correspond au code « ${c} »`);
@@ -275,7 +367,11 @@ function register(ctx) {
   router.get('/api/codes', async (req) => routeCode(req, req.query.code));
 
   // ----- Inventaires : périmètre et lignes ------------------------------------------------------
-  function validerFiltres(req, f) {
+  /**
+   * Filtres du périmètre. Le magasin des articles doit recouper le site / secteur de l'inventaire
+   * (secteurId) : un inventaire d'un site ne porte jamais sur les articles d'un autre site.
+   */
+  function validerFiltres(req, f, secteurId) {
     if (f == null || f === '') f = {};
     if (typeof f !== 'object' || Array.isArray(f)) throw new HttpError(400, 'Filtres du périmètre invalides');
     const out = { categorieCode: null, emplacement: '', fournisseurId: null, secteurId: null };
@@ -290,23 +386,29 @@ function register(ctx) {
     if (out.secteurId != null) {
       const s = db.get('secteurs', out.secteurId);
       if (!s || !perms.canSeeRecord(req.perms, req.user, { secteurId: s.id, createdBy: req.user.id }, { ecriture: true })) throw new HttpError(400, 'Magasin des articles introuvable ou hors de votre périmètre');
+      if (secteurId != null && !perms.secteursDescendants(db, [secteurId]).includes(s.id) && !perms.secteursDescendants(db, [s.id]).includes(Number(secteurId))) {
+        throw new HttpError(400, `Le magasin des articles « ${cheminSecteur(s.id)} » n'appartient pas au site / secteur de l'inventaire (${cheminSecteur(secteurId)})`);
+      }
     }
     return out;
   }
 
-  /** Articles actifs, modifiables par l'utilisateur, correspondant au périmètre (triés par emplacement puis code). */
+  /**
+   * Articles actifs, modifiables par l'utilisateur, correspondant au périmètre (triés par emplacement puis
+   * code) : articles du site / secteur de l'inventaire et de ses sous-secteurs, et articles sans magasin.
+   */
   function articlesPerimetre(req, secteurId, filtres) {
     let rows = db.list('articles', (a) => a.actif !== false).filter((a) => articleModifiable(req, a));
     if (filtres.categorieCode) rows = rows.filter((a) => a.categorieCode === filtres.categorieCode);
     if (filtres.fournisseurId != null) rows = rows.filter((a) => Number(a.fournisseurId) === filtres.fournisseurId);
     if (filtres.emplacement) { const p = cleEmplacement(filtres.emplacement); rows = rows.filter((a) => cleEmplacement(a.emplacement).startsWith(p)); }
+    if (secteurId != null) {
+      const ids = new Set(perms.secteursDescendants(db, [secteurId]));
+      rows = rows.filter((a) => sansSecteur(a) || ids.has(Number(a.secteurId)));
+    }
     if (filtres.secteurId != null) {
       const ids = new Set(perms.secteursDescendants(db, [filtres.secteurId]));
-      rows = rows.filter((a) => a.secteurId != null && a.secteurId !== '' && ids.has(Number(a.secteurId)));
-    } else if (secteurId != null) {
-      // Inventaire d'un site : articles de ce site ou non rattachés à un magasin
-      const site = ctx.siteDuSecteur(secteurId);
-      if (site != null) rows = rows.filter((a) => a.secteurId == null || a.secteurId === '' || ctx.siteDuSecteur(a.secteurId) === site);
+      rows = rows.filter((a) => !sansSecteur(a) && ids.has(Number(a.secteurId)));
     }
     return rows.sort((a, b) => cleEmplacement(a.emplacement).localeCompare(cleEmplacement(b.emplacement), 'fr', { numeric: true }) || String(a.code || '').localeCompare(String(b.code || ''), 'fr', { numeric: true }) || a.id - b.id);
   }
@@ -341,66 +443,123 @@ function register(ctx) {
     if (inv.statut !== 'en_cours') throw new HttpError(400, `L'inventaire ${inv.numero} est ${inv.statut === 'valide' ? 'validé' : 'annulé'} : aucune modification n'est possible`);
   }
 
-  function resumeListe(req, inv) {
+  /** En-tête d'un inventaire ; r : résumé vu par l'utilisateur (sinon calculé selon ses lignes visibles). */
+  function resumeListe(req, inv, r, articles) {
     const masque = masquer(req, inv);
-    const r = inv.resume || calculerResume(inv.lignes);
+    const vue = r ? { resume: r, masquees: 0 } : resumeVisible(req, inv, articles);
     return {
       id: inv.id, numero: inv.numero, nom: inv.nom, statut: inv.statut, statutLibelle: libelleStatut(inv.statut),
       secteurId: inv.secteurId == null ? null : inv.secteurId, secteurNom: nomSecteur(inv.secteurId), secteurChemin: cheminSecteur(inv.secteurId), siteId: ctx.siteDuSecteur(inv.secteurId),
       filtres: inv.filtres || {}, aveugle: !!inv.aveugle, commentaire: inv.commentaire || '',
       dateOuverture: inv.dateOuverture, dateValidation: inv.dateValidation || null, dateAnnulation: inv.dateAnnulation || null,
       createdBy: inv.createdBy, createdByNom: ctx.nomUser(inv.createdBy), validePar: inv.validePar || null, valideParNom: ctx.nomUser(inv.validePar),
-      resume: masque ? resumeMasque(r) : r, masque,
+      resume: masque ? resumeMasque(vue.resume) : vue.resume, masque, lignesHorsPortee: vue.masquees,
       createdAt: inv.createdAt, updatedAt: inv.updatedAt,
     };
   }
 
+  /** Journal de stock des articles (mouvements triés par date puis identifiant). */
+  function journalArticles(ids) {
+    const parArticle = new Map();
+    for (const m of db.list('mouvementsStock', (x) => ids.has(Number(x.articleId)))) {
+      const k = Number(m.articleId);
+      if (!parArticle.has(k)) parArticle.set(k, []);
+      parArticle.get(k).push(m);
+    }
+    for (const l of parArticle.values()) l.sort((x, y) => String(x.date).localeCompare(String(y.date)) || x.id - y.id);
+    return parArticle;
+  }
+  /** Stock système d'un article à une date, reconstitué par le journal (quantiteAvant du premier mouvement postérieur). */
+  function stockAuMoment(journal, article, date) {
+    const suivant = (journal.get(article.id) || []).find((m) => String(m.date) > date);
+    return arrondi(suivant ? num(suivant.quantiteAvant) : num(article.quantite));
+  }
+  /** Identifiant du dernier mouvement de stock enregistré : repère des mouvements postérieurs à un comptage. */
+  function dernierMouvementId() {
+    const c = db.data && db.data.meta && db.data.meta.counters ? Number(db.data.meta.counters.mouvementsStock) : NaN;
+    const col = db.data && db.data.collections ? db.data.collections.mouvementsStock : null;
+    if (!Number.isFinite(c) && !Array.isArray(col)) return db.list('mouvementsStock').reduce((m, x) => Math.max(m, Number(x.id) || 0), 0);
+    // Compteur des identifiants, et dernier mouvement de la collection (base importée sans nouvel ajout)
+    const dernier = Array.isArray(col) && col.length ? Number(col[col.length - 1].id) || 0 : 0;
+    return Math.max(Number.isFinite(c) ? c : 0, dernier);
+  }
+  /** Date du dernier comptage d'une ligne (null si inconnue). */
+  const dateComptage = (l) => l.dateComptage || ((l.comptages || []).length ? l.comptages[l.comptages.length - 1].date : null) || null;
+  /**
+   * Copie des lignes avec le stock au comptage des lignes comptées avant que ce stock ne soit mémorisé
+   * (inventaires ouverts avec une version antérieure) : reconstitué par le journal de stock.
+   */
+  function completerLignes(inv, lignes, articles, journal) {
+    return lignes.map((l) => {
+      const c = Object.assign({}, l);
+      if (inv.statut !== 'en_cours' || c.quantiteComptee == null || c.stockAuComptage != null) return c;
+      const a = articles.get(Number(c.articleId));
+      const date = dateComptage(c);
+      if (a && date) c.stockAuComptage = stockAuMoment(journal, a, String(date));
+      return c;
+    });
+  }
+
   /** Mouvements de stock par article depuis l'ouverture (hors mouvements produits par la validation). */
-  function mouvementsDepuis(inv) {
+  function mouvementsDepuis(inv, journal) {
     const exclus = new Set((inv.mouvementIds || []).map(Number));
     const depuis = String(inv.dateOuverture || '');
     const fin = inv.statut === 'valide' && inv.dateValidation ? String(inv.dateValidation) : null;
-    const ids = new Set((inv.lignes || []).map((l) => Number(l.articleId)));
     const parArticle = new Map();
-    for (const m of db.list('mouvementsStock', (x) => ids.has(Number(x.articleId)) && String(x.date) > depuis && !exclus.has(x.id) && (!fin || String(x.date) <= fin))) {
-      const k = Number(m.articleId);
-      const x = parArticle.get(k) || { nb: 0, variation: 0, dernier: null };
-      x.nb++;
-      x.variation = arrondi(x.variation + num(m.quantiteApres) - num(m.quantiteAvant));
-      if (!x.dernier || String(m.date) > x.dernier) x.dernier = String(m.date);
-      parArticle.set(k, x);
+    for (const [k, mvts] of journal) {
+      for (const m of mvts) {
+        if (!(String(m.date) > depuis) || exclus.has(m.id) || (fin && String(m.date) > fin)) continue;
+        const x = parArticle.get(k) || { nb: 0, variation: 0, dernier: null };
+        x.nb++;
+        x.variation = arrondi(x.variation + num(m.quantiteApres) - num(m.quantiteAvant));
+        if (!x.dernier || String(m.date) > x.dernier) x.dernier = String(m.date);
+        parArticle.set(k, x);
+      }
     }
     return parArticle;
   }
 
-  function enrichirLigne(l, inv, masque, refs) {
+  /**
+   * Ligne présentée : quantité de référence (stock au comptage pour une ligne comptée, stock actuel
+   * pour une ligne à compter, stock avant validation pour une ligne mise à zéro), écart, mouvements
+   * depuis l'ouverture, ligne modifiable par l'utilisateur ; quantités masquées en mode aveugle.
+   */
+  function enrichirLigne(l, inv, masque, refs, req) {
     const a = refs.articles.get(Number(l.articleId)) || null;
     const mv = refs.mouvements.get(Number(l.articleId)) || { nb: 0, variation: 0, dernier: null };
     const comptages = (l.comptages || []).map((c) => Object.assign({}, c, { userNom: refs.nom(c.userId) }));
     const dernier = comptages.length ? comptages[comptages.length - 1] : null;
     const compte = l.quantiteComptee != null;
-    const ecart = compte ? arrondi(num(l.quantiteComptee) - num(l.quantiteTheorique)) : null;
+    const enCours = inv.statut === 'en_cours';
+    const ecart = compte && !l.ignoree ? arrondi(ecartLigne(l, num(l.quantiteComptee))) : null;
+    let reference;
+    if (compte) reference = l.stockAuComptage != null ? num(l.stockAuComptage) : (l.quantiteAvantValidation != null ? num(l.quantiteAvantValidation) : num(l.quantiteTheorique));
+    else if (enCours && a) reference = num(a.quantite);
+    else reference = l.misAZero && l.quantiteAvantValidation != null ? num(l.quantiteAvantValidation) : num(l.quantiteTheorique);
     const out = Object.assign({}, l, {
       comptages, compte, existe: !!a, actif: a ? a.actif !== false : false,
       designation: l.designation || (a ? a.designation : ''), uniteLibelle: libelleListe('unites', l.uniteCode),
-      quantiteActuelle: a ? arrondi(num(a.quantite)) : null,
+      quantiteReference: arrondi(reference), quantiteActuelle: a ? arrondi(num(a.quantite)) : null,
       nbMouvementsDepuis: mv.nb, variationDepuis: mv.variation, dernierMouvement: mv.dernier,
-      ecart, valeurEcart: compte ? arrondi(ecart * num(l.prixUnitaire), 2) : null,
-      ecartActuel: compte && a && inv.statut === 'en_cours' ? arrondi(num(l.quantiteComptee) - num(a.quantite)) : null,
+      ecart, valeurEcart: ecart != null ? arrondi(ecart * num(l.prixUnitaire), 2) : null,
+      ecartActuel: compte && a && enCours ? arrondi(num(l.quantiteComptee) - num(a.quantite)) : null,
       dernierComptage: dernier ? dernier.date : null, dernierCompteurNom: dernier ? dernier.userNom : '',
+      modifiable: enCours && (!a || !req || articleModifiable(req, a)),
     });
     if (masque) {
-      for (const k of ['quantiteTheorique', 'quantiteActuelle', 'variationDepuis', 'ecart', 'valeurEcart', 'ecartActuel', 'quantiteAvantValidation', 'ecartApplique']) delete out[k];
+      for (const k of ['quantiteTheorique', 'quantiteReference', 'stockAuComptage', 'mouvementRepere', 'quantiteActuelle', 'variationDepuis', 'ecart', 'valeurEcart', 'ecartActuel', 'quantiteAvantValidation', 'ecartApplique', 'mouvementsApresComptage']) delete out[k];
       out.masque = true;
     }
     return out;
   }
-  function references(inv) {
-    const ids = new Set((inv.lignes || []).map((l) => Number(l.articleId)));
+  function references(inv, lignes) {
+    const ids = new Set((lignes || inv.lignes || []).map((l) => Number(l.articleId)));
     const noms = new Map();
+    const journal = journalArticles(ids);
     return {
-      articles: new Map(db.list('articles', (a) => ids.has(a.id)).map((a) => [a.id, a])),
-      mouvements: mouvementsDepuis(inv),
+      articles: carteArticles(ids),
+      journal,
+      mouvements: mouvementsDepuis(inv, journal),
       nom: (id) => { if (id == null) return ''; if (!noms.has(id)) noms.set(id, ctx.nomUser(id)); return noms.get(id); },
     };
   }
@@ -408,10 +567,15 @@ function register(ctx) {
   function detail(req, inv) {
     const masque = masquer(req, inv);
     const refs = references(inv);
-    const lignes = (inv.lignes || []).map((l) => enrichirLigne(l, inv, masque, refs));
-    const base = resumeListe(req, inv);
+    const visibles = lignesVisibles(req, inv, refs.articles);
+    const masquees = (inv.lignes || []).length - visibles.length;
+    const completes = completerLignes(inv, visibles, refs.articles, refs.journal);
+    // Résumé recalculé sur les lignes visibles (écarts appliqués pour un inventaire validé)
+    const resume = calculerResume(completes, { nonComptesAZero: inv.statut === 'valide' && !!inv.nonComptesAZero });
+    const lignes = completes.map((l) => enrichirLigne(l, inv, masque, refs, req));
+    const base = resumeListe(req, inv, resume);
     return Object.assign(base, {
-      lignes,
+      lignes, lignesHorsPortee: masquees,
       nbArticlesAvecMouvements: lignes.filter((l) => l.nbMouvementsDepuis > 0).length,
       nbArticlesSupprimes: lignes.filter((l) => !l.existe).length,
       mouvementIds: inv.mouvementIds || [],
@@ -437,13 +601,23 @@ function register(ctx) {
     throw new HttpError(500, 'Impossible de générer un numéro d\'inventaire unique : vérifiez le gabarit de numérotation');
   }
 
-  /** Secteur (site / magasin) de l'inventaire : obligatoire hors portée « tous », dans le périmètre modifiable. */
-  function validerSecteur(req, v) {
+  /**
+   * Secteur (site / magasin) de l'inventaire, dans le périmètre modifiable. Obligatoire hors portée
+   * « tous » ; en portée « tous », le site affiché est repris par défaut, et le seul site s'il n'y en a
+   * qu'un. Dès qu'il existe plusieurs sites, un inventaire « tous les sites » n'est plus possible.
+   * apercu : sans site choisi, l'aperçu d'un utilisateur de portée « tous » porte sur tous les sites.
+   */
+  function validerSecteur(req, v, { apercu = false } = {}) {
     let id = idRef(v, 'Site / magasin');
     if (id == null && req.perms.portee === 'tous' && req.perms.siteCourantId != null) id = req.perms.siteCourantId;
     if (id == null) {
       if (req.perms.portee !== 'tous') throw new HttpError(400, 'Site / magasin : champ obligatoire (votre accès est limité à certains secteurs)');
-      return null;
+      const listeSites = perms.sites(db);
+      if (listeSites.length === 1) id = listeSites[0].id;
+      else if (listeSites.length > 1) {
+        if (apercu) return null;
+        throw new HttpError(400, 'Site / magasin : champ obligatoire (plusieurs sites : choisissez le site ou le magasin inventorié)');
+      } else return null;
     }
     const s = db.get('secteurs', id);
     if (!s) throw new HttpError(400, 'Site / magasin introuvable');
@@ -452,10 +626,18 @@ function register(ctx) {
     return id;
   }
 
+  /** Inventaires en cours, visibles par l'utilisateur, qui contiennent déjà certains de ces articles. */
+  function chevauchements(req, articleIds, saufId) {
+    const ids = new Set(articleIds.map(Number));
+    return scopeInventaires(req, db.list(ENTITE, (i) => i.id !== saufId && i.statut === 'en_cours'), false)
+      .map((i) => ({ id: i.id, numero: i.numero, nom: i.nom, nbArticles: (i.lignes || []).filter((l) => ids.has(Number(l.articleId))).length }))
+      .filter((x) => x.nbArticles > 0);
+  }
+
   // ----- Routes : inventaires ------------------------------------------------------------------
   router.get('/api/inventaires', async (req) => {
     const q = req.query || {};
-    let rows = ctx.scope(req, db.list(ENTITE));
+    let rows = scopeInventaires(req, db.list(ENTITE));
     if (q.statut) {
       const sts = String(q.statut).split(',').filter(Boolean);
       for (const s of sts) if (!STATUTS.includes(s)) throw new HttpError(400, `Statut d'inventaire inconnu : ${s}`);
@@ -467,29 +649,32 @@ function register(ctx) {
     }
     const termes = cleCode(q.recherche).split(/\s+/).filter(Boolean);
     if (termes.length) rows = rows.filter((i) => { const t = cleCode([i.numero, i.nom, i.commentaire, nomSecteur(i.secteurId)].join(' ')); return termes.every((x) => t.includes(x)); });
-    return rows.sort((a, b) => String(b.dateOuverture || '').localeCompare(String(a.dateOuverture || '')) || b.id - a.id).map((i) => resumeListe(req, i));
+    // Lignes visibles : une seule lecture des articles pour toute la liste
+    const articles = req.perms.portee === 'tous' && !Array.isArray(req.perms.siteFiltre) ? null : carteArticles(null);
+    return rows.sort((a, b) => String(b.dateOuverture || '').localeCompare(String(a.dateOuverture || '')) || b.id - a.id).map((i) => resumeListe(req, i, null, articles));
   }, { perm: [MODULE, 'voir'] });
 
-  /** Aperçu du périmètre avant ouverture : nombre d'articles et valeur théorique. */
+  /** Aperçu du périmètre avant ouverture : nombre d'articles, valeur théorique, inventaires en cours qui les contiennent déjà. */
   router.get('/api/inventaires-apercu', async (req) => {
     const q = req.query || {};
-    const secteurId = q.secteurId ? idRef(q.secteurId, 'Site / magasin') : null;
-    const filtres = validerFiltres(req, { categorieCode: q.categorieCode, emplacement: q.emplacement, fournisseurId: q.fournisseurId, secteurId: q.magasinId });
+    const secteurId = validerSecteur(req, q.secteurId, { apercu: true });
+    const filtres = validerFiltres(req, { categorieCode: q.categorieCode, emplacement: q.emplacement, fournisseurId: q.fournisseurId, secteurId: q.magasinId }, secteurId);
     const rows = articlesPerimetre(req, secteurId, filtres);
     return {
       nbArticles: rows.length,
       valeurTheorique: arrondi(rows.reduce((s, a) => s + Math.max(0, num(a.quantite)) * num(a.prixUnitaire), 0), 2),
       exemples: rows.slice(0, 5).map((a) => ({ id: a.id, code: a.code, designation: a.designation, emplacement: a.emplacement || '' })),
+      secteurId, chevauchements: chevauchements(req, rows.map((a) => a.id), null),
     };
   }, { perm: [MODULE, 'creer'] });
 
-  router.get('/api/inventaires/:id', async (req) => detail(req, ctx.getVisible(req, ENTITE, req.params.id)), { perm: [MODULE, 'voir'] });
+  router.get('/api/inventaires/:id', async (req) => detail(req, getInventaire(req, req.params.id)), { perm: [MODULE, 'voir'] });
 
   router.post('/api/inventaires', async (req) => {
     const b = objet(req.body);
     const nomInv = texte(b.nom, 'Nom de l\'inventaire', { requis: true, max: 150 });
     const secteurId = validerSecteur(req, b.secteurId);
-    const filtres = validerFiltres(req, b.filtres);
+    const filtres = validerFiltres(req, b.filtres, secteurId);
     const aveugle = b.aveugle === undefined ? !!cfgInv().aveugle : booleen(b.aveugle, 'Mode aveugle');
     if (aveugle === false && cfgInv().aveugle && !can(req, 'valider')) throw new HttpError(403, 'Le comptage à l\'aveugle est imposé par la configuration : seul un valideur peut ouvrir un inventaire non aveugle');
     const commentaire = texte(b.commentaire, 'Commentaire', { max: 2000 });
@@ -503,17 +688,14 @@ function register(ctx) {
       mouvementIds: [], resume: calculerResume(lignes),
     });
     // Chevauchements avec d'autres inventaires en cours (même article compté deux fois)
-    const ids = new Set(lignes.map((l) => l.articleId));
-    const chevauchements = db.list(ENTITE, (i) => i.id !== inv.id && i.statut === 'en_cours')
-      .map((i) => ({ id: i.id, numero: i.numero, nom: i.nom, nbArticles: (i.lignes || []).filter((l) => ids.has(Number(l.articleId))).length }))
-      .filter((x) => x.nbArticles > 0);
+    const autres = chevauchements(req, lignes.map((l) => l.articleId), inv.id);
     ctx.audit(req, 'creation', ENTITE, inv.id, `Inventaire ${inv.numero} — ${inv.nom} : ${lignes.length} article(s)${aveugle ? ', comptage à l\'aveugle' : ''}${libellesFiltres(filtres).length ? ' (' + libellesFiltres(filtres).join(', ') + ')' : ''}`);
     ctx.emit('inventaire:ouvert', { inventaire: inv });
-    return Object.assign(detail(req, inv), { chevauchements });
+    return Object.assign(detail(req, inv), { chevauchements: autres });
   }, { perm: [MODULE, 'creer'] });
 
   router.put('/api/inventaires/:id', async (req) => {
-    const inv = ctx.getVisible(req, ENTITE, req.params.id);
+    const inv = getInventaire(req, req.params.id);
     exigerEnCours(inv);
     const b = objet(req.body);
     const patch = {};
@@ -533,105 +715,190 @@ function register(ctx) {
     return detail(req, maj);
   }, { perm: [MODULE, 'modifier'] });
 
-  /** Résout un code dans le contexte d'un inventaire (ligne existante ou article hors périmètre). */
-  function resoudreDansInventaire(req, inv, { code, articleId }) {
-    const lignes = inv.lignes || [];
+  /**
+   * Résout un code dans le contexte d'un inventaire (ligne existante ou article hors périmètre).
+   * Seules les lignes dont l'article est visible sont recherchées. ecriture : la ligne trouvée doit être
+   * modifiable par l'utilisateur (403 sinon, par exemple pour un article d'un site en lecture seule).
+   * Un article hors périmètre doit être modifiable et relever du site / secteur de l'inventaire.
+   */
+  function resoudreDansInventaire(req, inv, { code, articleId }, { ecriture = false } = {}) {
+    const articles = carteArticles(null);
+    const accessible = (l) => { const a = articles.get(Number(l.articleId)); return !a || articleVisible(req, a); };
+    const lignes = (inv.lignes || []).filter(accessible);
+    const retenir = (l) => {
+      const a = articles.get(Number(l.articleId));
+      if (ecriture && a && !articleModifiable(req, a)) throw new HttpError(403, `L'article ${l.code || '#' + l.articleId} relève d'un site ou d'un secteur que vous ne pouvez pas modifier (accès en lecture seule) : comptage impossible`);
+      return { ligne: l };
+    };
+    const idsInventaire = secteursInventaire(inv);
+    const horsPerimetre = (a) => {
+      if (!dansSecteurInventaire(inv, a, idsInventaire)) throw new HttpError(400, `L'article ${a.code || '#' + a.id} — ${a.designation || ''} ne relève pas du site / secteur de cet inventaire (${cheminSecteur(inv.secteurId)}) : comptez-le dans un inventaire de son site`);
+      return { article: a };
+    };
     if (articleId != null && articleId !== '') {
       const id = idRef(articleId, 'Article');
       const l = lignes.find((x) => Number(x.articleId) === id);
-      if (l) return { ligne: l };
-      const a = db.get('articles', id);
+      if (l) return retenir(l);
+      const a = articles.get(id);
       if (!a || !articleModifiable(req, a)) throw new HttpError(404, 'Article introuvable ou hors de votre périmètre');
-      return { article: a };
+      return horsPerimetre(a);
     }
     const c = texte(code, 'Code scanné', { requis: true, max: 200 });
     const k = cleCode(c);
-    const modifiables = triArticles(db.list('articles').filter((a) => articleModifiable(req, a)));
+    const modifiables = triArticles(Array.from(articles.values()).filter((a) => articleModifiable(req, a)));
+    const duSecteur = modifiables.filter((a) => dansSecteurInventaire(inv, a, idsInventaire));
     // À chaque niveau (code, référence fournisseur, code-barres), les lignes de l'inventaire sont prioritaires
     for (const [champ] of CHAMPS_CODE) {
       const l = lignes.find((x) => x[champ] && cleCode(x[champ]) === k);
-      if (l) return { ligne: l };
-      const a = modifiables.find((x) => x[champ] && cleCode(x[champ]) === k);
-      if (a) { const ligne = lignes.find((x) => Number(x.articleId) === a.id); return ligne ? { ligne } : { article: a }; }
+      if (l) return retenir(l);
+      const a = duSecteur.find((x) => x[champ] && cleCode(x[champ]) === k);
+      if (a) { const ligne = lignes.find((x) => Number(x.articleId) === a.id); return ligne ? retenir(ligne) : { article: a }; }
     }
+    // Article modifiable mais d'un autre site / secteur que l'inventaire
+    const ailleurs = trouverArticle(modifiables, k);
+    if (ailleurs) horsPerimetre(ailleurs.article);
     // Message utile : le code correspond peut-être à autre chose qu'un article
     const autre = db.findOne('equipements', (e) => cleCode(e.numero) === k) ? 'un équipement' : (db.findOne('ot', (o) => cleCode(o.numero) === k) ? 'un ordre de travail' : (db.findOne('demandes', (d) => cleCode(d.numero) === k) ? 'une demande d\'intervention' : null));
     throw new HttpError(404, autre ? `Le code « ${c} » correspond à ${autre}, pas à un article du magasin` : `Code « ${c} » inconnu : aucun article de votre périmètre ne correspond`);
   }
 
+  /** Lignes complétées (stock au comptage) si l'inventaire contient des comptages antérieurs à cette mémorisation. */
+  function lignesCompletes(inv, lignes) {
+    if (!lignes.some((l) => l.quantiteComptee != null && l.stockAuComptage == null)) return lignes;
+    const ids = new Set(lignes.map((l) => Number(l.articleId)));
+    return completerLignes(inv, lignes, carteArticles(ids), journalArticles(ids));
+  }
+  /** Ligne présentée seule (réponse d'un comptage, d'une résolution). */
+  function presenterLigne(req, inv, l, masque) {
+    return enrichirLigne(l, inv, masque, references(inv, [l]), req);
+  }
+
   router.get('/api/inventaires/:id/resoudre', async (req) => {
-    const inv = ctx.getVisible(req, ENTITE, req.params.id);
+    const inv = getInventaire(req, req.params.id);
     const r = resoudreDansInventaire(req, inv, { code: req.query.code, articleId: req.query.articleId });
     const masque = masquer(req, inv);
-    if (r.ligne) return { ligne: enrichirLigne(r.ligne, inv, masque, references(inv)), horsPerimetre: !!r.ligne.horsPerimetre, nouvelle: false };
+    if (r.ligne) {
+      const [l] = lignesCompletes(inv, [Object.assign({}, r.ligne)]);
+      return { ligne: presenterLigne(req, inv, l, masque), horsPerimetre: !!r.ligne.horsPerimetre, nouvelle: false, autresInventaires: autresInventairesEnCours(req, r.ligne.articleId, inv.id) };
+    }
     const a = r.article;
     const l = ligneDepuisArticle(a, true);
-    const apercu = enrichirLigne(l, Object.assign({}, inv, { lignes: [l] }), masque, references(Object.assign({}, inv, { lignes: [l] })));
-    return { ligne: apercu, horsPerimetre: true, nouvelle: true };
+    const apercu = enrichirLigne(l, Object.assign({}, inv, { lignes: [l] }), masque, references(Object.assign({}, inv, { lignes: [l] })), req);
+    return { ligne: apercu, horsPerimetre: true, nouvelle: true, autresInventaires: autresInventairesEnCours(req, a.id, inv.id) };
   }, { perm: [MODULE, 'voir'] });
 
   router.post('/api/inventaires/:id/comptage', async (req) => {
-    const inv = ctx.getVisible(req, ENTITE, req.params.id);
+    const inv = getInventaire(req, req.params.id);
     exigerEnCours(inv);
     const b = objet(req.body);
     const mode = b.mode == null || b.mode === '' ? 'remplacer' : String(b.mode);
     if (!MODES_COMPTAGE.includes(mode)) throw new HttpError(400, 'Mode de comptage invalide : « ajouter » ou « remplacer » attendu');
     const q = mode === 'ajouter' && (b.quantite == null || b.quantite === '') ? 1 : quantite(b.quantite, 'Quantité comptée');
     if (mode === 'ajouter' && !(q > 0)) throw new HttpError(400, 'Quantité à ajouter : la valeur doit être supérieure à 0');
-    const r = resoudreDansInventaire(req, inv, { code: b.code, articleId: b.articleId });
-    const lignes = (inv.lignes || []).map((l) => Object.assign({}, l));
+    // quantitePrecedente : quantité comptée connue du poste ; un écart signale un comptage concurrent
+    const attendu = b.quantitePrecedente === undefined ? undefined : quantite(b.quantitePrecedente, 'Quantité précédente', { requis: false });
+    const r = resoudreDansInventaire(req, inv, { code: b.code, articleId: b.articleId }, { ecriture: true });
+    const lignes = lignesCompletes(inv, (inv.lignes || []).map((l) => Object.assign({}, l)));
+    const masque = masquer(req, inv);
     let ligne;
     let nouvelle = false;
     if (r.ligne) ligne = lignes.find((l) => Number(l.articleId) === Number(r.ligne.articleId));
     else { ligne = ligneDepuisArticle(r.article, true); lignes.push(ligne); nouvelle = true; }
     const avant = ligne.quantiteComptee;
+    if (mode === 'remplacer' && attendu !== undefined && (avant == null ? null : arrondi(num(avant))) !== attendu) {
+      const dernier = (ligne.comptages || []).slice(-1)[0];
+      const message = avant == null
+        ? `Le comptage de ${ligne.code} a été annulé entre-temps : vérifiez la quantité puis validez de nouveau.`
+        : `${ligne.code} a été compté entre-temps${dernier && dernier.userId !== req.user.id ? ' par ' + ctx.nomUser(dernier.userId) : ''} : ${frNombre(avant)} déjà compté(s). Choisissez « Ajouter au comptage » ou « Remplacer ».`;
+      throw new HttpError(409, message, { conflit: true, ligne: presenterLigne(req, inv, ligne, masque) });
+    }
     const resultat = mode === 'ajouter' ? arrondi(num(avant) + q) : q;
     if (resultat > MAX_QUANTITE) throw new HttpError(400, 'Quantité comptée trop grande');
+    const maintenant = new Date().toISOString();
+    const article = db.get('articles', Number(ligne.articleId));
     ligne.quantiteComptee = resultat;
-    ligne.comptages = (ligne.comptages || []).concat([{ userId: req.user.id, date: new Date().toISOString(), quantite: q, mode, resultat }]).slice(-MAX_COMPTAGES_LIGNE);
+    ligne.dateComptage = maintenant;
+    // Stock système au moment du comptage : référence de l'écart de la ligne
+    if (article) ligne.stockAuComptage = arrondi(num(article.quantite));
+    ligne.mouvementRepere = dernierMouvementId();
+    ligne.comptages = (ligne.comptages || []).concat([{ userId: req.user.id, date: maintenant, quantite: q, mode, resultat }]).slice(-MAX_COMPTAGES_LIGNE);
     const resume = calculerResume(lignes);
     const maj = db.update(ENTITE, inv.id, { lignes, resume });
     if (nouvelle) ctx.audit(req, 'modification', ENTITE, inv.id, `Inventaire ${inv.numero} : article hors périmètre ajouté ${ligne.code} — ${ligne.designation} (compté ${frNombre(resultat)})`);
     else if (mode === 'remplacer' && avant != null && arrondi(avant) !== resultat) ctx.audit(req, 'modification', ENTITE, inv.id, `Inventaire ${inv.numero} : comptage corrigé ${ligne.code} — ${ligne.designation} : ${frNombre(avant)} → ${frNombre(resultat)}`);
-    const masque = masquer(req, maj);
-    return { ligne: enrichirLigne(ligne, maj, masque, references(maj)), resume: masque ? resumeMasque(resume) : resume, nouvelle, quantitePrecedente: avant == null ? null : avant };
+    const vue = resumeVisible(req, maj).resume;
+    return {
+      ligne: presenterLigne(req, maj, ligne, masque), resume: masque ? resumeMasque(vue) : vue, nouvelle, quantitePrecedente: avant == null ? null : avant,
+      autresInventaires: autresInventairesEnCours(req, ligne.articleId, inv.id),
+    };
   }, { perm: [MODULE, 'modifier'] });
 
   router.delete('/api/inventaires/:id/lignes/:articleId/comptage', async (req) => {
-    const inv = ctx.getVisible(req, ENTITE, req.params.id);
+    const inv = getInventaire(req, req.params.id);
     exigerEnCours(inv);
     const id = idRef(req.params.articleId, 'Article');
-    const lignes = (inv.lignes || []).map((l) => Object.assign({}, l));
+    const lignes = lignesCompletes(inv, (inv.lignes || []).map((l) => Object.assign({}, l)));
     const idx = lignes.findIndex((l) => Number(l.articleId) === id);
-    if (idx < 0) throw new HttpError(404, 'Cet article ne fait pas partie de l\'inventaire');
+    const a = db.get('articles', id);
+    if (idx < 0 || (a && !articleVisible(req, a))) throw new HttpError(404, 'Cet article ne fait pas partie de l\'inventaire');
+    if (a && !articleModifiable(req, a)) throw new HttpError(403, `L'article ${lignes[idx].code || '#' + id} relève d'un site ou d'un secteur que vous ne pouvez pas modifier (accès en lecture seule)`);
     const l = lignes[idx];
     const avant = l.quantiteComptee;
     let supprimee = false;
-    if (l.horsPerimetre) { lignes.splice(idx, 1); supprimee = true; } else { l.quantiteComptee = null; l.comptages = []; }
+    if (l.horsPerimetre) { lignes.splice(idx, 1); supprimee = true; } else { l.quantiteComptee = null; l.comptages = []; delete l.stockAuComptage; delete l.dateComptage; delete l.mouvementRepere; }
     const resume = calculerResume(lignes);
     const maj = db.update(ENTITE, inv.id, { lignes, resume });
     ctx.audit(req, 'modification', ENTITE, inv.id, `Inventaire ${inv.numero} : comptage annulé ${l.code} — ${l.designation}${avant != null ? ' (' + frNombre(avant) + ')' : ''}${supprimee ? ', ligne hors périmètre retirée' : ''}`);
     const masque = masquer(req, maj);
-    return { ligne: supprimee ? null : enrichirLigne(l, maj, masque, references(maj)), supprimee, resume: masque ? resumeMasque(resume) : resume };
+    const vue = resumeVisible(req, maj).resume;
+    return { ligne: supprimee ? null : presenterLigne(req, maj, l, masque), supprimee, resume: masque ? resumeMasque(vue) : vue };
   }, { perm: [MODULE, 'modifier'] });
 
   router.post('/api/inventaires/:id/valider', async (req) => {
-    const inv = ctx.getVisible(req, ENTITE, req.params.id);
+    const inv = getInventaire(req, req.params.id);
     exigerEnCours(inv);
     const stock = ctx.services.stock;
     if (!stock || typeof stock.inventorier !== 'function') throw new HttpError(503, 'Module stock indisponible : validation impossible');
     const b = objet(req.body);
     const zero = b.nonComptesAZero === undefined ? !!cfgInv().nonComptesAZero : booleen(b.nonComptesAZero, 'Mettre à zéro les non comptés');
-    const lignes = (inv.lignes || []).map((l) => Object.assign({}, l));
+    const ids = new Set((inv.lignes || []).map((l) => Number(l.articleId)));
+    const articles = carteArticles(ids);
+    const journal = journalArticles(ids);
+    const lignes = completerLignes(inv, inv.lignes || [], articles, journal);
     const aTraiter = lignes.filter((l) => l.quantiteComptee != null || zero);
     if (!aTraiter.length) throw new HttpError(400, 'Aucun article compté : comptez au moins un article (ou choisissez de mettre les non comptés à zéro) avant de valider');
+    // Avant toute écriture : chaque article retenu doit être modifiable par le valideur
+    const refusees = aTraiter.map((l) => articles.get(Number(l.articleId))).filter((a) => a && !articleModifiable(req, a));
+    if (refusees.length) {
+      const codes = refusees.filter((a) => articleVisible(req, a)).map((a) => a.code || '#' + a.id);
+      throw new HttpError(403, `Validation impossible : ${refusees.length} article(s) relève(nt) d'un site ou d'un secteur que vous ne pouvez pas modifier${codes.length ? ' (' + codes.slice(0, 10).join(', ') + (codes.length > 10 ? '…' : '') + ')' : ''}. Un valideur ayant accès à ces articles doit valider cet inventaire.`);
+    }
+    const exclus = new Set((inv.mouvementIds || []).map(Number));
+    /**
+     * Entrées, sorties et retours enregistrés après le comptage de la ligne (conservés par la validation) :
+     * mouvements postérieurs au repère du comptage, à défaut à sa date. Les mouvements d'inventaire
+     * (autre inventaire validé entre-temps) ne sont pas des flux : ils ne sont pas repris.
+     */
+    const fluxApres = (l) => {
+      const repere = l.mouvementRepere != null ? Number(l.mouvementRepere) : null;
+      const date = repere == null ? dateComptage(l) : null;
+      if (repere == null && !date) return 0;
+      return arrondi((journal.get(Number(l.articleId)) || [])
+        .filter((m) => m.type !== 'inventaire' && !exclus.has(m.id) && (repere != null ? m.id > repere : String(m.date) > String(date)))
+        .reduce((s, m) => s + num(m.quantiteApres) - num(m.quantiteAvant), 0));
+    };
     const motif = `Inventaire ${inv.numero} — ${inv.nom}`.slice(0, 500);
     const mouvementIds = [];
     let nbIgnorees = 0;
     try {
       for (const l of aTraiter) {
         if (!db.get('articles', l.articleId)) { l.ignoree = 'Article supprimé depuis l\'ouverture'; nbIgnorees++; continue; }
-        const qte = l.quantiteComptee != null ? num(l.quantiteComptee) : 0;
+        let qte = 0;
+        if (l.quantiteComptee != null) {
+          const flux = fluxApres(l);
+          if (flux) l.mouvementsApresComptage = flux;
+          qte = Math.max(0, arrondi(num(l.quantiteComptee) + flux));
+        }
         const r = stock.inventorier({ articleId: Number(l.articleId), quantite: qte, userId: req.user.id, motif });
         const m = r && r.mouvement ? r.mouvement : null;
         if (l.quantiteComptee == null) l.misAZero = true;
@@ -648,6 +915,7 @@ function register(ctx) {
       ctx.audit(req, 'validation', ENTITE, inv.id, `Inventaire ${inv.numero} : validation interrompue après ${mouvementIds.length} mouvement(s) — ${e.message}`);
       throw e;
     }
+    // Résumé validé : écarts réellement appliqués au stock
     const resume = calculerResume(lignes, { nonComptesAZero: zero });
     const maintenant = new Date().toISOString();
     const maj = db.update(ENTITE, inv.id, { statut: 'valide', lignes, resume, dateValidation: maintenant, validePar: req.user.id, mouvementIds, nonComptesAZero: zero });
@@ -662,7 +930,7 @@ function register(ctx) {
   }, { perm: [MODULE, 'valider'] });
 
   router.post('/api/inventaires/:id/annuler', async (req) => {
-    const inv = ctx.getVisible(req, ENTITE, req.params.id);
+    const inv = getInventaire(req, req.params.id);
     exigerEnCours(inv);
     if (!(can(req, 'valider') || (can(req, 'creer') && Number(inv.createdBy) === req.user.id))) {
       throw new HttpError(403, 'Droit insuffisant : seul un valideur d\'inventaire ou le créateur de l\'inventaire peut l\'annuler');
@@ -679,7 +947,7 @@ function register(ctx) {
   }, { perm: [MODULE, 'voir'] });
 
   router.delete('/api/inventaires/:id', async (req) => {
-    const inv = ctx.getVisible(req, ENTITE, req.params.id);
+    const inv = getInventaire(req, req.params.id);
     if (inv.statut === 'valide') throw new HttpError(400, `L'inventaire ${inv.numero} est validé : il justifie des mouvements de stock et ne peut pas être supprimé`);
     db.remove(ENTITE, inv.id);
     ctx.audit(req, 'suppression', ENTITE, inv.id, `Inventaire ${inv.numero} — ${inv.nom} (${libelleStatut(inv.statut)}, ${(inv.lignes || []).length} ligne(s))`);
@@ -687,7 +955,7 @@ function register(ctx) {
   }, { perm: [MODULE, 'supprimer'] });
 
   router.get('/api/inventaires/:id/export', async (req, res) => {
-    const inv = ctx.getVisible(req, ENTITE, req.params.id);
+    const inv = getInventaire(req, req.params.id);
     const d = detail(req, inv);
     const masque = d.masque;
     const valide = inv.statut === 'valide';
@@ -700,7 +968,7 @@ function register(ctx) {
     const lignes = [BOM + entetes.map(csvEscape).join(';')];
     for (const l of d.lignes) {
       lignes.push([l.code, l.designation, l.emplacement, libelleListe('categoriesArticles', l.categorieCode), l.uniteLibelle || l.uniteCode || '']
-        .concat(masque ? [] : [csvNombre(l.quantiteTheorique)])
+        .concat(masque ? [] : [csvNombre(l.quantiteReference != null ? l.quantiteReference : l.quantiteTheorique)])
         .concat([l.compte ? csvNombre(l.quantiteComptee) : (l.misAZero ? '0 (non compté)' : '')])
         .concat(masque ? [] : [l.compte ? csvNombre(l.ecart) : '', csvNombre(l.prixUnitaire), l.compte ? csvNombre(l.valeurEcart) : ''])
         .concat(valide && !masque ? [csvNombre(l.quantiteAvantValidation), csvNombre(l.ecartApplique)] : [])
@@ -842,9 +1110,11 @@ function insererDemo(ctx) {
 
   const articles = db.list('articles', (a) => a.actif !== false);
   if (!articles.some((a) => a.designation === 'Roulement à billes 6205-2RS')) return 'aucun article de démonstration : aucun inventaire créé';
-  const prefixe = (p) => articles.filter((a) => cleEmplacement(a.emplacement).startsWith(cleEmplacement(p)))
-    .sort((a, b) => cleEmplacement(a.emplacement).localeCompare(cleEmplacement(b.emplacement), 'fr', { numeric: true }) || String(a.code).localeCompare(String(b.code), 'fr', { numeric: true }));
   const MAINT = secteur('MAINT') || secteur('SITE');
+  // Articles du secteur des inventaires (et sans magasin) : chaque compteur voit toutes les lignes
+  const duSecteur = MAINT == null ? null : new Set(ctx.perms.secteursDescendants(db, [MAINT]));
+  const prefixe = (p) => articles.filter((a) => cleEmplacement(a.emplacement).startsWith(cleEmplacement(p)) && (!duSecteur || a.secteurId == null || a.secteurId === '' || duSecteur.has(Number(a.secteurId))))
+    .sort((a, b) => cleEmplacement(a.emplacement).localeCompare(cleEmplacement(b.emplacement), 'fr', { numeric: true }) || String(a.code).localeCompare(String(b.code), 'fr', { numeric: true }));
   const resp = userId('mdupont');
   const colMvt = db.data.collections.mouvementsStock || (db.data.collections.mouvementsStock = []);
   const colArt = db.data.collections.articles;
@@ -866,7 +1136,8 @@ function insererDemo(ctx) {
     const motif = `Inventaire ${num1} — ${nomComplet}`;
     const lignes = [];
     const mouvementIds = [];
-    const compteurs = [userId('kleroy'), userId('jbernard')];
+    // Compteurs : utilisateurs qui voient l'inventaire (secteur Maintenance ou portée « tous »)
+    const compteurs = [userId('kleroy'), resp];
     let i = 0;
     for (const a of central) {
       const hist = historique(a.id);
@@ -900,11 +1171,12 @@ function insererDemo(ctx) {
       mouvementIds.push(mvt.id);
       const compteur = compteurs[i % compteurs.length];
       i++;
+      const dateCompte = instant(30, `${String(8 + (i % 6)).padStart(2, '0')}:${String((i * 7) % 60).padStart(2, '0')}`);
       lignes.push({
         articleId: a.id, code: a.code || '', designation: a.designation || '', emplacement: a.emplacement || '', uniteCode: a.uniteCode || null,
         categorieCode: a.categorieCode || null, referenceFournisseur: a.referenceFournisseur || '', codeBarre: a.codeBarre || '',
         prixUnitaire: arrondi(num(a.prixUnitaire), 4), quantiteTheorique: theorique, quantiteComptee: T,
-        comptages: [{ userId: compteur, date: instant(30, `${String(8 + (i % 6)).padStart(2, '0')}:${String((i * 7) % 60).padStart(2, '0')}`), quantite: T, mode: 'remplacer', resultat: T }],
+        comptages: [{ userId: compteur, date: dateCompte, quantite: T, mode: 'remplacer', resultat: T }], dateComptage: dateCompte, stockAuComptage: theorique,
         horsPerimetre: false, mouvementId: mvt.id, quantiteAvantValidation: theorique, ecartApplique: e,
       });
     }
@@ -934,8 +1206,11 @@ function insererDemo(ctx) {
     lignes.forEach((l, idx) => {
       if (idx > 1) return; // les deux premiers emplacements sont comptés, le reste reste à faire
       const q = idx === 1 ? Math.max(0, arrondi(l.quantiteTheorique - 1)) : l.quantiteTheorique;
+      const date = instant(1, idx ? '14:20' : '14:05');
       l.quantiteComptee = q;
-      l.comptages = [{ userId: tech, date: instant(1, idx ? '14:20' : '14:05'), quantite: q, mode: 'remplacer', resultat: q }];
+      l.dateComptage = date;
+      l.stockAuComptage = quantiteA(l.articleId, date);
+      l.comptages = [{ userId: tech, date, quantite: q, mode: 'remplacer', resultat: q }];
     });
     const num2 = numero();
     const inv = db.insert(ENTITE, {

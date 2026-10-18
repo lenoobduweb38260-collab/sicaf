@@ -30,6 +30,10 @@ const MIME = {
   '.txt': 'text/plain; charset=utf-8', '.csv': 'text/csv; charset=utf-8', '.pdf': 'application/pdf',
 };
 const MAX_BODY = 25 * 1024 * 1024; // 25 Mo (logos, pièces jointes en base64)
+/** Quota global des pièces jointes (Mo, base64 compris) : défaut et bornes de config.general.quotaPiecesJointesMo. */
+const QUOTA_PIECES_DEFAUT_MO = 400;
+const QUOTA_PIECES_MIN_MO = 50;
+const QUOTA_PIECES_MAX_MO = 4000;
 const AUDIT_MAX = 5000;
 const NOTIF_MAX = 2000;
 
@@ -107,7 +111,8 @@ function analyserJson(texte) {
  */
 function createApp(options = {}) {
   const dataDir = options.dataDir || process.env.GMAO_DATA_DIR || path.join(__dirname, '..', 'data');
-  const db = new Db(dataDir, { inMemory: !!options.inMemory, saveDelay: options.saveDelay }).load();
+  const log = options.log || ((...a) => console.log(new Date().toISOString(), ...a));
+  const db = new Db(dataDir, { inMemory: !!options.inMemory, saveDelay: options.saveDelay, log }).load();
   seed(db, { adminPassword: options.adminPassword });
   const sec = () => (db.getConfig().securite || {});
   const sessions = new auth.Sessions({
@@ -115,8 +120,27 @@ function createApp(options = {}) {
     dureeMaxMs: () => Math.max(1, Number(sec().dureeSessionHeures) || 12) * 60 * 60 * 1000,
   });
   const router = new Router();
-  const log = options.log || ((...a) => console.log(new Date().toISOString(), ...a));
   const hooks = {}; // événements inter-modules : ctx.on('ot:cree', fn) / ctx.emit('ot:cree', data)
+
+  /**
+   * Entrées les plus anciennes du journal d'activité (au-delà de AUDIT_MAX) : archivées dans
+   * <données>/journal/audit-AAAA-MM.jsonl (une ligne JSON par entrée) au lieu d'être perdues.
+   */
+  function archiverJournal(entrees) {
+    if (db.inMemory || !entrees.length) return;
+    try {
+      const dossier = path.join(dataDir, 'journal');
+      fs.mkdirSync(dossier, { recursive: true });
+      const parMois = new Map();
+      for (const e of entrees) {
+        const mois = String(e.date || '').slice(0, 7);
+        const cle = /^\d{4}-\d{2}$/.test(mois) ? mois : 'divers';
+        if (!parMois.has(cle)) parMois.set(cle, []);
+        parMois.get(cle).push(JSON.stringify(e));
+      }
+      for (const [mois, lignes] of parMois) fs.appendFileSync(path.join(dossier, `audit-${mois}.jsonl`), lignes.join('\n') + '\n', 'utf8');
+    } catch (e) { log('Archivage du journal d\'activité impossible :', e.message); }
+  }
 
   const ctx = {
     db, router, sessions, perms, auth, HttpError, log, dataDir,
@@ -198,12 +222,13 @@ function createApp(options = {}) {
         id: db.nextId('audit'),
         date: new Date().toISOString(),
         userId: req && req.user ? req.user.id : null,
-        userNom: req && req.user ? `${req.user.prenom || ''} ${req.user.nom || ''}`.trim() || req.user.login : 'système',
+        // Requête sans compte (connexion, mot de passe oublié, autre site) : « Non connecté » ; tâche automatique : « Système »
+        userNom: req && req.user ? `${req.user.prenom || ''} ${req.user.nom || ''}`.trim() || req.user.login : (req && req.socket ? 'Non connecté' : 'Système'),
         action, entite, entiteId: entiteId == null ? null : entiteId,
         details: details == null ? '' : (typeof details === 'string' ? details : JSON.stringify(details)),
         ip: req && req.socket ? req.socket.remoteAddress : '',
       });
-      if (col.length > AUDIT_MAX) col.splice(0, col.length - AUDIT_MAX);
+      if (col.length > AUDIT_MAX) archiverJournal(col.splice(0, col.length - AUDIT_MAX));
       db.touch();
       if (options && options.notifier === false) return;
       try { notifierJournal(req, action, entite, entiteId, details); } catch (e) { log('Notification du journal impossible', e.message); }
@@ -216,7 +241,13 @@ function createApp(options = {}) {
       for (const uid of ids) {
         col.push({ id: db.nextId('notifications'), userId: uid, titre: titre || '', message: message || '', lien: lien || '', type: type || 'info', lu: false, date: new Date().toISOString() });
       }
-      if (col.length > NOTIF_MAX) col.splice(0, col.length - NOTIF_MAX);
+      if (col.length > NOTIF_MAX) {
+        // Les notifications déjà lues partent les premières : une rafale d'alertes n'efface pas celles des autres
+        let enTrop = col.length - NOTIF_MAX;
+        const garder = col.filter((n) => { if (enTrop > 0 && n.lu) { enTrop -= 1; return false; } return true; });
+        if (enTrop > 0) garder.splice(0, enTrop);
+        col.splice(0, col.length, ...garder);
+      }
       if (ids.length) db.touch();
     },
 
@@ -273,18 +304,35 @@ function createApp(options = {}) {
    * Journal d'activité → notification des rôles responsables (config.journal) : les événements
    * semblables (même action, même entité) sont regroupés dans une notification non lue de moins de 15 min.
    */
-  const LIBELLES_ACTION = { creation: 'Création', suppression: 'Suppression', modification: 'Modification', desactivation: 'Désactivation', restauration: 'Restauration', import: 'Import de données', reinitialisation_mdp: 'Réinitialisation de mot de passe', validation: 'Validation', cloture: 'Clôture',
-    connexion: 'Connexion', echec_connexion: 'Échec de connexion', blocage: 'Blocage temporaire', changement_mdp: 'Changement de mot de passe',
+  const LIBELLES_ACTION = {
+    creation: 'Création', modification: 'Modification', suppression: 'Suppression', desactivation: 'Désactivation', duplication: 'Duplication',
+    validation: 'Validation', validee: 'Validation', refus: 'Refus', cloture: 'Clôture', reouverture: 'Réouverture', affectation: 'Affectation',
+    statut: 'Changement de statut', etat: 'Changement d\'état', conversion: 'Conversion en OT', convertir: 'Conversion en OT', generation: 'Génération',
+    mouvement: 'Mouvement de stock', compteur: 'Relevé de compteur', document: 'Document', commentaire: 'Commentaire', temps: 'Temps passé', pieces: 'Pièces',
+    export: 'Export', import: 'Import de données', sauvegarde: 'Sauvegarde', restauration: 'Restauration', reception: 'Réception d\'une sauvegarde',
+    purge: 'Purge', renouvellement: 'Renouvellement', retablissement: 'Rétablissement des valeurs par défaut', demo: 'Données de démonstration',
+    connexion: 'Connexion', deconnexion: 'Déconnexion forcée', echec_connexion: 'Échec de connexion', blocage: 'Blocage temporaire',
+    changement_mdp: 'Changement de mot de passe', reinitialisation_mdp: 'Réinitialisation de mot de passe', echec_confirmation: 'Confirmation incorrecte',
     activation_double_auth: 'Activation de la double authentification', desactivation_double_auth: 'Désactivation de la double authentification',
     reinitialisation_double_auth: 'Réinitialisation de la double authentification', codes_secours: 'Nouveaux codes de secours', echec_double_auth: 'Code de vérification incorrect',
     demande_reinitialisation_mdp: 'Demande de réinitialisation de mot de passe', rejet_demande_reinitialisation_mdp: 'Demande de réinitialisation refusée',
     code_reinitialisation_mdp: 'Code de réinitialisation de mot de passe', annulation_code_reinitialisation: 'Annulation d\'un code de réinitialisation',
     echec_reinitialisation_mdp: 'Code de réinitialisation incorrect', reinitialisation_mdp_code: 'Mot de passe réinitialisé avec un code',
     reinitialisation_mdp_autonome: 'Mot de passe réinitialisé avec l\'application d\'authentification', recuperation_urgence: 'Récupération d\'urgence d\'un compte',
-    expiration_mdp: 'Mot de passe expiré' };
+    expiration_mdp: 'Mot de passe expiré',
+  };
   /** Libellés des actions du journal (repris par la vue Journal d'activité via GET /api/audit). */
   ctx.libellesActions = LIBELLES_ACTION;
-  const LIBELLES_ENTITE = { users: 'Utilisateurs', profils: 'Profils', secteurs: 'Secteurs', configuration: 'Configuration', equipements: 'Équipements', demandes: 'Demandes', ot: 'Ordres de travail', plansPreventifs: 'Préventif', articles: 'Stock', fournisseurs: 'Fournisseurs', plans: 'Plans 3D', inventaires: 'Inventaires', commandes: 'Commandes', factures: 'Factures', personnel: 'Personnel', visites: 'Audits & visites' };
+  const LIBELLES_ENTITE = {
+    users: 'Utilisateurs', profils: 'Profils', secteurs: 'Secteurs & sites', configuration: 'Configuration', systeme: 'Système', equipements: 'Équipements',
+    demandes: 'Demandes', ot: 'Ordres de travail', plansPreventifs: 'Préventif', preventif: 'Préventif', planning: 'Planning', articles: 'Stock', stock: 'Stock',
+    mouvementsStock: 'Mouvements de stock', fournisseurs: 'Fournisseurs', plans: 'Plans 3D', inventaires: 'Inventaires', inventaire: 'Étiquettes & inventaire',
+    achats: 'Achats & factures', commandes: 'Commandes fournisseurs', factures: 'Factures fournisseurs', rh: 'Ressources humaines', personnel: 'Personnel',
+    habilitations: 'Habilitations', formations: 'Formations', visitesMedicales: 'Visites médicales', absences: 'Absences', visites: 'Audits & visites',
+    sauvegardes: 'Sauvegardes', sauvegardesHistorique: 'Sauvegardes', rapports: 'Rapports', dashboard: 'Tableau de bord', audit: 'Journal d\'activité',
+  };
+  /** Libellés des éléments du journal (repris par la vue Journal d'activité via GET /api/audit). */
+  ctx.libellesEntites = LIBELLES_ENTITE;
   function notifierJournal(req, action, entite, entiteId, details) {
     const j = db.getConfig().journal || {};
     if (!j.notifications || !Array.isArray(j.actions) || !j.actions.includes(action)) return;
@@ -292,8 +340,15 @@ function createApp(options = {}) {
     const profils = new Set((j.profilsNotifies || []).map(Number));
     if (!profils.size) return;
     const auteurId = req && req.user ? req.user.id : null;
-    const auteur = req && req.user ? (`${req.user.prenom || ''} ${req.user.nom || ''}`.trim() || req.user.login) : 'système';
-    const dest = db.list('users', (u) => u.actif !== false && profils.has(Number(u.profilId)) && u.id !== auteurId);
+    const auteur = req && req.user ? (`${req.user.prenom || ''} ${req.user.nom || ''}`.trim() || req.user.login) : (req && req.socket ? 'Non connecté' : 'Système');
+    // Destinataires : profils choisis, mais seulement les comptes qui ont accès au Journal d'activité (le texte en
+    // reprend les détails) et qui peuvent voir l'élément concerné (portée, sites)
+    const config = db.getConfig();
+    const element = entiteId != null && Array.isArray(db.data.collections[entite]) ? db.get(entite, entiteId) : null;
+    const dest = db.list('users', (u) => u.actif !== false && profils.has(Number(u.profilId)) && u.id !== auteurId).filter((u) => {
+      const p = perms.effectivePermissions(db, u, null, config);
+      return perms.can(p, 'audit', 'voir') && (!element || perms.canSeeRecord(p, u, element));
+    });
     if (!dest.length) return;
     const titre = `${LIBELLES_ACTION[action] || action} — ${LIBELLES_ENTITE[entite] || entite}`;
     const texte = `${auteur} : ${String(details || (entiteId != null ? '#' + entiteId : '')).slice(0, 160)}`;
@@ -321,11 +376,36 @@ function createApp(options = {}) {
   registerCoreRoutes(ctx);
   loadModules(ctx);
 
+  // Écriture de la base impossible (disque plein, droits…) : le serveur continue avec les données en mémoire,
+  // retente l'écriture et prévient le pôle informatique (au plus une fois par heure).
+  let derniereAlerteEcriture = 0;
+  db.onErreurEcriture = (e) => {
+    if (Date.now() - derniereAlerteEcriture < 60 * 60 * 1000) return;
+    derniereAlerteEcriture = Date.now();
+    const ids = ctx.usersAvecDroit('systeme', 'modifier').map((u) => u.id);
+    ctx.notify(ids, { titre: 'Enregistrement des données impossible', message: `Les dernières modifications n'ont pas pu être écrites sur le disque du serveur (${String((e && e.code) || (e && e.message) || 'erreur').slice(0, 80)}). Elles sont conservées en mémoire et l'écriture est retentée automatiquement : vérifiez l'espace disque et les droits du dossier des données, et ne fermez pas le serveur avant le retour à la normale.`, lien: '#/systeme', type: 'alerte' });
+  };
+
   // Nettoyage périodique des sessions, des connexions en deux étapes inachevées, des codes de réinitialisation
   // expirés et des anciennes demandes de réinitialisation
   ctx.motsDePasse.purger();
   const sweeper = setInterval(() => { sessions.sweep(); ctx.deuxFacteurs.purger(); ctx.motsDePasse.purger(); }, 10 * 60 * 1000);
   if (sweeper.unref) sweeper.unref();
+
+  /**
+   * Quota global des pièces jointes (config.general.quotaPiecesJointesMo) : les photos et documents sont gardés en
+   * mémoire par le serveur et repris dans chaque sauvegarde ; au-delà du quota, les nouvelles pièces sont refusées.
+   */
+  function verifierQuotaPieces(corpsRequete) {
+    if (!corpsRequete || typeof corpsRequete !== 'object' || Buffer.isBuffer(corpsRequete)) return;
+    const ajout = db.taillePiecesNouvelles(corpsRequete);
+    if (!ajout) return;
+    const mo = Math.min(QUOTA_PIECES_MAX_MO, Math.max(QUOTA_PIECES_MIN_MO, Number(((db.data.config || {}).general || {}).quotaPiecesJointesMo) || QUOTA_PIECES_DEFAUT_MO));
+    const actuel = db.taillePieces();
+    if (actuel + ajout <= mo * 1024 * 1024) return;
+    const enMo = (n) => Math.round(n / (1024 * 1024));
+    throw new HttpError(413, `Espace réservé aux pièces jointes plein (${enMo(actuel)} Mo utilisés sur ${mo} Mo) : supprimez des pièces jointes devenues inutiles ou demandez au pôle informatique d'augmenter la limite (Configuration › Général).`);
+  }
 
   async function handleApi(req, res, url) {
     const match = router.match(req.method, url.pathname);
@@ -386,6 +466,7 @@ function createApp(options = {}) {
       throw new HttpError(403, 'La double authentification est obligatoire pour votre compte : activez-la pour continuer.', { deuxFacteursRequis: true });
     }
     if (route.opts.perm) ctx.requirePerm(req, route.opts.perm[0], route.opts.perm[1]);
+    if (req.ecriture && !route.opts.brut && !route.opts.sansQuotaPieces) verifierQuotaPieces(req.body);
 
     const result = await route.handler(req, res, ctx);
     if (res.writableEnded) return;
@@ -648,8 +729,13 @@ const ESSAIS_CODE_REINIT = 5;                     // codes incorrects tolérés 
 const DEMANDES_OUBLI_PAR_POSTE = 5;               // demandes « mot de passe oublié » par poste…
 const FENETRE_DEMANDES_OUBLI_MS = 15 * MINUTE_MS; // …sur 15 minutes
 const RELANCE_DEMANDE_MS = 30 * MINUTE_MS;        // notifications d'une même demande au plus toutes les 30 minutes
+const MAX_PROVENANCES = 10;                       // demandes suivantes d'une même demande en attente conservées
 const CONSERVATION_DEMANDES_MS = 90 * JOUR_MS;    // demandes traitées ou rejetées conservées 90 jours
 const MAX_HISTORIQUE_MDP = 24;
+const ECHECS_PAR_POSTE = 20;                      // échecs d'authentification tolérés par poste (tous identifiants)…
+const FENETRE_ECHECS_POSTE_MS = 15 * MINUTE_MS;   // …sur 15 minutes
+/** Adresses du poste serveur lui-même (application locale, sessions Windows du serveur) : pas de blocage par poste. */
+const ADRESSES_LOCALES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 /** Raisons d'un changement de mot de passe toujours imposé (le mot de passe initial dépend de la configuration). */
 const RAISONS_IMPOSEES = ['reinitialise', 'expire', 'administrateur'];
 const RAISONS_MDP = ['initial'].concat(RAISONS_IMPOSEES);
@@ -661,9 +747,20 @@ function dateHeureFr(d) {
   return `${x.toLocaleDateString('fr-FR')} à ${x.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`;
 }
 
-/** Texte brut sur une ligne ou quelques lignes : caractères de contrôle retirés, longueur limitée. */
+/**
+ * Texte brut sur une ligne ou quelques lignes : caractères de contrôle (C0, C1), de mise en forme (direction
+ * d'écriture, largeur nulle…) et séparateurs de ligne ou de paragraphe Unicode remplacés par une espace (les
+ * retours à la ligne ordinaires sont conservés), longueur limitée.
+ */
 function texteBrut(v, max) {
-  return String(v == null ? '' : v).replace(/[\u0000-\u0009\u000B-\u001F\u007F‪-‮⁦-⁩]/g, ' ').trim().slice(0, max);
+  return String(v == null ? '' : v).replace(/[^\P{Cc}\n]|\p{Cf}|[\u2028\u2029]/gu, ' ').trim().slice(0, max);
+}
+
+/** Identifiant de compte possible (même format que les comptes : lettres, chiffres, . _ @ -). */
+const RE_IDENTIFIANT = /^[\w.@-]{1,100}$/;
+/** Identifiant cité dans le journal et les alertes : caractères hors format remplacés par « ? », 60 caractères au plus. */
+function identifiantAffiche(login) {
+  return String(login == null ? '' : login).slice(0, 60).replace(/[^\w.@-]/g, '?');
 }
 
 /**
@@ -725,8 +822,16 @@ function installerMotsDePasse(ctx) {
       ctx.audit(Object.assign({ socket: req && req.socket }, { user: u }), 'expiration_mdp', 'users', u.id, `Mot de passe de « ${u.login} » expiré (plus de ${jours} jours) : changement imposé`);
       return u;
     },
+    /**
+     * Le mot de passe actuel est-il exigé pour changer de mot de passe dans cette session ? Il ne l'est pas seulement
+     * quand le changement est imposé et l'était déjà à l'ouverture de la session (mot de passe actuel saisi à la
+     * connexion) ; un poste resté ouvert ne permet donc jamais de changer le mot de passe sans le connaître.
+     */
+    ancienRequis(user, session) {
+      return !(mdp.changementImpose(user) && session && session.info && session.info.changementImposeALOuverture === true);
+    },
     /** Informations transmises au poste (amorçage, réponse de connexion) : aucune empreinte. */
-    infos(user) {
+    infos(user, session) {
       if (!user) return null;
       const fin = mdp.echeance(user);
       const doitChanger = mdp.changementImpose(user);
@@ -739,6 +844,7 @@ function installerMotsDePasse(ctx) {
         expireLe: fin === null ? null : new Date(fin).toISOString(),
         joursRestants,
         rappel: !doitChanger && joursRestants !== null && joursRestants <= seuilRappel,
+        ancienRequis: mdp.ancienRequis(user, session),
       };
     },
 
@@ -843,7 +949,8 @@ function installerMotsDePasse(ctx) {
     /** Gestionnaires d'un compte : droit utilisateurs › modifier, niveau hiérarchique supérieur, compte visible (sites compris). */
     gestionnaires(cible) {
       const profil = db.get('profils', cible.profilId);
-      return ctx.usersAvecDroit('utilisateurs', 'modifier', (u, p) => u.id !== cible.id && droits.canManageUser(p, profil) && ctx.utilisateurVisible(u, p, cible, true));
+      return ctx.usersAvecDroit('utilisateurs', 'modifier', (u, p) => u.id !== cible.id && droits.canManageUser(p, profil) && ctx.utilisateurVisible(u, p, cible, true)
+        && !droits.depassementsGestion(db, p, cible).length);
     },
     /** Demandes en attente d'un compte passées « traitées » (mode : code, temporaire ou utilisateur). */
     traiterDemandes(userId, { mode, par = null } = {}) {
@@ -868,29 +975,43 @@ function installerMotsDePasse(ctx) {
      * ou compte désactivé → journal uniquement.
      */
     enregistrerDemande({ login, message, ip, poste }) {
+      // Demande anonyme : journalisée sans auteur (le compte concerné est l'élément du journal)
       const socket = { remoteAddress: ip };
-      const user = db.findOne('users', (u) => String(u.login).toLowerCase() === login.toLowerCase());
+      const user = RE_IDENTIFIANT.test(login) ? db.findOne('users', (u) => String(u.login).toLowerCase() === login.toLowerCase()) : null;
       if (!user || user.actif === false) {
-        ctx.audit({ socket }, 'demande_reinitialisation_mdp', 'users', user ? user.id : null, `Demande de réinitialisation pour l'identifiant « ${login.slice(0, 60)} » (${user ? 'compte désactivé' : 'identifiant inconnu'}) : ignorée`, { notifier: false });
+        ctx.audit({ socket }, 'demande_reinitialisation_mdp', 'users', user ? user.id : null, `Demande de réinitialisation pour l'identifiant « ${identifiantAffiche(login)} » (${user ? 'compte désactivé' : 'identifiant inconnu'}) : ignorée`, { notifier: false });
         return null;
       }
       const t = mdp.maintenant();
       const maintenant = new Date(t).toISOString();
       const existante = db.findOne('demandesMdp', (d) => d.userId === user.id && d.statut === 'en_attente');
       let demande;
+      let autrePoste = false;
       if (existante) {
-        demande = db.update('demandesMdp', existante.id, { repetitions: (Number(existante.repetitions) || 1) + 1, derniereDemande: maintenant, ip, poste, message: message || existante.message || '' });
+        // La provenance d'origine (adresse, poste, message) est conservée ; les demandes suivantes sont ajoutées
+        // à une liste bornée, et une demande venue d'un autre poste est signalée sans attendre
+        const provenances = (Array.isArray(existante.provenances) ? existante.provenances : []).slice(-(MAX_PROVENANCES - 1));
+        const connues = new Set([existante.ip].concat(provenances.map((p) => p.ip)));
+        autrePoste = !connues.has(ip);
+        provenances.push({ ip, poste, message, date: maintenant });
+        demande = db.update('demandesMdp', existante.id, {
+          repetitions: (Number(existante.repetitions) || 1) + 1, derniereDemande: maintenant, provenances,
+          nbPostes: new Set([existante.ip].concat(provenances.map((p) => p.ip))).size,
+        });
       } else {
-        demande = db.insert('demandesMdp', { userId: user.id, login: user.login, message: message || '', ip, poste, statut: 'en_attente', repetitions: 1, derniereDemande: maintenant, traiteePar: null, traiteeLe: null, mode: null, motifRejet: null, derniereNotification: null });
+        demande = db.insert('demandesMdp', { userId: user.id, login: user.login, message: message || '', ip, poste, statut: 'en_attente', repetitions: 1, derniereDemande: maintenant, provenances: [], nbPostes: 1, traiteePar: null, traiteeLe: null, mode: null, motifRejet: null, derniereNotification: null });
       }
-      ctx.audit({ socket, user }, 'demande_reinitialisation_mdp', 'users', user.id, `Demande de réinitialisation du mot de passe de « ${user.login} » depuis ${ip || 'un poste inconnu'}${demande.repetitions > 1 ? ` (${demande.repetitions}e demande)` : ''}`);
+      ctx.audit({ socket }, 'demande_reinitialisation_mdp', 'users', user.id, `Demande de réinitialisation du mot de passe de « ${user.login} » depuis ${ip || 'un poste inconnu'}${demande.repetitions > 1 ? ` (${demande.repetitions}e demande${demande.nbPostes > 1 ? `, ${demande.nbPostes} postes différents` : ''})` : ''}`);
       const derniere = Date.parse(existante && existante.derniereNotification || '');
-      if (Number.isFinite(derniere) && t - derniere < RELANCE_DEMANDE_MS) return demande;
+      if (!autrePoste && Number.isFinite(derniere) && t - derniere < RELANCE_DEMANDE_MS) return demande;
       db.update('demandesMdp', demande.id, { derniereNotification: maintenant });
       const nom = ctx.nomUser(user.id);
+      const plusieursPostes = demande.nbPostes > 1
+        ? ` Attention : demandes reçues depuis ${demande.nbPostes} postes différents (première : ${demande.ip || 'poste inconnu'}, dernière : ${ip || 'poste inconnu'}) ; vérifiez l'identité du demandeur avant de lui remettre un code.`
+        : '';
       ctx.notify(mdp.gestionnaires(user).map((u) => u.id), {
-        titre: 'Demande de réinitialisation de mot de passe',
-        message: `${nom} (${user.login}) demande la réinitialisation de son mot de passe depuis l'écran de connexion (poste ${ip || 'inconnu'}${demande.repetitions > 1 ? `, ${demande.repetitions} demandes` : ''})${demande.message ? ` : « ${demande.message.slice(0, 160)} »` : '.'}`,
+        titre: demande.nbPostes > 1 ? 'Demande de réinitialisation depuis plusieurs postes' : 'Demande de réinitialisation de mot de passe',
+        message: `${nom} (${user.login}) demande la réinitialisation de son mot de passe depuis l'écran de connexion (poste ${demande.ip || 'inconnu'}${demande.repetitions > 1 ? `, ${demande.repetitions} demandes` : ''})${demande.message ? ` : « ${demande.message.slice(0, 160)} »` : '.'}${plusieursPostes}`,
         lien: '#/utilisateurs?demandesMdp=1', type: 'alerte',
       });
       ctx.notify(user.id, {
@@ -934,14 +1055,15 @@ function registerCoreRoutes(ctx) {
     const modules = perms.modulesConfigures(config);
     const secteurs = db.list('secteurs').sort((a, b) => (a.ordre || 0) - (b.ordre || 0) || a.nom.localeCompare(b.nom))
       .map((s) => Object.assign({}, s, { siteId: perms.siteDuSecteur(db, s.id) }));
-    const profils = db.list('profils').map((p) => ({ id: p.id, nom: p.nom, niveau: p.niveau, couleur: p.couleur, secteurId: p.secteurId, estAdmin: !!p.estAdmin, portee: p.portee, actif: p.actif !== false }));
+    const profils = db.list('profils').map((p) => ({ id: p.id, nom: p.nom, niveau: p.niveau, couleur: p.couleur, secteurId: p.secteurId, estAdmin: !!p.estAdmin, portee: p.portee, actif: p.actif !== false,
+      accesJournal: !!(p.estAdmin || (p.permissions && p.permissions.audit && p.permissions.audit.voir)) }));
     const users = db.list('users').map((u) => ({ id: u.id, login: u.login, nom: u.nom, prenom: u.prenom, profilId: u.profilId, secteurIds: u.secteurIds || [], siteAcces: u.siteAcces || [], managerId: u.managerId, actif: u.actif !== false, fonction: u.fonction || '' }));
     return {
       user: auth.cleanUser(req.user),
       permissions: req.perms,
       deuxFacteurs: deuxFacteurs.etat(req.user, req.perms),
-      // État du mot de passe : { doitChanger (changement imposé), raison, dateMdp, expireLe, joursRestants, rappel }
-      motDePasse: motsDePasse.infos(req.user),
+      // État du mot de passe : { doitChanger (changement imposé), raison, dateMdp, expireLe, joursRestants, rappel, ancienRequis }
+      motDePasse: motsDePasse.infos(req.user, req.session),
       config,
       modules,
       catalogue: { modules: perms.MODULES, actions: perms.ACTIONS, portees: perms.PORTEES, modesSite: perms.MODES_SITE },
@@ -956,7 +1078,48 @@ function registerCoreRoutes(ctx) {
     if ((db.getConfig().securite || {}).notifierBlocages === false) return;
     const ids = ctx.usersAvecDroit('systeme', 'modifier').map((u) => u.id);
     const motif = options.motif || 'Trop de mots de passe incorrects';
-    ctx.notify(ids, { titre: 'Compte temporairement bloqué', message: `${motif} pour l'identifiant « ${String(login).slice(0, 60)} » depuis ${ip || 'un poste inconnu'}. Accès bloqué 10 minutes.`, lien: '#/audit?action=' + (options.action || 'echec_connexion'), type: 'alerte' });
+    const titre = options.titre || 'Compte temporairement bloqué';
+    const message = options.message || `${motif} pour l'identifiant « ${identifiantAffiche(login)} » depuis ${ip || 'un poste inconnu'}. Accès bloqué 10 minutes.`;
+    // Blocages d'un même poste regroupés dans une notification non lue de moins de 30 minutes (pas d'inondation)
+    const cle = 'blocage:' + (ip || 'inconnu');
+    const limite = new Date(Date.now() - 30 * MINUTE_MS).toISOString();
+    const col = db.data.collections.notifications;
+    const nouveaux = [];
+    for (const id of ids) {
+      const existante = col.find((n) => n.userId === id && n.cle === cle && !n.lu && n.date >= limite);
+      if (!existante) { nouveaux.push(id); continue; }
+      existante.nombre = (existante.nombre || 1) + 1;
+      existante.message = `${message} (${existante.nombre} blocages depuis ce poste en moins de 30 minutes)`;
+      existante.date = new Date().toISOString();
+      db.touch();
+    }
+    if (!nouveaux.length) return;
+    ctx.notify(nouveaux, { titre, message, lien: '#/audit?action=' + (options.action || 'echec_connexion'), type: 'alerte' });
+    for (const n of col.slice(-nouveaux.length)) { n.cle = cle; n.nombre = 1; }
+  }
+
+  /**
+   * Échecs d'authentification par poste, tous identifiants confondus (connexion, codes de vérification, codes de
+   * réinitialisation) : au-delà de ECHECS_PAR_POSTE en 15 minutes, le poste est refusé (429) avant tout calcul
+   * d'empreinte, ce qui borne le volume du journal et des alertes qu'un poste peut produire.
+   */
+  const clePosteEchecs = (req) => {
+    const ip = String((req.socket && req.socket.remoteAddress) || '');
+    return ADRESSES_LOCALES.has(ip) ? null : 'auth-poste|' + ip;
+  };
+  function verifierPoste(req) {
+    const cle = clePosteEchecs(req);
+    const bloc = cle ? sessions.quotaAtteint(cle, ECHECS_PAR_POSTE, FENETRE_ECHECS_POSTE_MS) : 0;
+    if (bloc > 0) throw new HttpError(429, `Trop de tentatives depuis ce poste. Réessayez dans ${minutes(bloc)} min`);
+  }
+  function echecPoste(req) {
+    const cle = clePosteEchecs(req);
+    if (!cle) return;
+    sessions.quota(cle, ECHECS_PAR_POSTE, FENETRE_ECHECS_POSTE_MS);
+    if (!sessions.quotaAtteint(cle, ECHECS_PAR_POSTE, FENETRE_ECHECS_POSTE_MS)) return;
+    const ip = String(req.socket.remoteAddress || '');
+    ctx.audit({ socket: req.socket }, 'blocage', 'users', null, `Poste ${ip || 'inconnu'} bloqué 15 minutes : ${ECHECS_PAR_POSTE} échecs d'authentification (tous identifiants confondus)`);
+    notifierBlocage('', ip, { titre: 'Poste temporairement bloqué', message: `${ECHECS_PAR_POSTE} échecs d'authentification en moins de 15 minutes depuis le poste ${ip || 'inconnu'}, sur un ou plusieurs identifiants : ce poste ne peut plus se connecter ni réinitialiser de mot de passe pendant 15 minutes.` });
   }
 
   /** Poste à l'origine de la requête : une connexion en attente du code reste liée à ce poste. */
@@ -967,7 +1130,11 @@ function registerCoreRoutes(ctx) {
   /** Ouvre la session (cookie), journalise la connexion et renvoie l'amorçage. */
   function ouvrirSession(req, res, user, details = {}) {
     const poste = posteDe(req);
-    const token = sessions.create(user.id, { ua: poste.ua, ip: poste.ip, deuxFacteurs: !!details.deuxFacteurs });
+    // Expiration évaluée avant l'ouverture : une session ouverte alors que le changement est déjà imposé (le mot de
+    // passe actuel vient d'être saisi) peut le faire sans le ressaisir ; sinon le mot de passe actuel est exigé.
+    user = motsDePasse.evaluerExpiration(user, req);
+    const token = sessions.create(user.id, { ua: poste.ua, ip: poste.ip, deuxFacteurs: !!details.deuxFacteurs, changementImposeALOuverture: motsDePasse.changementImpose(user) });
+    req.session = sessions.get(token);
     db.update('users', user.id, { derniereConnexion: new Date().toISOString() });
     const securise = req.socket.encrypted ? '; Secure' : '';
     res.setHeader('Set-Cookie', `gmao_session=${token}; Path=/; HttpOnly; SameSite=Strict${securise}; Max-Age=${Math.floor(sessions.dureeMaxMs() / 1000)}`);
@@ -988,22 +1155,25 @@ function registerCoreRoutes(ctx) {
     const login = typeof b.login === 'string' ? b.login.trim().slice(0, 100) : '';
     const password = typeof b.password === 'string' ? b.password.slice(0, 500) : '';
     const ip = String(req.socket.remoteAddress || '');
+    verifierPoste(req);
     // Deux compteurs : par poste + identifiant, et par identifiant seul (attaque depuis plusieurs postes)
     const clePoste = ip + '|' + login.toLowerCase();
     const cleCompte = 'compte|' + login.toLowerCase();
     const bloc = Math.max(sessions.blocage(clePoste), sessions.blocage(cleCompte));
     if (bloc > 0) throw new HttpError(429, `Trop de tentatives. Réessayez dans ${minutes(bloc)} min`);
-    const user = login ? db.findOne('users', (u) => String(u.login).toLowerCase() === login.toLowerCase()) : null;
+    // Un identifiant hors du format des comptes est traité comme inconnu (même réponse)
+    const user = RE_IDENTIFIANT.test(login) ? db.findOne('users', (u) => String(u.login).toLowerCase() === login.toLowerCase()) : null;
     // Vérification exécutée même si le compte n'existe pas (temps de réponse identique)
     const ok = auth.verifyPassword(password, user ? user.passwordHash : 'scrypt$00$00') && !!user;
     if (!ok) {
       const bloquePoste = sessions.echec(clePoste);
       const bloqueCompte = sessions.echec(cleCompte);
-      ctx.audit({ socket: req.socket }, 'echec_connexion', 'users', user ? user.id : null, `Identifiant « ${login.slice(0, 60)} »${user ? '' : ' (inconnu)'}`);
+      ctx.audit({ socket: req.socket }, 'echec_connexion', 'users', user ? user.id : null, `Identifiant « ${identifiantAffiche(login)} »${user ? '' : ' (inconnu)'}`);
       if (bloquePoste || bloqueCompte) {
-        ctx.audit({ socket: req.socket }, 'blocage', 'users', user ? user.id : null, `Blocage après échecs répétés : « ${login.slice(0, 60)} »`);
+        ctx.audit({ socket: req.socket }, 'blocage', 'users', user ? user.id : null, `Blocage après échecs répétés : « ${identifiantAffiche(login)} »`);
         notifierBlocage(login, ip);
       }
+      echecPoste(req);
       throw new HttpError(401, 'Identifiant ou mot de passe incorrect');
     }
     if (user.actif === false) throw new HttpError(403, 'Ce compte est désactivé');
@@ -1024,6 +1194,7 @@ function registerCoreRoutes(ctx) {
     const b = req.body && typeof req.body === 'object' ? req.body : {};
     const poste = posteDe(req);
     const recommencer = (message, status = 401) => new HttpError(status, message || 'Délai dépassé ou demande invalide : saisissez de nouveau votre identifiant et votre mot de passe', { recommencer: true });
+    verifierPoste(req);
     const lu = deuxFacteurs.lireJeton(b.jeton, poste);
     if (!lu) throw recommencer();
     const { attente, user } = lu;
@@ -1036,6 +1207,7 @@ function registerCoreRoutes(ctx) {
     if (!resultat) {
       const bloque = sessions.echec(cle);
       ctx.audit({ socket: req.socket }, 'echec_double_auth', 'users', user.id, `Code de vérification incorrect pour « ${user.login} »`);
+      echecPoste(req);
       if (bloque) {
         deuxFacteurs.annulerAttentes(user.id);
         ctx.audit({ socket: req.socket }, 'blocage', 'users', user.id, `Blocage après des codes de vérification incorrects : « ${user.login} »`);
@@ -1091,7 +1263,8 @@ function registerCoreRoutes(ctx) {
   const corps = (req) => (req.body && typeof req.body === 'object' && !Array.isArray(req.body) && !Buffer.isBuffer(req.body) ? req.body : {});
   const lireLogin = (b) => (typeof b.login === 'string' ? b.login.trim().slice(0, 100) : '');
   const lireNouveau = (b) => (typeof b.nouveau === 'string' ? b.nouveau.slice(0, 500) : '');
-  const trouverCompte = (login) => (login ? db.findOne('users', (u) => String(u.login).toLowerCase() === login.toLowerCase()) : null);
+  /** Compte de cet identifiant ; un identifiant hors du format des comptes est traité comme inconnu. */
+  const trouverCompte = (login) => (login && RE_IDENTIFIANT.test(login) ? db.findOne('users', (u) => String(u.login).toLowerCase() === login.toLowerCase()) : null);
   /** Compteurs d'échecs : par poste + identifiant, et par identifiant seul (comme la connexion). */
   const clesReinit = (ip, login) => ['reinit|' + ip + '|' + login.toLowerCase(), 'reinit-compte|' + login.toLowerCase()];
   const verifierBlocages = (cles) => {
@@ -1103,9 +1276,10 @@ function registerCoreRoutes(ctx) {
   function echecReinitialisation(req, login, user, cles, details, options = {}) {
     const ip = String(req.socket.remoteAddress || '');
     const bloque = cles.map((c) => sessions.echec(c)).some(Boolean);
-    ctx.audit({ socket: req.socket }, 'echec_reinitialisation_mdp', 'users', user ? user.id : null, `${details} : identifiant « ${login.slice(0, 60)} »${user ? '' : ' (inconnu)'}`);
+    ctx.audit({ socket: req.socket }, 'echec_reinitialisation_mdp', 'users', user ? user.id : null, `${details} : identifiant « ${identifiantAffiche(login)} »${user ? '' : ' (inconnu)'}`);
+    echecPoste(req);
     if (!bloque) return;
-    ctx.audit({ socket: req.socket }, 'blocage', 'users', user ? user.id : null, `Blocage après des essais de réinitialisation incorrects : « ${login.slice(0, 60)} »`);
+    ctx.audit({ socket: req.socket }, 'blocage', 'users', user ? user.id : null, `Blocage après des essais de réinitialisation incorrects : « ${identifiantAffiche(login)} »`);
     notifierBlocage(login, ip, { motif: options.motif || 'Trop de codes de réinitialisation incorrects', action: 'echec_reinitialisation_mdp' });
     if (options.autonome && user) {
       deuxFacteurs.annulerAttentes(user.id);
@@ -1150,6 +1324,7 @@ function registerCoreRoutes(ctx) {
     const b = corps(req);
     const login = lireLogin(b);
     const nouveau = lireNouveau(b);
+    verifierPoste(req);
     const cles = clesReinit(String(req.socket.remoteAddress || ''), login);
     verifierBlocages(cles);
     const user = trouverCompte(login);
@@ -1178,6 +1353,7 @@ function registerCoreRoutes(ctx) {
     const b = corps(req);
     const login = lireLogin(b);
     const nouveau = lireNouveau(b);
+    verifierPoste(req);
     const user = trouverCompte(login);
     // Même blocage que les codes de vérification du compte, en plus des compteurs de réinitialisation
     const cles = clesReinit(String(req.socket.remoteAddress || ''), login).concat(user ? [cleCode(user.id)] : []);
@@ -1244,7 +1420,10 @@ function registerCoreRoutes(ctx) {
     const b = req.body && typeof req.body === 'object' ? req.body : {};
     const { ancien } = b;
     const nouveau = typeof b.nouveau === 'string' ? b.nouveau.slice(0, 500) : b.nouveau;
-    if (!req.user.doitChangerMdp) confirmerMotDePasse(req, ancien, 'Ancien mot de passe incorrect');
+    if (motsDePasse.ancienRequis(req.user, req.session)) {
+      if (typeof ancien !== 'string' || !ancien) throw new HttpError(400, 'Saisissez votre mot de passe actuel');
+      confirmerMotDePasse(req, ancien, 'Ancien mot de passe incorrect');
+    }
     const refus = typeof nouveau === 'string' ? await motsDePasse.refus(req.user, nouveau) : auth.validerMotDePasse(nouveau, db.getConfig(), { login: req.user.login });
     if (refus) throw new HttpError(400, refus);
     const actuel = db.get('users', req.user.id);

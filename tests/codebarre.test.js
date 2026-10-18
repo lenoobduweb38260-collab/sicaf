@@ -274,6 +274,56 @@ describe('Douchette (émulation clavier)', () => {
     } finally { global.performance.now = origNow; }
   });
 
+  test('option actif : aucune touche interceptée quand l\'écoute est inactive (module désactivé)', () => {
+    const sim = simulation();
+    const origNow = global.performance.now;
+    global.performance.now = () => sim.now();
+    try {
+      const lus = [];
+      let actif = false;
+      const stop = CB.ecouterDouchette((c) => lus.push(c), { cible: sim.doc, actif: () => actif });
+      const scanner = (txt) => { const evs = []; for (const ch of txt) { evs.push(sim.touche(ch)); sim.avancer(5); } evs.push(sim.touche('Enter')); return evs; };
+      const evs = scanner('ART-0001');
+      assert.deepEqual(lus, []);
+      assert.ok(evs.every((e) => !e.defaultPrevented), 'aucune touche consommée');
+      actif = true;
+      scanner('ART-0002');
+      assert.deepEqual(lus, ['ART-0002']);
+      stop();
+    } finally { global.performance.now = origNow; }
+  });
+
+  test('suivreFrappe : saisie complète à la vitesse d\'une douchette, frappe humaine, correction, collage', () => {
+    let horloge = 5000;
+    const origNow = global.performance.now;
+    global.performance.now = () => horloge;
+    try {
+      const ecouteurs = [];
+      const champ = { value: '', addEventListener: (t, f) => ecouteurs.push(f), removeEventListener: (t, f) => { const i = ecouteurs.indexOf(f); if (i >= 0) ecouteurs.splice(i, 1); } };
+      const touche = (key) => { ecouteurs.forEach((f) => f({ key, ctrlKey: false, metaKey: false })); if (key.length === 1) champ.value += key; else if (key === 'Backspace') champ.value = champ.value.slice(0, -1); };
+      const taper = (txt, delai) => { for (const ch of txt) { touche(ch); horloge += delai; } };
+      const f = CB.suivreFrappe(champ);
+      taper('104523', 6);
+      assert.equal(f.rapide(), true, 'douchette');
+      champ.value = ''; f.reinitialiser();
+      taper('12', 6);
+      assert.equal(f.rapide(), false, 'trop court');
+      champ.value = '';
+      taper('125', 140);
+      assert.equal(f.rapide(), false, 'frappe humaine');
+      champ.value = '';
+      taper('1045', 6); touche('Backspace'); taper('9', 6);
+      assert.equal(f.rapide(), false, 'correction au clavier');
+      champ.value = '104523';
+      assert.equal(f.rapide(), false, 'valeur collée');
+      champ.value = '';
+      taper('5', 400); taper('104523', 6);
+      assert.equal(f.rapide(), false, 'début de saisie humaine');
+      f.arreter();
+      assert.equal(ecouteurs.length, 0);
+    } finally { global.performance.now = origNow; }
+  });
+
   test('estChampSaisie : champs texte, zones de texte, listes et contenus éditables', () => {
     assert.equal(CB.estChampSaisie({ tagName: 'INPUT', type: 'search' }), true);
     assert.equal(CB.estChampSaisie({ tagName: 'INPUT', type: 'checkbox' }), false);

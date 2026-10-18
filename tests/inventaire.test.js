@@ -76,6 +76,7 @@ describe('Module Étiquettes & inventaire', () => {
     art.huile = article('ART-0005', { designation: 'Huile hydraulique ZS 46', categorieCode: 'lubrifiant', uniteCode: 'l', quantite: 120, prixUnitaire: 3.85, emplacement: 'Local lubrifiants — Fût n°2' });
     art.inactif = article('ART-0006', { designation: 'Ancienne courroie', actif: false, emplacement: 'Magasin central — A2' });
     art.prod = article('ART-0007', { designation: 'Pièce réservée à la production', secteurId: prod.id, emplacement: 'Magasin central — A3' });
+    art.maint = article('ART-0008', { designation: 'Pièce du magasin maintenance', secteurId: maint.id, emplacement: 'Magasin central — A3 — Bac 1' });
     art.val = article('ART-0101', { designation: 'Roulement Valréas', secteurId: prod2.id, emplacement: 'Magasin Valréas — R1', prixUnitaire: 5 });
     art.val2 = article('ART-0102', { designation: 'Filtre Valréas', secteurId: prod2.id, emplacement: 'Magasin Valréas — R2', prixUnitaire: 20, quantite: 6 });
     art.accent = article('ÉLEC-01', { designation: 'Câble électrique', categorieCode: 'electrique', emplacement: 'Magasin logistique — Touret', secteurId: log.id });
@@ -144,16 +145,18 @@ describe('Module Étiquettes & inventaire', () => {
     test('validation stricte des entrées', async () => {
       const cas = [
         [{}, 'nom obligatoire'],
-        [{ nom: '   ' }, 'nom vide'],
-        [{ nom: 'X'.repeat(151) }, 'nom trop long'],
-        [{ nom: 'Inv', filtres: { categorieCode: 'inconnue' } }, 'catégorie inconnue'],
-        [{ nom: 'Inv', filtres: { fournisseurId: 99999 } }, 'fournisseur inexistant'],
-        [{ nom: 'Inv', filtres: { secteurId: 99999 } }, 'magasin inexistant'],
-        [{ nom: 'Inv', filtres: 'tout' }, 'filtres invalides'],
+        [{ nom: '   ', secteurId: site1.id }, 'nom vide'],
+        [{ nom: 'X'.repeat(151), secteurId: site1.id }, 'nom trop long'],
+        [{ nom: 'Inv', secteurId: site1.id, filtres: { categorieCode: 'inconnue' } }, 'catégorie inconnue'],
+        [{ nom: 'Inv', secteurId: site1.id, filtres: { fournisseurId: 99999 } }, 'fournisseur inexistant'],
+        [{ nom: 'Inv', secteurId: site1.id, filtres: { secteurId: 99999 } }, 'magasin inexistant'],
+        [{ nom: 'Inv', secteurId: site1.id, filtres: 'tout' }, 'filtres invalides'],
         [{ nom: 'Inv', secteurId: 99999 }, 'site inexistant'],
         [{ nom: 'Inv', secteurId: 'abc' }, 'site invalide'],
-        [{ nom: 'Inv', aveugle: 'peut-être' }, 'booléen invalide'],
-        [{ nom: 'Inv', filtres: { emplacement: 'Zone inexistante' } }, 'périmètre vide'],
+        [{ nom: 'Inv', secteurId: site1.id, aveugle: 'peut-être' }, 'booléen invalide'],
+        [{ nom: 'Inv', secteurId: site1.id, filtres: { emplacement: 'Zone inexistante' } }, 'périmètre vide'],
+        [{ nom: 'Inv' }, 'site obligatoire : plusieurs sites'],
+        [{ nom: 'Inv', secteurId: site1.id, filtres: { secteurId: prod2.id } }, 'magasin d\'un autre site'],
       ];
       for (const [body, msg] of cas) {
         const r = await admin.post('/api/inventaires', body);
@@ -187,7 +190,7 @@ describe('Module Étiquettes & inventaire', () => {
       assert.match(invA.numero, /^INV-\d{4}-\d{3}$/);
       assert.equal(invA.statut, 'en_cours');
       assert.equal(invA.secteurId, maint.id);
-      assert.deepEqual(invA.lignes.map((l) => l.code).sort(), ['ART-0001', 'ART-0002', 'ART-0007'], 'actifs uniquement (pas l\'article inactif) — resp a la portée « tous »');
+      assert.deepEqual(invA.lignes.map((l) => l.code).sort(), ['ART-0001', 'ART-0002', 'ART-0008'], 'actifs uniquement (pas l\'article inactif), du secteur Maintenance ou sans magasin (pas ART-0007 de Production)');
       const l = invA.lignes.find((x) => x.code === 'ART-0001');
       assert.equal(l.quantiteTheorique, 12);
       assert.equal(l.quantiteComptee, null);
@@ -292,14 +295,14 @@ describe('Module Étiquettes & inventaire', () => {
     });
 
     test('annulation d\'un comptage et correction (auditée)', async () => {
-      await tech.ok('POST', `/api/inventaires/${invA.id}/comptage`, { code: 'ART-0007', quantite: 9 });
-      const d = await tech.ok('DELETE', `/api/inventaires/${invA.id}/lignes/${art.prod.id}/comptage`);
+      await tech.ok('POST', `/api/inventaires/${invA.id}/comptage`, { code: 'ART-0008', quantite: 9 });
+      const d = await tech.ok('DELETE', `/api/inventaires/${invA.id}/lignes/${art.maint.id}/comptage`);
       assert.equal(d.supprimee, false);
       assert.equal(d.ligne.quantiteComptee, null);
       assert.equal(d.ligne.comptages.length, 0);
       assert.equal((await tech.del(`/api/inventaires/${invA.id}/lignes/99999/comptage`)).status, 404);
-      await tech.ok('POST', `/api/inventaires/${invA.id}/comptage`, { code: 'ART-0007', quantite: 9 });
-      await tech.ok('POST', `/api/inventaires/${invA.id}/comptage`, { code: 'ART-0007', quantite: 10, mode: 'remplacer' });
+      await tech.ok('POST', `/api/inventaires/${invA.id}/comptage`, { code: 'ART-0008', quantite: 9 });
+      await tech.ok('POST', `/api/inventaires/${invA.id}/comptage`, { code: 'ART-0008', quantite: 10, mode: 'remplacer' });
       assert.ok(srv.db.list('audit', (a) => a.entiteId === invA.id && /corrigé.*9 → 10/.test(a.details)).length, 'correction auditée');
     });
 
@@ -393,7 +396,7 @@ describe('Module Étiquettes & inventaire', () => {
     });
 
     test('mouvements d\'inventaire pour les lignes comptées, stock mis à jour, notification et audit', async () => {
-      // Ligne courroie comptée 4, stock passé à 3 par la sortie : la validation fixe le stock à 4
+      // Ligne courroie comptée 4 (stock 4 au comptage), puis sortie de 1 : la validation conserve la sortie (stock 3, aucun écart)
       const avant = srv.db.count('mouvementsStock');
       const v = await admin.ok('POST', `/api/inventaires/${invA.id}/valider`, { nonComptesAZero: false });
       assert.equal(v.statut, 'valide');
@@ -406,11 +409,15 @@ describe('Module Étiquettes & inventaire', () => {
       assert.equal(m.type, 'inventaire');
       assert.match(m.motif, /^Inventaire INV-\d{4}-\d{3}/);
       assert.equal(srv.db.get('articles', art.roulement.id).quantite, 12);
-      assert.equal(srv.db.get('articles', art.courroie.id).quantite, 4);
-      assert.equal(srv.db.get('articles', art.prod.id).quantite, 10);
+      assert.equal(srv.db.get('articles', art.courroie.id).quantite, 3);
+      assert.equal(srv.db.get('articles', art.maint.id).quantite, 10);
+      assert.equal(srv.db.get('articles', art.prod.id).quantite, 10, 'article de Production hors de l\'inventaire Maintenance');
       const lc = v.lignes.find((l) => l.code === 'ART-0002');
       assert.equal(lc.quantiteAvantValidation, 3);
-      assert.equal(lc.ecartApplique, 1);
+      assert.equal(lc.ecartApplique, 0);
+      assert.equal(lc.mouvementsApresComptage, -1);
+      assert.equal(lc.ecart, 0);
+      assert.equal(v.resume.nbEcarts, 0, 'résumé : écarts réellement appliqués');
       assert.ok(srv.db.list('audit', (a) => a.action === 'validation' && a.entiteId === invA.id).length);
       const notif = srv.db.list('notifications', (n) => n.userId === userId('resp') && n.lien === `#/inventaire/${invA.id}`);
       assert.equal(notif.length, 1, 'le créateur est notifié');
@@ -564,6 +571,249 @@ describe('Module Étiquettes & inventaire', () => {
     });
   });
 
+  // ----- Non-régression : portée des inventaires et de leurs lignes --------------------------------
+  describe('portée des inventaires et des lignes', () => {
+    const { calculerResume } = require('../server/modules/inventaire');
+    let nAncien = 0;
+    /** Inventaire enregistré tel qu'une version antérieure pouvait le produire (sans contrôle de périmètre). */
+    function ancien(nomInv, secteurId, articles, extra) {
+      const lignes = articles.map((x) => {
+        const a = srv.db.get('articles', x.id);
+        return { articleId: a.id, code: a.code, designation: a.designation, emplacement: a.emplacement, uniteCode: a.uniteCode, categorieCode: a.categorieCode, referenceFournisseur: a.referenceFournisseur || '', codeBarre: a.codeBarre || '', prixUnitaire: a.prixUnitaire, quantiteTheorique: a.quantite, quantiteComptee: null, comptages: [], horsPerimetre: false };
+      });
+      return srv.db.insert('inventaires', Object.assign({
+        numero: `INV-ANC-${++nAncien}`, nom: nomInv, statut: 'en_cours', secteurId, filtres: {}, aveugle: false, commentaire: '', lignes, createdBy: 1,
+        dateOuverture: new Date(Date.now() - 3600e3).toISOString(), dateValidation: null, validePar: null, mouvementIds: [], resume: calculerResume(lignes),
+      }, extra || {}));
+    }
+    const connecter = async (login) => { const c = clientSite(null); await c.login(login, 'motdepasse1'); return c; };
+
+    test('inventaire « tous les sites » (sans secteur) : réservé à la portée « tous » dès qu\'il existe plusieurs sites', async () => {
+      const inv = ancien('Inventaire global', null, [art.roulement, art.prod, art.val]);
+      const t1 = await connecter('tech.site1');
+      assert.equal((await t1.get('/api/inventaires/' + inv.id)).status, 404);
+      assert.ok(!(await t1.ok('GET', '/api/inventaires')).some((i) => i.id === inv.id));
+      assert.equal((await t1.post(`/api/inventaires/${inv.id}/comptage`, { articleId: art.roulement.id, quantite: 0 })).status, 404);
+      assert.equal((await t1.get('/api/codes/' + inv.numero)).status, 404);
+      const lecteur = await connecter('lecteur');
+      assert.equal((await lecteur.post(`/api/inventaires/${inv.id}/comptage`, { articleId: art.val.id, quantite: 1 })).status, 404);
+      assert.equal((await lecteur.post(`/api/inventaires/${inv.id}/valider`, {})).status, 404);
+      assert.equal((await resp.get('/api/inventaires/' + inv.id)).status, 200, 'portée « tous »');
+      // Création : le site est obligatoire dès qu'il en existe plusieurs
+      const r = await resp.post('/api/inventaires', { nom: 'Sans site', filtres: { emplacement: 'Magasin central — A1' } });
+      assert.equal(r.status, 400);
+      assert.match(r.body.erreur, /plusieurs sites/);
+      assert.equal(srv.db.get('articles', art.val.id).quantite, 10);
+      srv.db.remove('inventaires', inv.id);
+    });
+
+    test('installation à un seul site : ce site est repris par défaut', async () => {
+      const autre = await demarrer();
+      try {
+        const c = autre.client();
+        await c.login('admin', 'admin');
+        autre.db.insert('articles', { code: 'U-1', designation: 'Article unique', quantite: 2, emplacement: 'Magasin', actif: true, secteurId: null });
+        const inv = await c.ok('POST', '/api/inventaires', { nom: 'Site unique' });
+        assert.equal(inv.secteurId, autre.db.findOne('secteurs', (s) => s.type === 'site').id);
+      } finally { await autre.stop(); }
+    });
+
+    test('lignes d\'articles hors de la portée : masquées, ni comptées, ni validées', async () => {
+      // Inventaire Maintenance ouvert avant la correction, avec un article de Production
+      const inv = ancien('Ancien inventaire maintenance', maint.id, [art.roulement, art.prod]);
+      const d = await tech.ok('GET', '/api/inventaires/' + inv.id);
+      assert.deepEqual(d.lignes.map((l) => l.code), ['ART-0001']);
+      assert.equal(d.lignesHorsPortee, 1);
+      assert.equal(d.resume.nbLignes, 1);
+      assert.equal((await tech.ok('GET', '/api/inventaires')).find((i) => i.id === inv.id).resume.nbLignes, 1, 'liste : résumé des lignes visibles');
+      assert.equal((await tech.post(`/api/inventaires/${inv.id}/comptage`, { articleId: art.prod.id, quantite: 0 })).status, 404);
+      assert.equal((await tech.post(`/api/inventaires/${inv.id}/comptage`, { code: 'ART-0007', quantite: 0 })).status, 404);
+      assert.equal((await tech.get(`/api/inventaires/${inv.id}/resoudre?code=ART-0007`)).status, 404);
+      assert.equal((await tech.del(`/api/inventaires/${inv.id}/lignes/${art.prod.id}/comptage`)).status, 404);
+      // Compté par la portée « tous » : le valideur limité à Maintenance ne peut pas fixer ce stock
+      await admin.ok('POST', `/api/inventaires/${inv.id}/comptage`, { articleId: art.prod.id, quantite: 2 });
+      await tech.ok('POST', `/api/inventaires/${inv.id}/comptage`, { articleId: art.roulement.id, quantite: 12 });
+      const refus = await respMaint.post(`/api/inventaires/${inv.id}/valider`, {});
+      assert.equal(refus.status, 403);
+      assert.match(refus.body.erreur, /1 article/);
+      assert.ok(!/ART-0007/.test(refus.body.erreur), 'code d\'un article invisible non divulgué');
+      await admin.ok('DELETE', `/api/inventaires/${inv.id}/lignes/${art.prod.id}/comptage`);
+      assert.equal((await respMaint.post(`/api/inventaires/${inv.id}/valider`, { nonComptesAZero: true })).status, 403, 'mise à zéro : même contrôle');
+      assert.equal(srv.db.get('articles', art.prod.id).quantite, 10, 'stock de Production intact');
+      assert.equal((await admin.ok('GET', '/api/inventaires/' + inv.id)).lignes.length, 2, 'la portée « tous » voit toutes les lignes');
+      await admin.ok('POST', `/api/inventaires/${inv.id}/annuler`, {});
+    });
+
+    test('site en lecture seule : ligne consultable mais ni comptée ni validée', async () => {
+      const inv = ancien('Ancien inventaire site 1', site1.id, [art.contacteur, art.val]);
+      const lecteur = await connecter('lecteur');
+      const d = await lecteur.ok('GET', '/api/inventaires/' + inv.id);
+      const lv = d.lignes.find((l) => l.code === 'ART-0101');
+      assert.ok(lv, 'consultation autorisée');
+      assert.equal(lv.modifiable, false);
+      assert.equal(d.lignes.find((l) => l.code === 'ART-0003').modifiable, true);
+      const c = await lecteur.post(`/api/inventaires/${inv.id}/comptage`, { code: 'ART-0101', quantite: 1 });
+      assert.equal(c.status, 403);
+      assert.match(c.body.erreur, /lecture seule/);
+      await admin.ok('POST', `/api/inventaires/${inv.id}/comptage`, { code: 'ART-0101', quantite: 1 });
+      const v = await lecteur.post(`/api/inventaires/${inv.id}/valider`, {});
+      assert.equal(v.status, 403);
+      assert.match(v.body.erreur, /ART-0101/);
+      assert.equal((await lecteur.del(`/api/inventaires/${inv.id}/lignes/${art.val.id}/comptage`)).status, 403);
+      assert.equal(srv.db.get('articles', art.val.id).quantite, 10);
+      await admin.ok('POST', `/api/inventaires/${inv.id}/annuler`, {});
+    });
+
+    test('périmètre limité au site / secteur de l\'inventaire', async () => {
+      const r = await admin.post('/api/inventaires', { nom: 'Mauvais magasin', secteurId: site1.id, filtres: { secteurId: prod2.id } });
+      assert.equal(r.status, 400);
+      assert.match(r.body.erreur, /n'appartient pas au site/);
+      // Inventaire du site : articles de tous ses secteurs
+      const a3 = await admin.ok('POST', '/api/inventaires', { nom: 'Site 1 A3', secteurId: site1.id, filtres: { emplacement: 'Magasin central — A3' } });
+      assert.deepEqual(a3.lignes.map((l) => l.code).sort(), ['ART-0007', 'ART-0008']);
+      await admin.ok('DELETE', '/api/inventaires/' + a3.id);
+      const inv = await admin.ok('POST', '/api/inventaires', { nom: 'Site 1 allée D1', secteurId: site1.id, filtres: { emplacement: 'Magasin central — D1' } });
+      const h = await admin.post(`/api/inventaires/${inv.id}/comptage`, { code: 'ART-0101', quantite: 1 });
+      assert.equal(h.status, 400);
+      assert.match(h.body.erreur, /ne relève pas du site/);
+      assert.equal((await admin.post(`/api/inventaires/${inv.id}/comptage`, { articleId: art.val.id, quantite: 1 })).status, 400);
+      assert.equal((await admin.get(`/api/inventaires/${inv.id}/resoudre?code=ART-0101`)).status, 400);
+      const ok = await admin.ok('GET', `/api/inventaires/${inv.id}/resoudre?code=ART-0007`);
+      assert.equal(ok.nouvelle, true, 'autre secteur du même site : accepté hors périmètre');
+      // Inventaire de Maintenance : un article de Production n'y est pas ajouté
+      const invM = await admin.ok('POST', '/api/inventaires', { nom: 'Maintenance D1', secteurId: maint.id, filtres: { emplacement: 'Magasin central — D1' } });
+      assert.equal((await admin.post(`/api/inventaires/${invM.id}/comptage`, { code: 'ART-0007', quantite: 1 })).status, 400);
+      await admin.ok('POST', `/api/inventaires/${inv.id}/annuler`, {});
+      await admin.ok('POST', `/api/inventaires/${invM.id}/annuler`, {});
+    });
+  });
+
+  // ----- Non-régression : écarts et mouvements postérieurs au comptage ----------------------------
+  describe('écarts au comptage et mouvements de stock pendant l\'inventaire', () => {
+    let joint;
+    const ouvrir = (nomInv) => resp.ok('POST', '/api/inventaires', { nom: nomInv, secteurId: maint.id, filtres: { emplacement: 'Magasin central — E1' } });
+    const stock = () => srv.ctx.services.stock;
+    before(() => { joint = article('ART-0201', { designation: 'Joint torique 40 × 3', quantite: 10, prixUnitaire: 10, emplacement: 'Magasin central — E1', secteurId: maint.id }); });
+
+    test('sortie avant le comptage : aucun écart fictif (résumé, audit, export)', async () => {
+      const inv = await ouvrir('Sortie avant comptage');
+      stock().sortir({ articleId: joint.id, quantite: 3, userId: 1, motif: 'OT en cours' });
+      const c = await tech.ok('POST', `/api/inventaires/${inv.id}/comptage`, { articleId: joint.id, quantite: 7 });
+      assert.equal(c.ligne.ecart, 0);
+      assert.equal(c.ligne.quantiteReference, 7, 'stock au moment du comptage');
+      assert.equal(c.resume.nbEcarts, 0);
+      const v = await resp.ok('POST', `/api/inventaires/${inv.id}/valider`, {});
+      assert.equal(srv.db.get('articles', joint.id).quantite, 7);
+      assert.equal(v.resume.nbEcarts, 0);
+      assert.equal(v.resume.valeurEcart, 0);
+      assert.ok(srv.db.list('audit', (x) => x.entiteId === inv.id && x.action === 'validation' && /0 écart/.test(x.details)).length);
+      const csv = await resp.get(`/api/inventaires/${inv.id}/export`);
+      const ligne = csv.body.split('\r\n').find((x) => x.startsWith('ART-0201'));
+      assert.match(ligne, /^ART-0201;[^;]*;[^;]*;[^;]*;[^;]*;7;7;0;10;0;7;0;/, ligne);
+    });
+
+    test('entrées et sorties après le comptage : conservées par la validation', async () => {
+      const inv = await ouvrir('Mouvements après comptage');
+      await tech.ok('POST', `/api/inventaires/${inv.id}/comptage`, { articleId: joint.id, quantite: 6 }); // stock 7 : écart -1
+      stock().sortir({ articleId: joint.id, quantite: 4, userId: 1, motif: 'OT' });
+      stock().entrer({ articleId: joint.id, quantite: 2, userId: 1, motif: 'Réception' });
+      const d = await resp.ok('GET', '/api/inventaires/' + inv.id);
+      assert.equal(d.lignes[0].ecart, -1);
+      const v = await resp.ok('POST', `/api/inventaires/${inv.id}/valider`, {});
+      assert.equal(srv.db.get('articles', joint.id).quantite, 4, '6 comptés − 4 sortis + 2 reçus');
+      const l = v.lignes.find((x) => x.code === 'ART-0201');
+      assert.equal(l.ecartApplique, -1);
+      assert.equal(l.mouvementsApresComptage, -2);
+      assert.equal(v.resume.valeurEcart, -10);
+    });
+
+    test('deux inventaires en cours sur le même article : l\'écart n\'est pas appliqué deux fois', async () => {
+      const i1 = await ouvrir('Premier');
+      const i2 = await ouvrir('Second');
+      assert.equal(i2.chevauchements[0].id, i1.id);
+      await tech.ok('POST', `/api/inventaires/${i1.id}/comptage`, { articleId: joint.id, quantite: 3 });
+      await tech.ok('POST', `/api/inventaires/${i2.id}/comptage`, { articleId: joint.id, quantite: 3 });
+      await resp.ok('POST', `/api/inventaires/${i1.id}/valider`, {});
+      assert.equal(srv.db.get('articles', joint.id).quantite, 3);
+      const v2 = await resp.ok('POST', `/api/inventaires/${i2.id}/valider`, {});
+      assert.equal(srv.db.get('articles', joint.id).quantite, 3);
+      assert.equal(v2.lignes.find((x) => x.code === 'ART-0201').ecartApplique, 0);
+      assert.equal(v2.resume.nbEcarts, 0);
+    });
+
+    test('comptage d\'une version antérieure (sans stock mémorisé) : stock reconstitué par le journal', async () => {
+      const inv = await ouvrir('Comptage ancien');
+      // Comptage enregistré avant cette version : ni stock au comptage ni repère
+      const brut = srv.db.get('inventaires', inv.id);
+      await new Promise((r) => setTimeout(r, 5));
+      const date = new Date().toISOString();
+      const lignes = brut.lignes.map((l) => Object.assign({}, l, { quantiteComptee: 2, comptages: [{ userId: 1, date, quantite: 2, mode: 'remplacer', resultat: 2 }] }));
+      srv.db.update('inventaires', inv.id, { lignes });
+      await new Promise((r) => setTimeout(r, 5));
+      stock().sortir({ articleId: joint.id, quantite: 1, userId: 1, motif: 'OT' }); // 3 → 2
+      const d = await resp.ok('GET', '/api/inventaires/' + inv.id);
+      assert.equal(d.lignes[0].quantiteReference, 3);
+      assert.equal(d.lignes[0].ecart, -1);
+      await resp.ok('POST', `/api/inventaires/${inv.id}/valider`, {});
+      assert.equal(srv.db.get('articles', joint.id).quantite, 1, '2 comptés − 1 sorti après le comptage');
+    });
+  });
+
+  // ----- Non-régression : comptage concurrent, chevauchements, export, module désactivé ------------
+  describe('comptage concurrent, chevauchements, export, module désactivé', () => {
+    test('comptage concurrent : 409 si la quantité connue du poste a changé', async () => {
+      const inv = await resp.ok('POST', '/api/inventaires', { nom: 'Concurrence', secteurId: maint.id, filtres: { emplacement: 'Magasin central — D2' } });
+      const url = `/api/inventaires/${inv.id}/comptage`;
+      await resp.ok('POST', url, { code: 'ART-0004', quantite: 5, mode: 'remplacer', quantitePrecedente: null });
+      const r = await tech.post(url, { code: 'ART-0004', quantite: 3, mode: 'remplacer', quantitePrecedente: null });
+      assert.equal(r.status, 409);
+      assert.match(r.body.erreur, /compté entre-temps par resp/);
+      assert.equal(r.body.details.ligne.quantiteComptee, 5);
+      assert.equal((await resp.ok('GET', '/api/inventaires/' + inv.id)).lignes[0].quantiteComptee, 5, 'premier comptage conservé');
+      assert.equal((await tech.ok('POST', url, { code: 'ART-0004', quantite: 3, mode: 'ajouter', quantitePrecedente: 5 })).ligne.quantiteComptee, 8);
+      assert.equal((await tech.ok('POST', url, { code: 'ART-0004', quantite: 7, mode: 'remplacer', quantitePrecedente: 8 })).ligne.quantiteComptee, 7);
+      assert.equal((await tech.ok('POST', url, { code: 'ART-0004', quantite: 6 })).ligne.quantiteComptee, 6, 'sans quantité précédente : comportement inchangé');
+      await resp.ok('POST', `/api/inventaires/${inv.id}/annuler`, {});
+    });
+
+    test('aperçu : inventaires en cours qui contiennent déjà les articles ; autres inventaires signalés au scan', async () => {
+      const i1 = await resp.ok('POST', '/api/inventaires', { nom: 'Allée D1', secteurId: maint.id, filtres: { emplacement: 'Magasin central — D1' } });
+      const ap = await resp.ok('GET', `/api/inventaires-apercu?secteurId=${maint.id}&emplacement=${encodeURIComponent('Magasin central — D')}`);
+      assert.deepEqual(ap.chevauchements.map((c) => [c.id, c.nbArticles]), [[i1.id, 1]]);
+      const i2 = await resp.ok('POST', '/api/inventaires', { nom: 'Allée A1', secteurId: maint.id, filtres: { emplacement: 'Magasin central — A1' } });
+      const res = await tech.ok('GET', `/api/inventaires/${i2.id}/resoudre?code=ART-0003`);
+      assert.equal(res.nouvelle, true);
+      assert.deepEqual(res.autresInventaires.map((x) => x.id), [i1.id]);
+      const c = await tech.ok('POST', `/api/inventaires/${i2.id}/comptage`, { code: 'ART-0003', quantite: 3 });
+      assert.deepEqual(c.autresInventaires.map((x) => x.numero), [i1.numero]);
+      await resp.ok('POST', `/api/inventaires/${i1.id}/annuler`, {});
+      await resp.ok('POST', `/api/inventaires/${i2.id}/annuler`, {});
+    });
+
+    test('export CSV : formules de tableur neutralisées, nombres négatifs conservés', async () => {
+      const f = article('=1+2', { designation: '@SOMME(1+1)', emplacement: '+Z9 — formule', quantite: 5, prixUnitaire: 2, secteurId: maint.id });
+      const inv = await resp.ok('POST', '/api/inventaires', { nom: 'Formules', secteurId: maint.id, filtres: { emplacement: '+Z9' } });
+      await resp.ok('POST', `/api/inventaires/${inv.id}/comptage`, { articleId: f.id, quantite: 2 });
+      const csv = await resp.get(`/api/inventaires/${inv.id}/export`);
+      const ligne = csv.body.split('\r\n')[1];
+      assert.ok(ligne.startsWith('\'=1+2;\'@SOMME(1+1);\'+Z9 — formule;'), ligne);
+      assert.match(ligne, /;5;2;-3;2;-6;/, 'écart et valeur négatifs restent des nombres');
+      await resp.ok('POST', `/api/inventaires/${inv.id}/annuler`, {});
+      srv.db.update('articles', f.id, { actif: false });
+    });
+
+    test('module désactivé : la résolution des codes est refusée', async () => {
+      config((c) => { c.modules = c.modules || {}; c.modules.inventaire = Object.assign({}, c.modules.inventaire, { actif: false }); });
+      try {
+        const r = await admin.get('/api/codes/ART-0001');
+        assert.equal(r.status, 403);
+        assert.match(r.body.erreur, /désactivé/);
+        assert.equal((await admin.get('/api/codes?code=EQ-0042')).status, 403);
+      } finally { config((c) => { c.modules.inventaire.actif = true; }); }
+      assert.equal((await admin.get('/api/codes/ART-0001')).status, 200);
+    });
+  });
+
   // ----- Services, démonstration ----------------------------------------------------------------
   test('services publiés : resoudreCode, enCoursPourArticle, calculerResume', async () => {
     const s = srv.ctx.services.inventaire;
@@ -599,6 +849,10 @@ describe('Module Étiquettes & inventaire', () => {
       assert.ok(jours > 29 && jours < 31.5, 'validé il y a 30 jours');
       assert.ok(enCours.resume.nbComptees > 0 && enCours.resume.nbComptees < enCours.resume.nbLignes, 'partiellement compté');
       assert.ok(/^INV-\d{4}-\d{3}$/.test(valide.numero) && valide.numero !== enCours.numero);
+      // Compteurs de démonstration : des utilisateurs qui voient ces inventaires (secteur Maintenance ou portée « tous »)
+      const logins = new Set(invs.flatMap((i) => i.lignes.flatMap((l) => (l.comptages || []).map((c) => autre.db.get('users', c.userId).login))));
+      assert.ok(logins.size >= 1 && [...logins].every((x) => ['kleroy', 'mdupont'].includes(x)), [...logins].join(', '));
+      assert.ok(enCours.lignes.filter((l) => l.quantiteComptee != null).every((l) => l.stockAuComptage != null), 'stock au comptage mémorisé');
       // Continuité du journal de stock (les écarts ont été intégrés sans changer le stock actuel)
       const mvts = autre.db.list('mouvementsStock');
       for (const a of autre.db.list('articles')) {

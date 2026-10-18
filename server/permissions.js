@@ -301,6 +301,39 @@ function canManageUser(actorPerms, targetProfil) {
   return actorPerms.niveau < Number(targetProfil.niveau || 99);
 }
 
+/** Rang des portées (une portée plus large a un rang plus élevé). */
+const RANG_PORTEE = { perso: 1, secteurs: 2, site: 3, tous: 4 };
+
+/**
+ * Ce qu'un gestionnaire ne pourrait pas accorder lui-même sur ce compte : droits individuels (surcharges) qu'il ne
+ * possède pas, portée individuelle plus large que la sienne, secteurs hors de son périmètre d'écriture, accès à un
+ * site qu'il n'a pas (ou seulement en lecture pour un accès complet). Liste vide pour un administrateur.
+ * Sert à refuser la réinitialisation du mot de passe ou de la double authentification d'un compte qui dépasse
+ * ses propres droits (prise de contrôle du compte).
+ */
+function depassementsGestion(db, actorPerms, cible) {
+  if (!actorPerms || actorPerms.estAdmin || !cible) return [];
+  const out = [];
+  const accordes = {};
+  const ov = normaliserOverrides(cible.overrides);
+  for (const m of Object.keys(ov)) for (const a of Object.keys(ov[m])) if (ov[m][a] === true) { accordes[m] = accordes[m] || {}; accordes[m][a] = true; }
+  const manquants = droitsNonPossedes(actorPerms, accordes);
+  if (manquants.length) out.push('droits individuels : ' + manquants.join(', '));
+  if (cible.porteeOverride && PORTEES[cible.porteeOverride] && (RANG_PORTEE[cible.porteeOverride] || 0) > (RANG_PORTEE[actorPerms.portee] || 0)) {
+    out.push('portée « ' + PORTEES[cible.porteeOverride] + ' »');
+  }
+  if (actorPerms.portee !== 'tous') {
+    const ecriture = new Set((actorPerms.secteurIds || []).map(Number));
+    const hors = (cible.secteurIds || []).map(Number).filter((id) => !ecriture.has(id));
+    if (hors.length) out.push('secteurs hors de votre périmètre : ' + hors.map((id) => (db.get('secteurs', id) || {}).nom || '#' + id).join(', '));
+    for (const a of normaliserSiteAcces(db, cible.siteAcces)) {
+      const mien = (actorPerms.sites || []).find((x) => x.id === a.siteId);
+      if (!mien || (a.mode === 'complet' && mien.mode !== 'complet')) out.push(`accès au site « ${(db.get('secteurs', a.siteId) || {}).nom || a.siteId} »`);
+    }
+  }
+  return out;
+}
+
 /** Un utilisateur ne peut accorder que des droits qu'il possède lui-même (sauf administrateur). */
 function droitsNonPossedes(actorPerms, matrice) {
   if (actorPerms.estAdmin) return [];
@@ -320,5 +353,5 @@ module.exports = {
   sites, siteDuSecteur, normaliserSiteAcces, appliquerSiteCourant,
   moduleByKey, matriceVide, matricePleine, normaliserMatrice, normaliserOverrides,
   secteursDescendants, modulesConfigures, effectivePermissions, can, canSeeRecord,
-  canManageUser, droitsNonPossedes,
+  canManageUser, droitsNonPossedes, depassementsGestion,
 };
