@@ -502,11 +502,15 @@ describe('Script de génération de la paire de clés', () => {
   });
 
   test('dans le dépôt : refusé si non ignoré par git ou embarqué dans l\'application', () => {
-    const dansDepot = path.join(RACINE, `cle-essai-${aleatoire()}.pem`);
+    // Les extensions de clés et certificats (*.pem, *.key, *.pfx, *.p12) sont ignorées par .gitignore : un autre nom sert au cas « non ignoré »
+    const dansDepot = path.join(RACINE, `cle-essai-${aleatoire()}.txt`);
     const r = executer([dansDepot]);
     assert.equal(r.status, 2);
     assert.match(r.stderr, /dépôt/);
     assert.equal(fs.existsSync(dansDepot), false);
+    const pemRacine = generateur.controlerEmplacement(path.join(RACINE, `cle-essai-${aleatoire()}.pem`));
+    assert.equal(pemRacine.ok, true, '*.pem ignoré par .gitignore : accepté avec avertissement');
+    assert.match(pemRacine.avertissement || '', /ignoré par \.gitignore/);
     const embarque = path.join(RACINE, 'server', `cle-${aleatoire()}.log`);
     assert.equal(executer([embarque]).status, 2);
     assert.equal(fs.existsSync(embarque), false);

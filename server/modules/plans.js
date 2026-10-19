@@ -314,8 +314,9 @@ function register(ctx) {
     if (n < min || n > max) throw erreur(prefixe, `${libelle} hors limites (${min} à ${max})`);
     return arrondi(n, decimales == null ? 3 : decimales);
   }
+  /** Texte libre : seule une chaîne est acceptée (booléens, nombres, tableaux et objets refusés). */
   function texte(v, max, libelle, prefixe, obligatoire) {
-    if (v != null && typeof v === 'object') throw erreur(prefixe, `${libelle} invalide`);
+    if (v != null && typeof v !== 'string') throw erreur(prefixe, `${libelle} : valeur invalide (texte attendu)`);
     const s = String(v == null ? '' : v).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').trim();
     if (obligatoire && !s) throw erreur(prefixe, `${libelle} est obligatoire`);
     if (s.length > max) throw erreur(prefixe, `${libelle} : ${max} caractères maximum`);
@@ -708,7 +709,7 @@ function register(ctx) {
     });
     const rapport = { liensRetires: 0, liensConserves: 0 };
     const data = validerPlan(req, {
-      nom: String(b.nom || '').trim() || `${source.nom} (copie)`, description: source.description, secteurId,
+      nom: texte(b.nom, 150, 'Le nom du plan', '') || `${source.nom} (copie)`, description: source.description, secteurId,
       dimensions: source.dimensions, niveaux: source.niveaux, vue: source.vue, objets,
       fond: source.fond ? Object.assign({}, source.fond) : null,
     }, null, { tolerant: true, rapport });

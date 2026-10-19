@@ -503,6 +503,7 @@
         const triees = rows.slice().sort((a, b) => (a.fournisseurNom ? 0 : 1) - (b.fournisseurNom ? 0 : 1) || String(a.fournisseurNom).localeCompare(String(b.fournisseurNom), 'fr') || String(a.code).localeCompare(String(b.code), 'fr', { numeric: true }));
         cont.appendChild(el('div', { class: 'barre-outils' },
           el('span', { class: 'texte-2' }, 'Regroupement par fournisseur habituel'), el('span', { class: 'espace' }),
+          GMAO.moduleVisible('achats') && GMAO.can('achats', 'creer') ? ui.bouton('Créer les commandes', { icone: 'euro', classe: 'btn-sm', titre: 'Commandes fournisseurs depuis les alertes (module Achats & factures)', onClic: () => GMAO.navigate('#/achats?alertes=1') }) : null,
           ui.bouton('Imprimer les bons de commande', { icone: 'imprimer', classe: 'btn-sm', onClic: () => imprimerCommandes(parFournisseur) }),
           can('exporter') ? ui.bouton('Exporter la liste à commander', { icone: 'export', classe: 'btn-sm btn-primaire', onClic: () => ui.exportCsv(`stock-a-commander-${ui.aujourdhui()}.csv`, colonnesExport, triees) }) : null));
         const tableau = ui.table({
@@ -608,6 +609,12 @@
       { cle: 'valorisation', label: 'Valorisation', icone: 'euro', rendu: rendreValorisation },
     ], { hash: true, actif: ongletInitial });
     zoneOnglets.appendChild(onglets.el);
+    // Lien direct vers une saisie de mouvement (ex. action rapide du tableau de bord : #/stock?mouvement=entree) ;
+    // le paramètre est retiré de l'adresse pour qu'un rechargement ne rouvre pas la fenêtre
+    if (can('modifier') && ['entree', 'sortie', 'inventaire'].includes(query.mouvement)) {
+      try { history.replaceState(null, '', location.hash.replace(/[?&]mouvement=[^&]*/, '').replace(/\?$/, '')); } catch (e) { /* adresse conservée */ }
+      ouvrirMouvement({ articles, type: query.mouvement, apres: rafraichir });
+    }
   }
 
   // ----- Fiche article ------------------------------------------------------------------------
@@ -640,6 +647,7 @@
     container.appendChild(el('div', { class: 'barre-outils' },
       can('creer') ? ui.bouton('Dupliquer', { icone: 'copier', classe: 'btn-sm', onClic: () => ouvrirFormulaire(a, { copie: true, apres: (n) => GMAO.navigate('#/stock/' + n.id) }) }) : null,
       ui.bouton('Imprimer la fiche', { icone: 'imprimer', classe: 'btn-sm', onClic: () => imprimerFiche(a) }),
+      GMAO.moduleVisible('inventaire') ? ui.bouton('Imprimer l\'étiquette', { icone: 'imprimer', classe: 'btn-sm', onClic: () => GMAO.navigate(`#/inventaire?onglet=etiquettes&source=articles&ids=${a.id}`) }) : null,
       ui.bouton('Journal complet', { icone: 'liste', classe: 'btn-sm', onClic: () => GMAO.navigate(`#/stock?onglet=mouvements&articleId=${a.id}`) }),
       el('span', { class: 'espace' }),
       !actif && can('modifier') ? ui.bouton('Réactiver', { icone: 'check', classe: 'btn-sm btn-ok', onClic: () => reactiver(a, recharger) }) : null,

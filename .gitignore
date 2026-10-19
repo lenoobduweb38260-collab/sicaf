@@ -7,6 +7,12 @@ node_modules/
 dist/
 build/
 
+# Clés et certificats (signature des mises à jour, HTTPS, double authentification) : jamais versionnés
+*.pem
+*.pfx
+*.p12
+*.key
+
 # Divers
 .DS_Store
 Thumbs.db

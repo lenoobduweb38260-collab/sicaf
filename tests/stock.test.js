@@ -429,6 +429,24 @@ describe('Module Stock & pièces détachées', () => {
     assert.ok(r.emplacements.includes('Magasin A — Étagère 3'));
   });
 
+  test('exports CSV : cellules commençant par = + - @ neutralisées (injection de formules), nombres intacts', async () => {
+    const a = await admin.ok('POST', '/api/articles', { designation: '=HYPERLINK("http://exemple.invalid";"Cliquer")', description: '@cmd|calc', emplacement: '-A1', categorieCode: 'mecanique', quantite: 3, seuilMin: 1, prixUnitaire: 12.5 });
+    await admin.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'entree', quantite: 2, motif: '+SUM(1;2)' });
+    const r = await admin.brut('/api/articles-export');
+    assert.equal(r.status, 200);
+    assert.deepEqual([...r.body.subarray(0, 3)], [0xef, 0xbb, 0xbf], 'BOM UTF-8 (octets bruts)');
+    const ligne = r.body.toString('utf8').split('\r\n').find((l) => l.startsWith(a.code + ';'));
+    assert.ok(ligne, 'ligne exportée');
+    assert.ok(ligne.includes(';"\'=HYPERLINK('), 'apostrophe devant = : ' + ligne);
+    assert.ok(!/;"?=HYPERLINK/.test(ligne), 'aucune formule exécutable');
+    assert.ok(ligne.includes(';\'-A1;'), 'emplacement neutralisé : ' + ligne);
+    assert.ok(ligne.includes(';\'@cmd|calc'), 'description neutralisée : ' + ligne);
+    assert.ok(ligne.includes(';12,5;'), 'les nombres restent des nombres : ' + ligne);
+    const mv = String((await admin.get('/api/mouvements-export?articleId=' + a.id)).body).split('\r\n').find((l) => l.includes('SUM'));
+    assert.ok(mv && mv.includes('"\'+SUM(1;2)"'), 'motif du mouvement neutralisé : ' + mv);
+    assert.equal(srv.ctx.csvEscape('=x'), '\'=x', 'utilitaire commun du cœur');
+  });
+
   test('exports CSV', async () => {
     const a = await admin.get('/api/articles-export?categorieCode=mecanique');
     assert.equal(a.status, 200);
@@ -509,6 +527,19 @@ describe('Module Stock & pièces détachées', () => {
     // Non authentifié
     const anonyme = srv.client();
     assert.equal((await anonyme.get('/api/articles')).status, 401);
+  });
+
+  test('portée site / perso : un article ne peut être rattaché qu\'à un secteur modifiable (sites en lecture seule exclus)', async () => {
+    const site2 = srv.db.insert('secteurs', { nom: 'Usine de Valréas', code: 'VAL', type: 'site', parentId: null, actif: true, ordre: 90 });
+    const prod2 = srv.db.insert('secteurs', { nom: 'Production Valréas', code: 'VPROD', type: 'atelier', parentId: site2.id, actif: true, ordre: 91 });
+    const site = await creerUtilisateur('resp.site', 'Responsable maintenance', [prod.id], { porteeOverride: 'site', siteAcces: [{ siteId: site2.id, mode: 'lecture' }] });
+    const r1 = await site.post('/api/articles', { designation: 'Article Valréas', secteurId: prod2.id });
+    assert.equal(r1.status, 403, 'portée site : site en lecture seule refusé'); assert.match(r1.body.erreur, /lecture seule/);
+    const a = await site.ok('POST', '/api/articles', { designation: 'Article Carpentras', secteurId: prod.id });
+    assert.equal((await site.put('/api/articles/' + a.id, { secteurId: prod2.id })).status, 403, 'changement de secteur vers un site en lecture seule refusé');
+    const perso = await creerUtilisateur('magasinier.perso', 'Responsable maintenance', [], { porteeOverride: 'perso', siteAcces: [{ siteId: site2.id, mode: 'lecture' }] });
+    assert.equal((await perso.post('/api/articles', { designation: 'Article perso Valréas', secteurId: prod2.id })).status, 403, 'portée perso : site en lecture seule refusé');
+    assert.equal((await perso.post('/api/articles', { designation: 'Article perso Carpentras', secteurId: maint.id })).status, 200, 'portée perso sans secteur : autres secteurs permis');
   });
 
   test('portée par secteur : articles d\'un magasin hors secteur invisibles', async () => {

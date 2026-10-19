@@ -591,6 +591,15 @@ describe('Rapports & historique', () => {
   });
 
   // ----- Service publié et données de démonstration -------------------------------------------------------
+  test('exports CSV : cellules commençant par = + - @ neutralisées (injection de formules)', async () => {
+    const o = ot('INJ', { titre: '=HYPERLINK("http://exemple.invalid";"Cliquer")', rapport: '@cmd|calc', createdAt: '2023-01-10T08:00:00.000Z', dateDebut: '2023-01-10T08:00:00.000Z', dateFin: '2023-01-10T10:00:00.000Z', dateCloture: '2023-01-10T10:00:00.000Z', equipementId: presse.id, secteurId: PROD, tempsPasse: [{ userId: tech1.id, date: '2023-01-10', heures: 2 }] });
+    const ligne = lignesCsv((await admin.get('/api/rapports/export?type=historique&du=2023-01-01&au=2023-01-31')).body).find((l) => l.startsWith(o.numero + ';'));
+    assert.ok(ligne, 'ligne exportée');
+    assert.ok(ligne.includes(';"\'=HYPERLINK('), 'apostrophe devant = : ' + ligne);
+    assert.ok(!/;"?=HYPERLINK/.test(ligne), 'aucune formule exécutable');
+    srv.db.remove('ot', o.id); // sans incidence sur les comptages des tests suivants
+  });
+
   test('service ctx.services.rapports utilisable par les autres modules', async () => {
     const s = srv.ctx.services.rapports;
     assert.ok(s && typeof s.synthese === 'function');

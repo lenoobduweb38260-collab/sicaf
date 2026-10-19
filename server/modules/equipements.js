@@ -13,16 +13,18 @@
  * (et de ses sous-équipements déplacés) reprennent le nouveau secteur, puisque la portée des autres modules
  * repose sur le secteurId copié de l'équipement.
  */
+const crypto = require('crypto');
+
+/** Identifiant stable d'une ligne jointe (document) : une requête rejouée après suppression ne vise pas la ligne suivante. */
+function uid() { return 'u' + crypto.randomBytes(5).toString('hex'); }
+
 const nom = 'Équipements';
 const ENTITE = 'equipements';
 const TAILLE_MAX_DOC = 5 * 1024 * 1024; // 5 Mo par document
 const MAX_DOCS = 50;
 const UNITES_COMPTEUR = ['heures', 'cycles', 'km', 'pièces', 'tonnes', 'm³', 'litres'];
 
-function csvEscape(v) {
-  const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+const { csvEscape } = require('../csv');
 const pad = (n) => String(n).padStart(2, '0');
 /** Jour local « AAAA-MM-JJ » : les dates du calendrier (garantie) se comparent au jour local, jamais au jour UTC. */
 function jourLocal(d) { d = d || new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
@@ -121,7 +123,7 @@ function register(ctx) {
   const triNumero = (a, b) => String(a.numero || '').localeCompare(String(b.numero || ''), 'fr', { numeric: true });
 
   function resumeDoc(d, i) {
-    return { index: i, nom: d.nom, type: d.type, taille: d.taille, date: d.date, userId: d.userId, userNom: ctx.nomUser(d.userId), estImage: estImage(d.type) };
+    return { index: i, uid: d.uid || null, nom: d.nom, type: d.type, taille: d.taille, date: d.date, userId: d.userId, userNom: ctx.nomUser(d.userId), estImage: estImage(d.type) };
   }
   function nbReferences(id) {
     return {
@@ -210,7 +212,17 @@ function register(ctx) {
     throw new HttpError(500, 'Impossible de générer un numéro d\'équipement unique');
   }
 
-  function valider(req, body, existant) {
+  /** Champs personnalisés repris d'une source (duplication) : validés quand c'est possible, sans contrôle « obligatoire ». */
+  function champsPersoSouples(input) {
+    try { return ctx.champsPerso(ENTITE, input || {}); } catch (e) {
+      const defs = ((ctx.config().champsPersonnalises || {})[ENTITE]) || [];
+      const out = {};
+      for (const d of defs) out[d.cle] = input && input[d.cle] !== undefined && input[d.cle] !== '' ? input[d.cle] : null;
+      return out;
+    }
+  }
+  /** options.champsSouples : champs personnalisés non bloquants (duplication d'un équipement créé avant l'ajout d'un champ obligatoire). */
+  function valider(req, body, existant, options = {}) {
     body = body && typeof body === 'object' ? body : {};
     const out = {};
     // Un numéro de série est souvent numérique : c'est le seul texte où un nombre est toléré
@@ -286,7 +298,8 @@ function register(ctx) {
     }
 
     out.actif = body.actif === undefined ? (existant ? existant.actif !== false : true) : !!body.actif;
-    if (body.champs !== undefined || !existant) out.champs = ctx.champsPerso(ENTITE, body.champs || (existant && existant.champs) || {});
+    if (options.champsSouples) out.champs = champsPersoSouples(body.champs);
+    else if (body.champs !== undefined || !existant) out.champs = ctx.champsPerso(ENTITE, body.champs || (existant && existant.champs) || {});
     if (numeroAGenerer) out.numero = genererNumero();
     return out;
   }
@@ -481,7 +494,10 @@ function register(ctx) {
     });
     if (b.parentId !== undefined) copie.parentId = b.parentId == null || b.parentId === '' ? null : Number(b.parentId);
     if (b.secteurId !== undefined && b.secteurId !== '' && b.secteurId != null) copie.secteurId = Number(b.secteurId);
-    const data = valider(req, copie, null);
+    // Champs personnalisés : ceux de la source, complétés par ceux saisis dans la fenêtre de duplication ; un champ
+    // devenu obligatoire après la création de la source ne bloque pas la copie
+    copie.champs = Object.assign({}, source.champs || {}, b.champs && typeof b.champs === 'object' && !Array.isArray(b.champs) ? b.champs : {});
+    const data = valider(req, copie, null, { champsSouples: true });
     Object.assign(data, { documents: [], compteurReleves: [], historiqueEtats: [], createdBy: req.user.id });
     const e = db.insert(ENTITE, data);
     ctx.audit(req, 'duplication', ENTITE, e.id, `Équipement ${e.numero} ${e.nom} (copie de ${source.numero})`);
@@ -572,21 +588,31 @@ function register(ctx) {
     const docs = existant.documents || [];
     if (docs.length >= MAX_DOCS) throw new HttpError(400, `Nombre maximal de documents atteint (${MAX_DOCS})`);
     const type = (typeof b.type === 'string' && b.type.trim() ? b.type.trim() : (m[1] || 'application/octet-stream')).slice(0, 100);
-    const doc = { nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, date: new Date().toISOString(), userId: req.user.id, description };
+    const doc = { uid: uid(), nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, date: new Date().toISOString(), userId: req.user.id, description };
     const e = db.update(ENTITE, existant.id, { documents: docs.concat([doc]) });
     ctx.audit(req, 'document', ENTITE, e.id, `Document ajouté à ${e.numero} : ${nomDoc} (${Math.round(taille / 1024)} Ko)`);
     return { ok: true, document: resumeDoc(doc, e.documents.length - 1), documents: e.documents.map(resumeDoc) };
   }, { perm: [ENTITE, 'modifier'] });
 
-  function indexDoc(req, existant) {
-    const idx = Number(req.params.index);
-    const docs = existant.documents || [];
-    if (!Number.isInteger(idx) || idx < 0 || idx >= docs.length) throw new HttpError(404, 'Document introuvable');
+  /**
+   * Position d'une ligne désignée par son identifiant stable `uid` (recommandé : une requête rejouée après
+   * suppression échoue en 404 au lieu d'atteindre la ligne suivante) ou, à défaut, par son index.
+   */
+  function indexDans(liste, ref, message) {
+    const s = String(ref == null ? '' : ref).trim();
+    if (/^\d+$/.test(s)) {
+      const idx = Number(s);
+      if (idx >= (liste || []).length) throw new HttpError(404, message);
+      return idx;
+    }
+    const idx = (liste || []).findIndex((x) => x && x.uid != null && x.uid === s);
+    if (idx < 0) throw new HttpError(404, message);
     return idx;
   }
+  const indexDoc = (req, existant) => indexDans(existant.documents, req.params.ref, 'Document introuvable');
 
   /** Téléchargement / aperçu d'un document (GET, cookie de session suffisant). */
-  router.get('/api/equipements/:id/documents/:index', async (req, res) => {
+  router.get('/api/equipements/:id/documents/:ref', async (req, res) => {
     const existant = getVisible(req, req.params.id);
     const doc = existant.documents[indexDoc(req, existant)];
     const m = /^data:([^;,]*)(?:;[^,]*)?;base64,(.*)$/s.exec(doc.contenu || '');
@@ -607,7 +633,7 @@ function register(ctx) {
     res.end(buf);
   }, { perm: [ENTITE, 'voir'] });
 
-  router.delete('/api/equipements/:id/documents/:index', async (req) => {
+  router.delete('/api/equipements/:id/documents/:ref', async (req) => {
     const existant = getVisible(req, req.params.id);
     verifierPorteeEcriture(req, existant.secteurId);
     const idx = indexDoc(req, existant);

@@ -100,6 +100,11 @@
     if (voir('preventif')) ajouter(k.preventifsEnRetard, pluriel(k.preventifsEnRetard, 'préventif en retard', 'préventifs en retard'), ROUGE, '#/preventif?etat=en_retard', 'preventif');
     if (voir('stock')) ajouter(c.articlesRupture, pluriel(c.articlesRupture, 'article en rupture', 'articles en rupture'), ROUGE, '#/stock?onglet=alertes', 'stock');
     if (voir('stock')) ajouter((k.articlesSousSeuil || 0) - (c.articlesRupture || 0), pluriel((k.articlesSousSeuil || 0) - (c.articlesRupture || 0), 'article sous le seuil', 'articles sous le seuil'), ORANGE, '#/stock?onglet=alertes', 'stock');
+    // Module Achats & factures (compteurs de la pastille du menu, lus avec le tableau de bord)
+    if (d.achats) {
+      ajouter(d.achats.facturesEnRetard, pluriel(d.achats.facturesEnRetard, 'facture en retard de paiement', 'factures en retard de paiement'), ROUGE, '#/achats?onglet=factures&filtre=retard', 'euro');
+      ajouter(d.achats.commandesAValider, pluriel(d.achats.commandesAValider, 'commande à valider', 'commandes à valider'), ORANGE, '#/achats?onglet=commandes&statutCommande=a_valider', 'euro');
+    }
     return pts;
   }
 
@@ -133,8 +138,9 @@
     const actions = [];
     if (voir('demandes') && GMAO.can('demandes', 'creer')) actions.push(ui.bouton('Nouvelle demande', { icone: 'plus', classe: 'btn-primaire', onClic: aller('#/demandes?nouveau=1') }));
     if (voir('ot') && GMAO.can('ot', 'creer')) actions.push(ui.bouton('Nouvel OT', { icone: 'ot', classe: actions.length ? '' : 'btn-primaire', onClic: aller('#/ot?nouveau=1') }));
-    // Raccourci vers le stock : la vue Stock ne propose pas d'ouverture directe du formulaire d'entrée, le libellé ne la promet donc pas
-    if (voir('stock') && (GMAO.can('stock', 'modifier') || GMAO.can('stock', 'creer'))) actions.push(ui.bouton(GMAO.moduleLabel('stock') || 'Stock & pièces', { icone: 'stock', onClic: aller('#/stock') }));
+    // Entrée de stock : la vue Stock ouvre directement la saisie du mouvement (#/stock?mouvement=entree)
+    if (voir('stock') && GMAO.can('stock', 'modifier')) actions.push(ui.bouton('Entrée de stock', { icone: 'stock', onClic: aller('#/stock?mouvement=entree') }));
+    else if (voir('stock') && GMAO.can('stock', 'creer')) actions.push(ui.bouton(GMAO.moduleLabel('stock') || 'Stock & pièces', { icone: 'stock', onClic: aller('#/stock') }));
     if (voir('planning')) actions.push(ui.bouton('Planning', { icone: 'planning', onClic: aller('#/planning') }));
 
     return el('div', { class: 'carte', style: { display: 'flex', gap: '16px', alignItems: 'flex-start', flexWrap: 'wrap', background: 'linear-gradient(120deg, var(--primaire-clair) 0%, var(--surface) 62%)' } },
@@ -570,6 +576,7 @@
         if (donnees) zone.style.opacity = '0.55';
         try {
           const d = await api.get('/api/dashboard');
+          if (voir('achats')) { try { d.achats = await api.get('/api/achats/compteurs'); } catch (e) { d.achats = null; } }
           if (!container.isConnected) return;
           d.kpis = d.kpis || {}; d.graphiques = d.graphiques || {}; d.listes = d.listes || {}; d.compteurs = d.compteurs || {}; d.filtres = d.filtres || {}; d.droits = d.droits || {}; d.sources = d.sources || {};
           donnees = d;

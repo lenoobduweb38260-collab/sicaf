@@ -64,11 +64,10 @@ const CHAMPS_PLANIFICATION = ['titre', 'description', 'typeCode', 'prioriteCode'
 
 const RE_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
-function csvEscape(v) {
-  const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+const { csvEscape } = require('../csv');
 function pad(n) { return String(n).padStart(2, '0'); }
+/** Référence lisible d'un OT : le préfixe « OT » n'est ajouté que si le numéro ne commence pas déjà par lui. */
+function refOt(numero) { const n = String(numero == null ? '' : numero); return /^ot(?![a-zà-ÿ])/i.test(n) ? n : `OT ${n}`; }
 /** Date locale AAAA-MM-JJ. */
 function dateLocale(d) { d = d || new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
 /** Jour local (AAAA-MM-JJ) d'une date ou d'un horodatage ISO. */
@@ -590,6 +589,8 @@ function register(ctx) {
   /** Règle de visibilité d'une demande d'intervention (celle du module Demandes : portée, puis N+1 du demandeur). */
   function demandeVisible(req, d) {
     if (!perms.can(req.perms, 'demandes', 'voir')) return false;
+    const sd = ctx.services.demandes;
+    if (sd && typeof sd.visible === 'function') { try { return !!sd.visible(req, d); } catch (e) { /* repli sur la règle locale */ } }
     if (ctx.canSee(req, d)) return true;
     const dem = d.demandeurId != null ? db.get('users', d.demandeurId) : null;
     return !!(dem && dem.managerId != null && Number(dem.managerId) === req.user.id);
@@ -671,7 +672,7 @@ function register(ctx) {
     }, data);
     record.coutTotal = arrondi((record.coutExterne || 0));
     const o = db.insert(ENTITE, record);
-    ctx.audit(req, options.source === 'duplication' ? 'duplication' : 'creation', ENTITE, o.id, `OT ${o.numero} : ${o.titre}${demande ? ` (demande ${demande.numero || demande.id})` : ''}${plan ? ` (plan ${plan.numero || plan.nom})` : ''}${options.commentaire ? ' — ' + options.commentaire : ''}`);
+    ctx.audit(req, options.source === 'duplication' ? 'duplication' : 'creation', ENTITE, o.id, `${refOt(o.numero)} : ${o.titre}${demande ? ` (demande ${demande.numero || demande.id})` : ''}${plan ? ` (plan ${plan.numero || plan.nom})` : ''}${options.commentaire ? ' — ' + options.commentaire : ''}`);
     const acteur = req && req.user ? req.user.id : null;
     if (o.techniciens.length) {
       notifier(o.techniciens, acteur, { titre: `Nouvel ordre de travail : ${o.numero}`, message: `${o.titre}${o.datePrevue ? ' — prévu le ' + jourDe(o.datePrevue).split('-').reverse().join('/') : ''}`, lien: `#/ot/${o.id}`, type: o.prioriteCode && o.prioriteCode === (ctx.liste('priorites').slice(-1)[0] || {}).code ? 'alerte' : 'info' });
@@ -721,20 +722,20 @@ function register(ctx) {
     avecCouts(o, patch);
     const maj = db.update(ENTITE, o.id, patch);
     const actionAudit = action === 'cloture' ? 'cloture' : action === 'reouverture' ? 'reouverture' : 'statut';
-    ctx.audit(req, actionAudit, ENTITE, o.id, `OT ${o.numero} : ${st.libelle(ancien)} → ${st.libelle(nouveau)}${opts.commentaire ? ' — ' + String(opts.commentaire).slice(0, 300) : ''}`);
+    ctx.audit(req, actionAudit, ENTITE, o.id, `${refOt(o.numero)} : ${st.libelle(ancien)} → ${st.libelle(nouveau)}${opts.commentaire ? ' — ' + String(opts.commentaire).slice(0, 300) : ''}`);
     const acteur = req && req.user ? req.user.id : null;
     if (opts.silencieux) { /* notifications déjà envoyées par l'appelant */ } else if (finalNouveau) {
       const annule = st.estAnnulation(nouveau);
       const destinataires = [maj.createdBy].concat(maj.techniciens || []);
       if (!demandeurPrevenuParDemandes(maj, annule)) destinataires.push(demandeurDe(maj));
       notifier(destinataires, acteur, {
-        titre: `OT ${maj.numero} ${annule ? 'annulé' : 'terminé'}`,
+        titre: `${refOt(maj.numero)} ${annule ? 'annulé' : 'terminé'}`,
         message: annule ? `${maj.titre}${opts.commentaire ? ' — motif : ' + String(opts.commentaire).slice(0, 200) : ''}` : `${maj.titre}${maj.rapport ? ' — ' + String(maj.rapport).slice(0, 200) : ''}`,
         lien: `#/ot/${maj.id}`, type: annule ? 'alerte' : 'info',
       });
     } else {
       const cibles = (maj.techniciens || []).concat(nouveau === st.attente || finalAncien ? [maj.createdBy] : []);
-      notifier(cibles, acteur, { titre: `OT ${maj.numero} : ${st.libelle(nouveau)}`, message: `${maj.titre}${opts.commentaire ? ' — ' + String(opts.commentaire).slice(0, 200) : ''}`, lien: `#/ot/${maj.id}`, type: 'info' });
+      notifier(cibles, acteur, { titre: `${refOt(maj.numero)} : ${st.libelle(nouveau)}`, message: `${maj.titre}${opts.commentaire ? ' — ' + String(opts.commentaire).slice(0, 200) : ''}`, lien: `#/ot/${maj.id}`, type: 'info' });
     }
     ctx.emit('ot:statut', charge(maj, { ancien, nouveau }));
     if (finalNouveau && !finalAncien) {
@@ -863,16 +864,32 @@ function register(ctx) {
   router.get('/api/ot-techniciens', async (req) => {
     const st = ST();
     const ouverts = db.list(ENTITE, (o) => !st.estFinal(o.statut));
-    const config = db.getConfig();
+    const config = ctx.config();
+    // Absence validée (module RH) à la date prévue : ?datePrevue=AAAA-MM-JJ, ou date prévue de l'OT ?otId=
+    let dateRef = null;
+    if (req.query.datePrevue != null && req.query.datePrevue !== '') {
+      dateRef = jourDe(req.query.datePrevue);
+      if (!dateRef) throw new HttpError(400, 'Date prévue invalide (AAAA-MM-JJ attendu)');
+    } else if (req.query.otId) dateRef = jourDe(getVisible(req, req.query.otId).datePrevue) || null;
+    const rh = ctx.services.rh;
+    const voitRh = perms.can(req.perms, 'rh', 'voir');
+    const absenceDe = (u) => {
+      if (!dateRef || !rh || typeof rh.absenceDe !== 'function') return null;
+      try { return rh.absenceDe(u.id, dateRef) || null; } catch (e) { return null; }
+    };
     return db.list('users', (u) => u.actif !== false).map((u) => {
       const p = perms.effectivePermissions(db, u, null, config);
       if (!perms.can(p, ENTITE, 'voir') || !technicienDansPerimetre(req, u)) return null;
+      const absence = absenceDe(u);
       return {
         id: u.id, login: u.login, nom: u.nom, prenom: u.prenom || '', nomComplet: `${u.prenom || ''} ${u.nom || ''}`.trim() || u.login, fonction: u.fonction || '',
         secteurIds: u.secteurIds || [], profilNom: p.profilNom || '',
         peutModifier: perms.can(p, ENTITE, 'modifier'), peutCloturer: perms.can(p, ENTITE, 'cloturer'),
         charge: ouverts.filter((o) => estAffecte(u.id, o)).length,
         heuresPrevues: arrondi(ouverts.filter((o) => estAffecte(u.id, o)).reduce((s, o) => s + (Number(o.dureeEstimee) || 0), 0)),
+        // Absent à la date de référence (libellé détaillé réservé au droit Ressources humaines › Voir)
+        absent: !!absence, absenceDate: dateRef,
+        absenceLibelle: absence ? (voitRh ? `${absence.libelle || 'Absent'}${absence.demiJournee ? ' (demi-journée)' : ''}` : 'Absent') : '',
       };
     }).filter(Boolean).sort((a, b) => a.nomComplet.localeCompare(b.nomComplet, 'fr'));
   }, { perm: [ENTITE, 'voir'] });
@@ -944,9 +961,9 @@ function register(ctx) {
     avecCouts(o, patch);
     const maj = db.update(ENTITE, o.id, patch);
     const LIBELLES = { titre: 'titre', description: 'description', typeCode: 'type', prioriteCode: 'priorité', equipementId: 'équipement', secteurId: 'secteur', datePrevue: 'date prévue', dureeEstimee: 'durée estimée', fournisseurId: 'prestataire', coutExterne: 'coût externe', champs: 'champs personnalisés', rapport: 'compte rendu', causeCode: 'cause', compteurReleve: 'relevé de compteur', dateDebut: 'date de début', dateFin: 'date de fin', technicienId: 'responsable', techniciens: 'intervenants' };
-    ctx.audit(req, affChangee && changes.every((k) => k === 'technicienId' || k === 'techniciens') ? 'affectation' : 'modification', ENTITE, o.id, `OT ${maj.numero} : ${changes.map((k) => LIBELLES[k] || k).join(', ')}`);
-    if (nouveauxIntervenants.length) notifier(nouveauxIntervenants, req.user.id, { titre: `Affectation : OT ${maj.numero}`, message: `${maj.titre}${maj.datePrevue ? ' — prévu le ' + jourDe(maj.datePrevue).split('-').reverse().join('/') : ''}`, lien: `#/ot/${maj.id}`, type: 'info' });
-    if (patch.datePrevue !== undefined && !egal(patch.datePrevue, o.datePrevue)) notifier((maj.techniciens || []).filter((id) => !nouveauxIntervenants.includes(id)), req.user.id, { titre: `OT ${maj.numero} replanifié`, message: `${maj.titre} — nouvelle date prévue : ${maj.datePrevue ? jourDe(maj.datePrevue).split('-').reverse().join('/') : 'non planifiée'}`, lien: `#/ot/${maj.id}`, type: 'info' });
+    ctx.audit(req, affChangee && changes.every((k) => k === 'technicienId' || k === 'techniciens') ? 'affectation' : 'modification', ENTITE, o.id, `${refOt(maj.numero)} : ${changes.map((k) => LIBELLES[k] || k).join(', ')}`);
+    if (nouveauxIntervenants.length) notifier(nouveauxIntervenants, req.user.id, { titre: `Affectation : ${refOt(maj.numero)}`, message: `${maj.titre}${maj.datePrevue ? ' — prévu le ' + jourDe(maj.datePrevue).split('-').reverse().join('/') : ''}`, lien: `#/ot/${maj.id}`, type: 'info' });
+    if (patch.datePrevue !== undefined && !egal(patch.datePrevue, o.datePrevue)) notifier((maj.techniciens || []).filter((id) => !nouveauxIntervenants.includes(id)), req.user.id, { titre: `${refOt(maj.numero)} replanifié`, message: `${maj.titre} — nouvelle date prévue : ${maj.datePrevue ? jourDe(maj.datePrevue).split('-').reverse().join('/') : 'non planifiée'}`, lien: `#/ot/${maj.id}`, type: 'info' });
     ctx.emit('ot:modifie', charge(maj, { champsModifies: changes }));
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
@@ -960,7 +977,7 @@ function register(ctx) {
     if (imput.total) throw new HttpError(400, `Des achats sont imputés à cet ordre de travail (${[imput.factures ? `${imput.factures} facture(s)` : '', imput.commandes ? `${imput.commandes} commande(s)` : ''].filter(Boolean).join(', ')}) : annulez-le plutôt que de le supprimer, pour conserver le lien et les coûts`);
     verifierPorteeSecteur(req, o.secteurId);
     db.remove(ENTITE, o.id);
-    ctx.audit(req, 'suppression', ENTITE, o.id, `OT ${o.numero} : ${o.titre}`);
+    ctx.audit(req, 'suppression', ENTITE, o.id, `${refOt(o.numero)} : ${o.titre}`);
     if (!st.estFinal(o.statut)) ctx.emit('ot:annule', charge(o, { ancien: o.statut, nouveau: null, suppression: true }));
     ctx.emit('ot:supprime', charge(o));
     return { ok: true };
@@ -979,7 +996,7 @@ function register(ctx) {
       taches: (source.taches || []).map((t) => ({ libelle: t.libelle, duree: t.duree == null ? null : t.duree })), champs: source.champs || {},
     };
     // Champs personnalisés repris tels quels : un champ rendu obligatoire après la création de la source ne bloque pas la copie
-    const o = creer(req, copie, { source: 'duplication', commentaire: `Copie de l'OT ${source.numero}`, champsSouples: true });
+    const o = creer(req, copie, { source: 'duplication', commentaire: `Copie de l'ordre de travail ${source.numero}`, champsSouples: true });
     return detail(req, o);
   }, { perm: [ENTITE, 'creer'] });
 
@@ -1029,10 +1046,10 @@ function register(ctx) {
     const resumeAff = `Responsable : ${ctx.nomUser(aff.technicienId) || '—'} ; intervenants : ${aff.techniciens.map((id) => ctx.nomUser(id)).join(', ') || '—'}${patch.datePrevue ? ' ; prévu le ' + jourDe(patch.datePrevue).split('-').reverse().join('/') : ''}`;
     patch.historique = (o.historique || []).concat([entree(req, 'affectation', o.statut, resumeAff + (commentaire ? ' — ' + commentaire : ''))]);
     let maj = db.update(ENTITE, o.id, patch);
-    ctx.audit(req, 'affectation', ENTITE, o.id, `OT ${o.numero} : ${resumeAff}`);
+    ctx.audit(req, 'affectation', ENTITE, o.id, `${refOt(o.numero)} : ${resumeAff}`);
     const datePrevue = maj.datePrevue ? ' — prévu le ' + jourDe(maj.datePrevue).split('-').reverse().join('/') : '';
-    notifier(nouveaux, req.user.id, { titre: `Affectation : OT ${maj.numero}`, message: `${maj.titre}${datePrevue}${commentaire ? ' — ' + commentaire : ''}`, lien: `#/ot/${maj.id}`, type: 'info' });
-    if (patch.datePrevue !== undefined && !egal(patch.datePrevue, o.datePrevue)) notifier(aff.techniciens.filter((id) => !nouveaux.includes(id)), req.user.id, { titre: `OT ${maj.numero} replanifié`, message: `${maj.titre}${datePrevue || ' — date prévue retirée'}`, lien: `#/ot/${maj.id}`, type: 'info' });
+    notifier(nouveaux, req.user.id, { titre: `Affectation : ${refOt(maj.numero)}`, message: `${maj.titre}${datePrevue}${commentaire ? ' — ' + commentaire : ''}`, lien: `#/ot/${maj.id}`, type: 'info' });
+    if (patch.datePrevue !== undefined && !egal(patch.datePrevue, o.datePrevue)) notifier(aff.techniciens.filter((id) => !nouveaux.includes(id)), req.user.id, { titre: `${refOt(maj.numero)} replanifié`, message: `${maj.titre}${datePrevue || ' — date prévue retirée'}`, lien: `#/ot/${maj.id}`, type: 'info' });
     // Passage automatique au statut « planifié » lorsque l'OT initial est affecté et daté
     if (b.planifier !== false && st.planifie && maj.statut === st.initial && st.initial !== st.planifie && maj.datePrevue && (maj.technicienId != null || (maj.techniciens || []).length)) {
       maj = changerStatut(req, maj, st.planifie, { commentaire: 'Planification à l\'affectation', silencieux: true });
@@ -1081,7 +1098,7 @@ function register(ctx) {
       const sEq = ctx.services.equipements;
       if (sEq && typeof sEq.releverCompteur === 'function') {
         try {
-          const optionsReleve = { otId: o.id, commentaire: `Relevé à la clôture de l'OT ${o.numero}` };
+          const optionsReleve = { otId: o.id, commentaire: `Relevé à la clôture de l'ordre de travail ${o.numero}` };
           if (tReleve < Date.now() - 3600000) optionsReleve.date = new Date(tReleve).toISOString(); // intervention antérieure : relevé historisé à sa date
           sEq.releverCompteur(o.equipementId, compteurReleve, { user: req.user, socket: req.socket }, optionsReleve);
         } catch (e) {
@@ -1147,10 +1164,10 @@ function register(ctx) {
     avecCouts(o, patch);
     const maj = db.update(ENTITE, o.id, patch);
     if (nouvelIntervenant) {
-      ctx.audit(req, 'affectation', ENTITE, o.id, `OT ${o.numero} : intervenant ajouté ${ctx.nomUser(userId)} (saisie de temps)`);
-      if (pourAutrui) notifier([userId], req.user.id, { titre: `Affectation : OT ${maj.numero}`, message: `${maj.titre} — ${heures} h saisie(s) pour vous par ${ctx.nomUser(req.user.id)}`, lien: `#/ot/${maj.id}`, type: 'info' });
+      ctx.audit(req, 'affectation', ENTITE, o.id, `${refOt(o.numero)} : intervenant ajouté ${ctx.nomUser(userId)} (saisie de temps)`);
+      if (pourAutrui) notifier([userId], req.user.id, { titre: `Affectation : ${refOt(maj.numero)}`, message: `${maj.titre} — ${heures} h saisie(s) pour vous par ${ctx.nomUser(req.user.id)}`, lien: `#/ot/${maj.id}`, type: 'info' });
     }
-    ctx.audit(req, 'temps', ENTITE, o.id, `OT ${o.numero} : ${heures} h le ${date} pour ${ctx.nomUser(userId)}${commentaire ? ' — ' + commentaire : ''}`);
+    ctx.audit(req, 'temps', ENTITE, o.id, `${refOt(o.numero)} : ${heures} h le ${date} pour ${ctx.nomUser(userId)}${commentaire ? ' — ' + commentaire : ''}`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1179,7 +1196,7 @@ function register(ctx) {
     if (Number(t.userId) !== req.user.id && Number(t.saisiPar) !== req.user.id && !can(req, 'modifier')) throw new HttpError(403, 'Vous ne pouvez supprimer que vos propres saisies de temps');
     const temps = o.tempsPasse.slice(); temps.splice(idx, 1);
     const maj = db.update(ENTITE, o.id, avecCouts(o, { tempsPasse: temps }));
-    ctx.audit(req, 'temps', ENTITE, o.id, `OT ${o.numero} : suppression de ${t.heures} h du ${t.date} (${ctx.nomUser(t.userId)})`);
+    ctx.audit(req, 'temps', ENTITE, o.id, `${refOt(o.numero)} : suppression de ${t.heures} h du ${t.date} (${ctx.nomUser(t.userId)})`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1200,7 +1217,7 @@ function register(ctx) {
     if ((o.pieces || []).length >= MAX_PIECES) throw new HttpError(400, 'Nombre maximal de lignes de pièces atteint');
     let r;
     try {
-      r = await stock.sortir({ articleId, quantite, otId: o.id, userId: req.user.id, motif: `OT ${o.numero} — ${o.titre}` });
+      r = await stock.sortir({ articleId, quantite, otId: o.id, userId: req.user.id, motif: `${refOt(o.numero)} — ${o.titre}` });
     } catch (e) {
       if (e && e.status) throw e;
       throw new HttpError(400, (e && e.message) || 'Sortie de stock refusée');
@@ -1211,7 +1228,7 @@ function register(ctx) {
     const courant = db.get(ENTITE, o.id) || o;
     const piece = { uid: uid(), articleId, code: art.code || '', designation: art.designation || '', uniteCode: art.uniteCode || null, quantite, prixUnitaire: Number.isFinite(pu) ? pu : 0, mouvementId: mouvement && mouvement.id != null ? mouvement.id : null, date: maintenant(), userId: req.user.id };
     const maj = db.update(ENTITE, o.id, avecCouts(courant, { pieces: (courant.pieces || []).concat([piece]) }));
-    ctx.audit(req, 'pieces', ENTITE, o.id, `OT ${o.numero} : sortie de ${quantite} × ${piece.code ? piece.code + ' ' : ''}${piece.designation}`);
+    ctx.audit(req, 'pieces', ENTITE, o.id, `${refOt(o.numero)} : sortie de ${quantite} × ${piece.code ? piece.code + ' ' : ''}${piece.designation}`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1234,7 +1251,7 @@ function register(ctx) {
     const i2 = pieces.findIndex((p) => p === piece || (p.mouvementId != null && p.mouvementId === piece.mouvementId && p.articleId === piece.articleId));
     pieces.splice(i2 >= 0 ? i2 : idx, 1);
     const maj = db.update(ENTITE, o.id, avecCouts(courant, { pieces }));
-    ctx.audit(req, 'pieces', ENTITE, o.id, `OT ${o.numero} : retour en stock de ${piece.quantite} × ${piece.code ? piece.code + ' ' : ''}${piece.designation}`);
+    ctx.audit(req, 'pieces', ENTITE, o.id, `${refOt(o.numero)} : retour en stock de ${piece.quantite} × ${piece.code ? piece.code + ' ' : ''}${piece.designation}`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1249,7 +1266,7 @@ function register(ctx) {
     if (taches.length >= MAX_TACHES) throw new HttpError(400, `Nombre maximal de tâches atteint (${MAX_TACHES})`);
     const ordre = taches.reduce((m, t) => Math.max(m, Number(t.ordre) || 0), 0) + 1;
     const maj = db.update(ENTITE, o.id, { taches: taches.concat([{ uid: uid(), ordre, libelle, duree: nombre(b.duree, 'La durée de la tâche', { min: 0, max: 1000 }), fait: false, faitPar: null, dateFait: null }]) });
-    ctx.audit(req, 'modification', ENTITE, o.id, `OT ${o.numero} : tâche ajoutée « ${libelle} »`);
+    ctx.audit(req, 'modification', ENTITE, o.id, `${refOt(o.numero)} : tâche ajoutée « ${libelle} »`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1273,7 +1290,7 @@ function register(ctx) {
       t.dateFait = b.fait ? maintenant() : null;
     }
     const maj = db.update(ENTITE, o.id, { taches });
-    ctx.audit(req, 'modification', ENTITE, o.id, `OT ${o.numero} : tâche « ${t.libelle} » ${b.fait === undefined ? 'renommée' : (t.fait ? 'réalisée' : 'à refaire')}`);
+    ctx.audit(req, 'modification', ENTITE, o.id, `${refOt(o.numero)} : tâche « ${t.libelle} » ${b.fait === undefined ? 'renommée' : (t.fait ? 'réalisée' : 'à refaire')}`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1287,7 +1304,7 @@ function register(ctx) {
     const taches = o.taches.filter((_, i) => i !== idx).map((t, i) => Object.assign({}, t, { ordre: i + 1 }));
     const historique = (o.historique || []).concat([entree(req, 'modification', o.statut, `Tâche supprimée de la gamme : « ${sup.libelle} »${sup.fait ? ' (elle était cochée)' : ''}`)]);
     const maj = db.update(ENTITE, o.id, { taches, historique });
-    ctx.audit(req, 'modification', ENTITE, o.id, `OT ${o.numero} : tâche supprimée « ${sup.libelle} »`);
+    ctx.audit(req, 'modification', ENTITE, o.id, `${refOt(o.numero)} : tâche supprimée « ${sup.libelle} »`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1298,8 +1315,8 @@ function register(ctx) {
     const t = texte(b.texte, 'Le commentaire', { requis: true, max: MAX_COMMENTAIRE });
     const commentaires = (o.commentaires || []).concat([{ uid: uid(), userId: req.user.id, date: maintenant(), texte: t }]);
     const maj = db.update(ENTITE, o.id, { commentaires });
-    ctx.audit(req, 'commentaire', ENTITE, o.id, `OT ${o.numero} : ${t.slice(0, 200)}`);
-    notifier([o.createdBy].concat(o.techniciens || []), req.user.id, { titre: `Commentaire sur l'OT ${o.numero}`, message: `${ctx.nomUser(req.user.id)} : ${t.slice(0, 200)}`, lien: `#/ot/${o.id}?onglet=commentaires`, type: 'info' });
+    ctx.audit(req, 'commentaire', ENTITE, o.id, `${refOt(o.numero)} : ${t.slice(0, 200)}`);
+    notifier([o.createdBy].concat(o.techniciens || []), req.user.id, { titre: `Commentaire sur l'ordre de travail ${o.numero}`, message: `${ctx.nomUser(req.user.id)} : ${t.slice(0, 200)}`, lien: `#/ot/${o.id}?onglet=commentaires`, type: 'info' });
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1310,7 +1327,7 @@ function register(ctx) {
     if (Number(c.userId) !== req.user.id && !can(req, 'modifier')) throw new HttpError(403, 'Vous ne pouvez supprimer que vos propres commentaires');
     const commentaires = o.commentaires.slice(); commentaires.splice(idx, 1);
     const maj = db.update(ENTITE, o.id, { commentaires });
-    ctx.audit(req, 'commentaire', ENTITE, o.id, `OT ${o.numero} : commentaire supprimé`);
+    ctx.audit(req, 'commentaire', ENTITE, o.id, `${refOt(o.numero)} : commentaire supprimé`);
     return detail(req, maj);
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1333,7 +1350,7 @@ function register(ctx) {
     const type = String(b.type || m[1] || 'application/octet-stream').slice(0, 100);
     const doc = { uid: uid(), nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, date: maintenant(), userId: req.user.id, description: String(b.description || '').trim().slice(0, 500) };
     const maj = db.update(ENTITE, o.id, { documents: docs.concat([doc]) });
-    ctx.audit(req, 'document', ENTITE, o.id, `OT ${o.numero} : document ajouté ${nomDoc} (${Math.max(1, Math.round(taille / 1024))} Ko)`);
+    ctx.audit(req, 'document', ENTITE, o.id, `${refOt(o.numero)} : document ajouté ${nomDoc} (${Math.max(1, Math.round(taille / 1024))} Ko)`);
     return { ok: true, document: resumeDoc(doc, maj.documents.length - 1), documents: maj.documents.map(resumeDoc) };
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1365,7 +1382,7 @@ function register(ctx) {
     if (!can(req, 'modifier') && !(Number(doc.userId) === req.user.id && peutRealiser(req, o))) throw new HttpError(403, 'Vous ne pouvez supprimer que les documents que vous avez ajoutés');
     const docs = o.documents.slice(); docs.splice(idx, 1);
     const maj = db.update(ENTITE, o.id, { documents: docs });
-    ctx.audit(req, 'document', ENTITE, o.id, `OT ${o.numero} : document supprimé ${doc.nom}`);
+    ctx.audit(req, 'document', ENTITE, o.id, `${refOt(o.numero)} : document supprimé ${doc.nom}`);
     return { ok: true, documents: maj.documents.map(resumeDoc) };
   }, { perm: [ENTITE, 'voir'] });
 
@@ -1603,7 +1620,7 @@ function insererDemo(ctx) {
           nbPieces++;
         };
         try {
-          const r = stock.sortir({ articleId: a.id, quantite, otId: o.id, userId: tech, motif: `OT ${o.numero} — ${o.titre}` });
+          const r = stock.sortir({ articleId: a.id, quantite, otId: o.id, userId: tech, motif: `${refOt(o.numero)} — ${o.titre}` });
           if (r && typeof r.then === 'function') r.then(appliquer).catch(() => {}); else appliquer(r);
         } catch (e) { /* stock insuffisant : on ignore pour la démonstration */ }
       }

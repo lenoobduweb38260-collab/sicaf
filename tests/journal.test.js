@@ -51,6 +51,17 @@ describe('Journal d\'activité et notifications des responsables', () => {
     await admin.ok('DELETE', '/api/utilisateurs/' + u.id);
     assert.equal((await resp.ok('GET', '/api/notifications')).notifications.length, avant, 'notifications désactivées');
   });
+
+  test('export CSV du journal : cellules commençant par = + - @ neutralisées (injection de formules)', async () => {
+    srv.ctx.audit(null, 'modification', 'ot', 1, '=HYPERLINK("http://exemple.invalid";"Cliquer")');
+    srv.ctx.audit(null, 'modification', 'ot', 1, '-12,5');
+    const lignes = String((await admin.get('/api/audit/export?entite=ot')).body).split('\r\n');
+    const ligne = lignes.find((l) => l.includes('HYPERLINK'));
+    assert.ok(ligne, 'ligne exportée');
+    assert.ok(ligne.includes(';"\'=HYPERLINK('), 'apostrophe devant = : ' + ligne);
+    assert.ok(!/;"?=HYPERLINK/.test(ligne), 'aucune formule exécutable');
+    assert.ok(lignes.some((l) => l.includes(';-12,5;')), 'un nombre négatif reste un nombre');
+  });
 });
 
 describe('Notifications du journal : destinataires limités à ceux qui peuvent lire l\'élément', () => {

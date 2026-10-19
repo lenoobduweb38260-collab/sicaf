@@ -155,6 +155,68 @@ describe('Noyau : authentification, profils, utilisateurs, hiérarchie, configur
     assert.ok(sys.collections.some((c) => c.nom === 'users'));
   });
 
+  test('ctx.csvEscape : utilitaire CSV commun (formules de tableur neutralisées, nombres intacts)', () => {
+    const f = srv.ctx.csvEscape;
+    assert.equal(typeof f, 'function');
+    assert.equal(f('=1+1'), '\'=1+1');
+    assert.equal(f('+33 6 00 00 00 00'), '\'+33 6 00 00 00 00');
+    assert.equal(f('-cmd|calc'), '\'-cmd|calc');
+    assert.equal(f('@SUM(1)'), '\'@SUM(1)');
+    assert.equal(f('\tx'), '\'\tx');
+    assert.equal(f('-12,5'), '-12,5');
+    assert.equal(f('+2.5'), '+2.5');
+    assert.equal(f(-3), '-3');
+    assert.equal(f(null), '');
+    assert.equal(f('a;b'), '"a;b"');
+    assert.equal(f('l1\nl2'), 'l1 l2');
+    assert.equal(f('=HYPERLINK("x";"y")'), '"\'=HYPERLINK(""x"";""y"")"');
+    assert.equal(f, require('../server/csv').csvEscape, 'même fonction que server/csv.js');
+  });
+
+  test('configuration figée : copie partagée entre les appels, invalidée par db.setConfig, listes recopiées', async () => {
+    const c1 = srv.ctx.config();
+    assert.ok(Object.isFrozen(c1) && Object.isFrozen(c1.listes) && Object.isFrozen(c1.listes.priorites[0]), 'copie gelée en profondeur');
+    assert.equal(srv.ctx.config(), c1, 'même copie tant que la configuration ne change pas');
+    assert.throws(() => { c1.general.theme = 'autre'; }, TypeError, 'modification de la copie refusée');
+    const l1 = srv.ctx.liste('priorites');
+    l1[0].label = 'Modifié localement'; l1.push({ code: 'zz', label: 'ZZ' });
+    const l2 = srv.ctx.liste('priorites');
+    assert.notEqual(l2[0].label, 'Modifié localement', 'ctx.liste renvoie une copie modifiable sans effet sur la configuration');
+    assert.ok(!l2.some((x) => x.code === 'zz'));
+    const cfg = srv.db.getConfig(); cfg.general.messageAccueil = 'Bonjour à tous'; srv.db.setConfig(cfg);
+    const c2 = srv.ctx.config();
+    assert.notEqual(c2, c1, 'nouvelle copie après db.setConfig');
+    assert.equal(c2.general.messageAccueil, 'Bonjour à tous');
+    assert.equal((await admin.ok('GET', '/api/auth/me')).config.general.messageAccueil, 'Bonjour à tous', 'amorçage à jour');
+  });
+
+  test('utilisateurs et secteurs : un champ texte attend une chaîne (nombres et booléens refusés)', async () => {
+    const profils = await admin.ok('GET', '/api/profils');
+    const profilId = profils.find((p) => p.nom === 'Technicien').id;
+    const r = await admin.post('/api/utilisateurs', { login: 'chaine1', nom: 12, profilId, password: 'test1234' });
+    assert.equal(r.status, 400); assert.match(r.body.erreur, /texte attendu/);
+    assert.equal((await admin.post('/api/utilisateurs', { login: 'chaine1', nom: 'Chaîne', prenom: true, profilId, password: 'test1234' })).status, 400);
+    assert.equal((await admin.post('/api/utilisateurs', { login: 'chaine1', nom: 'Chaîne', matricule: 1234, profilId, password: 'test1234' })).status, 400);
+    const u = await admin.ok('POST', '/api/utilisateurs', { login: 'chaine1', nom: 'Chaîne', matricule: '1234', profilId, password: 'test1234' });
+    assert.equal(u.matricule, '1234');
+    assert.equal((await admin.put('/api/utilisateurs/' + u.id, { fonction: 42 })).status, 400);
+    assert.equal((await admin.put('/api/utilisateurs/' + u.id, { commentaire: ['x'] })).status, 400);
+    assert.equal((await admin.put('/api/utilisateurs/' + u.id, { fonction: 'Magasinier', commentaire: 'Note' })).status, 200);
+    const s = await admin.post('/api/secteurs', { nom: true, code: 'T1' });
+    assert.equal(s.status, 400); assert.match(s.body.erreur, /texte attendu/);
+    assert.equal((await admin.post('/api/secteurs', { nom: 'Zone test', code: 12 })).status, 400);
+    const sec = await admin.ok('POST', '/api/secteurs', { nom: 'Zone test', code: 'ZT' });
+    assert.equal((await admin.put('/api/secteurs/' + sec.id, { description: 7 })).status, 400);
+    assert.equal((await admin.put('/api/secteurs/' + sec.id, { description: 'Texte' })).status, 200);
+  });
+
+  test('portée « perso » : le demandeur d\'une commande (demandeurUserId) voit son propre élément', () => {
+    const { canSeeRecord } = srv.ctx.perms;
+    const p = { portee: 'perso', secteurIds: [], secteurIdsLecture: [] };
+    assert.equal(canSeeRecord(p, { id: 7 }, { demandeurUserId: 7, createdBy: 2 }), true);
+    assert.equal(canSeeRecord(p, { id: 8 }, { demandeurUserId: 7, createdBy: 2 }), false);
+  });
+
   test('numérotation configurable', async () => {
     const n1 = srv.db.nextNumber('ot', 'OT-{annee}-{num:4}');
     const n2 = srv.db.nextNumber('ot', 'OT-{annee}-{num:4}');

@@ -205,7 +205,8 @@ function register(ctx) {
     if (!perms.can(req.perms, 'demandes', 'valider')) return false;
     const dem = d.demandeurId != null ? refs.users().get(Number(d.demandeurId)) : null;
     const estSuperieur = !!(dem && dem.managerId != null && Number(dem.managerId) === req.user.id);
-    if (!estSuperieur && !perms.canSeeRecord(req.perms, req.user, d)) return false;
+    // Valider est une écriture : les demandes des sites accessibles en lecture seule sont exclues (comme dans le module Demandes)
+    if (!estSuperieur && !perms.canSeeRecord(req.perms, req.user, d, { ecriture: true })) return false;
     if (wf.validerParSuperieurUniquement && !req.perms.estAdmin && !estSuperieur) return false;
     return true;
   }

@@ -750,8 +750,12 @@
     });
   }
 
-  /** Modale contenant un formulaire. onSubmit(valeurs, modal, form) ; retourner false pour laisser ouvert. */
-  function formModal({ titre, champs, valeurs, colonnes = 2, taille, onSubmit, submitLabel = 'Enregistrer', annulerLabel = 'Annuler', boutonsSupp = [], apres, avant, onFermer } = {}) {
+  /**
+   * Modale contenant un formulaire. onSubmit(valeurs, modal, form) ; retourner false pour laisser ouvert.
+   * `modifie(form)` (facultatif) : saisie en cours non détectée par le formulaire lui-même (ex. éditeur d'un champ
+   * `html`) ; une fermeture par le fond ou par Échap demande alors confirmation, comme pour une saisie ordinaire.
+   */
+  function formModal({ titre, champs, valeurs, colonnes = 2, taille, onSubmit, submitLabel = 'Enregistrer', annulerLabel = 'Annuler', boutonsSupp = [], apres, avant, onFermer, modifie } = {}) {
     const f = form({ champs, valeurs, colonnes });
     // Saisie en cours : modification faite par l'utilisateur et valeurs différentes de celles d'origine
     let touche = false;
@@ -761,7 +765,7 @@
     const lire = () => { try { return JSON.stringify(f.valeurs()); } catch (e) { return ''; } };
     const initiales = lire();
     const m = modal({
-      titre, taille, onFermer, modifie: () => touche && lire() !== initiales,
+      titre, taille, onFermer, modifie: () => (touche && lire() !== initiales) || (typeof modifie === 'function' && !!modifie(f)),
       contenu: frag(avant || null, f.el, apres || null),
       boutons: [
         ...boutonsSupp.map((b) => Object.assign({}, b, { onClic: b.onClic ? (mm, btn) => b.onClic(f, mm, btn) : undefined })),

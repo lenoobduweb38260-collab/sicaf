@@ -361,6 +361,36 @@ describe('Sauvegardes multi-destinations et multi-sites', () => {
     assert.equal(absent.status, 404);
   });
 
+  test('clé de double authentification : jointe aux sauvegardes chiffrées seulement, restaurée avec la base', async () => {
+    const fichierCle = path.join(A.dataDir, 'cle-double-authentification.key');
+    const K1 = 'a'.repeat(64); const K2 = 'b'.repeat(64);
+    fs.writeFileSync(fichierCle, K1 + '\n', { mode: 0o600 });
+    A.ctx.deuxFacteurs.rechargerCle();
+    const secretChiffre = A.ctx.deuxFacteurs.chiffrer('secret-totp');
+    const ex = await adminA.ok('POST', '/api/sauvegardes-avancees/executer', { destinationId: destD.id });
+    assert.equal(ex.chiffre, true);
+    const { decoder } = require('../server/modules/sauvegardes');
+    const dec = await decoder(fs.readFileSync(path.join(dossierD, ex.fichier)), MDP);
+    assert.equal(dec.data.cleDoubleAuthentification, K1, 'clé jointe à la sauvegarde chiffrée');
+    // Serveur « réinstallé » (autre clé) : les secrets des applications d'authentification ne sont plus lisibles
+    fs.writeFileSync(fichierCle, K2 + '\n', { mode: 0o600 });
+    A.ctx.deuxFacteurs.rechargerCle();
+    assert.throws(() => A.ctx.deuxFacteurs.dechiffrer(secretChiffre));
+    const r = await adminA.ok('POST', '/api/sauvegardes-avancees/restaurer', { source: 'destination', destinationId: destD.id, fichier: ex.fichier });
+    assert.equal(r.cleDeuxFacteursRestauree, true);
+    assert.match(r.message, /clé de double authentification restaurée/);
+    assert.equal(fs.readFileSync(fichierCle, 'utf8').trim(), K1, 'fichier de clé restauré avec la base');
+    assert.equal(A.ctx.deuxFacteurs.dechiffrer(secretChiffre), 'secret-totp', 'secrets de nouveau vérifiables');
+    assert.equal(A.db.data.cleDoubleAuthentification, undefined, 'la clé ne rejoint pas la base');
+    // Sauvegarde en clair : la clé n'est jamais jointe
+    await adminA.ok('PUT', '/api/sauvegardes-avancees/parametres', { chiffrer: false });
+    const clair = await adminA.ok('POST', '/api/sauvegardes-avancees/executer', { destinationId: destD.id });
+    assert.equal(clair.chiffre, false);
+    const decClair = await decoder(fs.readFileSync(path.join(dossierD, clair.fichier)), '');
+    assert.equal(decClair.data.cleDoubleAuthentification, undefined, 'aucune clé dans une sauvegarde en clair');
+    await adminA.ok('PUT', '/api/sauvegardes-avancees/parametres', { chiffrer: true, motDePasseChiffrement: MDP });
+  });
+
   test('destination serveur : clé de réception générée sur l\'autre site, envoi, fichier reçu et empreinte vérifiés', async () => {
     // Sur Valréas : génération de la clé (affichée une seule fois) et activation de la réception
     const gen = await adminB.ok('POST', '/api/sauvegardes-avancees/cle-reception/generer');
@@ -994,6 +1024,19 @@ describe('Sauvegardes multi-destinations et multi-sites', () => {
     // Les destinations désactivées ne sont pas utilisées par une sauvegarde complète
     const ex = await adminA.ok('POST', '/api/sauvegardes-avancees/executer', {});
     assert.ok(ex.resultats.every((x) => !demo.some((d) => d.id === x.destinationId)));
+  });
+
+  test('réception : réception désactivée ou clé invalide contrôlées avant la lecture du corps (connexion fermée, fichier non chargé)', async () => {
+    const gros = Buffer.alloc(2 * 1024 * 1024, 1);
+    const entetes = { 'content-type': 'application/octet-stream', 'x-gmao-cle': 'gmao_mauvaise-cle-xxxxxxxxxxxxxxxxxxxxxxxx', 'x-gmao-source': 'X', 'x-gmao-fichier': 'gmao-X-20261014-101010.json.gz', 'x-gmao-sha256': 'a'.repeat(64) };
+    const r = await fetch(B.base + '/api/replication/recevoir', { method: 'POST', headers: entetes, body: gros });
+    assert.equal(r.status, 403);
+    assert.equal(String(r.headers.get('connection') || '').toLowerCase(), 'close', 'connexion fermée après le refus : le corps n\'est pas lu');
+    assert.match((await r.json()).erreur, /Clé de réception invalide/);
+    const r2 = await fetch(A.base + '/api/replication/recevoir', { method: 'POST', headers: entetes, body: gros });
+    assert.equal(r2.status, 403, 'réception désactivée sur A');
+    assert.equal(String(r2.headers.get('connection') || '').toLowerCase(), 'close');
+    assert.match((await r2.json()).erreur, /désactivée/);
   });
 
   test('anti-force-brute : blocage après plusieurs clés invalides', async () => {

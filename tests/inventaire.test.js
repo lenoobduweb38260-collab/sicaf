@@ -386,6 +386,21 @@ describe('Module Étiquettes & inventaire', () => {
 
   // ----- Validation ---------------------------------------------------------------------------
   describe('validation', () => {
+    test('comptage : écriture décimale seulement (hexadécimal, exposant refusés) ; nom de l\'inventaire : texte attendu', async () => {
+      const inv = await resp.ok('POST', '/api/inventaires', { nom: 'Contrôle de saisie', secteurId: maint.id, filtres: { emplacement: 'Local lubrifiants' } });
+      for (const q of ['0x10', '1e3', '12abc', 'Infinity', '1_000']) {
+        const r = await resp.post(`/api/inventaires/${inv.id}/comptage`, { code: 'ART-0005', quantite: q });
+        assert.equal(r.status, 400, q);
+        assert.match(r.body.erreur, /nombre attendu/);
+      }
+      assert.equal((await resp.post(`/api/inventaires/${inv.id}/comptage`, { code: 'ART-0005', quantite: '12,5' })).status, 200, 'virgule décimale acceptée');
+      const r = await resp.put('/api/inventaires/' + inv.id, { nom: 12 });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /texte attendu/);
+      assert.equal((await resp.put('/api/inventaires/' + inv.id, { commentaire: true })).status, 400);
+      await resp.ok('POST', `/api/inventaires/${inv.id}/annuler`, {});
+      await resp.ok('DELETE', '/api/inventaires/' + inv.id);
+    });
+
     test('droit valider requis (403) ; validation sans comptage refusée', async () => {
       assert.equal((await tech.post(`/api/inventaires/${invA.id}/valider`, {})).status, 403);
       const vide = await resp.ok('POST', '/api/inventaires', { nom: 'Vide', secteurId: maint.id, filtres: { emplacement: 'Local lubrifiants' } });
@@ -399,6 +414,8 @@ describe('Module Étiquettes & inventaire', () => {
       // Ligne courroie comptée 4 (stock 4 au comptage), puis sortie de 1 : la validation conserve la sortie (stock 3, aucun écart)
       const avant = srv.db.count('mouvementsStock');
       const v = await admin.ok('POST', `/api/inventaires/${invA.id}/valider`, { nonComptesAZero: false });
+      // Mouvements enregistrés sans entrée de journal unitaire : une seule entrée récapitulative par inventaire
+      assert.equal(srv.db.count('audit', (a) => a.action === 'mouvement' && /Inventaire INV-/.test(String(a.details))), 0, 'journal non saturé par la validation');
       assert.equal(v.statut, 'valide');
       assert.equal(v.validePar, 1);
       assert.ok(v.dateValidation);
@@ -418,7 +435,7 @@ describe('Module Étiquettes & inventaire', () => {
       assert.equal(lc.mouvementsApresComptage, -1);
       assert.equal(lc.ecart, 0);
       assert.equal(v.resume.nbEcarts, 0, 'résumé : écarts réellement appliqués');
-      assert.ok(srv.db.list('audit', (a) => a.action === 'validation' && a.entiteId === invA.id).length);
+      assert.equal(srv.db.list('audit', (a) => a.action === 'validation' && a.entite === 'inventaires' && a.entiteId === invA.id && /validé/.test(a.details)).length, 1, 'une entrée récapitulative');
       const notif = srv.db.list('notifications', (n) => n.userId === userId('resp') && n.lien === `#/inventaire/${invA.id}`);
       assert.equal(notif.length, 1, 'le créateur est notifié');
       assert.ok(evenements.some(([e, n]) => e === 'inventaire:valide' && n === invA.numero));
@@ -464,6 +481,16 @@ describe('Module Étiquettes & inventaire', () => {
 
   // ----- Étiquettes --------------------------------------------------------------------------
   describe('données d\'étiquettes', () => {
+    test('sous le seuil : règle du module Stock (un article sans seuil n\'est pas suivi)', async () => {
+      srv.db.update('articles', art.huile.id, { quantite: 0, seuilMin: 0 });
+      assert.ok(!(await tech.ok('GET', '/api/etiquettes/donnees?sousSeuil=1')).lignes.some((x) => x.code === 'ART-0005'), 'quantité nulle sans seuil : non suivi');
+      assert.equal((await tech.ok('GET', `/api/etiquettes/donnees?ids=${art.huile.id}`)).lignes[0].sousSeuil, false);
+      srv.db.update('articles', art.huile.id, { quantite: 1, seuilMin: 2 });
+      assert.equal((await tech.ok('GET', `/api/etiquettes/donnees?ids=${art.huile.id}`)).lignes[0].sousSeuil, true);
+      assert.ok((await tech.ok('GET', '/api/etiquettes/donnees?sousSeuil=1')).lignes.some((x) => x.code === 'ART-0005'));
+      srv.db.update('articles', art.huile.id, { quantite: 120, seuilMin: 2 });
+    });
+
     test('articles : filtres, sous le seuil, recherche, identifiants (ordre conservé), portée', async () => {
       const r = await tech.ok('GET', '/api/etiquettes/donnees?source=articles');
       const codes = r.lignes.map((l) => l.code);

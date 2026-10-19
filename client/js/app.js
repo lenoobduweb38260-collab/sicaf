@@ -79,6 +79,8 @@
 
     /** Recharge l'amorçage (droits, config, références) sans recharger la page. */
     async refresh(rerendre = true) {
+      const changementEtaitRequis = this.changementMdpRequis() || !!this._changementMdpEffectue;
+      this._changementMdpEffectue = false;
       const data = await api.get('/api/auth/me', null, { silent401: true });
       appliquerBootstrap(data);
       construireNavigation();
@@ -86,7 +88,12 @@
       majRappelMdp();
       if (rerendre) this.rendre();
       if (GMAO.changementMdpRequis()) imposerChangementMdp();
-      else if (GMAO.deuxFacteursRequis()) imposerEnrolement();
+      else {
+        if (GMAO.deuxFacteursRequis()) imposerEnrolement();
+        // Changement de mot de passe imposé tout juste effectué : les crochets de connexion (compteurs du menu…)
+        // n'avaient pas encore été appelés à l'amorçage
+        if (changementEtaitRequis) this._surConnexion.forEach((fn) => { try { fn(this.user); } catch (e) { console.error(e); } });
+      }
     },
     async refreshRefs() { return this.refresh(false); },
 
@@ -165,6 +172,7 @@
             if (GMAO.motDePasse) GMAO.motDePasse = Object.assign({}, GMAO.motDePasse, { doitChanger: false, raison: null, rappel: false });
             majRappelMdp();
             toast('Mot de passe modifié', 'succes');
+            if (force) GMAO._changementMdpEffectue = true; // l'amorçage qui suit appelle les crochets de connexion restés en attente
             if (apres) setTimeout(apres, 0);
             else GMAO.refresh(false).catch(() => {}); // nouvelle échéance
           } },

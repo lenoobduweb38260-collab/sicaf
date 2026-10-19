@@ -275,6 +275,46 @@ describe('Module Équipements', () => {
     await admin.ok('DELETE', '/api/equipements/' + copie.id);
   });
 
+  test('export CSV : cellules commençant par = + - @ neutralisées (injection de formules)', async () => {
+    const e = await admin.ok('POST', '/api/equipements', { nom: '=HYPERLINK("http://exemple.invalid";"Cliquer")', localisation: '-Z1', marque: '@cmd', secteurId: prod.id });
+    const ligne = String((await admin.get('/api/equipements-export')).body).split('\r\n').find((l) => l.startsWith(e.numero + ';'));
+    assert.ok(ligne, 'ligne exportée');
+    assert.ok(ligne.includes(';"\'=HYPERLINK('), 'apostrophe devant = : ' + ligne);
+    assert.ok(ligne.includes(';\'-Z1;\'@cmd;'), 'localisation et marque neutralisées : ' + ligne);
+    assert.ok(!/;"?=HYPERLINK/.test(ligne), 'aucune formule exécutable');
+    await admin.ok('DELETE', '/api/equipements/' + e.id);
+  });
+
+  test('duplication : un champ personnalisé devenu obligatoire après la création de la source ne bloque pas la copie', async () => {
+    const source = await admin.ok('POST', '/api/equipements', { nom: 'Pompe doseuse', secteurId: prod.id });
+    const cfg = await admin.ok('PUT', '/api/configuration', { champsPersonnalises: { equipements: [{ label: 'Centre de coût', type: 'texte', obligatoire: true }] } });
+    const cle = cfg.champsPersonnalises.equipements[0].cle;
+    try {
+      assert.equal((await admin.post('/api/equipements', { nom: 'Création directe', secteurId: prod.id })).status, 400, 'création : champ obligatoire contrôlé');
+      const copie = await admin.ok('POST', `/api/equipements/${source.id}/dupliquer`, { nom: 'Pompe doseuse (copie)' });
+      assert.equal(copie.nom, 'Pompe doseuse (copie)');
+      assert.equal(copie.champs[cle], null, 'champ absent de la source : vide, à compléter');
+      const copie2 = await admin.ok('POST', `/api/equipements/${source.id}/dupliquer`, { nom: 'Pompe doseuse (copie 2)', champs: { [cle]: 'CC-12' } });
+      assert.equal(copie2.champs[cle], 'CC-12', 'champ saisi dans la fenêtre de duplication repris');
+      await admin.ok('DELETE', '/api/equipements/' + copie.id); await admin.ok('DELETE', '/api/equipements/' + copie2.id);
+    } finally { await admin.ok('PUT', '/api/configuration', { champsPersonnalises: { equipements: [] } }); }
+    await admin.ok('DELETE', '/api/equipements/' + source.id);
+  });
+
+  test('documents : identifiant stable (uid) ; une suppression rejouée ne retire pas le document suivant', async () => {
+    const e = await admin.ok('POST', '/api/equipements', { nom: 'Équipement à documents', secteurId: prod.id });
+    const doc = (nom) => ({ nom, type: 'text/plain', contenu: 'data:text/plain;base64,' + Buffer.from('contenu ' + nom).toString('base64') });
+    const r1 = await admin.ok('POST', `/api/equipements/${e.id}/documents`, doc('a.txt'));
+    const r2 = await admin.ok('POST', `/api/equipements/${e.id}/documents`, doc('b.txt'));
+    assert.ok(/^u[0-9a-f]{10}$/.test(r1.document.uid) && r2.document.uid !== r1.document.uid, 'uid posé à l\'ajout');
+    assert.equal((await admin.get(`/api/equipements/${e.id}/documents/${r2.document.uid}`)).body, 'contenu b.txt', 'lecture par uid');
+    const sup = await admin.ok('DELETE', `/api/equipements/${e.id}/documents/${r1.document.uid}`);
+    assert.deepEqual(sup.documents.map((d) => d.nom), ['b.txt']);
+    assert.equal((await admin.del(`/api/equipements/${e.id}/documents/${r1.document.uid}`)).status, 404, 'requête rejouée : 404, le document suivant est conservé');
+    assert.equal(srv.db.get('equipements', e.id).documents.length, 1);
+    await admin.ok('DELETE', '/api/equipements/' + e.id);
+  });
+
   test('export CSV (droit exporter, filtres, champs)', async () => {
     const r = await admin.get('/api/equipements-export?secteurId=' + prod.id);
     assert.equal(r.status, 200);

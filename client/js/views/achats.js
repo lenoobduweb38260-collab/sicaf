@@ -977,6 +977,7 @@
   /** Documents (commande ou facture) : liste, aperçu PDF / image, ajout, suppression. */
   function rendreDocuments(type, r, recharger, { apercu = false } = {}) {
     const base = `/api/${type === 'facture' ? 'factures' : 'commandes'}/${r.id}/documents`;
+    const ref = (d) => (d.uid ? d.uid : d.index); // identifiant stable de préférence à la position
     const cont = el('div');
     const peut = r.actions && r.actions.documents && !lectureSeule(r);
     const zoneApercu = el('div', { class: 'mt' });
@@ -989,15 +990,15 @@
         // Lecteur PDF intégré indisponible sur ce poste : fiche du document avec ouverture / téléchargement
         zoneApercu.appendChild(el('div', { class: 'ach-pdf-repli' }, iconeDim('facture', 40, 'var(--danger)'), el('div', { class: 'texte-gras', style: { color: 'var(--texte)' } }, d.nom),
           el('div', { class: 'texte-petit' }, `Document PDF · ${tailleLisible(d.taille)} — l'aperçu intégré n'est pas disponible sur ce poste.`),
-          el('div', { class: 'inline' }, el('a', { class: 'btn btn-sm', href: `${base}/${d.index}`, target: '_blank', rel: 'noopener' }, icone('voir'), 'Ouvrir'),
-            el('button', { type: 'button', class: 'btn btn-sm btn-primaire', onclick: () => api.telecharger(`${base}/${d.index}?telecharger=1`, d.nom).catch(erreur) }, icone('export'), 'Télécharger'))));
+          el('div', { class: 'inline' }, el('a', { class: 'btn btn-sm', href: `${base}/${ref(d)}`, target: '_blank', rel: 'noopener' }, icone('voir'), 'Ouvrir'),
+            el('button', { type: 'button', class: 'btn btn-sm btn-primaire', onclick: () => api.telecharger(`${base}/${ref(d)}?telecharger=1`, d.nom).catch(erreur) }, icone('export'), 'Télécharger'))));
         return;
       }
       zoneApercu.appendChild(ui.chargement('Chargement de l\'aperçu…'));
       try {
         const h = { 'X-Requested-With': 'GMAO' };
         if (api.siteCourant()) h['X-GMAO-Site'] = api.siteCourant();
-        const res = await fetch(`${base}/${d.index}`, { credentials: 'same-origin', headers: h });
+        const res = await fetch(`${base}/${ref(d)}`, { credentials: 'same-origin', headers: h });
         if (!res.ok) throw new Error(`Erreur ${res.status}`);
         const blob = await res.blob();
         if (urlCourante) URL.revokeObjectURL(urlCourante);
@@ -1017,10 +1018,10 @@
       el('span', { class: 'ach-doc-nom', title: d.nom, onclick: () => afficher(d) }, d.nom),
       el('span', { class: 'texte-2 texte-petit', style: { whiteSpace: 'nowrap' } }, `${tailleLisible(d.taille)} · ${dateFr(String(d.date || '').slice(0, 10))}`),
       (d.estPdf || d.estImage) ? el('button', { type: 'button', class: 'btn btn-icone btn-sm', title: 'Aperçu', onclick: () => afficher(d) }, icone('voir')) : null,
-      el('button', { type: 'button', class: 'btn btn-icone btn-sm', title: 'Télécharger', onclick: () => api.telecharger(`${base}/${d.index}?telecharger=1`, d.nom).catch(erreur) }, icone('export')),
+      el('button', { type: 'button', class: 'btn btn-icone btn-sm', title: 'Télécharger', onclick: () => api.telecharger(`${base}/${ref(d)}?telecharger=1`, d.nom).catch(erreur) }, icone('export')),
       peut ? el('button', { type: 'button', class: 'btn btn-icone btn-sm texte-danger', title: 'Supprimer', onclick: async () => {
         if (!(await ui.confirm({ titre: 'Supprimer la pièce jointe', message: `Supprimer « ${d.nom} » ?`, okLabel: 'Supprimer', danger: true }))) return;
-        try { await api.del(`${base}/${d.index}`); toast('Pièce jointe supprimée', 'succes'); recharger(); } catch (e) { erreur(e); }
+        try { await api.del(`${base}/${ref(d)}`); toast('Pièce jointe supprimée', 'succes'); recharger(); } catch (e) { erreur(e); }
       } }, icone('supprimer')) : null))));
     cont.appendChild(zoneApercu);
     const premier = docs.find((d) => d.estPdf || d.estImage);

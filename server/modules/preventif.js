@@ -139,10 +139,7 @@ function libelleEcheance(p, echeance, unite) {
   if (p && p.type === 'compteur') return `échéance à ${formatNombre(echeance)} ${abregeUnite(unite)}`;
   return `échéance du ${formatDateFr(echeance)}`;
 }
-function csvEscape(v) {
-  const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+const { csvEscape } = require('../csv');
 const triNumero = (a, b) => String(a.numero || '').localeCompare(String(b.numero || ''), 'fr', { numeric: true }) || a.id - b.id;
 
 /** Rythme d'utilisation d'un équipement (unités de compteur par jour) d'après ses relevés. */
@@ -188,10 +185,23 @@ function register(ctx) {
     if (s && typeof s.visible === 'function') { try { return !!s.visible(req, e); } catch (err) { /* repli sur la portée standard */ } }
     return ctx.canSee(req, e);
   }
-  /** Un utilisateur limité à ses secteurs ne rattache un plan qu'à ses propres secteurs. */
+  /**
+   * Un utilisateur limité à ses sites / secteurs ne rattache un plan qu'à un secteur qu'il peut modifier (même règle
+   * que les équipements : toute portée autre que « tous » ; en portée « perso » sans secteur, seuls les sites
+   * accessibles en lecture seule sont refusés). Appliquée à la création et au changement de secteur d'un plan.
+   */
   function verifierPorteeSecteur(req, secteurId) {
-    if (!req || !req.perms || req.perms.portee !== 'secteurs' || secteurId == null) return;
-    if (!req.perms.secteurIds.includes(Number(secteurId))) throw new HttpError(403, 'Ce secteur est hors de votre périmètre : vous ne pouvez gérer que les plans préventifs de vos secteurs');
+    if (!req || !req.perms || req.perms.portee === 'tous' || secteurId == null) return;
+    const sid = Number(secteurId);
+    const lectureSeule = (req.perms.secteurIdsLecture || []).includes(sid);
+    const modifiables = req.perms.secteurIds || [];
+    if (req.perms.portee === 'perso' && !modifiables.length) {
+      if (lectureSeule) throw new HttpError(403, 'Ce site est accessible en lecture seule pour vous : impossible d\'y gérer un plan préventif');
+      return;
+    }
+    if (!modifiables.includes(sid)) {
+      throw new HttpError(403, lectureSeule ? 'Ce site est accessible en lecture seule pour vous : impossible d\'y gérer un plan préventif' : 'Ce secteur est hors de votre périmètre : vous ne pouvez gérer que les plans préventifs de vos secteurs');
+    }
   }
 
   // ----- Validation des entrées --------------------------------------------------------------
@@ -706,7 +716,9 @@ function register(ctx) {
     if (p.type === 'compteur') {
       const eq = plan.equipementId != null ? db.get('equipements', plan.equipementId) : null;
       let valeur = nombreOuNull(o.compteurReleve);
-      if (valeur == null && eq && eq.compteur) valeur = nombreOuNull(eq.compteur.valeur);
+      const courant = eq && eq.compteur ? nombreOuNull(eq.compteur.valeur) : null;
+      if (valeur == null) valeur = courant;
+      else if (courant != null && valeur > courant) valeur = courant; // relevé borné au compteur courant de l'équipement
       const ancienne = nombreOuNull(plan.derniereExecution);
       if (valeur != null && ancienne != null && valeur < ancienne) return null; // réalisation antérieure à la dernière connue
       if (valeur != null) { patch.derniereExecution = valeur; patch.prochaineEcheance = arrondi(valeur + Number(p.valeur || 0), 3); } else {
@@ -776,11 +788,22 @@ function register(ctx) {
   }
 
   const otDe = (data) => (data && data.ot && typeof data.ot === 'object' ? data.ot : data);
+  /**
+   * L'OT réalise-t-il bien le plan : même équipement que le plan (un OT déplacé sur un autre équipement n'enregistre
+   * rien). Un événement sans champ equipementId (émetteur interne partiel) est accepté.
+   */
+  function otDuPlan(plan, o) {
+    if (o.equipementId === undefined) return true;
+    const eqPlan = plan.equipementId == null || plan.equipementId === '' ? null : Number(plan.equipementId);
+    const eqOt = o.equipementId == null || o.equipementId === '' ? null : Number(o.equipementId);
+    return eqPlan === eqOt;
+  }
   ctx.on('ot:termine', (data) => {
     const o = otDe(data);
     if (!o || o.planPreventifId == null) return;
     const plan = db.get(ENTITE, o.planPreventifId);
-    if (plan) enregistrerRealisation(plan, o);
+    if (!plan || !otDuPlan(plan, o)) return;
+    enregistrerRealisation(plan, o);
   });
   /** La réalisation est remise en cause si l'OT qui l'a enregistrée quitte un statut « terminé » ou disparaît. */
   function remettreEnCause(data, motif) {

@@ -130,10 +130,7 @@ function heuresEntre(a, b) {
   if (ta == null || tb == null || tb < ta) return null;
   return (tb - ta) / 3600000;
 }
-function csvEscape(v) {
-  const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+const { csvEscape } = require('../csv');
 const csvNombre = (n, dec = 2) => (n == null || n === '' ? '' : String(arrondi(n, dec)).replace('.', ','));
 
 /** Outils de lecture de la liste de statuts d'OT configurée (repli sur les codes par défaut). */

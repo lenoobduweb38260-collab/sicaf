@@ -590,6 +590,12 @@
     if (!acces.achats) return sansAcces('stock');
     const a = f.achats || {};
     const cont = el('div');
+    // Module Achats & factures : commandes et factures de ce fournisseur
+    if (GMAO.moduleVisible('achats')) {
+      cont.appendChild(el('div', { class: 'barre-outils', style: { marginBottom: '10px' } },
+        ui.bouton('Commandes du fournisseur', { icone: 'liste', classe: 'btn-sm', onClic: () => GMAO.navigate(`#/achats?onglet=commandes&fournisseurId=${f.id}`) }),
+        ui.bouton('Factures du fournisseur', { icone: 'euro', classe: 'btn-sm', onClic: () => GMAO.navigate(`#/achats?onglet=factures&fournisseurId=${f.id}`) })));
+    }
     if (!a.nbReceptions) {
       cont.appendChild(ui.vide('Aucune réception en stock n\'a été enregistrée auprès de ce fournisseur (mouvements d\'entrée du module Stock).', 'euro'));
       return cont;

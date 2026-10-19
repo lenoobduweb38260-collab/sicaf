@@ -17,7 +17,19 @@
 
   // ----- Utilitaires ------------------------------------------------------
   const can = (action) => GMAO.can(MODULE, action);
-  const urlDocument = (eqId, index, telecharger) => `/api/equipements/${eqId}/documents/${index}${telecharger ? '?telecharger=1' : ''}`;
+  /** Adresse d'un document : identifiant stable `uid` de préférence à la position (requête rejouée sans risque). */
+  const refDocument = (d) => (d && d.uid ? d.uid : d.index);
+  const urlDocument = (eqId, ref, telecharger) => `/api/equipements/${eqId}/documents/${ref}${telecharger ? '?telecharger=1' : ''}`;
+  /**
+   * Bouton « Localiser sur le plan » (module Plans 3D) : masqué tant que GET /api/plans-localiser/:id ne renvoie aucun
+   * plan ; la vue Plans gère le choix entre plusieurs plans et le centrage sur l'objet.
+   */
+  function boutonPlan(equipementId, classe) {
+    if (!GMAO.moduleVisible('plans') || equipementId == null) return null;
+    const btn = ui.bouton('Localiser sur le plan', { icone: 'plan3d', classe: `${classe || ''} masque`.trim(), onClic: () => GMAO.navigate('#/plans?equipementId=' + equipementId) });
+    api.get('/api/plans-localiser/' + equipementId).then((plans) => { if (Array.isArray(plans) && plans.length) btn.classList.remove('masque'); }).catch(() => {});
+    return btn;
+  }
   function tailleLisible(octets) {
     const n = Number(octets) || 0;
     if (n < 1024) return `${n} o`;
@@ -578,7 +590,7 @@
     if (!docs.length) { cont.appendChild(ui.vide('Aucun document joint (photos, notices, schémas, certificats…)', 'piece_jointe')); return cont; }
     const grille = el('div', { class: 'grille', style: { gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))' } });
     for (const d of docs) {
-      const url = urlDocument(e.id, d.index);
+      const url = urlDocument(e.id, refDocument(d));
       grille.appendChild(el('div', { class: 'carte', style: { marginBottom: 0, padding: '12px', display: 'flex', flexDirection: 'column', gap: '6px' } },
         d.estImage
           ? el('a', { href: url, target: '_blank', rel: 'noopener', title: 'Ouvrir l\'image' }, el('img', { src: url, alt: d.nom, style: { width: '100%', height: '140px', objectFit: 'cover', borderRadius: '6px', border: '1px solid var(--bordure)', display: 'block' } }))
@@ -588,10 +600,10 @@
         d.description ? el('div', { class: 'texte-petit' }, d.description) : null,
         el('div', { class: 'inline', style: { marginTop: 'auto', gap: '4px', flexWrap: 'wrap' } },
           el('a', { class: 'btn btn-sm', href: url, target: '_blank', rel: 'noopener', title: 'Ouvrir dans un nouvel onglet' }, icone('voir'), 'Ouvrir'),
-          el('button', { class: 'btn btn-sm', type: 'button', title: 'Télécharger', onclick: () => api.telecharger(urlDocument(e.id, d.index, true), d.nom).catch(erreur) }, icone('export'), 'Télécharger'),
+          el('button', { class: 'btn btn-sm', type: 'button', title: 'Télécharger', onclick: () => api.telecharger(urlDocument(e.id, refDocument(d), true), d.nom).catch(erreur) }, icone('export'), 'Télécharger'),
           can('modifier') ? el('button', { class: 'btn btn-sm btn-icone texte-danger', type: 'button', title: 'Supprimer', style: { marginLeft: 'auto' }, onclick: async () => {
             if (!(await ui.confirm({ titre: 'Supprimer le document', message: `Supprimer « ${d.nom} » ?`, okLabel: 'Supprimer', danger: true }))) return;
-            try { await api.del(`/api/equipements/${e.id}/documents/${d.index}`); toast('Document supprimé', 'succes'); recharger(); } catch (err) { erreur(err); }
+            try { await api.del(urlDocument(e.id, refDocument(d))); toast('Document supprimé', 'succes'); recharger(); } catch (err) { erreur(err); }
           } }, icone('supprimer')) : null)));
     }
     cont.appendChild(grille);
@@ -685,6 +697,8 @@
       can('creer') ? ui.bouton('Ajouter un sous-équipement', { icone: 'plus', classe: 'btn-sm', onClic: () => ouvrirFormulaire(null, { parentId: e.id, secteurId: e.secteurId }) }) : null,
       can('creer') ? ui.bouton('Dupliquer', { icone: 'copier', classe: 'btn-sm', onClic: () => dupliquer(e) }) : null,
       ui.bouton('Imprimer la fiche', { icone: 'imprimer', classe: 'btn-sm', onClic: () => imprimerFiche(e) }),
+      GMAO.moduleVisible('inventaire') ? ui.bouton('Imprimer l\'étiquette', { icone: 'imprimer', classe: 'btn-sm', onClic: () => GMAO.navigate(`#/inventaire?onglet=etiquettes&source=equipements&ids=${e.id}`) }) : null,
+      boutonPlan(e.id, 'btn-sm'),
       el('span', { class: 'espace' }),
       can('supprimer') ? ui.bouton('Supprimer', { icone: 'supprimer', classe: 'btn-sm btn-danger', onClic: () => supprimer(e, (r) => (r.desactive ? recharger() : GMAO.navigate('#/equipements'))) }) : null));
 

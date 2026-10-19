@@ -245,6 +245,9 @@ class Coffre {
     this._cle = null;
   }
 
+  /** Oublie la clé lue : relue dans le fichier au prochain usage (fichier restauré avec une sauvegarde). */
+  recharger() { this._cle = null; }
+
   cle() {
     if (this._cle) return this._cle;
     if (this.enMemoire) { this._cle = crypto.randomBytes(32); return this._cle; }

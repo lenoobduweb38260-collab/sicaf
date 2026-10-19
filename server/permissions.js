@@ -256,7 +256,7 @@ function can(perms, module, action) {
 }
 
 /** Champs d'un enregistrement considérés comme « appartenance » pour la portée « perso ». */
-const CHAMPS_PERSO = ['createdBy', 'demandeurId', 'technicienId', 'responsableId', 'utilisateurId', 'assigneA'];
+const CHAMPS_PERSO = ['createdBy', 'demandeurId', 'demandeurUserId', 'technicienId', 'responsableId', 'utilisateurId', 'assigneA'];
 
 /** L'utilisateur est-il l'intervenant désigné (OT, plan préventif : `technicienId`, `techniciens[]`) ? */
 function estIntervenant(record, uid) {

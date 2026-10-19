@@ -9,16 +9,25 @@ const nom = 'Secteurs';
 function register(ctx) {
   const { router, db, HttpError, perms } = ctx;
 
+  /** Texte libre : seule une chaîne est acceptée (booléens, nombres, tableaux et objets refusés). */
+  function chaine(v, libelle) {
+    if (v == null) return '';
+    if (typeof v !== 'string') throw new HttpError(400, `${libelle} : valeur invalide (texte attendu)`);
+    return v.trim();
+  }
+  /** Valeur texte saisie, ou valeur existante quand le champ n'est pas fourni. */
+  const texteOuExistant = (body, existant, cle, libelle) => (body[cle] == null ? String((existant && existant[cle]) || '').trim() : chaine(body[cle], libelle));
+
   function valider(body, existant) {
     const out = {};
-    out.nom = String(body.nom == null ? (existant ? existant.nom : '') : body.nom).trim();
+    out.nom = texteOuExistant(body, existant, 'nom', 'Le nom du secteur');
     if (!out.nom) throw new HttpError(400, 'Le nom du secteur est obligatoire');
-    out.code = String(body.code == null ? (existant ? existant.code || '' : '') : body.code).trim().toUpperCase();
+    out.code = texteOuExistant(body, existant, 'code', 'Le code du secteur').toUpperCase();
     if (out.code) {
       const doublon = db.findOne('secteurs', (s) => (s.code || '').toUpperCase() === out.code && (!existant || s.id !== existant.id));
       if (doublon) throw new HttpError(400, 'Ce code de secteur est déjà utilisé');
     }
-    out.description = String(body.description == null ? (existant ? existant.description || '' : '') : body.description).trim();
+    out.description = texteOuExistant(body, existant, 'description', 'La description');
     out.couleur = /^#[0-9a-fA-F]{6}$/.test(body.couleur || '') ? body.couleur : (existant ? existant.couleur || '#6b7280' : '#6b7280');
     out.ordre = body.ordre == null ? (existant ? existant.ordre || 0 : db.count('secteurs') + 1) : Number(body.ordre) || 0;
     const parentId = body.parentId === undefined ? (existant ? existant.parentId : null) : (body.parentId == null || body.parentId === '' ? null : Number(body.parentId));

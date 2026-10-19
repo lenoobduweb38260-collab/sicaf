@@ -253,6 +253,8 @@ describe('Plans 3D', () => {
   test('duplication : nouveau numéro, version 1, objets et liens conservés sur le même site', async () => {
     const p = await admin.ok('POST', '/api/plans', planSimple({ nom: 'Source', objets: [machine('m1', { equipementId: eqMaint.id }), { id: 'z', type: 'zone', x: 5, y: 5, largeur: 4, profondeur: 4, secteurId: maint.id }] }));
     const c = await admin.ok('POST', `/api/plans/${p.id}/dupliquer`, {});
+    assert.equal((await admin.post(`/api/plans/${p.id}/dupliquer`, { nom: true })).status, 400, 'nom : texte attendu');
+    assert.equal((await admin.post(`/api/plans/${p.id}/dupliquer`, { nom: 12 })).status, 400, 'nom : texte attendu');
     assert.notEqual(c.id, p.id);
     assert.notEqual(c.numero, p.numero);
     assert.equal(c.nom, 'Source (copie)');

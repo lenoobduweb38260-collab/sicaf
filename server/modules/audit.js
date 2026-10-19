@@ -4,15 +4,8 @@
  */
 const nom = 'Audit';
 
-/**
- * Cellule CSV : guillemets si nécessaire ; une valeur texte qui commence par = + - @ (ou une tabulation, un retour
- * chariot) est précédée d'une apostrophe pour qu'un tableur ne l'interprète pas comme une formule.
- */
-function csvEscape(v) {
-  let s = v == null ? '' : String(v);
-  if (typeof v !== 'number' && /^[=+\-@\t\r]/.test(s) && !/^[-+]?\d[\d\s.,]*$/.test(s)) s = "'" + s;
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+// Cellule CSV (utilitaire commun du cœur : guillemets, neutralisation des formules de tableur)
+const { csvEscape } = require('../csv');
 
 function register(ctx) {
   const { router, db } = ctx;

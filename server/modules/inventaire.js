@@ -60,11 +60,7 @@ const BOM = String.fromCharCode(0xfeff);
  * = + - @ (ou une tabulation) serait interprété comme une formule par le tableur : il est préfixé
  * d'une apostrophe. Les nombres (« -3 », « -17,8 ») restent des nombres.
  */
-function csvEscape(v) {
-  let s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
-  if (/^[=+\-@\t\r]/.test(s) && !/^[-+]?\d+(,\d+)?$/.test(s)) s = '\'' + s;
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+const { csvEscape } = require('../csv');
 const csvNombre = (n) => (n == null || n === '' ? '' : String(arrondi(n, 4)).replace('.', ','));
 
 /** Code encodable en Code 128 ? (sinon message d'erreur) */
@@ -134,8 +130,9 @@ function register(ctx) {
     if (typeof b !== 'object' || Array.isArray(b) || Buffer.isBuffer(b)) throw new HttpError(400, 'Corps de requête invalide (objet JSON attendu)');
     return b;
   }
+  /** Texte libre : seule une chaîne est acceptée (booléens, nombres, tableaux et objets refusés). */
   function texte(v, label, { requis = false, max = 1000 } = {}) {
-    if (v != null && typeof v === 'object') throw new HttpError(400, `${label} invalide`);
+    if (v != null && typeof v !== 'string') throw new HttpError(400, `${label} : valeur invalide (texte attendu)`);
     const s = String(v == null ? '' : v).trim();
     if (requis && !s) throw new HttpError(400, `${label} : champ obligatoire`);
     if (s.length > max) throw new HttpError(400, `${label} : ${max} caractères au maximum`);
@@ -150,6 +147,8 @@ function register(ctx) {
   function quantite(v, label, { requis = true } = {}) {
     if (v == null || v === '') { if (requis) throw new HttpError(400, `${label} : valeur obligatoire`); return null; }
     if (typeof v === 'boolean' || typeof v === 'object') throw new HttpError(400, `${label} : nombre attendu`);
+    // Chaîne : écriture décimale seulement (virgule acceptée) ; Number() accepterait l'hexadécimal ou l'exposant
+    if (typeof v === 'string' && !/^\s*-?\d+(?:[.,]\d+)?\s*$/.test(v)) throw new HttpError(400, `${label} : nombre attendu`);
     const n = Number(String(v).replace(',', '.'));
     if (!Number.isFinite(n)) throw new HttpError(400, `${label} : nombre attendu`);
     if (n < 0) throw new HttpError(400, `${label} : la valeur doit être positive ou nulle`);
@@ -170,7 +169,22 @@ function register(ctx) {
     return STATUTS_DEFAUT.map((d) => Object.assign({}, d, l.find((x) => x.code === d.code) || {}));
   }
   const libelleStatut = (code) => (statutsInventaire().find((s) => s.code === code) || {}).label || code;
-  const libelleListe = (liste, code) => { if (code == null || code === '') return ''; const it = ctx.liste(liste).find((x) => x.code === code); return it ? it.label : String(code); };
+  // Libellés des listes de valeurs : cartes code → libellé mémorisées tant que la configuration (copie figée du cœur) ne change pas
+  const cacheListes = { config: null, cartes: new Map() };
+  function carteListe(liste) {
+    const cfg = ctx.config();
+    if (cacheListes.config !== cfg) { cacheListes.config = cfg; cacheListes.cartes.clear(); }
+    let m = cacheListes.cartes.get(liste);
+    if (!m) { m = new Map(ctx.liste(liste).map((x) => [x.code, x.label])); cacheListes.cartes.set(liste, m); }
+    return m;
+  }
+  const libelleListe = (liste, code) => { if (code == null || code === '') return ''; const m = carteListe(liste); return m.has(code) ? m.get(code) : String(code); };
+  /** Article sous le seuil : règle du module Stock (un article sans seuil n'est pas suivi), par son service quand il est présent. */
+  function sousSeuil(a) {
+    const s = ctx.services.stock;
+    if (s && typeof s.estSousSeuil === 'function') { try { return !!s.estSousSeuil(a); } catch (e) { /* repli ci-dessous */ } }
+    return num(a.seuilMin) > 0 && num(a.quantite) <= num(a.seuilMin);
+  }
   function cheminSecteur(id) {
     const parts = []; let cur = id == null ? null : db.get('secteurs', id); const vus = new Set();
     while (cur && !vus.has(cur.id)) { parts.unshift(cur.nom); vus.add(cur.id); cur = cur.parentId != null ? db.get('secteurs', cur.parentId) : null; }
@@ -300,7 +314,7 @@ function register(ctx) {
           lien: `#/stock/${a.id}`,
           details: {
             quantite: arrondi(num(a.quantite)), unite: a.uniteCode || '', uniteLibelle: libelleListe('unites', a.uniteCode), emplacement: a.emplacement || '',
-            seuilMin: num(a.seuilMin), prixUnitaire: num(a.prixUnitaire), sousSeuil: a.actif !== false && num(a.quantite) <= num(a.seuilMin),
+            seuilMin: num(a.seuilMin), prixUnitaire: num(a.prixUnitaire), sousSeuil: a.actif !== false && sousSeuil(a),
             actif: a.actif !== false, categorieCode: a.categorieCode || null, referenceFournisseur: a.referenceFournisseur || '',
             fournisseurNom: nomFournisseur(a.fournisseurId), secteurId: a.secteurId == null || a.secteurId === '' ? null : Number(a.secteurId),
             inventairesEnCours: inventairesEnCours(req, a.id),
@@ -899,7 +913,8 @@ function register(ctx) {
           if (flux) l.mouvementsApresComptage = flux;
           qte = Math.max(0, arrondi(num(l.quantiteComptee) + flux));
         }
-        const r = stock.inventorier({ articleId: Number(l.articleId), quantite: qte, userId: req.user.id, motif });
+        // Mouvement sans entrée de journal unitaire : l'inventaire validé fait l'objet d'une seule entrée récapitulative
+        const r = stock.inventorier({ articleId: Number(l.articleId), quantite: qte, userId: req.user.id, motif, silencieux: true });
         const m = r && r.mouvement ? r.mouvement : null;
         if (l.quantiteComptee == null) l.misAZero = true;
         if (m) {
@@ -993,7 +1008,7 @@ function register(ctx) {
     return {
       id: a.id, type: 'article', code: a.code || '', designation: a.designation || '', emplacement: a.emplacement || '', referenceFournisseur: a.referenceFournisseur || '',
       uniteCode: a.uniteCode || '', uniteLibelle: libelleListe('unites', a.uniteCode), categorieCode: a.categorieCode || '', categorieLibelle: libelleListe('categoriesArticles', a.categorieCode),
-      prixUnitaire: num(a.prixUnitaire), quantite: arrondi(num(a.quantite)), seuilMin: num(a.seuilMin), sousSeuil: a.actif !== false && num(a.quantite) <= num(a.seuilMin),
+      prixUnitaire: num(a.prixUnitaire), quantite: arrondi(num(a.quantite)), seuilMin: num(a.seuilMin), sousSeuil: a.actif !== false && sousSeuil(a),
       fournisseurId: a.fournisseurId == null || a.fournisseurId === '' ? null : Number(a.fournisseurId), fournisseurNom: nomFournisseur(a.fournisseurId),
       secteurId: a.secteurId == null || a.secteurId === '' ? null : Number(a.secteurId), secteurNom: nomSecteur(a.secteurId), actif: a.actif !== false,
       encodable: c.encodable, erreurCode: c.erreur,
@@ -1026,7 +1041,7 @@ function register(ctx) {
         if (q.fournisseurId) { const f = idRef(q.fournisseurId, 'Fournisseur'); rows = rows.filter((a) => Number(a.fournisseurId) === f); }
         if (q.emplacement) { const p = cleEmplacement(q.emplacement); rows = rows.filter((a) => cleEmplacement(a.emplacement).startsWith(p)); }
         if (q.secteurId) { const s = new Set(perms.secteursDescendants(db, [idRef(q.secteurId, 'Secteur')])); rows = rows.filter((a) => a.secteurId != null && s.has(Number(a.secteurId))); }
-        if (vrai(q.sousSeuil)) rows = rows.filter((a) => num(a.quantite) <= num(a.seuilMin));
+        if (vrai(q.sousSeuil)) rows = rows.filter((a) => sousSeuil(a));
       }
     } else {
       rows = db.list('equipements').filter((e) => equipementVisible(req, e));

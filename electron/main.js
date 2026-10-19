@@ -296,7 +296,8 @@ function creerFenetrePrincipale(url) {
   fenetre = new BrowserWindow({
     width: f.largeur, height: f.hauteur, minWidth: 1000, minHeight: 650, show: false,
     title: NOM, icon: ICONE, autoHideMenuBar: true, backgroundColor: '#f3f4f6',
-    webPreferences: { preload: PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true, spellcheck: true },
+    // plugins : lecteur PDF intégré (aperçu des factures et documents dans la GMAO)
+    webPreferences: { preload: PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true, spellcheck: true, plugins: true },
   });
   if (f.maximisee) fenetre.maximize();
   fenetre.once('ready-to-show', () => { if (!DEMARRAGE_CACHE) fenetre.show(); });
@@ -305,7 +306,7 @@ function creerFenetrePrincipale(url) {
   // Fenêtres secondaires : impressions (about:blank) et pages de l'application ; liens externes → navigateur
   fenetre.webContents.setWindowOpenHandler(({ url: u }) => {
     if (u === 'about:blank' || origineAutorisee(u)) {
-      return { action: 'allow', overrideBrowserWindowOptions: { icon: ICONE, autoHideMenuBar: true, webPreferences: { contextIsolation: true, sandbox: true } } };
+      return { action: 'allow', overrideBrowserWindowOptions: { icon: ICONE, autoHideMenuBar: true, webPreferences: { contextIsolation: true, sandbox: true, plugins: true } } };
     }
     if (/^(https?|mailto):/i.test(u)) shell.openExternal(u);
     return { action: 'deny' };
@@ -558,6 +559,9 @@ function gestionnaireMaj() {
   return creerGestionnaire({
     versionActuelle: app.getVersion(),
     config: { source: m.source, depot: m.depot || DEPOT_DEFAUT, chemin: m.chemin, url: m.url },
+    // Clé publique de signature des manifestes (package.json › gmao.clePubliqueMaj) : dès qu'elle est définie, un
+    // manifeste non signé ou mal signé est refusé
+    clePublique: (PKG.gmao && PKG.gmao.clePubliqueMaj) || undefined,
     fetch: (u, o) => net.fetch(u, o),
     dossierTelechargement: path.join(app.getPath('temp'), 'gmao-sicaf-maj'),
     agent: `GMAO-SICAF/${app.getVersion()}`,
@@ -587,12 +591,19 @@ async function verifierMisesAJour(manuel) {
     if (!manuel && parametres.valeurs.misesAJour.ignorerVersion === info.version) return info;
     const r = await dialog.showMessageBox(parent, {
       type: 'info', title: `${NOM} — mise à jour`, message: `Une nouvelle version est disponible : ${info.version}`,
-      detail: `Version installée : ${app.getVersion()}${info.notes ? `\n\nNouveautés :\n${info.notes.slice(0, 1500)}` : ''}${partageActif() ? '\n\nCe poste héberge la GMAO pour le réseau : l\'accès sera interrompu une minute pendant l\'installation.' : ''}`,
+      detail: `Version installée : ${app.getVersion()}${info.signatureVerifiee ? '\nSignature de l\'éditeur vérifiée.' : ''}${info.notes ? `\n\nNouveautés :\n${info.notes.slice(0, 1500)}` : ''}${partageActif() ? '\n\nCe poste héberge la GMAO pour le réseau : l\'accès sera interrompu une minute pendant l\'installation.' : ''}`,
       buttons: PORTABLE ? ['Télécharger', 'Plus tard', 'Ignorer cette version'] : ['Installer maintenant', 'Plus tard', 'Ignorer cette version'], defaultId: 0, cancelId: 1,
     });
     if (r.response === 2) { parametres.enregistrer({ misesAJour: { ignorerVersion: info.version } }); return info; }
     if (r.response !== 0) return info;
-    if (PORTABLE) { shell.openExternal(info.page || info.telechargement.url || ''); return info; }
+    if (PORTABLE) {
+      // Version portable : pas d'installation silencieuse ; la source « dossier » s'ouvre dans l'explorateur (fichier
+      // de l'installateur sélectionné), les autres sources dans le navigateur
+      const t = info.telechargement || {};
+      if (t.type === 'fichier' && t.chemin) shell.showItemInFolder(t.chemin);
+      else if (/^https?:/i.test(String(info.page || t.url || ''))) shell.openExternal(info.page || t.url);
+      return info;
+    }
     const fichier = await g.telecharger(info, (x) => { if (fenetre) fenetre.setProgressBar(x); });
     if (fenetre) fenetre.setProgressBar(-1);
     // Installation silencieuse dans le même dossier, puis relance automatique de l'application

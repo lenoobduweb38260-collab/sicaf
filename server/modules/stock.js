@@ -36,10 +36,7 @@ const vrai = (v) => v === true || v === 1 || ['1', 'true', 'oui', 'on'].includes
 const faux = (v) => v === false || v === 0 || ['0', 'false', 'non', 'off'].includes(String(v == null ? '' : v).toLowerCase());
 const parDateDesc = (a, b) => String(b.date || '').localeCompare(String(a.date || '')) || (b.id - a.id);
 
-function csvEscape(v) {
-  const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+const { csvEscape } = require('../csv');
 const csvNombre = (n) => (n == null || n === '' ? '' : String(arrondi(n, 4)).replace('.', ','));
 
 /** Quantité en dessous (ou au niveau) du seuil minimum. Un article sans seuil (0) n'est pas suivi : jamais en alerte. */
@@ -100,8 +97,23 @@ function register(ctx) {
 
   // ----- Références -----------------------------------------------------------------
   const uniteCode = (a) => a.uniteCode || '';
-  const libelleListe = (liste, code) => { const it = ctx.liste(liste).find((x) => x.code === code); return it ? it.label : (code || ''); };
+  // Libellés des listes de valeurs : cartes code → libellé mémorisées tant que la configuration (copie figée du cœur) ne change pas
+  const cacheListes = { config: null, cartes: new Map() };
+  function carteListe(liste) {
+    const cfg = ctx.config();
+    if (cacheListes.config !== cfg) { cacheListes.config = cfg; cacheListes.cartes.clear(); }
+    let m = cacheListes.cartes.get(liste);
+    if (!m) { m = new Map(ctx.liste(liste).map((x) => [x.code, x.label])); cacheListes.cartes.set(liste, m); }
+    return m;
+  }
+  const libelleListe = (liste, code) => { const m = carteListe(liste); return m.has(code) ? m.get(code) : (code || ''); };
   const statutsOt = () => ctx.liste('statutsOT');
+  /** Codes des statuts d'OT finaux (une lecture de la liste par appel, pour filtrer une liste d'OT). */
+  function statutsOtFinaux() {
+    const s = ctx.services.ot;
+    if (s && typeof s.estFinal === 'function') { try { return { has: (code) => !!s.estFinal(code) }; } catch (e) { /* repli */ } }
+    return new Set(statutsOt().filter((x) => x.final).map((x) => x.code));
+  }
   function otEstFinal(o) {
     const s = ctx.services.ot;
     if (s && typeof s.estFinal === 'function') { try { return !!s.estFinal(o.statut); } catch (e) { /* repli */ } }
@@ -180,6 +192,24 @@ function register(ctx) {
   }
 
   // ----- Portée -------------------------------------------------------------------------
+  /**
+   * Un utilisateur limité à ses sites / secteurs ne rattache un article qu'à un secteur qu'il peut modifier (même
+   * règle que les équipements : toute portée autre que « tous » ; en portée « perso » sans secteur, seuls les sites
+   * accessibles en lecture seule sont refusés). Appliquée à la création et au changement de secteur d'un article.
+   */
+  function verifierPorteeEcriture(req, secteurId) {
+    if (!req || !req.perms || req.perms.estAdmin || req.perms.portee === 'tous' || secteurId == null) return;
+    const sid = Number(secteurId);
+    const lectureSeule = (req.perms.secteurIdsLecture || []).includes(sid);
+    const modifiables = req.perms.secteurIds || [];
+    if (req.perms.portee === 'perso' && !modifiables.length) {
+      if (lectureSeule) throw new HttpError(403, 'Ce site est accessible en lecture seule pour vous : impossible d\'y rattacher un article');
+      return;
+    }
+    if (!modifiables.includes(sid)) {
+      throw new HttpError(403, lectureSeule ? 'Ce site est accessible en lecture seule pour vous : impossible d\'y rattacher un article' : 'Vous ne pouvez rattacher un article qu\'à l\'un de vos secteurs');
+    }
+  }
   function articleVisible(req, id) {
     const a = db.get(ENTITE, id);
     if (!a || !ctx.canSee(req, a)) throw new HttpError(404, 'Article introuvable');
@@ -328,9 +358,7 @@ function register(ctx) {
     if (secteurId != null) {
       if (!db.get('secteurs', secteurId)) throw new HttpError(400, 'Secteur introuvable');
       const change = !existant || Number(existant.secteurId) !== secteurId;
-      if (change && req && req.perms && req.perms.portee === 'secteurs' && !req.perms.estAdmin && !req.perms.secteurIds.includes(secteurId)) {
-        throw new HttpError(403, 'Vous ne pouvez rattacher un article qu\'à l\'un de vos secteurs');
-      }
+      if (change) verifierPorteeEcriture(req, secteurId);
     }
     out.secteurId = secteurId;
 
@@ -721,7 +749,8 @@ function register(ctx) {
     const equipements = db.list('equipements').filter((e) => equipementVisible(req, e))
       .map((e) => ({ id: e.id, numero: e.numero || '', nom: e.nom || '', secteurId: e.secteurId == null ? null : e.secteurId, actif: e.actif !== false }))
       .sort((a, b) => a.nom.localeCompare(b.nom, 'fr'));
-    const otOuverts = ctx.scope(req, db.list('ot')).filter((o) => !otEstFinal(o))
+    const finaux = statutsOtFinaux();
+    const otOuverts = ctx.scope(req, db.list('ot')).filter((o) => !finaux.has(o.statut))
       .map((o) => ({ id: o.id, numero: o.numero || '', titre: o.titre || '', statut: o.statut, equipementId: o.equipementId == null ? null : o.equipementId }))
       .sort((a, b) => String(b.numero).localeCompare(String(a.numero), 'fr', { numeric: true }));
     const emplacements = Array.from(new Set(ctx.scope(req, db.list(ENTITE)).map((a) => a.emplacement).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'fr'));

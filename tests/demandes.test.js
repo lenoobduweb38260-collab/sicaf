@@ -728,6 +728,93 @@ describe('Demandes d\'intervention', () => {
     assert.ok(mod.seedDemo, 'module exporté');
   });
 
+  test('service ctx.services.demandes.creer : mêmes contrôles, numérotation, journal et circuit que POST /api/demandes', async () => {
+    const s = srv.ctx.services.demandes;
+    assert.equal(typeof s.creer, 'function');
+    const u = srv.db.get('users', uDemandeur.id);
+    const req = { user: u, perms: srv.ctx.perms.effectivePermissions(srv.db, u, null, srv.ctx.config()), ecriture: true, method: 'POST', query: {}, params: {} };
+    const d = s.creer({ titre: 'Créée par le service', description: 'Depuis une visite', equipementId: presse.id }, req);
+    assert.ok(d.id && /^DI-/.test(d.numero), 'numérotée');
+    assert.equal(d.statut, 'soumise');
+    assert.equal(d.demandeurId, uDemandeur.id);
+    assert.ok(srv.db.list('audit', (a) => a.action === 'creation' && a.entite === 'demandes' && a.entiteId === d.id).length, 'journal');
+    assert.throws(() => s.creer({ titre: 'x', equipementId: presse.id }, req), (e) => e.status === 400, 'validation identique à la route');
+    assert.throws(() => s.creer({ titre: 'Sans requête' }), (e) => e.status === 400);
+    const t = srv.db.get('users', uTech.id);
+    const reqTech = { user: t, perms: Object.assign(srv.ctx.perms.effectivePermissions(srv.db, t, null, srv.ctx.config()), { modules: { demandes: { voir: true } } }), ecriture: true, query: {}, params: {} };
+    assert.throws(() => s.creer({ titre: 'Sans le droit créer', equipementId: presse.id }, reqTech), (e) => e.status === 403, 'droit demandes › créer exigé');
+    await admin.ok('DELETE', '/api/demandes/' + d.id);
+  });
+
+  test('écouteur ot:cree : une demande soumise reçoit le lien sans être validée ; seule une demande validée est convertie ; refusée ignorée', async () => {
+    const ot = (numero, demandeId) => srv.db.insert('ot', { numero, titre: 'OT de test', statut: 'nouveau', demandeId, secteurId: PROD, createdBy: uChefProd.id, techniciens: [], historique: [] });
+    const soumise = await demandeur.ok('POST', '/api/demandes', { titre: 'Soumise liée par événement', secteurId: PROD });
+    const ot1 = ot('OT-EVT-1', soumise.id);
+    srv.ctx.emit('ot:cree', { ot: ot1 });
+    let d = srv.db.get('demandes', soumise.id);
+    assert.equal(d.otId, ot1.id, 'lien posé');
+    assert.equal(d.statut, 'soumise', 'pas de conversion sans validation');
+    assert.equal(d.dateValidation, null, 'aucune date de validation déduite de l\'OT');
+    assert.equal(d.validateurId, null, 'aucun valideur déduit de l\'OT');
+    config({ otAutoDepuisDemande: false });
+    try {
+      const validee = await demandeur.ok('POST', '/api/demandes', { titre: 'Validée puis liée par événement', secteurId: PROD });
+      await chefProd.ok('POST', `/api/demandes/${validee.id}/valider`, {});
+      const ot2 = ot('OT-EVT-2', validee.id);
+      srv.ctx.emit('ot:cree', { ot: ot2 });
+      d = srv.db.get('demandes', validee.id);
+      assert.equal(d.statut, 'convertie'); assert.equal(d.otId, ot2.id);
+      assert.equal(d.validateurId, uChefProd.id, 'valideur inchangé');
+      const refusee = await demandeur.ok('POST', '/api/demandes', { titre: 'Refusée puis OT', secteurId: PROD });
+      await chefProd.ok('POST', `/api/demandes/${refusee.id}/refuser`, { motif: 'Doublon' });
+      const ot3 = ot('OT-EVT-3', refusee.id);
+      srv.ctx.emit('ot:cree', { ot: ot3 });
+      d = srv.db.get('demandes', refusee.id);
+      assert.equal(d.statut, 'refusee', 'demande refusée ignorée'); assert.equal(d.otId, null);
+      for (const o of [ot1, ot2, ot3]) srv.db.remove('ot', o.id);
+      for (const x of [soumise, validee, refusee]) srv.db.remove('demandes', x.id);
+    } finally { config({ otAutoDepuisDemande: true }); }
+  });
+
+  test('service ctx.services.demandes.visible : portée, puis N+1 du demandeur', async () => {
+    const s = srv.ctx.services.demandes;
+    assert.equal(typeof s.visible, 'function');
+    const d = await demandeur.ok('POST', '/api/demandes', { titre: 'Visibilité par le service', secteurId: PROD });
+    const reqDe = (id) => { const u = srv.db.get('users', id); return { user: u, perms: srv.ctx.perms.effectivePermissions(srv.db, u, null, srv.ctx.config()) }; };
+    assert.equal(s.visible(reqDe(uChefProd.id), d), true, 'secteur de la demande');
+    assert.equal(s.visible(reqDe(uChefLog.id), d), false, 'autre secteur');
+    assert.equal(s.visible(reqDe(uDemandeur.id), d.id), true, 'demandeur (par identifiant)');
+    await admin.ok('DELETE', '/api/demandes/' + d.id);
+  });
+
+  test('export CSV : les listes de valeurs ne sont lues qu\'une fois par export', async () => {
+    const original = srv.ctx.liste;
+    let appels = 0;
+    srv.ctx.liste = function (...args) { appels++; return original.apply(this, args); };
+    try {
+      const r = await admin.get('/api/demandes-export');
+      assert.equal(r.status, 200);
+      const lignes = r.body.split('\r\n').length - 1;
+      assert.ok(lignes >= 3, `${lignes} lignes exportées`);
+      assert.ok(appels <= 8, `${appels} lectures de listes pour ${lignes} lignes (lecture par ligne proscrite)`);
+    } finally { srv.ctx.liste = original; }
+  });
+
+  test('pièces jointes : identifiant stable (uid) ; une suppression rejouée ne retire pas la pièce suivante', async () => {
+    const d = await demandeur.ok('POST', '/api/demandes', { titre: 'Pièces jointes par identifiant', secteurId: PROD });
+    const pj = (nom) => ({ nom, type: 'text/plain', contenu: 'data:text/plain;base64,' + Buffer.from('contenu ' + nom).toString('base64') });
+    const r1 = await demandeur.ok('POST', `/api/demandes/${d.id}/documents`, pj('a.txt'));
+    const r2 = await demandeur.ok('POST', `/api/demandes/${d.id}/documents`, pj('b.txt'));
+    assert.ok(/^u[0-9a-f]{10}$/.test(r1.document.uid) && r2.document.uid !== r1.document.uid, 'uid posé à l\'ajout');
+    assert.equal((await demandeur.get(`/api/demandes/${d.id}/documents/${r2.document.uid}`)).body, 'contenu b.txt', 'lecture par uid');
+    const sup = await demandeur.ok('DELETE', `/api/demandes/${d.id}/documents/${r1.document.uid}`);
+    assert.deepEqual(sup.pieceJointes.map((p) => p.nom), ['b.txt']);
+    assert.equal((await demandeur.del(`/api/demandes/${d.id}/documents/${r1.document.uid}`)).status, 404, 'requête rejouée : 404, la pièce suivante est conservée');
+    assert.equal(srv.db.get('demandes', d.id).pieceJointes.length, 1);
+    assert.equal((await demandeur.get(`/api/demandes/${d.id}/documents/0`)).body, 'contenu b.txt', 'index toujours accepté');
+    await admin.ok('DELETE', '/api/demandes/' + d.id);
+  });
+
   test('seedDemo : 7 demandes réalistes, idempotent', async () => {
     const mod = require('../server/modules/demandes');
     const avant = srv.db.count('demandes');

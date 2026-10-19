@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-qVYaO1Lq/dWwAzroOWsdXGGu5XqDoDYzjZhYIQJjI+c='; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-50qfEYeXBApoET7Eje/+cfcY1nZAFkhK2CCq+yeBuDA='; base-uri 'none'; form-action 'none'">
   <title>GMAO SICAF — Paramètres de connexion</title>
   <style>
     :root { --primaire: #2563eb; --fond: #0f172a; --carte: #ffffff; --texte: #111827; --texte2: #6b7280; --bordure: #e5e7eb; --ok: #15803d; --danger: #b91c1c; --alerte: #b45309; }
@@ -114,6 +114,19 @@
       <label class="ligne"><input type="checkbox" id="windows"> Démarrer la GMAO avec Windows (dans la zone de notification)</label>
       <label class="ligne"><input type="checkbox" id="arriere-plan"> Garder la GMAO active en arrière-plan quand la fenêtre est fermée</label>
       <label class="ligne"><input type="checkbox" id="maj"> Installer automatiquement les nouvelles versions de l'application</label>
+      <div class="champ">
+        <label for="maj-source">Source des mises à jour</label>
+        <select id="maj-source">
+          <option value="github">Publications GitHub du dépôt de l'entreprise</option>
+          <option value="dossier">Dossier réseau interne (latest.json et installateur)</option>
+          <option value="url">Adresse web interne (latest.json et installateur)</option>
+          <option value="aucune">Aucune : mises à jour installées à la main</option>
+        </select>
+        <div class="rangee masque" id="maj-depot-rangee"><input type="text" id="maj-depot" placeholder="Dépôt GitHub (organisation/depot), vide = dépôt par défaut" maxlength="200" spellcheck="false"></div>
+        <div class="rangee masque" id="maj-chemin-rangee"><input type="text" id="maj-chemin" placeholder="\\NAS\gmao\mises-a-jour" maxlength="500" spellcheck="false"></div>
+        <div class="rangee masque" id="maj-url-rangee"><input type="text" id="maj-url" placeholder="https://intranet.exemple.fr/gmao/" maxlength="500" spellcheck="false"></div>
+        <div class="petit">L'installateur est téléchargé depuis cette source ; son empreinte (et sa signature, si une clé est configurée) est vérifiée avant l'installation.</div>
+      </div>
       <div class="pied" style="margin-top:6px"><span class="petit" id="version"></span><button type="button" id="btn-maj">Rechercher une mise à jour maintenant</button></div>
     </div>
 
@@ -353,6 +366,14 @@
     $('url').addEventListener('keydown', (e) => { if (e.key === 'Enter') tester(); });
     $('url').addEventListener('input', () => { dernierTest = null; $('resultat-test').textContent = ''; vider($('bloc-certificat')); $('bloc-certificat').className = 'masque'; $('empreinte-confirmee').classList.add('masque'); });
     $('btn-maj').addEventListener('click', () => B.verifierMisesAJour());
+    /** Champ complémentaire affiché selon la source des mises à jour choisie. */
+    function majSourceAffichage() {
+      const v = $('maj-source').value;
+      $('maj-depot-rangee').classList.toggle('masque', v !== 'github');
+      $('maj-chemin-rangee').classList.toggle('masque', v !== 'dossier');
+      $('maj-url-rangee').classList.toggle('masque', v !== 'url');
+    }
+    $('maj-source').addEventListener('change', majSourceAffichage);
     $('btn-quitter').addEventListener('click', () => B.quitter());
     $('btn-reessayer').addEventListener('click', () => B.reessayer());
     $('btn-deverrouiller').addEventListener('click', deverrouiller);
@@ -386,7 +407,7 @@
           serveur: { port, partageReseau: $('partage').checked, dossierDonnees: $('dossier').value.trim() },
           demarrerAvecWindows: $('windows').checked,
           reduireDansZoneNotification: $('arriere-plan').checked,
-          misesAJour: { automatique: $('maj').checked },
+          misesAJour: { automatique: $('maj').checked, source: $('maj-source').value, depot: $('maj-depot').value.trim(), chemin: $('maj-chemin').value.trim(), url: $('maj-url').value.trim() },
           nouveauCodeInformatique: c1 || undefined,
         };
         if (mode === 'client') donnees.client = await parametresClient();
@@ -423,6 +444,11 @@
       $('windows').checked = !!p.demarrerAvecWindows;
       $('arriere-plan').checked = !!p.reduireDansZoneNotification;
       $('maj').checked = !!p.misesAJour.automatique;
+      $('maj-source').value = ['github', 'dossier', 'url', 'aucune'].includes(p.misesAJour.source) ? p.misesAJour.source : 'github';
+      $('maj-depot').value = p.misesAJour.depot || '';
+      $('maj-chemin').value = p.misesAJour.chemin || '';
+      $('maj-url').value = p.misesAJour.url || '';
+      majSourceAffichage();
       $('version').textContent = `Version installée : ${infos.version || ''}${infos.portable ? ' (portable)' : ''}`;
       choisir(p.mode || 'serveur');
     }

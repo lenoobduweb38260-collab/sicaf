@@ -407,13 +407,24 @@
     }
   }
 
+  /**
+   * Bouton « Localiser sur le plan » (module Plans 3D) : masqué tant que GET /api/plans-localiser/:id ne renvoie aucun
+   * plan ; la vue Plans gère le choix entre plusieurs plans et le centrage sur l'objet.
+   */
+  function boutonPlan(equipementId, classe) {
+    if (!GMAO.moduleVisible('plans') || equipementId == null) return null;
+    const btn = ui.bouton('Localiser sur le plan', { icone: 'plan3d', classe: `${classe || ''} masque`.trim(), onClic: () => GMAO.navigate('#/plans?equipementId=' + equipementId) });
+    api.get('/api/plans-localiser/' + equipementId).then((plans) => { if (Array.isArray(plans) && plans.length) btn.classList.remove('masque'); }).catch(() => {});
+    return btn;
+  }
+
   function rendrePiecesJointes(d, cont, recharger) {
     ui.vider(cont);
     const pjs = d.pieceJointes || [];
     if (!pjs.length) cont.appendChild(el('p', { class: 'texte-2 texte-petit' }, 'Aucune pièce jointe.'));
     const tailleLisible = (t) => (t > 1024 * 1024 ? (t / 1024 / 1024).toFixed(1) + ' Mo' : Math.max(1, Math.round(t / 1024)) + ' Ko');
     for (const p of pjs) {
-      const url = `/api/demandes/${d.id}/documents/${p.index}`;
+      const url = `/api/demandes/${d.id}/documents/${p.uid || p.index}`; // identifiant stable de préférence à la position
       // Suppression réservée à l'auteur de la pièce jointe, aux valideurs et aux administrateurs (indicateur calculé par le serveur)
       const supprimable = p.supprimable !== undefined ? !!p.supprimable : !!(d.actions && d.actions.joindre);
       cont.appendChild(el('div', { class: 'inline', style: { gap: '10px', padding: '6px 0', borderBottom: '1px solid var(--bordure)', width: '100%' } },
@@ -422,7 +433,7 @@
         el('a', { href: url + '?telecharger=1', class: 'btn btn-icone btn-sm', title: 'Télécharger' }, icone('export')),
         supprimable ? el('button', { type: 'button', class: 'btn btn-icone btn-sm texte-danger', title: 'Supprimer', onclick: async () => {
           if (!(await ui.confirm({ titre: 'Supprimer la pièce jointe', message: `Supprimer « ${p.nom} » ?`, okLabel: 'Supprimer', danger: true }))) return;
-          try { await api.del(`/api/demandes/${d.id}/documents/${p.index}`); toast('Pièce jointe supprimée', 'succes'); recharger(); } catch (e) { erreur(e); }
+          try { await api.del(`/api/demandes/${d.id}/documents/${p.uid || p.index}`); toast('Pièce jointe supprimée', 'succes'); recharger(); } catch (e) { erreur(e); }
         } }, icone('supprimer')) : null));
     }
   }
@@ -459,7 +470,7 @@
     const details = ui.details([
       { label: 'Statut', valeur: ui.badgeListe('statutsDemande', d.statut) }, { label: 'Priorité', valeur: frag(ui.badgeListe('priorites', d.prioriteCode), d.echeance && !d.final ? el('span', { class: 'texte-2 texte-petit ml' }, 'échéance ' + ui.formatDateHeure(d.echeance)) : null) },
       { label: 'Type', valeur: badgeSouple('typesIntervention', d.typeCode) }, { label: 'Arrêt de production', valeur: d.arretProduction ? el('span', { class: 'texte-danger texte-gras' }, 'Oui') : 'Non' },
-      { label: 'Équipement', valeur: d.equipement ? frag(equipementOuvrable(d) ? el('a', { href: '#/equipements/' + d.equipement.id }, `${d.equipement.nom}`) : el('span', null, `${d.equipement.nom}`), el('span', { class: 'texte-2' }, ` (${d.equipement.numero || '#' + d.equipement.id})`), d.equipement.etatCode ? frag(' ', ui.badgeListe('etatsEquipement', d.equipement.etatCode)) : null) : '—' },
+      { label: 'Équipement', valeur: d.equipement ? frag(equipementOuvrable(d) ? el('a', { href: '#/equipements/' + d.equipement.id }, `${d.equipement.nom}`) : el('span', null, `${d.equipement.nom}`), el('span', { class: 'texte-2' }, ` (${d.equipement.numero || '#' + d.equipement.id})`), d.equipement.etatCode ? frag(' ', ui.badgeListe('etatsEquipement', d.equipement.etatCode)) : null, equipementOuvrable(d) ? frag(' ', boutonPlan(d.equipement.id, 'btn-sm')) : null) : '—' },
       { label: 'Secteur', valeur: d.secteurChemin || '—' },
       { label: 'Demandeur', valeur: d.demandeur ? el('span', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, ui.avatar(d.demandeur.nomComplet, 26), el('span', null, el('div', null, d.demandeur.nomComplet), d.demandeur.fonction ? el('div', { class: 'texte-2 texte-petit' }, d.demandeur.fonction) : null)) : d.demandeurNom },
       { label: 'Date de la demande', valeur: ui.formatDateHeure(d.dateDemande) },

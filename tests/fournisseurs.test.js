@@ -389,6 +389,16 @@ describe('Module Fournisseurs & prestataires', () => {
       assert.equal(sans.status, 200);
       assert.ok(!sans.body.split('\r\n')[0].includes('Total des achats'));
     });
+
+    test('export CSV : cellules commençant par = + - @ neutralisées (injection de formules)', async () => {
+      const f = await admin.ok('POST', '/api/fournisseurs', { nom: '=HYPERLINK("http://exemple.invalid";"Cliquer")', typeCode: 'fournisseur', contact: '-cmd', telephone: '+33 4 90 00 00 00' });
+      const ligne = String((await admin.get('/api/fournisseurs-export')).body).split('\r\n').find((l) => l.includes('HYPERLINK'));
+      assert.ok(ligne, 'ligne exportée');
+      assert.ok(ligne.startsWith('"\'=HYPERLINK('), 'apostrophe devant = : ' + ligne);
+      assert.ok(ligne.includes(';\'-cmd;\'+33 4 90 00 00 00;'), 'contact et téléphone (textes) neutralisés : ' + ligne);
+      assert.ok(!/^"?=HYPERLINK/.test(ligne), 'aucune formule exécutable');
+      await admin.ok('DELETE', '/api/fournisseurs/' + f.id);
+    });
   });
 
   test('suppression : références d\'autres modules (ex. commandes d\'achat) prises en compte', async () => {

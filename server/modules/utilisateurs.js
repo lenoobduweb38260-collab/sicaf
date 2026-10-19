@@ -47,21 +47,30 @@ function register(ctx) {
     return u;
   }
 
+  /** Texte libre : seule une chaîne est acceptée (booléens, nombres, tableaux et objets refusés). */
+  function chaine(v, libelle) {
+    if (v == null) return '';
+    if (typeof v !== 'string') throw new HttpError(400, `${libelle} : valeur invalide (texte attendu)`);
+    return v.trim();
+  }
+  /** Valeur texte saisie, ou valeur existante quand le champ n'est pas fourni. */
+  const texteOuExistant = (body, existant, cle, libelle) => (body[cle] == null ? String((existant && existant[cle]) || '').trim() : chaine(body[cle], libelle));
+
   function validerUser(req, body, existant) {
     const out = {};
-    const login = String(body.login == null ? (existant ? existant.login : '') : body.login).trim();
+    const login = texteOuExistant(body, existant, 'login', 'L\'identifiant');
     if (!login) throw new HttpError(400, 'L\'identifiant est obligatoire');
     if (!/^[\w.@-]{2,50}$/.test(login)) throw new HttpError(400, 'Identifiant invalide (2 à 50 caractères : lettres, chiffres, . _ @ -)');
     const doublon = db.findOne('users', (u) => u.login.toLowerCase() === login.toLowerCase() && (!existant || u.id !== existant.id));
     if (doublon) throw new HttpError(400, 'Cet identifiant est déjà utilisé');
     out.login = login;
-    out.nom = String(body.nom == null ? (existant ? existant.nom : '') : body.nom).trim();
+    out.nom = texteOuExistant(body, existant, 'nom', 'Le nom');
     if (!out.nom) throw new HttpError(400, 'Le nom est obligatoire');
-    out.prenom = String(body.prenom == null ? (existant ? existant.prenom || '' : '') : body.prenom).trim();
-    out.email = String(body.email == null ? (existant ? existant.email || '' : '') : body.email).trim();
-    out.telephone = String(body.telephone == null ? (existant ? existant.telephone || '' : '') : body.telephone).trim();
-    out.fonction = String(body.fonction == null ? (existant ? existant.fonction || '' : '') : body.fonction).trim();
-    out.matricule = String(body.matricule == null ? (existant ? existant.matricule || '' : '') : body.matricule).trim();
+    out.prenom = texteOuExistant(body, existant, 'prenom', 'Le prénom');
+    out.email = texteOuExistant(body, existant, 'email', 'L\'e-mail');
+    out.telephone = texteOuExistant(body, existant, 'telephone', 'Le téléphone');
+    out.fonction = texteOuExistant(body, existant, 'fonction', 'La fonction');
+    out.matricule = texteOuExistant(body, existant, 'matricule', 'Le matricule');
 
     // Profil
     const profilId = body.profilId == null ? (existant ? existant.profilId : null) : Number(body.profilId);
@@ -125,7 +134,7 @@ function register(ctx) {
     } else if (!existant) out.siteAcces = [];
 
     if (body.champs !== undefined || !existant) out.champs = ctx.champsPerso('utilisateurs', body.champs || (existant && existant.champs) || {});
-    if (body.commentaire !== undefined) out.commentaire = String(body.commentaire || '');
+    if (body.commentaire !== undefined) out.commentaire = chaine(body.commentaire, 'Le commentaire');
     return out;
   }
 

@@ -523,6 +523,43 @@ describe('Ordres de travail', () => {
     assert.equal(r.commentaires.length, 0);
   });
 
+  test('export CSV : cellules commençant par = + - @ neutralisées (injection de formules)', async () => {
+    const o = await resp.ok('POST', '/api/ot', { titre: '=HYPERLINK("http://exemple.invalid";"Cliquer")', description: '@cmd|calc', equipementId: presse.id, typeCode: 'correctif' });
+    const ligne = String((await resp.get('/api/ot-export')).body).split('\r\n').find((l) => l.startsWith(o.numero + ';'));
+    assert.ok(ligne, 'ligne exportée');
+    assert.ok(ligne.includes(';"\'=HYPERLINK('), 'apostrophe devant = : ' + ligne);
+    assert.ok(!/;"?=HYPERLINK/.test(ligne), 'aucune formule exécutable');
+    await admin.ok('DELETE', '/api/ot/' + o.id);
+  });
+
+  test('intervenants : absence validée à la date prévue signalée (module RH), libellé détaillé réservé au droit rh › voir', async () => {
+    const rh = srv.ctx.services.rh;
+    if (!rh || typeof rh.absenceDe !== 'function') return;
+    const jour = '2030-06-10';
+    const pers = srv.db.insert('personnel', { nom: 'Technicien', prenom: 'Théo', userId: uTechProd.id, secteurId: PROD, actif: true });
+    const abs = srv.db.insert('absences', { personnelId: pers.id, typeCode: 'conges', statut: 'validee', dateDebut: '2030-06-09', dateFin: '2030-06-11', secteurId: PROD });
+    try {
+      const sans = (await resp.ok('GET', '/api/ot-techniciens')).find((t) => t.id === uTechProd.id);
+      assert.equal(sans.absent, false); assert.equal(sans.absenceLibelle, '');
+      const avec = (await resp.ok('GET', `/api/ot-techniciens?datePrevue=${jour}`)).find((t) => t.id === uTechProd.id);
+      assert.equal(avec.absent, true); assert.equal(avec.absenceDate, jour);
+      const u = srv.db.get('users', uResp.id);
+      const voitRh = srv.ctx.perms.can(srv.ctx.perms.effectivePermissions(srv.db, u, null, srv.ctx.config()), 'rh', 'voir');
+      assert.equal(avec.absenceLibelle, voitRh ? 'Congés payés' : 'Absent');
+      const t = srv.db.get('users', uTechProd.id);
+      const techVoitRh = srv.ctx.perms.can(srv.ctx.perms.effectivePermissions(srv.db, t, null, srv.ctx.config()), 'rh', 'voir');
+      const vu = (await techProd.ok('GET', `/api/ot-techniciens?datePrevue=${jour}`)).find((x) => x.id === uTechProd.id);
+      assert.equal(vu.absenceLibelle, techVoitRh ? 'Congés payés' : 'Absent');
+      const autre = (await resp.ok('GET', `/api/ot-techniciens?datePrevue=2030-06-12`)).find((x) => x.id === uTechProd.id);
+      assert.equal(autre.absent, false, 'hors de la période d\'absence');
+      const o = await resp.ok('POST', '/api/ot', { titre: 'OT planifié pendant une absence', equipementId: presse.id, typeCode: 'correctif', datePrevue: jour });
+      const parOt = (await resp.ok('GET', `/api/ot-techniciens?otId=${o.id}`)).find((x) => x.id === uTechProd.id);
+      assert.equal(parOt.absent, true, 'date prévue de l\'OT');
+      assert.equal((await resp.get('/api/ot-techniciens?datePrevue=pas-une-date')).status, 400);
+      await admin.ok('DELETE', '/api/ot/' + o.id);
+    } finally { srv.db.remove('absences', abs.id); srv.db.remove('personnel', pers.id); }
+  });
+
   test('export CSV et liste des intervenants', async () => {
     const r = await resp.get('/api/ot-export?ouverts=1');
     assert.equal(r.status, 200);
@@ -565,7 +602,8 @@ describe('Ordres de travail', () => {
     assert.equal(srv.db.get('demandes', d.id).statut, 'cloturee');
     const nouvelles = notifsDe(uDemandeur.id).slice(avantCloture);
     assert.equal(nouvelles.length, 1, `une seule notification de fin d'intervention : ${nouvelles.map((n) => n.titre).join(' | ')}`);
-    assert.match(nouvelles[0].titre, /Demande .* clôturée|OT .* terminé/);
+    assert.match(nouvelles[0].titre, /Demande .* clôturée|OT\S* terminé/);
+    assert.ok(!/^OT OT-/.test(nouvelles[0].titre), 'préfixe « OT » non doublé : ' + nouvelles[0].titre);
     // Sans clôture automatique de la demande, c'est l'OT qui prévient le demandeur
     const d2 = await demandeur.ok('POST', '/api/demandes', { titre: 'Vibration anormale presse test', equipementId: presse.id, prioriteCode: 'normale', typeCode: 'correctif' });
     const v2 = await chefProd.ok('POST', `/api/demandes/${d2.id}/valider`, {});
@@ -576,7 +614,8 @@ describe('Ordres de travail', () => {
       await chefProd.ok('POST', `/api/ot/${otId2}/cloturer`, { rapport: 'Fixations resserrées.' });
       const n2 = notifsDe(uDemandeur.id).slice(avant2);
       assert.equal(n2.length, 1);
-      assert.match(n2[0].titre, /OT .* terminé/);
+      assert.match(n2[0].titre, /OT\S* terminé/);
+      assert.ok(!/^OT OT-/.test(n2[0].titre), 'préfixe « OT » non doublé : ' + n2[0].titre);
       assert.equal(srv.db.get('demandes', d2.id).statut, 'convertie', 'demande non clôturée (option désactivée)');
     } finally { config({ workflow: { cloturerDemandeAvecOt: true } }); }
   });

@@ -13,6 +13,7 @@ const { URL } = require('url');
 
 const { Db } = require('./db');
 const { Router, HttpError } = require('./router');
+const csv = require('./csv');
 const auth = require('./auth');
 const totp = require('./totp');
 const perms = require('./permissions');
@@ -114,7 +115,25 @@ function createApp(options = {}) {
   const log = options.log || ((...a) => console.log(new Date().toISOString(), ...a));
   const db = new Db(dataDir, { inMemory: !!options.inMemory, saveDelay: options.saveDelay, log }).load();
   seed(db, { adminPassword: options.adminPassword });
-  const sec = () => (db.getConfig().securite || {});
+
+  /**
+   * Configuration figée : copie profonde gelée de db.data.config, recalculée seulement quand la base remplace
+   * sa configuration (db.setConfig, import, restauration). Les lectures du cœur et des modules (ctx.config(),
+   * ctx.liste(), permissions, notifications du journal) n'ont ainsi plus à recopier toute la configuration
+   * (logo en base64 compris) à chaque appel ; une modification de la copie lève une erreur au lieu de la corrompre.
+   */
+  let configFigee = null;
+  let configSource = null;
+  function gelerProfond(o) {
+    if (o && typeof o === 'object' && !Object.isFrozen(o)) { Object.freeze(o); for (const v of Object.values(o)) gelerProfond(v); }
+    return o;
+  }
+  function configCourante() {
+    const source = db.data.config || {};
+    if (!configFigee || configSource !== source) { configFigee = gelerProfond(JSON.parse(JSON.stringify(source))); configSource = source; }
+    return configFigee;
+  }
+  const sec = () => (configCourante().securite || {});
   const sessions = new auth.Sessions({
     inactiviteMs: () => Math.max(5, Number(sec().inactiviteMinutes) || 60) * 60 * 1000,
     dureeMaxMs: () => Math.max(1, Number(sec().dureeSessionHeures) || 12) * 60 * 60 * 1000,
@@ -157,13 +176,16 @@ function createApp(options = {}) {
     /** Fonction appelée à l'arrêt du serveur (app.stop()) : les modules y arrêtent leurs minuteurs. */
     onArret(fn) { if (typeof fn === 'function') arrets.push(fn); },
 
-    /** Configuration courante (copie). */
-    config() { return db.getConfig(); },
+    /** Configuration courante : copie figée (lecture seule, partagée entre les appels ; db.getConfig() pour une copie modifiable). */
+    config() { return configCourante(); },
 
-    /** Liste de valeurs configurée (ex. 'statutsOT'). */
+    /** Cellule CSV (guillemets, formules de tableur neutralisées) : même règle pour tous les exports (server/csv.js). */
+    csvEscape: csv.csvEscape,
+
+    /** Liste de valeurs configurée (ex. 'statutsOT') : copie triée de cette seule liste (éléments modifiables). */
     liste(nom) {
-      const l = (db.getConfig().listes || {})[nom];
-      return Array.isArray(l) ? l.slice().sort((a, b) => (a.ordre || 0) - (b.ordre || 0)) : [];
+      const l = (configCourante().listes || {})[nom];
+      return Array.isArray(l) ? l.map((x) => Object.assign({}, x)).sort((a, b) => (a.ordre || 0) - (b.ordre || 0)) : [];
     },
 
     /** Vérifie une permission, lève 403 sinon. */
@@ -259,7 +281,7 @@ function createApp(options = {}) {
 
     /** Utilisateurs possédant une permission donnée (actifs). */
     usersAvecDroit(module, action, filtre) {
-      const config = db.getConfig();
+      const config = configCourante();
       return db.list('users', (u) => u.actif !== false).filter((u) => {
         const p = perms.effectivePermissions(db, u, null, config);
         if (!perms.can(p, module, action)) return false;
@@ -277,7 +299,7 @@ function createApp(options = {}) {
 
     /** Valide et nettoie les champs personnalisés d'une entité. */
     champsPerso(entite, input) {
-      const defs = ((db.getConfig().champsPersonnalises || {})[entite]) || [];
+      const defs = ((configCourante().champsPersonnalises || {})[entite]) || [];
       const out = {};
       const src = input && typeof input === 'object' ? input : {};
       for (const d of defs) {
@@ -340,7 +362,7 @@ function createApp(options = {}) {
   /** Libellés des éléments du journal (repris par la vue Journal d'activité via GET /api/audit). */
   ctx.libellesEntites = LIBELLES_ENTITE;
   function notifierJournal(req, action, entite, entiteId, details) {
-    const j = db.getConfig().journal || {};
+    const j = configCourante().journal || {};
     if (!j.notifications || !Array.isArray(j.actions) || !j.actions.includes(action)) return;
     if (Array.isArray(j.entites) && j.entites.length && !j.entites.includes(entite)) return;
     const profils = new Set((j.profilsNotifies || []).map(Number));
@@ -349,7 +371,7 @@ function createApp(options = {}) {
     const auteur = req && req.user ? (`${req.user.prenom || ''} ${req.user.nom || ''}`.trim() || req.user.login) : (req && req.socket ? 'Non connecté' : 'Système');
     // Destinataires : profils choisis, mais seulement les comptes qui ont accès au Journal d'activité (le texte en
     // reprend les détails) et qui peuvent voir l'élément concerné (portée, sites)
-    const config = db.getConfig();
+    const config = configCourante();
     const element = entiteId != null && Array.isArray(db.data.collections[entite]) ? db.get(entite, entiteId) : null;
     const dest = db.list('users', (u) => u.actif !== false && profils.has(Number(u.profilId)) && u.id !== auteurId).filter((u) => {
       const p = perms.effectivePermissions(db, u, null, config);
@@ -457,7 +479,7 @@ function createApp(options = {}) {
     req.ecriture = req.method !== 'GET' && req.method !== 'HEAD';
     if (req.user) {
       req.profil = db.get('profils', req.user.profilId);
-      req.perms = perms.effectivePermissions(db, req.user, req.profil, db.getConfig());
+      req.perms = perms.effectivePermissions(db, req.user, req.profil, configCourante());
       perms.appliquerSiteCourant(db, req.perms, req.headers['x-gmao-site']);
     }
 
@@ -515,7 +537,7 @@ function createApp(options = {}) {
     if (!options.bureau) return false;
     if (url.pathname.startsWith('/api/replication/')) return false; // sauvegardes reçues d'un autre site
     if (MARQUEUR_BUREAU.test(String(req.headers['user-agent'] || ''))) return false;
-    const reseau = db.getConfig().reseau || {};
+    const reseau = configCourante().reseau || {};
     return !reseau.accesNavigateur;
   }
   const PAGE_APPLICATION = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>GMAO SICAF</title><style>body{font-family:Segoe UI,Arial,sans-serif;background:#0f172a;color:#e5e7eb;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}div{max-width:520px;background:#1e293b;padding:28px 32px;border-radius:12px}h1{color:#60a5fa;margin-top:0}</style></head><body><div><h1>GMAO SICAF</h1><p>La GMAO s'utilise avec l'<strong>application GMAO SICAF</strong> installée sur votre poste (mode « Se connecter à la GMAO d'un autre poste »).</p><p>L'accès par un navigateur web est désactivé. Contactez le pôle informatique.</p></div></body></html>`;
@@ -534,7 +556,7 @@ function createApp(options = {}) {
     if (hote === 'localhost' || hote.endsWith('.localhost')) return true;
     const poste = os.hostname().toLowerCase();
     if (hote === poste || hote.split('.')[0] === poste.split('.')[0]) return true;
-    const noms = ((db.getConfig().reseau || {}).nomsAutorises || []).map((n) => String(n).toLowerCase().trim()).filter(Boolean);
+    const noms = ((configCourante().reseau || {}).nomsAutorises || []).map((n) => String(n).toLowerCase().trim()).filter(Boolean);
     return noms.includes(hote);
   }
 
@@ -631,7 +653,7 @@ function installerDeuxFacteurs(ctx) {
     actif(user) { return !!(user && user.deuxFacteurs && user.deuxFacteurs.actif); },
     /** Compte sensible : administrateur, ou droit « Modifier » sur le système, les utilisateurs, les profils ou la configuration. */
     sensible(user, p) {
-      const d = p || droits.effectivePermissions(db, user, null, db.getConfig());
+      const d = p || droits.effectivePermissions(db, user, null, ctx.config());
       return !!d.estAdmin || MODULES_SENSIBLES.some((m) => droits.can(d, m, 'modifier'));
     },
     /** La configuration impose-t-elle la double authentification à ce compte ? */
@@ -649,6 +671,8 @@ function installerDeuxFacteurs(ctx) {
 
     chiffrer: (texte) => coffre.chiffrer(texte),
     dechiffrer: (chiffre) => coffre.dechiffrer(chiffre),
+    /** Relit la clé de chiffrement depuis <données>/cle-double-authentification.key (restaurée avec une sauvegarde). */
+    rechargerCle: () => coffre.recharger(),
 
     // ----- Connexions en attente du code (après un mot de passe correct) -----
     creerJeton(user, poste) {
@@ -1089,7 +1113,7 @@ function registerCoreRoutes(ctx) {
 
   /** Prévient le pôle informatique (droit Système › Modifier) d'un blocage de compte. */
   function notifierBlocage(login, ip, options = {}) {
-    if ((db.getConfig().securite || {}).notifierBlocages === false) return;
+    if ((ctx.config().securite || {}).notifierBlocages === false) return;
     const ids = ctx.usersAvecDroit('systeme', 'modifier').map((u) => u.id);
     const motif = options.motif || 'Trop de mots de passe incorrects';
     const titre = options.titre || 'Compte temporairement bloqué';
@@ -1154,7 +1178,7 @@ function registerCoreRoutes(ctx) {
     res.setHeader('Set-Cookie', `gmao_session=${token}; Path=/; HttpOnly; SameSite=Strict${securise}; Max-Age=${Math.floor(sessions.dureeMaxMs() / 1000)}`);
     req.user = db.get('users', user.id);
     req.profil = db.get('profils', req.user.profilId);
-    req.perms = perms.effectivePermissions(db, req.user, req.profil, db.getConfig());
+    req.perms = perms.effectivePermissions(db, req.user, req.profil, ctx.config());
     perms.appliquerSiteCourant(db, req.perms, req.headers['x-gmao-site']);
     ctx.audit(req, 'connexion', 'users', user.id, details.texte || '');
     return bootstrap(req);

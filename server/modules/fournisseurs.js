@@ -38,10 +38,7 @@ const faux = (v) => v === false || v === 0 || ['0', 'false', 'non', 'off'].inclu
 const RE_EMAIL = /^[^\s@<>(),;:"[\]\\]+@[^\s@<>(),;:"[\]\\]+\.[^\s@<>(),;:"[\]\\]{2,}$/;
 const RE_TELEPHONE = /^\+?[0-9\s().\/-]{4,30}$/;
 
-function csvEscape(v) {
-  const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+const { csvEscape } = require('../csv');
 /** SIRET lisible : « 123 456 789 00012 ». */
 function formatSiret(s) {
   const d = String(s || '').replace(/\D/g, '');

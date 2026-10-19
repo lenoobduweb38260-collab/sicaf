@@ -20,6 +20,11 @@
  * Événements émis : 'achats:commandeRecue' ({ commande, reception, complete }), 'achats:facturePayee' ({ facture }),
  *   'achats:commandeValidee' ({ commande }), 'achats:factureValidee' ({ facture }).
  */
+const crypto = require('crypto');
+
+/** Identifiant stable d'une ligne jointe (document) : une requête rejouée après suppression ne vise pas la ligne suivante. */
+function uid() { return 'u' + crypto.randomBytes(5).toString('hex'); }
+
 const nom = 'Achats & factures';
 const MODULE = 'achats';
 const CMD = 'commandes';
@@ -88,12 +93,7 @@ function semaineISO(jour) {
 }
 const normaliser = (s) => String(s == null ? '' : s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
 
-function csvEscape(v) {
-  let s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
-  // Protection contre l'injection de formules dans les tableurs
-  if (/^[=+\-@]/.test(s) && Number.isNaN(Number(s.replace(',', '.')))) s = "'" + s;
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+const { csvEscape } = require('../csv');
 const csvNombre = (n, d = 2) => (n == null || n === '' ? '' : String(arrondi(n, d)).replace('.', ','));
 const csvDate = (j) => (j && RE_DATE.test(String(j).slice(0, 10)) ? String(j).slice(0, 10).split('-').reverse().join('/') : '');
 
@@ -477,7 +477,7 @@ function register(ctx) {
 
   function montantRecuHT(c) { return arrondi((c.lignes || []).reduce((s, l) => s + arrondi(num(l.quantiteRecue) * num(l.prixUnitaireHT)), 0)); }
 
-  function resumeDoc(d, i) { return { index: i, nom: d.nom, type: d.type, taille: d.taille, date: d.date, userId: d.userId, description: d.description || '', estImage: estImage(d.type), estPdf: d.type === 'application/pdf' }; }
+  function resumeDoc(d, i) { return { index: i, uid: d.uid || null, nom: d.nom, type: d.type, taille: d.taille, date: d.date, userId: d.userId, description: d.description || '', estImage: estImage(d.type), estPdf: d.type === 'application/pdf' }; }
 
   function resumeCommande(c, refs, jour) {
     const { documents, historique, ...reste } = c;
@@ -855,7 +855,8 @@ function register(ctx) {
     for (const r of aEntrer) {
       const l = lignes[r.index];
       if (!db.get('articles', l.articleId)) { avertissements.push(`Ligne ${r.index + 1} : article supprimé du stock, aucune entrée enregistrée`); continue; }
-      const res = s.entrer({ articleId: l.articleId, quantite: r.quantite, userId: req.user.id, motif: `Réception ${c.numero}${bonLivraison ? ' — BL ' + bonLivraison : ''}`, prixUnitaire: l.prixUnitaireHT, fournisseurId: c.fournisseurId });
+      // Entrée sans entrée de journal unitaire : la réception fait l'objet d'une seule entrée récapitulative (ci-dessous)
+      const res = s.entrer({ articleId: l.articleId, quantite: r.quantite, userId: req.user.id, motif: `Réception ${c.numero}${bonLivraison ? ' — BL ' + bonLivraison : ''}`, prixUnitaire: l.prixUnitaireHT, fournisseurId: c.fournisseurId, silencieux: true });
       if (res && res.mouvement) mouvements.set(r.index, res.mouvement.id);
     }
     for (const r of recues) lignes[r.index].quantiteRecue = arrondi(num(lignes[r.index].quantiteRecue) + r.quantite, 3);
@@ -1340,16 +1341,27 @@ function register(ctx) {
     if (!signatureValide(type, buf)) throw new HttpError(400, 'Le contenu du fichier ne correspond pas à son format déclaré');
     const docs = record.documents || [];
     if (docs.length >= MAX_DOCS) throw new HttpError(400, `Nombre maximal de documents atteint (${MAX_DOCS})`);
-    const doc = { nom: nomDoc, type, taille, contenu: `data:${type};base64,${base64}`, date: new Date().toISOString(), userId: req.user.id, description: texte(b.description, 'Description', { max: 300 }) };
+    const doc = { uid: uid(), nom: nomDoc, type, taille, contenu: `data:${type};base64,${base64}`, date: new Date().toISOString(), userId: req.user.id, description: texte(b.description, 'Description', { max: 300 }) };
     const maj = db.update(col, record.id, { documents: docs.concat([doc]) });
     ctx.audit(req, 'document', col, maj.id, `${col === FAC ? 'Facture' : 'Commande'} ${maj.numero} : document ajouté — ${nomDoc} (${Math.max(1, Math.round(taille / 1024))} Ko)`);
     return maj;
   }
-  function indexDoc(req, record) {
-    const idx = Number(req.params.index);
-    if (!Number.isInteger(idx) || idx < 0 || idx >= (record.documents || []).length) throw new HttpError(404, 'Document introuvable');
+  /**
+   * Position d'une ligne désignée par son identifiant stable `uid` (recommandé : une requête rejouée après
+   * suppression échoue en 404 au lieu d'atteindre la ligne suivante) ou, à défaut, par son index.
+   */
+  function indexDans(liste, ref, message) {
+    const s = String(ref == null ? '' : ref).trim();
+    if (/^\d+$/.test(s)) {
+      const idx = Number(s);
+      if (idx >= (liste || []).length) throw new HttpError(404, message);
+      return idx;
+    }
+    const idx = (liste || []).findIndex((x) => x && x.uid != null && x.uid === s);
+    if (idx < 0) throw new HttpError(404, message);
     return idx;
   }
+  const indexDoc = (req, record) => indexDans(record.documents, req.params.ref, 'Document introuvable');
   function servirDocument(req, res, doc) {
     const m = /^data:([^;,]*)(?:;[^,]*)?;base64,(.*)$/s.exec(doc.contenu || '');
     if (!m) throw new HttpError(500, 'Document corrompu');
@@ -1374,11 +1386,11 @@ function register(ctx) {
     const maj = ajouterDocument(req, CMD, c, objet(req.body), TYPES_COMMANDE);
     return { ok: true, documents: (maj.documents || []).map(resumeDoc) };
   }, { perm: [MODULE, 'voir'] });
-  router.get('/api/commandes/:id/documents/:index', async (req, res) => {
+  router.get('/api/commandes/:id/documents/:ref', async (req, res) => {
     const c = getCommande(req, req.params.id);
     servirDocument(req, res, c.documents[indexDoc(req, c)]);
   }, { perm: [MODULE, 'voir'] });
-  router.delete('/api/commandes/:id/documents/:index', async (req) => {
+  router.delete('/api/commandes/:id/documents/:ref', async (req) => {
     const c = getCommande(req, req.params.id);
     if (!actionsCommande(req, c).documents) throw new HttpError(403, 'Droit insuffisant : Achats & factures › Modifier');
     const idx = indexDoc(req, c);
@@ -1395,11 +1407,11 @@ function register(ctx) {
     const maj = ajouterDocument(req, FAC, f, objet(req.body), TYPES_FACTURE);
     return { ok: true, documents: (maj.documents || []).map(resumeDoc) };
   }, { perm: [MODULE, 'voir'] });
-  router.get('/api/factures/:id/documents/:index', async (req, res) => {
+  router.get('/api/factures/:id/documents/:ref', async (req, res) => {
     const f = getFacture(req, req.params.id);
     servirDocument(req, res, f.documents[indexDoc(req, f)]);
   }, { perm: [MODULE, 'voir'] });
-  router.delete('/api/factures/:id/documents/:index', async (req) => {
+  router.delete('/api/factures/:id/documents/:ref', async (req) => {
     const f = getFacture(req, req.params.id);
     if (finauxFac().has(f.statut)) throw new HttpError(400, `La facture ${f.numero} est ${libelle('statutsFacture', f.statut).toLowerCase()} : ses pièces jointes sont conservées`);
     if (!actionsFacture(req, f).documents) throw new HttpError(403, 'Droit insuffisant : Achats & factures › Modifier');

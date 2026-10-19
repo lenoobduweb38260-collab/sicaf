@@ -174,6 +174,8 @@ describe('Achats & factures', () => {
       assert.equal(r1.nbEntreesStock, 1);
       assert.equal(srv.db.get('articles', art1.id).quantite, stockAvant + 3);
       const mvt = srv.db.list('mouvementsStock').pop();
+      assert.equal(srv.db.count('audit', (a) => a.action === 'mouvement' && /Réception/.test(String(a.details))), 0, 'entrée en stock sans entrée de journal unitaire');
+      assert.ok(srv.db.list('audit', (a) => a.entite === 'commandes' && a.entiteId === c.id && /réception/i.test(String(a.details)) && /entrée\(s\) en stock/.test(String(a.details))).length, 'une entrée récapitulative par réception');
       assert.equal(mvt.type, 'entree');
       assert.equal(mvt.motif, `Réception ${c.numero} — BL BL-001`);
       assert.equal(mvt.fournisseurId, four1.id);
@@ -428,6 +430,21 @@ describe('Achats & factures', () => {
       await admin.ok('DELETE', '/api/factures/' + re.id);
       await admin.ok('DELETE', '/api/factures/' + f.id);
       assert.equal((await admin.get('/api/factures/' + f.id)).status, 404);
+    });
+
+    test('pièces jointes : identifiant stable (uid) ; une suppression rejouée ne retire pas la pièce suivante', async () => {
+      const f = await admin.ok('POST', '/api/factures', { fournisseurId: four2.id, secteurId: MAINT.id, numeroFournisseur: 'PJ-UID', montantHT: 10 });
+      const r1 = await admin.ok('POST', `/api/factures/${f.id}/documents`, { nom: 'un.pdf', type: 'application/pdf', contenu: dataUrl('application/pdf', PDF) });
+      const r2 = await admin.ok('POST', `/api/factures/${f.id}/documents`, { nom: 'deux.png', type: 'image/png', contenu: dataUrl('image/png', PNG) });
+      const [d1, d2] = r2.documents;
+      assert.equal(r1.documents.length, 1);
+      assert.ok(/^u[0-9a-f]{10}$/.test(d1.uid) && d1.uid !== d2.uid, 'uid posé à l\'ajout');
+      assert.match((await admin.get(`/api/factures/${f.id}/documents/${d2.uid}`)).headers.get('content-type'), /image\/png/, 'lecture par uid');
+      const sup = await admin.ok('DELETE', `/api/factures/${f.id}/documents/${d1.uid}`);
+      assert.deepEqual(sup.documents.map((d) => d.nom), ['deux.png']);
+      assert.equal((await admin.del(`/api/factures/${f.id}/documents/${d1.uid}`)).status, 404, 'requête rejouée : 404, la pièce suivante est conservée');
+      assert.equal(srv.db.get('factures', f.id).documents.length, 1);
+      await admin.ok('DELETE', '/api/factures/' + f.id);
     });
 
     test('pièces jointes : PDF / image ≤ 10 Mo, signature contrôlée, aperçu et suppression', async () => {

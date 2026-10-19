@@ -3,12 +3,15 @@
  *
  *   GMAO.rendreSauvegardesAvancees(container)  → { rafraichir() }
  *
- * Cartes : indicateurs, « Sauvegarde automatique » (planification, compression, chiffrement — mot de passe en
- * écriture seule), « Destinations » (dossiers, clés USB, partages réseau, serveurs GMAO d'autres sites : tester,
- * sauvegarder maintenant, voir les fichiers, modifier, supprimer), « Recevoir les sauvegardes d'autres sites »
- * (activation, clé affichée une seule fois, adresse à communiquer, sauvegardes reçues par site), « Restauration »
- * (copies locales, fichier téléversé) et « Historique ».
- * Droits : Configuration et Système › Voir pour consulter ; › Modifier pour agir (le serveur reste la référence).
+ * Cartes : indicateurs, « Sauvegarde automatique » (interrupteur à effet immédiat, puis planification, compression,
+ * chiffrement — mot de passe en écriture seule — enregistrées par le bouton « Enregistrer les paramètres »),
+ * « Destinations » (dossiers, clés USB, partages réseau, serveurs GMAO d'autres sites : tester, sauvegarder
+ * maintenant, voir les fichiers, modifier, supprimer), « Recevoir les sauvegardes d'autres sites » (activation, clé
+ * affichée une seule fois, adresse et empreinte du certificat à communiquer, sauvegardes reçues par site),
+ * « Restauration » (copies locales, état précédent, fichier téléversé) et « Historique ».
+ * Droits : Configuration et Système › Voir pour consulter ; › Modifier pour agir ; la gestion des destinations, les
+ * paramètres, la clé et la restauration exigent l'accès à tous les sites (le serveur reste la référence).
+ * Un rechargement de la page conserve le défilement, les recherches, les filtres et la saisie non enregistrée.
  */
 (function (racine, fabrique) {
   'use strict';
@@ -60,8 +63,40 @@
     return n >= 24 && heure ? `${base} à ${heure}` : base;
   }
   function empreinteCourte(sha) { return sha ? `${String(sha).slice(0, 12)}…` : '—'; }
+  /** Valeur courte du KPI « Prochaine sauvegarde » (la date complète est reportée dans le détail). */
+  function libelleProchaine(iso, now = new Date()) {
+    const d = iso ? new Date(iso) : null;
+    if (!d || Number.isNaN(d.getTime())) return { valeur: '—', detail: '' };
+    const p = (n) => String(n).padStart(2, '0');
+    const heure = `${p(d.getHours())}:${p(d.getMinutes())}`;
+    const date = `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()}`;
+    const detail = `${date} ${heure}`;
+    if (d.getTime() <= now.getTime() + 5 * 60000) return { valeur: 'Imminente', detail };
+    const jour = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const ecart = Math.round((jour(d) - jour(now)) / 86400000);
+    if (ecart === 0) return { valeur: `Aujourd'hui ${heure}`, detail };
+    if (ecart === 1) return { valeur: `Demain ${heure}`, detail };
+    return { valeur: date, detail };
+  }
+  /**
+   * Segments d'un chemin ou d'une adresse, coupés après chaque séparateur (retour à la ligne possible entre les
+   * segments, jamais au milieu d'un mot) ; les séparateurs de tête (« \\ » d'un partage, « // » d'une adresse) restent
+   * attachés au segment qui les suit ou les précède.
+   */
+  function morceauxChemin(chemin) {
+    const s = String(chemin == null ? '' : chemin);
+    const out = [];
+    let courant = '';
+    for (const c of s) {
+      const sep = c === '\\' || c === '/';
+      if (!sep && /[\\/]$/.test(courant) && /[^\\/]/.test(courant)) { out.push(courant); courant = ''; }
+      courant += c;
+    }
+    if (courant) out.push(courant);
+    return out;
+  }
 
-  const outils = { formatTaille, formatDureeMs, libelleFrequence, empreinteCourte, FREQUENCES };
+  const outils = { formatTaille, formatDureeMs, libelleFrequence, empreinteCourte, libelleProchaine, morceauxChemin, FREQUENCES };
 
   // ----- Interface -----
   function installer(win) {
@@ -80,13 +115,15 @@
 .sav-titre svg { width: 20px; height: 20px; color: var(--primaire); }
 .sav-intro { margin: 0 0 12px; }
 .sav-kpis { margin: 12px 0 16px; }
+.sav-kpis .kpi-valeur { overflow-wrap: anywhere; }
 .sav-cartes { align-items: start; }
 .sav-aide { background: var(--surface-2); border: 1px dashed var(--bordure-2); border-radius: var(--rayon); padding: 10px 14px; font-size: 12.5px; color: var(--texte-2); margin-top: 12px; }
 .sav-aide summary { cursor: pointer; font-weight: 600; color: var(--texte); }
 .sav-aide ul { margin: 8px 0 2px; padding-left: 18px; }
 .sav-aide li { margin: 4px 0; }
 .sav-aide code { white-space: nowrap; }
-.sav-emplacement { font-family: Consolas, "Courier New", monospace; font-size: 12px; word-break: break-all; color: var(--texte); }
+.sav-emplacement { font-family: Consolas, "Courier New", monospace; font-size: 12px; overflow-wrap: anywhere; color: var(--texte); }
+.sav-empreinte { display: inline-block; font-family: Consolas, "Courier New", monospace; font-size: 12px; padding: 4px 8px; background: var(--fond-2); border: 1px solid var(--bordure-2); border-radius: 6px; overflow-wrap: anywhere; user-select: all; color: var(--texte); }
 .sav-cle { font-family: Consolas, "Courier New", monospace; font-size: 14px; padding: 12px 14px; background: var(--fond-2); border: 1px solid var(--bordure-2); border-radius: 6px; word-break: break-all; user-select: all; color: var(--texte); margin: 10px 0; }
 .sav-resultats { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .sav-resultats li { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--bordure); border-left: 4px solid var(--ok); border-radius: 6px; background: var(--surface-2); }
@@ -115,10 +152,15 @@
 .sav-nom-dest .cellule-principale { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .sav-notes { max-width: 380px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sav-dest-tableau td { vertical-align: middle; }
-.sav-actions-carte { display: flex; gap: 8px; flex-wrap: wrap; }
+.sav-actions-carte { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.sav-modifie { display: inline-flex; align-items: center; }
+.sav-modifie.masque { display: none; }
+.sav-rien { display: flex; align-items: center; gap: 6px; margin: 0 0 10px; }
+.sav-rien svg { width: 16px; height: 16px; flex-shrink: 0; color: var(--info); }
 .sav-confirmation { margin-top: 6px; }
 .sav-etape { display: flex; gap: 10px; align-items: flex-start; margin: 8px 0; font-size: 13px; }
 .sav-etape-num { width: 22px; height: 22px; border-radius: 50%; background: var(--primaire); color: #fff; font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+@media (max-width: 1440px) { .sav-notes { max-width: 220px; } .sav-kpis .kpi-valeur { font-size: 20px; } }
 @media (max-width: 1100px) { .sav-cartes.grille-2 { grid-template-columns: 1fr; } }
 `;
       doc.head.appendChild(el('style', { id: 'sav-styles' }, css));
@@ -150,11 +192,14 @@
     function badgesFormat(f) {
       return frag(f.compresse ? ui.badge('Compressée', '#0891b2') : null, ' ', f.chiffre ? ui.badge('Chiffrée', '#7c3aed') : null, !f.compresse && !f.chiffre ? ui.badge('JSON') : null);
     }
-    function nomSite(secteurId) {
-      if (secteurId == null) return el('span', { class: 'texte-2' }, 'Tous les sites');
-      const ch = ui.cheminSecteur(secteurId);
-      return ch || ui.nomSecteur(secteurId);
+    /** Chemin ou adresse : retour à la ligne possible après chaque séparateur (le texte copié reste intact). */
+    function renduChemin(chemin) {
+      const span = el('span', { class: 'sav-emplacement' });
+      morceauxChemin(chemin).forEach((m, i) => { if (i) span.appendChild(el('wbr')); span.appendChild(doc.createTextNode(m)); });
+      return span;
     }
+    const empreinteEl = (e) => el('code', { class: 'sav-empreinte' }, e || '—');
+    const badgeEtatPrecedent = () => ui.badge('État avant restauration', '#8b5cf6', { titre: 'Copie de l\'état de la base faite automatiquement avant une restauration ou un import : la restaurer annule cette opération' });
 
     /** Fenêtre d'attente non fermable, remplacée ensuite par un résultat. */
     function modaleAttente(titre, message) {
@@ -167,33 +212,61 @@
       const zone = el('div', { class: 'sav' });
       container.appendChild(zone);
       let etat = null;
+      let tableauDest = null; // tableau des destinations (recherche conservée lors d'un rechargement)
+      let tableauHisto = null;
+      let formAuto = null; // formulaire « Sauvegarde automatique » (saisie non enregistrée conservée)
+      const filtresHisto = { type: '', resultat: '' };
 
       const modifiable = () => peutModifierDroits() && !!(etat && etat.droits && etat.droits.modifier);
       const global = () => modifiable() && !!(etat && etat.droits && etat.droits.global);
       const restaurable = () => modifiable() && !!(etat && etat.droits && etat.droits.restaurer);
-      const destModifiable = (d) => modifiable() && !GMAO.siteLectureSeule(d.secteurId) && (d.secteurId != null || global());
+      /** Gestion des destinations (ajout, modification, suppression) : réservée aux accès à tous les sites. */
+      const gestion = () => modifiable() && !!(etat && etat.droits && (etat.droits.destinations !== undefined ? etat.droits.destinations : etat.droits.global));
+      /** Destination que l'utilisateur peut tester et utiliser pour une sauvegarde manuelle. */
+      const destUtilisable = (d) => modifiable() && !GMAO.siteLectureSeule(d.secteurId) && (d.secteurId != null || global());
+      const destGerable = (d) => gestion() && destUtilisable(d);
+      const siteCourantLecture = () => GMAO.siteLectureSeule(GMAO.siteCourant());
+      const titre = () => el('h2', { class: 'sav-titre' }, icone('serveur'), 'Sauvegardes multi-destinations et multi-sites');
 
-      async function rendre() {
-        ui.vider(zone);
-        zone.appendChild(el('h2', { class: 'sav-titre' }, icone('serveur'), 'Sauvegardes multi-destinations et multi-sites'));
-        zone.appendChild(ui.chargement('Chargement des sauvegardes…'));
+      /** Ce que l'utilisateur a saisi ou positionné sur la page, conservé lors d'un rechargement. */
+      function memoriser() {
+        const recherche = (t) => { const i = t ? t.el.querySelector('input[type=search]') : null; return i ? i.value : ''; };
+        return { defilement: win.scrollY, rechercheDest: recherche(tableauDest), rechercheHisto: recherche(tableauHisto), saisieAuto: formAuto && formAuto.modifie() ? formAuto.valeurs() : null };
+      }
+      function restaurerAffichage(memo, conserverSaisie) {
+        if (memo.rechercheDest && tableauDest) tableauDest.rechercher(memo.rechercheDest);
+        if (memo.rechercheHisto && tableauHisto) tableauHisto.rechercher(memo.rechercheHisto);
+        if (conserverSaisie && memo.saisieAuto && formAuto) formAuto.reprendre(memo.saisieAuto);
+        win.scrollTo(0, memo.defilement);
+      }
+      /** Recharge les données puis reconstruit les cartes ; l'affichage précédent reste en place pendant le chargement. */
+      async function rendre({ conserverSaisie = true } = {}) {
+        const memo = etat ? memoriser() : null;
+        if (!memo) {
+          ui.vider(zone);
+          zone.appendChild(titre());
+          zone.appendChild(ui.chargement('Chargement des sauvegardes…'));
+        }
         try { etat = await api.get(BASE); } catch (e) {
           ui.vider(zone);
-          zone.appendChild(el('h2', { class: 'sav-titre' }, icone('serveur'), 'Sauvegardes multi-destinations et multi-sites'));
-          zone.appendChild(ui.alerte(e.status === 403 ? 'Consultation réservée : réservée au pôle informatique (droit Système › Voir).' : 'Sauvegardes multi-sites indisponibles : ' + e.message, e.status === 403 ? 'info' : 'alerte'));
+          zone.appendChild(titre());
+          zone.appendChild(ui.alerte(e.status === 403 ? 'Consultation réservée au pôle informatique (droit Système › Voir).' : 'Sauvegardes multi-sites indisponibles : ' + e.message, e.status === 403 ? 'info' : 'alerte'));
           return;
         }
+        construire();
+        if (memo) restaurerAffichage(memo, conserverSaisie);
+      }
+      function construire() {
         ui.vider(zone);
         const s = etat.serveur || {};
-        zone.appendChild(el('div', { class: 'carte-titre', style: { marginBottom: '0' } },
-          el('h2', { class: 'sav-titre' }, icone('serveur'), 'Sauvegardes multi-destinations et multi-sites'),
-          ui.bouton('Actualiser', { icone: 'rafraichir', classe: 'btn-sm', onClic: rendre })));
+        const p = etat.parametres || {};
+        zone.appendChild(el('div', { class: 'carte-titre', style: { marginBottom: '0' } }, titre(), ui.bouton('Actualiser', { icone: 'rafraichir', classe: 'btn-sm', onClic: () => rendre() })));
         zone.appendChild(el('p', { class: 'texte-2 texte-petit sav-intro' },
           `Ce serveur : « ${s.nom || 'GMAO'} » (version ${s.version || '—'}). Chaque sauvegarde est copiée localement puis envoyée à toutes les destinations actives : disques, clés USB, partages réseau et serveurs GMAO des autres sites (ex. Carpentras ⇄ Valréas).`));
         if (s.memoire) zone.appendChild(ui.alerte('Serveur de démonstration sans stockage sur disque : la copie locale et la réception des sauvegardes d\'autres sites sont désactivées.', 'info'));
         if (!modifiable()) zone.appendChild(ui.alerte('Consultation seule : les modifications sont réservées au pôle informatique (droit Système › Modifier).', 'info'));
-        else if (!global()) zone.appendChild(ui.alerte('Votre accès est limité à vos sites : les paramètres globaux, la clé de réception et la restauration sont réservés aux utilisateurs ayant accès à tous les sites.', 'info'));
-        const p = etat.parametres || {};
+        else if (!global()) zone.appendChild(ui.alerte('Votre accès est limité à vos sites : les paramètres globaux, la clé de réception, la restauration et la gestion des destinations (ajout, modification, suppression) sont réservés aux utilisateurs ayant accès à tous les sites. Vous pouvez tester les destinations de vos sites et lancer une sauvegarde vers elles.', 'info'));
+        else if (GMAO.siteCourant() != null) zone.appendChild(ui.alerte(`Sélecteur de site positionné sur « ${ui.nomSecteur(GMAO.siteCourant())} » : seules les destinations de ce site et les destinations communes sont affichées et utilisées par « Sauvegarder maintenant » ; la planification automatique ne tient pas compte d'une telle sauvegarde. Choisissez « Tous les sites » dans l'en-tête pour une sauvegarde complète du serveur.`, 'info'));
         if (p.derniereExecution && p.derniereExecution.ok === false) {
           zone.appendChild(ui.alerte(frag(el('strong', null, 'Dernière sauvegarde en échec '), `(${ui.formatDateHeure(p.derniereExecution.date)}) : ${p.derniereExecution.message || ''}`), 'alerte'));
         }
@@ -207,6 +280,25 @@
         zone.appendChild(carteHistorique());
       }
 
+      // ----- Cibles d'une sauvegarde manuelle (mêmes règles que le serveur) -----
+      /** Destinations actives que « Sauvegarder maintenant vers toutes les destinations » utiliserait pour cet utilisateur. */
+      function ciblesExecution() {
+        return (etat.destinations || []).filter((d) => d.actif && destUtilisable(d));
+      }
+      function copieLocaleDisponible() {
+        return global() && !(etat.serveur || {}).memoire && Number((etat.parametres || {}).conserverLocal) > 0;
+      }
+      /** Pourquoi « Sauvegarder maintenant vers toutes les destinations » n'a rien à faire. */
+      function raisonRien() {
+        const s = etat.serveur || {};
+        const p = etat.parametres || {};
+        if (siteCourantLecture()) return 'Le site sélectionné dans l\'en-tête n\'est accessible qu\'en lecture : aucune sauvegarde possible dans ce contexte';
+        if (!global()) return (etat.destinations || []).some((d) => d.actif) ? 'Aucune destination active utilisable dans votre périmètre : les destinations communes à tous les sites et la copie locale sont réservées aux utilisateurs ayant accès à tous les sites' : 'Aucune destination active dans votre périmètre : demandez l\'ajout d\'une destination à un utilisateur ayant accès à tous les sites';
+        if (GMAO.siteCourant() != null) return 'Aucune destination active pour le site sélectionné : choisissez « Tous les sites » dans l\'en-tête, ou rattachez une destination active à ce site';
+        if (s.memoire) return 'Aucune destination active : ajoutez une destination (dossier ou serveur d\'un autre site). La copie locale est indisponible sur ce serveur de démonstration';
+        return Number(p.conserverLocal) > 0 ? 'Aucune destination active : ajoutez une destination (dossier ou serveur d\'un autre site)' : 'Aucune destination active et copie locale désactivée : rien à sauvegarder';
+      }
+
       // ----- Indicateurs -----
       function prochaine(p, actives) {
         const s = etat.serveur || {};
@@ -215,20 +307,34 @@
         else if (s.planification === false) { valeur = 'Non planifiée'; detail = 'Serveur sans stockage (démonstration)'; couleur = '#6b7280'; }
         else if (!actives && !(p.conserverLocal > 0)) { valeur = 'Rien à sauvegarder'; detail = 'Aucune destination active ni copie locale'; couleur = '#f59e0b'; }
         else {
-          const d = p.prochaineExecution ? new Date(p.prochaineExecution) : null;
-          valeur = !d ? '—' : (d.getTime() <= Date.now() + 5 * 60000 ? 'Dans quelques minutes' : ui.formatDateHeure(d));
-          detail = libelleFrequence(p.frequenceHeures, p.heure);
+          const x = libelleProchaine(p.prochaineExecution);
+          valeur = x.valeur;
+          detail = [x.detail, libelleFrequence(p.frequenceHeures, p.heure)].filter(Boolean).join(' · ');
         }
         return ui.kpi({ label: 'Prochaine sauvegarde automatique', valeur, icone: 'horloge', couleur, detail });
+      }
+      /** Dernière sauvegarde réussie visible par l'utilisateur : exécution complète du serveur, historique ou dernier envoi réussi vers une destination. */
+      function derniereReussieVisible() {
+        const dates = [(etat.parametres || {}).derniereReussite];
+        const h = (etat.historique || []).find((x) => x.type === 'sauvegarde' && x.ok);
+        if (h) dates.push(h.date);
+        for (const d of etat.destinations || []) if (d.derniere && d.derniere.ok && d.derniere.date) dates.push(d.derniere.date);
+        return dates.filter(Boolean).sort().pop() || null;
       }
       function indicateurs() {
         const p = etat.parametres || {};
         const dests = etat.destinations || [];
         const actives = dests.filter((d) => d.actif).length;
         const nbRecues = (etat.recues || []).reduce((t, r) => t + (r.nombre || 0), 0);
-        const ok = p.derniereReussite;
+        const ok = derniereReussieVisible();
+        const complete = p.derniereReussite || null;
+        let detail;
+        if (!ok) detail = 'Lancez une première sauvegarde';
+        else if (!global()) detail = ui.formatDateHeure(ok);
+        else if (complete && complete >= ok) detail = `${ui.formatDateHeure(ok)} · sauvegarde complète du serveur`;
+        else detail = `${ui.formatDateHeure(ok)} · dernière sauvegarde complète du serveur : ${complete ? ui.relatif(complete) : 'jamais'}`;
         return el('div', { class: 'grille grille-4 sav-kpis' },
-          ui.kpi({ label: 'Dernière sauvegarde réussie', valeur: ok ? ui.relatif(ok) : 'Jamais', icone: 'check', couleur: ok ? '#16a34a' : '#dc2626', detail: ok ? ui.formatDateHeure(ok) : 'Lancez une première sauvegarde' }),
+          ui.kpi({ label: 'Dernière sauvegarde réussie', valeur: ok ? ui.relatif(ok) : 'Jamais', icone: 'check', couleur: ok ? '#16a34a' : '#dc2626', detail }),
           prochaine(p, actives),
           ui.kpi({ label: 'Destinations actives', valeur: `${actives} / ${dests.length}`, icone: 'dossier', couleur: actives ? '#0f766e' : '#f59e0b', detail: actives ? `${dests.filter((d) => d.actif && d.type === 'serveur').length} serveur(s) d'autres sites` : 'Ajoutez au moins une destination externe' }),
           ui.kpi({ label: 'Sauvegardes reçues', valeur: String(nbRecues), icone: 'import', couleur: '#0891b2', detail: p.accepterReception ? `Réception active · ${(etat.recues || []).length} site(s)` : 'Réception désactivée', onClic: () => { const c = doc.getElementById('sav-carte-recues'); if (c) c.scrollIntoView({ behavior: 'smooth', block: 'start' }); } }));
@@ -238,36 +344,57 @@
       function carteAutomatique() {
         const p = etat.parametres || {};
         const dis = !global();
+        // Interrupteur principal : prend effet immédiatement, comme celui de la réception dans la carte voisine
+        const inter = el('div', { class: 'interrupteur' + (p.automatique ? ' actif' : ''), role: 'switch', tabindex: 0, 'aria-checked': p.automatique ? 'true' : 'false', title: dis ? 'Réservé au pôle informatique (accès à tous les sites)' : '', style: dis ? { opacity: '0.6', cursor: 'not-allowed' } : null });
+        const bascule = async () => {
+          if (dis) return;
+          const nouveau = !inter.classList.contains('actif');
+          try { await api.put(BASE + '/parametres', { automatique: nouveau }); toast(nouveau ? 'Sauvegarde automatique activée' : 'Sauvegarde automatique désactivée', 'succes'); rendre(); } catch (e) { erreur(e); }
+        };
+        inter.addEventListener('click', bascule);
+        inter.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); bascule(); } });
+
         const freqs = FREQUENCES.slice();
         if (!freqs.some((f) => f.value === p.frequenceHeures)) freqs.push({ value: p.frequenceHeures, label: libelleFrequence(p.frequenceHeures) });
+        // Saisie non enregistrée : signalée, et conservée si la page est rechargée par une autre action
+        const indicateur = el('span', { class: 'sav-modifie masque' }, ui.badge('Modifications non enregistrées', '#f59e0b'));
+        const majModif = () => { indicateur.classList.toggle('masque', !modifie()); };
         const f = ui.form({ colonnes: 2, valeurs: {
-          automatique: !!p.automatique, frequenceHeures: p.frequenceHeures || 24, heure: p.heure || '22:00', conserverLocal: p.conserverLocal == null ? 30 : p.conserverLocal,
+          frequenceHeures: p.frequenceHeures || 24, heure: p.heure || '22:00', conserverLocal: p.conserverLocal == null ? 30 : p.conserverLocal,
           compresser: p.compresser !== false, chiffrer: !!p.chiffrer, nomServeur: p.nomServeur || '',
         }, champs: [
-          { nom: 'automatique', label: 'Sauvegarde automatique activée', type: 'interrupteur', disabled: dis, pleineLargeur: true },
-          { nom: 'frequenceHeures', label: 'Fréquence', type: 'select', options: freqs, disabled: dis },
-          { nom: 'heure', label: 'Heure de la sauvegarde', type: 'heure', disabled: dis, aide: 'Heure de référence pour une sauvegarde quotidienne ou espacée de plusieurs jours', afficherSi: (v) => Number(v.frequenceHeures) >= 24 },
-          { nom: 'conserverLocal', label: 'Copies locales conservées', type: 'nombre', min: 0, max: 365, step: 1, disabled: dis, aide: '0 = aucune copie locale', requis: true },
-          { nom: 'nomServeur', label: 'Nom de ce serveur pour les autres sites', type: 'texte', disabled: dis, placeholder: (etat.serveur || {}).nom || '', aide: 'Facultatif (par défaut : nom du site principal)' },
-          { nom: 'compresser', label: 'Compresser (gzip, environ 10 fois plus petit)', type: 'interrupteur', disabled: dis },
-          { nom: 'chiffrer', label: 'Chiffrer (AES-256)', type: 'interrupteur', disabled: dis },
+          { nom: 'frequenceHeures', label: 'Fréquence', type: 'select', options: freqs, disabled: dis, onChange: majModif },
+          { nom: 'heure', label: 'Heure de la sauvegarde', type: 'heure', disabled: dis, aide: 'Heure de référence pour une sauvegarde quotidienne ou espacée de plusieurs jours', afficherSi: (v) => Number(v.frequenceHeures) >= 24, onChange: majModif },
+          { nom: 'conserverLocal', label: 'Copies locales conservées', type: 'nombre', min: 0, max: 365, step: 1, disabled: dis, aide: '0 = aucune copie locale', requis: true, onChange: majModif },
+          { nom: 'nomServeur', label: 'Nom de ce serveur pour les autres sites', type: 'texte', disabled: dis, placeholder: (etat.serveur || {}).nom || '', aide: 'Facultatif (par défaut : nom du site principal)', onChange: majModif },
+          { nom: 'compresser', label: 'Compresser (gzip, environ 10 fois plus petit)', type: 'interrupteur', disabled: dis, onChange: majModif },
+          { nom: 'chiffrer', label: 'Chiffrer (AES-256)', type: 'interrupteur', disabled: dis, onChange: majModif },
           { nom: 'motDePasseChiffrement', label: p.motDePasseDefini ? 'Nouveau mot de passe de chiffrement' : 'Mot de passe de chiffrement', type: 'mdp', disabled: dis,
-            placeholder: p.motDePasseDefini ? '•••••••• (inchangé si vide)' : 'Au moins 8 caractères', afficherSi: (v) => v.chiffrer && !dis,
+            placeholder: p.motDePasseDefini ? '•••••••• (inchangé si vide)' : 'Au moins 8 caractères', afficherSi: (v) => v.chiffrer && !dis, onChange: majModif,
             valider: (v, vals) => (vals.chiffrer && !p.motDePasseDefini && !v ? 'Mot de passe obligatoire pour chiffrer' : (v && v.length < 8 ? 'Au moins 8 caractères' : '')) },
-          { nom: 'confirmationMdp', label: 'Confirmer le mot de passe', type: 'mdp', disabled: dis, afficherSi: (v) => v.chiffrer && !dis,
+          { nom: 'confirmationMdp', label: 'Confirmer le mot de passe', type: 'mdp', disabled: dis, afficherSi: (v) => v.chiffrer && !dis, onChange: majModif,
             valider: (v, vals) => (vals.motDePasseChiffrement && v !== vals.motDePasseChiffrement ? 'Les mots de passe ne correspondent pas' : '') },
           { nom: 'avertissement', type: 'html', afficherSi: (v) => v.chiffrer, rendu: () => ui.alerte(frag(icone('alerte'), ' ', el('strong', null, 'Conservez ce mot de passe en lieu sûr : '), 'sans ce mot de passe, les sauvegardes chiffrées sont irrécupérables. Il est mémorisé sur ce serveur (en écriture seule, jamais réaffiché) et devra être saisi pour restaurer une sauvegarde chiffrée sur un autre serveur.'), 'alerte') },
         ] });
         if (dis) f.el.classList.add('sav-lecture');
+        const lire = () => { try { return JSON.stringify(f.valeurs()); } catch (e) { return ''; } };
+        const initiales = lire();
+        const modifie = () => lire() !== initiales;
+        f.el.addEventListener('input', majModif);
+        formAuto = {
+          valeurs: () => f.valeurs(), modifie,
+          reprendre(v) { for (const [k, x] of Object.entries(v || {})) f.set(k, x); f.rafraichirVisibilite(); majModif(); },
+        };
         const enregistrer = async () => {
           if (!f.valider()) return;
           const v = f.valeurs();
-          const corps = { automatique: v.automatique, frequenceHeures: Number(v.frequenceHeures), heure: v.heure || p.heure || '22:00', conserverLocal: Number(v.conserverLocal), compresser: v.compresser, chiffrer: v.chiffrer, nomServeur: v.nomServeur || '' };
+          const corps = { frequenceHeures: Number(v.frequenceHeures), heure: v.heure || p.heure || '22:00', conserverLocal: Number(v.conserverLocal), compresser: v.compresser, chiffrer: v.chiffrer, nomServeur: v.nomServeur || '' };
           if (v.chiffrer && v.motDePasseChiffrement) corps.motDePasseChiffrement = v.motDePasseChiffrement;
-          try { await api.put(BASE + '/parametres', corps); toast('Paramètres de sauvegarde enregistrés', 'succes'); rendre(); } catch (e) { erreur(e); }
+          try { await api.put(BASE + '/parametres', corps); toast('Paramètres de sauvegarde enregistrés', 'succes'); rendre({ conserverSaisie: false }); } catch (e) { erreur(e); }
         };
         const actions = global() ? el('div', { class: 'sav-actions-carte mt' },
           ui.bouton('Enregistrer les paramètres', { icone: 'check', classe: 'btn-primaire', onClic: enregistrer }),
+          indicateur,
           p.motDePasseDefini && !p.chiffrer ? ui.bouton('Oublier le mot de passe', { icone: 'supprimer', classe: 'btn-sm btn-lien', onClic: async () => {
             if (!(await ui.confirm({ titre: 'Mot de passe de chiffrement', message: 'Supprimer le mot de passe mémorisé ? Les sauvegardes chiffrées existantes ne pourront être restaurées qu\'en ressaisissant ce mot de passe.', okLabel: 'Supprimer', danger: true }))) return;
             try { await api.put(BASE + '/parametres', { supprimerMotDePasse: true }); toast('Mot de passe supprimé', 'succes'); rendre(); } catch (e) { erreur(e); }
@@ -276,7 +403,12 @@
         const locales = etat.locales || [];
         const info = el('div', { class: 'texte-2 texte-petit mt' },
           s.dossierLocal ? frag('Copies locales : ', el('code', null, s.dossierLocal), ` — ${locales.length} sauvegarde${locales.length > 1 ? 's' : ''}`) : 'Copie locale indisponible (serveur sans stockage)');
-        return ui.carte('Sauvegarde automatique', frag(f.el, actions, info), { actions: [ui.badge(p.automatique ? 'Active' : 'Désactivée', p.automatique ? '#16a34a' : '#6b7280')] });
+        const contenu = frag(
+          el('div', { class: 'sav-ligne' }, inter, el('span', null, 'Sauvegarde automatique activée'), dis ? null : el('span', { class: 'texte-2 texte-petit' }, '(prend effet immédiatement)')),
+          el('div', { class: 'sav-separateur' }),
+          dis ? null : el('p', { class: 'texte-2 texte-petit', style: { margin: '0 0 8px' } }, 'Les réglages ci-dessous s\'appliquent au clic sur « Enregistrer les paramètres ».'),
+          f.el, actions, info);
+        return ui.carte('Sauvegarde automatique', contenu, { actions: [ui.badge(p.automatique ? 'Active' : 'Désactivée', p.automatique ? '#16a34a' : '#6b7280')] });
       }
 
       // ----- Carte : réception -----
@@ -306,6 +438,12 @@
           } }) : null);
 
         const adresses = el('div', { class: 'sav-adresses' }, (s.adresses || []).map((a) => el('div', { class: 'sav-adresse' }, el('code', null, a), boutonCopier(a))));
+        // Serveur en HTTPS (poste serveur de l'application de bureau) : l'autre site épingle ce certificat avant tout envoi
+        const chiffre = s.protocole === 'https' && !!s.empreinte;
+        const empreinte = chiffre ? frag(
+          el('div', { class: 'sav-ligne', style: { marginTop: '10px' } }, el('span', { class: 'texte-gras' }, 'Empreinte du certificat HTTPS de ce serveur :')),
+          el('div', { class: 'sav-adresse', style: { marginTop: '6px' } }, empreinteEl(s.empreinte), boutonCopier(s.empreinte, 'Copier l\'empreinte')),
+          el('div', { class: 'aide texte-2 texte-petit', style: { marginTop: '6px' } }, 'Ce serveur répond en HTTPS avec son propre certificat : sur l\'autre site, saisissez cette empreinte dans la destination (champ « Empreinte du certificat HTTPS ») ou confirmez-la lors du premier test. Rien n\'est envoyé avant cette confirmation.')) : null;
         const conserver = el('input', { type: 'number', min: 1, max: 365, step: 1, value: String(p.conserverRecues || 10), disabled: dis, style: { width: '80px', minWidth: '0' }, 'aria-label': 'Sauvegardes reçues conservées par site' });
         const ligneConserver = el('div', { class: 'sav-ligne' },
           el('label', { class: 'texte-petit texte-gras' }, 'Conserver par site :'), conserver, el('span', { class: 'texte-2 texte-petit' }, 'sauvegardes'),
@@ -323,6 +461,7 @@
           el('div', { class: 'sav-ligne' }, el('span', { class: 'texte-gras' }, 'Adresse à communiquer à l\'autre site :')),
           adresses,
           el('div', { class: 'aide texte-2 texte-petit', style: { marginTop: '6px' } }, 'Le serveur doit être joignable depuis l\'autre site (réseau d\'entreprise ou VPN, port autorisé dans le pare-feu Windows).'),
+          empreinte,
           el('div', { class: 'sav-separateur' }),
           ligneConserver);
         return ui.carte('Recevoir les sauvegardes d\'autres sites', contenu, { actions: [ui.badge(p.accepterReception ? 'Réception active' : 'Réception désactivée', p.accepterReception ? '#16a34a' : '#6b7280')] });
@@ -333,7 +472,9 @@
         if (p.cleReceptionDefinie && !(await ui.confirm({ titre: 'Nouvelle clé de réception', message: 'L\'ancienne clé ne fonctionnera plus : chaque site qui envoie ses sauvegardes ici devra saisir la nouvelle clé. Continuer ?', okLabel: 'Générer', danger: true }))) return;
         let r;
         try { r = await api.post(BASE + '/cle-reception/generer'); } catch (e) { erreur(e); return; }
-        const adresses = (etat.serveur || {}).adresses || [];
+        const s = etat.serveur || {};
+        const adresses = s.adresses || [];
+        const chiffre = s.protocole === 'https' && !!s.empreinte;
         ui.modal({
           titre: 'Clé de réception des sauvegardes', fermable: false,
           contenu: frag(
@@ -343,9 +484,10 @@
             el('div', { class: 'sav-separateur' }),
             el('div', { class: 'texte-gras', style: { marginBottom: '6px' } }, 'Sur le serveur GMAO de l\'autre site :'),
             el('div', { class: 'sav-etape' }, el('span', { class: 'sav-etape-num' }, '1'), el('div', null, 'Système & informatique › Base de données & sauvegardes › Destinations › « Ajouter une destination », type « Serveur GMAO d\'un autre site ».')),
-            el('div', { class: 'sav-etape' }, el('span', { class: 'sav-etape-num' }, '2'), el('div', null, 'Adresse de ce serveur : ', adresses.length ? el('code', null, adresses[0]) : '—', adresses.length > 1 ? el('span', { class: 'texte-2 texte-petit' }, ` (ou ${adresses.slice(1).join(', ')})`) : null)),
+            el('div', { class: 'sav-etape' }, el('span', { class: 'sav-etape-num' }, '2'), el('div', null, 'Adresse de ce serveur : ', adresses.length ? el('code', null, adresses[0]) : '—', adresses.length > 1 ? el('span', { class: 'texte-2 texte-petit' }, ` (ou ${adresses.slice(1).join(', ')})`) : null,
+              chiffre ? el('div', { style: { marginTop: '6px' } }, 'Empreinte du certificat HTTPS de ce serveur, à confirmer sur l\'autre site : ', empreinteEl(s.empreinte)) : null)),
             el('div', { class: 'sav-etape' }, el('span', { class: 'sav-etape-num' }, '3'), el('div', null, 'Collez la clé ci-dessus, enregistrez puis cliquez sur « Tester ».')),
-            (etat.parametres || {}).accepterReception || (etat.serveur || {}).memoire ? null : ui.alerte('Pensez à activer « Accepter les sauvegardes envoyées par d\'autres sites ».', 'info')),
+            p.accepterReception || s.memoire ? null : ui.alerte('Pensez à activer « Accepter les sauvegardes envoyées par d\'autres sites ».', 'info')),
           boutons: [{ label: 'J\'ai copié la clé', classe: 'btn-primaire', icone: 'check' }],
           onFermer: () => rendre(),
         });
@@ -419,70 +561,90 @@
                 el('div', { class: 'cellule-principale' }, el('span', null, d.nom), d.demo ? ui.badge('Exemple') : null),
                 el('div', { class: 'cellule-secondaire' }, d.type === 'serveur' ? 'Autre site' : 'Dossier', ' · ', siteTexte(d)),
                 d.notes ? el('div', { class: 'cellule-secondaire sav-notes', title: d.notes }, d.notes) : null)) },
-            { cle: 'emplacement', label: 'Emplacement', largeur: '24%', rendu: (d) => el('div', null, el('span', { class: 'sav-emplacement' }, emplacement(d)), d.type === 'serveur' ? el('div', { class: 'cellule-secondaire' }, d.cleDefinie ? 'Clé de réception enregistrée' : 'Clé manquante') : null), valeurTri: emplacement },
+            { cle: 'emplacement', label: 'Emplacement', largeur: '24%', rendu: (d) => el('div', null, renduChemin(emplacement(d)), d.type === 'serveur' ? el('div', { class: 'cellule-secondaire' }, d.cleDefinie ? 'Clé de réception enregistrée' : 'Clé manquante', /^https:/i.test(d.url || '') ? (d.empreinte ? ' · certificat confirmé' : ' · certificat à confirmer') : '') : null), valeurTri: emplacement },
             { cle: 'conserver', label: 'Copies', aligner: 'droite', rendu: (d) => String(d.conserver), valeurTri: (d) => d.conserver },
             { cle: 'derniere', label: 'Dernière sauvegarde', rendu: cellDerniere, valeurTri: (d) => (d.derniere ? d.derniere.date : '') },
             { cle: 'actif', label: 'État', rendu: (d) => frag(d.actif ? ui.badge('Active', '#16a34a') : ui.badge('Désactivée', '#6b7280'), GMAO.siteLectureSeule(d.secteurId) ? frag(' ', ui.badge('Lecture seule', '#f59e0b', { contour: true })) : null) },
           ],
           actions: [
-            { icone: 'check', titre: 'Tester la destination', visible: destModifiable, onClic: tester },
-            { icone: 'sauvegarde', titre: 'Sauvegarder maintenant vers cette destination', visible: destModifiable, onClic: (d) => executer(d) },
+            { icone: 'check', titre: 'Tester la destination', visible: destUtilisable, onClic: tester },
+            { icone: 'sauvegarde', titre: 'Sauvegarder maintenant vers cette destination', visible: destUtilisable, onClic: (d) => executer(d) },
             { icone: 'liste', titre: 'Voir les fichiers', onClic: voirFichiers },
-            { icone: 'modifier', titre: 'Modifier', visible: destModifiable, onClic: (d) => formulaireDestination(d) },
-            { icone: 'supprimer', titre: 'Supprimer', classe: 'texte-danger', visible: destModifiable, onClic: supprimer },
+            { icone: 'modifier', titre: 'Modifier', visible: destGerable, onClic: (d) => formulaireDestination(d) },
+            { icone: 'supprimer', titre: 'Supprimer', classe: 'texte-danger', visible: destGerable, onClic: supprimer },
           ],
         });
+        tableauDest = tableau;
         const aide = el('details', { class: 'sav-aide' },
           el('summary', null, 'Exemples de destinations'),
           el('ul', null,
             el('li', null, el('code', null, 'D:\\Sauvegardes\\GMAO'), ' — second disque du serveur (protège contre une erreur de manipulation, pas contre la perte du disque principal).'),
             el('li', null, el('code', null, 'E:\\GMAO'), ' — clé USB ou disque externe : branchez-le avant l\'heure de sauvegarde et rangez-le hors du local serveur.'),
             el('li', null, el('code', null, '\\\\NAS\\GMAO'), ' — partage réseau (NAS) : le compte Windows qui exécute la GMAO doit pouvoir y écrire.'),
-            el('li', null, el('code', null, 'http://srv-valreas:8585'), ' — serveur GMAO d\'un autre site : saisissez son adresse et la clé de réception fournie par cet autre site (carte « Recevoir les sauvegardes d\'autres sites » de son écran).')),
+            el('li', null, el('code', null, 'http://srv-valreas:8585'), ' — serveur GMAO d\'un autre site : saisissez son adresse et la clé de réception fournie par cet autre site (carte « Recevoir les sauvegardes d\'autres sites » de son écran). En https://, l\'empreinte de son certificat est confirmée au premier test.')),
           el('div', null, 'Règle du 3-2-1 : trois copies, sur deux supports différents, dont une hors du site.'));
+        // « Sauvegarder maintenant » n'est actif que si au moins une cible existe pour cet utilisateur
+        const rien = modifiable() && !ciblesExecution().length && !copieLocaleDisponible();
         const actions = modifiable() ? [
-          ui.bouton('Ajouter une destination', { icone: 'plus', classe: 'btn-sm', onClic: () => formulaireDestination(null) }),
-          ui.bouton('Sauvegarder maintenant vers toutes les destinations', { icone: 'sauvegarde', classe: 'btn-sm btn-primaire', onClic: () => executer(null) }),
+          gestion() && !siteCourantLecture() ? ui.bouton('Ajouter une destination', { icone: 'plus', classe: 'btn-sm', onClic: () => formulaireDestination(null) }) : null,
+          ui.bouton('Sauvegarder maintenant vers toutes les destinations', { icone: 'sauvegarde', classe: 'btn-sm btn-primaire', disabled: rien, titre: rien ? raisonRien() : '', onClic: () => executer(null) }),
         ] : null;
-        return ui.carte(`Destinations (${dests.length})`, frag(el('div', { class: 'sav-dest-tableau' }, tableau.el), aide), { actions });
+        return ui.carte(`Destinations (${dests.length})`, frag(rien ? el('p', { class: 'texte-2 texte-petit sav-rien' }, icone('info'), el('span', null, raisonRien())) : null, el('div', { class: 'sav-dest-tableau' }, tableau.el), aide), { actions });
       }
 
       function formulaireDestination(d) {
         const edition = !!d;
-        const sitesOptions = [{ value: '', label: 'Tous les sites (destination commune)' }].concat(ui.optionsSecteurs({ typeSite: true }).filter((o) => !GMAO.siteLectureSeule(o.value)));
+        // Seuls les sites modifiables sont proposés ; « Tous les sites » est réservé aux accès à tous les sites
+        const modifiables = ui.optionsSecteurs({ typeSite: true }).filter((o) => !GMAO.siteLectureSeule(o.value));
+        const sitesOptions = (global() ? [{ value: '', label: 'Tous les sites (destination commune)' }] : []).concat(modifiables);
         if (edition && d.secteurId != null && !sitesOptions.some((o) => String(o.value) === String(d.secteurId))) sitesOptions.push({ value: d.secteurId, label: ui.cheminSecteur(d.secteurId) || ui.nomSecteur(d.secteurId) });
+        if (!sitesOptions.length) { toast('Aucun site modifiable dans votre périmètre : impossible d\'ajouter une destination', 'alerte'); return; }
+        const courant = GMAO.siteCourant();
+        const siteDefaut = courant != null && modifiables.some((o) => Number(o.value) === Number(courant)) ? courant : (global() ? '' : modifiables[0].value);
+        const cleConnue = edition && d.cleDefinie && d.type === 'serveur';
         const typeInitial = edition ? d.type : 'dossier';
+        const estHttps = (v) => /^https:/i.test(String(v.url || '').trim());
         ui.formModal({
           titre: edition ? `Modifier la destination « ${d.nom} »` : 'Nouvelle destination de sauvegarde', taille: 'large',
-          valeurs: edition ? { nom: d.nom, type: d.type, chemin: d.chemin, url: d.url, conserver: d.conserver, secteurId: d.secteurId == null ? '' : d.secteurId, actif: d.actif, notes: d.notes } : { type: 'dossier', conserver: 10, actif: true, secteurId: GMAO.siteCourant() || '' },
+          valeurs: edition ? { nom: d.nom, type: d.type, chemin: d.chemin, url: d.url, empreinte: d.empreinte || '', conserver: d.conserver, secteurId: d.secteurId == null ? '' : d.secteurId, actif: d.actif, notes: d.notes } : { type: 'dossier', conserver: 10, actif: true, secteurId: siteDefaut },
           champs: [
             { nom: 'nom', label: 'Nom', type: 'texte', requis: true, placeholder: 'Ex. NAS du service informatique', maxLength: 80 },
             { nom: 'secteurId', label: 'Site', type: 'select', options: sitesOptions, aide: 'Site où se trouve la destination (filtre multi-site)' },
             { nom: 'type', label: 'Type de destination', type: 'radio', pleineLargeur: true, options: [{ value: 'dossier', label: 'Dossier : disque, clé USB ou partage réseau' }, { value: 'serveur', label: 'Serveur GMAO d\'un autre site' }] },
-            { nom: 'chemin', label: 'Chemin du dossier', type: 'texte', pleineLargeur: true, placeholder: 'D:\\Sauvegardes\\GMAO', suggestions: ['D:\\Sauvegardes\\GMAO', 'E:\\GMAO', '\\\\NAS\\GMAO'],
+            { nom: 'chemin', label: 'Chemin du dossier', type: 'texte', requis: true, pleineLargeur: true, placeholder: 'D:\\Sauvegardes\\GMAO', suggestions: ['D:\\Sauvegardes\\GMAO', 'E:\\GMAO', '\\\\NAS\\GMAO'],
               aide: 'Exemples : D:\\Sauvegardes\\GMAO (disque), E:\\GMAO (clé USB), \\\\NAS\\GMAO (partage réseau). Le dossier est créé s\'il n\'existe pas.',
-              afficherSi: (v) => v.type === 'dossier', valider: (v, vals) => (vals.type === 'dossier' && !String(v || '').trim() ? 'Champ obligatoire' : '') },
-            { nom: 'url', label: 'Adresse du serveur GMAO de l\'autre site', type: 'texte', placeholder: 'http://srv-valreas:8585',
+              afficherSi: (v) => v.type === 'dossier' },
+            { nom: 'url', label: 'Adresse du serveur GMAO de l\'autre site', type: 'texte', requis: true, placeholder: 'http://srv-valreas:8585',
               aide: 'Adresse affichée sur l\'autre site dans « Recevoir les sauvegardes d\'autres sites »',
-              afficherSi: (v) => v.type === 'serveur', valider: (v, vals) => (vals.type !== 'serveur' ? '' : (!String(v || '').trim() ? 'Champ obligatoire' : (!/^https?:\/\/[^\s/]+/i.test(String(v).trim()) ? 'L\'adresse doit commencer par http:// ou https://' : ''))) },
-            { nom: 'cle', label: 'Clé de réception fournie par l\'autre site', type: 'mdp', placeholder: edition && d.cleDefinie && d.type === 'serveur' ? '•••••••• (inchangée si vide)' : 'Collez la clé générée sur l\'autre site',
+              afficherSi: (v) => v.type === 'serveur', onInput: (v, f) => f.rafraichirVisibilite(),
+              valider: (v) => (v && !/^https?:\/\/[^\s/]+/i.test(String(v).trim()) ? 'L\'adresse doit commencer par http:// ou https://' : '') },
+            { nom: 'cle', label: 'Clé de réception fournie par l\'autre site', type: 'mdp', requis: !cleConnue, placeholder: cleConnue ? '•••••••• (inchangée si vide)' : 'Collez la clé générée sur l\'autre site',
               aide: 'Générée sur le serveur de l\'autre site (bouton « Générer la clé »)', afficherSi: (v) => v.type === 'serveur',
-              valider: (v, vals) => (vals.type === 'serveur' && !v && !(edition && d.cleDefinie && d.type === 'serveur') ? 'Champ obligatoire' : (v && v.trim().length < 16 ? 'Clé trop courte : copiez la clé complète' : '')) },
+              valider: (v) => (v && v.trim().length < 16 ? 'Clé trop courte : copiez la clé complète' : '') },
+            { nom: 'empreinte', label: 'Empreinte du certificat HTTPS', type: 'texte', pleineLargeur: true, placeholder: 'AB:CD:EF:… (64 caractères hexadécimaux)',
+              aide: 'Adresse https:// (poste serveur de l\'application de bureau) : empreinte SHA-256 du certificat, affichée sur l\'autre site dans « Recevoir les sauvegardes d\'autres sites ». Laissez vide pour la relever au premier test, puis confirmez-la : rien n\'est envoyé avant.',
+              afficherSi: (v) => v.type === 'serveur' && estHttps(v),
+              valider: (v) => (v && !/^[0-9a-f]{64}$/i.test(String(v).replace(/[^0-9a-f]/gi, '')) ? 'Empreinte invalide : 64 caractères hexadécimaux, telle qu\'affichée sur l\'autre site' : '') },
             { nom: 'conserver', label: 'Sauvegardes conservées', type: 'nombre', min: 1, max: 365, step: 1, requis: true, aide: 'Les plus anciennes sauvegardes de ce serveur sont supprimées au-delà' },
             { nom: 'actif', label: 'Destination active (utilisée par les sauvegardes automatiques)', type: 'interrupteur' },
             { nom: 'notes', label: 'Notes', type: 'texte_long', lignes: 2, placeholder: 'Ex. clé USB échangée chaque vendredi, rangée au coffre' },
           ],
           submitLabel: edition ? 'Enregistrer et tester' : 'Ajouter et tester',
-          onSubmit: async (v) => {
+          onSubmit: async (v, modal) => {
             const corps = { nom: String(v.nom || '').trim(), type: v.type || typeInitial, conserver: Number(v.conserver), actif: !!v.actif, notes: v.notes || '', secteurId: v.secteurId === '' || v.secteurId == null ? null : Number(v.secteurId) };
             if (corps.type === 'dossier') corps.chemin = String(v.chemin || '').trim();
-            else { corps.url = String(v.url || '').trim(); if (v.cle) corps.cle = v.cle.trim(); }
+            else {
+              corps.url = String(v.url || '').trim();
+              if (v.cle) corps.cle = v.cle.trim();
+              corps.empreinte = estHttps(v) ? String(v.empreinte || '').trim() : '';
+            }
             const res = edition ? await api.put(`${BASE}/destinations/${d.id}`, corps) : await api.post(BASE + '/destinations', corps);
-            let t = null;
-            try { t = await api.post(`${BASE}/destinations/${res.id}/tester`); } catch (e) { t = { ok: false, message: e.message }; }
-            if (t.ok) toast(`Destination ${edition ? 'enregistrée' : 'ajoutée'} — test réussi : ${t.message}`, 'succes', 6000);
-            else toast(`Destination ${edition ? 'enregistrée' : 'ajoutée'}, mais le test a échoué : ${t.message}`, 'alerte', 9000);
+            // Destination enregistrée : la fenêtre se ferme et le test s'affiche dans sa propre fenêtre d'attente
+            modal.fermer();
+            toast(`Destination ${edition ? 'enregistrée' : 'ajoutée'} : test en cours…`, 'succes');
             rendre();
+            tester(res);
+            return undefined;
           },
         });
       }
@@ -496,20 +658,59 @@
         ui.vider(m.corps);
         m.corps.appendChild(ui.alerte(frag(el('strong', null, r.ok ? 'Destination opérationnelle. ' : 'Échec du test. '), r.message || ''), r.ok ? 'ok' : 'alerte'));
         m.corps.appendChild(ui.details([
-          { label: 'Emplacement', valeur: el('span', { class: 'sav-emplacement' }, d.type === 'serveur' ? d.url : d.chemin) },
+          { label: 'Emplacement', valeur: renduChemin(d.type === 'serveur' ? d.url : d.chemin) },
           r.site ? { label: 'Site distant', valeur: r.site } : null,
           r.version ? { label: 'Version GMAO distante', valeur: r.version } : null,
           r.espaceLibre != null ? { label: 'Espace libre', valeur: formatTaille(r.espaceLibre) } : null,
+          d.type === 'serveur' && d.empreinte ? { label: 'Certificat HTTPS', valeur: frag('Empreinte confirmée : ', empreinteEl(d.empreinte)) } : null,
           { label: 'Durée du test', valeur: formatDureeMs(r.dureeMs) },
         ]));
+        const boutons = [{ label: 'Fermer', classe: r.code ? '' : 'btn-primaire' }];
+        const majPuisRetester = async (corps, message) => {
+          const maj = await api.put(`${BASE}/destinations/${d.id}`, corps);
+          toast(message, 'succes');
+          rendre();
+          tester(maj);
+        };
+        // Serveur distant en HTTPS (application de bureau) : bascule d'adresse et confirmation de l'empreinte du certificat
+        if (r.code === 'REDIRECTION_HTTPS' && r.adresseHttps && destGerable(d)) {
+          m.corps.appendChild(el('p', { class: 'texte-2 texte-petit' }, 'Ce serveur n\'accepte que les connexions chiffrées : son certificat devra ensuite être confirmé par son empreinte.'));
+          boutons.unshift({ label: 'Utiliser l\'adresse https://', classe: 'btn-primaire', icone: 'check', onClic: () => majPuisRetester({ url: r.adresseHttps }, 'Adresse de la destination mise à jour') });
+        }
+        if (r.code === 'EMPREINTE_NON_CONFIRMEE' && r.empreintePresentee && destGerable(d)) {
+          m.corps.appendChild(el('div', { class: 'mt' },
+            el('div', { class: 'texte-gras' }, 'Empreinte du certificat présenté par le serveur distant :'),
+            el('div', { style: { margin: '6px 0' } }, empreinteEl(r.empreintePresentee)),
+            el('p', { class: 'texte-2 texte-petit' }, 'Comparez-la avec l\'empreinte affichée sur le poste serveur de l\'autre site (carte « Recevoir les sauvegardes d\'autres sites »). Si elles sont identiques, confirmez-la : la clé de réception et les sauvegardes ne seront envoyées qu\'à ce certificat.')));
+          boutons.unshift({ label: 'Confirmer cette empreinte', classe: 'btn-primaire', icone: 'check', onClic: () => majPuisRetester({ empreinte: r.empreintePresentee }, 'Empreinte du certificat confirmée') });
+        }
+        if (r.code === 'EMPREINTE_DIFFERENTE' && r.empreintePresentee && destGerable(d)) {
+          m.corps.appendChild(el('div', { class: 'mt' },
+            ui.alerte(frag(el('strong', null, 'Attention : '), 'le certificat présenté ne correspond pas à l\'empreinte confirmée ; rien n\'a été envoyé. Ne remplacez l\'empreinte que si le poste serveur de l\'autre site a réellement été réinstallé, après vérification auprès de son pôle informatique.'), 'danger'),
+            el('div', { class: 'texte-gras' }, 'Empreinte confirmée :'), el('div', { style: { margin: '4px 0 8px' } }, empreinteEl(d.empreinte)),
+            el('div', { class: 'texte-gras' }, 'Empreinte présentée :'), el('div', { style: { margin: '4px 0' } }, empreinteEl(r.empreintePresentee))));
+          boutons.unshift({ label: 'Remplacer l\'empreinte confirmée', classe: 'btn-danger', fermer: false, onClic: async () => {
+            if (!(await ui.confirm({ titre: 'Remplacer l\'empreinte', message: 'Remplacer l\'empreinte confirmée par celle du certificat présenté ? En cas d\'usurpation, la clé de réception et la base complète seraient envoyées à un serveur inconnu.', okLabel: 'Remplacer', danger: true }))) return false;
+            m.fermer();
+            await majPuisRetester({ empreinte: r.empreintePresentee }, 'Empreinte du certificat remplacée');
+            return false;
+          } });
+        }
         if (!r.ok && d.type === 'dossier') m.corps.appendChild(el('p', { class: 'texte-2 texte-petit' }, 'Vérifiez que le lecteur (clé USB, disque externe) est branché, que le partage réseau est accessible et que le compte Windows qui exécute la GMAO peut y écrire.'));
-        if (!r.ok && d.type === 'serveur') m.corps.appendChild(el('p', { class: 'texte-2 texte-petit' }, 'Vérifiez l\'adresse, que la GMAO de l\'autre site est démarrée et accessible depuis le réseau, que la réception y est activée et que la clé saisie est la dernière générée sur ce serveur.'));
-        m.setBoutons([{ label: 'Fermer', classe: 'btn-primaire', onClic: () => { rendre(); } }]);
+        if (!r.ok && d.type === 'serveur' && !r.code) m.corps.appendChild(el('p', { class: 'texte-2 texte-petit' }, 'Vérifiez l\'adresse, que la GMAO de l\'autre site est démarrée et accessible depuis le réseau, que la réception y est activée et que la clé saisie est la dernière générée sur ce serveur.'));
+        m.setBoutons(boutons);
       }
 
       async function executer(d) {
         const libelle = d ? `vers « ${d.nom} »` : 'vers toutes les destinations';
-        if (!d && !(await ui.confirm({ titre: 'Sauvegarder maintenant', message: 'Créer une sauvegarde complète de la base et l\'envoyer à toutes les destinations actives (et en copie locale) ?', okLabel: 'Sauvegarder' }))) return;
+        if (!d) {
+          const cibles = ciblesExecution();
+          const noms = cibles.map((x) => `« ${x.nom} »`);
+          const liste = noms.length > 4 ? `${noms.slice(0, 4).join(', ')} et ${noms.length - 4} autre${noms.length - 4 > 1 ? 's' : ''}` : noms.join(', ');
+          const vers = [cibles.length ? (cibles.length > 1 ? `${cibles.length} destinations (${liste})` : liste) : null, copieLocaleDisponible() ? 'la copie locale de ce serveur' : null].filter(Boolean).join(' et ');
+          const siteSel = global() && GMAO.siteCourant() != null ? ` Le sélecteur de site est positionné sur « ${ui.nomSecteur(GMAO.siteCourant())} » : seules les destinations de ce site et les destinations communes sont utilisées, et la planification automatique n'en tiendra pas compte.` : '';
+          if (!(await ui.confirm({ titre: 'Sauvegarder maintenant', message: `Créer une sauvegarde de toute la base et l'envoyer vers ${vers} ?${siteSel}`, okLabel: 'Sauvegarder' }))) return;
+        }
         const m = modaleAttente('Sauvegarde en cours', `Sauvegarde ${libelle}…`);
         let r;
         try { r = await api.post(BASE + '/executer', d ? { destinationId: d.id } : {}); } catch (e) { m.fermer(); erreur(e); rendre(); return; }
@@ -527,6 +728,7 @@
         for (const x of r.resultats || []) lignes.push({ ok: x.ok, nom: x.nom, emplacement: x.emplacement || '', message: x.message, dureeMs: x.dureeMs });
         return frag(
           ui.alerte(r.message || (r.ok ? 'Sauvegarde réussie' : 'Sauvegarde incomplète'), r.ok ? 'ok' : 'alerte'),
+          r.complete === false && r.siteCourantId != null ? ui.alerte('Sauvegarde limitée au site sélectionné : non prise en compte par la planification automatique.', 'info') : null,
           r.fichier ? ui.details([
             { label: 'Fichier', valeur: el('span', { class: 'sav-emplacement' }, r.fichier) },
             { label: 'Taille', valeur: formatTaille(r.taille) },
@@ -566,7 +768,7 @@
             { cle: 'sha256', label: 'Empreinte SHA-256', rendu: (f) => (f.sha256 ? el('span', { class: 'sav-mono', title: f.sha256 }, empreinteCourte(f.sha256)) : el('span', { class: 'texte-alerte texte-petit' }, 'absente')) },
           ],
           actions: r.restaurable ? [
-            { icone: 'rafraichir', titre: 'Restaurer cette sauvegarde', visible: () => restaurable(), onClic: (f) => { m.fermer(); restaurer({ source: 'destination', destinationId: d.id, fichier: f.nom, chiffre: f.chiffre, provenance: f.ceServeur ? null : f.identifiant }); } },
+            { icone: 'rafraichir', titre: 'Restaurer cette sauvegarde', visible: () => restaurable(), onClic: (f) => { m.fermer(); restaurer({ source: 'destination', destinationId: d.id, nomDestination: d.nom, fichier: f.nom, chiffre: f.chiffre, provenance: f.ceServeur ? null : f.identifiant }); } },
             { icone: 'export', titre: 'Télécharger', visible: () => restaurable(), onClic: (f) => api.telecharger(`${BASE}/telecharger?source=destination&destinationId=${d.id}&fichier=${encodeURIComponent(f.nom)}`, f.nom).catch(erreur) },
           ] : [],
         });
@@ -574,16 +776,27 @@
       }
 
       // ----- Restauration -----
-      function champsConfirmation(chiffre, avecMotDePasse) {
+      /**
+       * Champs de confirmation d'une restauration. Le mot de passe est obligatoire pour une sauvegarde chiffrée par un autre
+       * site (sauvegarde reçue, fichier d'un autre serveur) ou quand ce serveur n'a pas de mot de passe de chiffrement.
+       */
+      function champsConfirmation(chiffre, avecMotDePasse, { autreServeur = false, provenance = '' } = {}) {
+        const mdpLocal = !!(etat.parametres || {}).motDePasseDefini;
+        const requis = chiffre === true && (autreServeur || !mdpLocal);
+        let placeholder, aide;
+        if (chiffre === null) { placeholder = mdpLocal ? 'Laisser vide pour utiliser celui de ce serveur' : 'Mot de passe défini sur le serveur d\'origine'; aide = 'Uniquement si le fichier est chiffré (.enc). Une sauvegarde d\'un autre site est chiffrée avec le mot de passe de cet autre site.'; }
+        else if (autreServeur) { placeholder = `Mot de passe défini sur le serveur de « ${provenance || 'l\'autre site'} »`; aide = 'Cette sauvegarde a été chiffrée par l\'autre site avec son propre mot de passe de chiffrement : celui de ce serveur ne permet pas de la lire.'; }
+        else { placeholder = mdpLocal ? 'Laisser vide pour utiliser celui de ce serveur' : 'Mot de passe utilisé lors de la sauvegarde'; aide = mdpLocal ? 'Sauvegarde chiffrée par ce serveur' : 'Aucun mot de passe de chiffrement n\'est défini sur ce serveur : indiquez celui utilisé lors de la sauvegarde'; }
         return [
-          avecMotDePasse ? { nom: 'motDePasse', label: 'Mot de passe de chiffrement de cette sauvegarde', type: 'mdp', pleineLargeur: true, placeholder: (etat.parametres || {}).motDePasseDefini ? 'Laisser vide pour utiliser celui de ce serveur' : 'Mot de passe défini sur le serveur d\'origine', aide: chiffre === null ? 'Uniquement si le fichier est chiffré (.enc)' : 'Une sauvegarde reçue d\'un autre site est chiffrée avec le mot de passe de cet autre site' } : null,
+          avecMotDePasse ? { nom: 'motDePasse', label: 'Mot de passe de chiffrement de cette sauvegarde', type: 'mdp', pleineLargeur: true, requis, placeholder, aide } : null,
           { nom: 'confirmationRestauration', label: 'Pour confirmer, saisissez RESTAURER', type: 'texte', requis: true, pleineLargeur: true, placeholder: 'RESTAURER', valider: (v) => (String(v || '').trim().toUpperCase() !== 'RESTAURER' ? 'Saisissez RESTAURER pour confirmer' : '') },
         ];
       }
-      function avertissementRestauration(provenance) {
+      function avertissementRestauration(provenance, etatPrecedent) {
         const nomServeur = (etat.serveur || {}).nom || 'ce serveur';
         return frag(
-          ui.alerte(frag(el('strong', null, 'Attention : '), `toutes les données actuelles de ce serveur (« ${nomServeur} ») seront remplacées par le contenu de la sauvegarde. Une copie de l'état actuel est faite automatiquement juste avant. Les paramètres de sauvegarde de ce serveur (destinations, clés, mot de passe) sont conservés.`), 'alerte'),
+          ui.alerte(frag(el('strong', null, 'Attention : '), `toutes les données actuelles de ce serveur (« ${nomServeur} ») seront remplacées par le contenu de la sauvegarde. Une copie de l'état actuel est faite automatiquement juste avant (visible dans « Copies locales » avec le badge « État avant restauration »). Les paramètres de sauvegarde de ce serveur (destinations, clés, mot de passe) sont conservés.`), 'alerte'),
+          etatPrecedent ? ui.alerte('Retour en arrière : la base reviendra à l\'état qu\'elle avait juste avant la restauration ou l\'import correspondant.', 'info') : null,
           provenance ? ui.alerte(`Cette sauvegarde provient de « ${provenance} » : ne la restaurez ici que pour reconstruire les données de ce site (remplacement de son serveur, sinistre).`, 'info') : null);
       }
       async function apresRestauration(r) {
@@ -597,12 +810,17 @@
         if (b) { b.classList.remove('btn-primaire'); b.classList.add('btn-danger'); }
         return m;
       }
-      function restaurer({ source, destinationId, site, fichier, chiffre, provenance }) {
+      function restaurer({ source, destinationId, nomDestination, site, fichier, chiffre, provenance, etatPrecedent }) {
+        const autreServeur = source === 'recue' || !!provenance;
+        let origine;
+        if (source === 'recue') origine = `Sauvegarde reçue de « ${provenance || site} »`;
+        else if (source === 'locale') origine = etatPrecedent ? 'Copie locale de l\'état précédent (faite avant une restauration ou un import)' : 'Copie locale de ce serveur';
+        else origine = frag(`Destination « ${nomDestination || destinationId} »`, provenance ? ` — sauvegarde d'un autre site (${provenance})` : '');
         boutonDanger(ui.formModal({
-          titre: 'Restaurer une sauvegarde', taille: 'large', colonnes: 1,
-          avant: frag(avertissementRestauration(provenance), ui.details([{ label: 'Fichier', valeur: el('span', { class: 'sav-emplacement' }, fichier) }, { label: 'Origine', valeur: source === 'recue' ? `Sauvegarde reçue de « ${provenance || site} »` : (source === 'locale' ? 'Copie locale' : 'Destination') }])),
-          champs: champsConfirmation(chiffre, !!chiffre),
-          submitLabel: 'Restaurer',
+          titre: etatPrecedent ? 'Revenir à l\'état précédent' : 'Restaurer une sauvegarde', taille: 'large', colonnes: 1,
+          avant: frag(avertissementRestauration(provenance, etatPrecedent), ui.details([{ label: 'Fichier', valeur: el('span', { class: 'sav-emplacement' }, fichier) }, { label: 'Origine', valeur: origine }])),
+          champs: champsConfirmation(chiffre, !!chiffre, { autreServeur, provenance: provenance || site }),
+          submitLabel: etatPrecedent ? 'Revenir à cet état' : 'Restaurer',
           onSubmit: async (v, modal) => {
             const m = modaleAttente('Restauration en cours', 'Vérification de l\'empreinte, déchiffrement et restauration…');
             let r;
@@ -624,7 +842,7 @@
         });
         boutonDanger(ui.formModal({
           titre: 'Restaurer depuis un fichier', taille: 'large', colonnes: 1,
-          avant: avertissementRestauration(null),
+          avant: avertissementRestauration(null, false),
           champs: [
             { nom: 'fichier', type: 'html', label: 'Fichier de sauvegarde (.json, .json.gz, .json.gz.enc)', rendu: () => frag(input, infoFichier) },
             { nom: 'sha256', label: 'Empreinte SHA-256 (facultative)', type: 'texte', placeholder: 'Contenu du fichier .sha256 associé', aide: 'Si elle est indiquée, l\'intégrité du fichier est vérifiée avant restauration',
@@ -657,23 +875,25 @@
         const t = ui.table({
           lignes: locales, compact: true, recherche: true, pagination: true, tailleParPage: 15, vide: 'Aucune copie locale.',
           colonnes: [
-            { cle: 'nom', label: 'Fichier', rendu: (f) => el('span', { class: 'sav-fichier' }, f.nom) },
+            { cle: 'nom', label: 'Fichier', rendu: (f) => el('div', null, el('div', { class: 'sav-fichier' }, f.nom), f.etatPrecedent ? el('div', { class: 'cellule-secondaire' }, badgeEtatPrecedent()) : null) },
             { cle: 'date', label: 'Sauvegarde du', type: 'datetime' },
             { cle: 'taille', label: 'Taille', aligner: 'droite', rendu: (f) => formatTaille(f.taille), valeurTri: (f) => f.taille },
             { cle: 'format', label: 'Format', tri: false, rendu: badgesFormat },
             { cle: 'sha256', label: 'Empreinte', rendu: (f) => el('span', { class: 'sav-mono', title: f.sha256 || '' }, empreinteCourte(f.sha256)) },
           ],
           actions: [
-            { icone: 'rafraichir', titre: 'Restaurer cette copie', visible: () => restaurable(), onClic: (f) => { m.fermer(); restaurer({ source: 'locale', fichier: f.nom, chiffre: f.chiffre }); } },
+            { icone: 'rafraichir', titre: 'Restaurer cette copie', visible: () => restaurable(), onClic: (f) => { m.fermer(); restaurer({ source: 'locale', fichier: f.nom, chiffre: f.chiffre, etatPrecedent: !!f.etatPrecedent }); } },
             { icone: 'export', titre: 'Télécharger', visible: () => restaurable(), onClic: (f) => api.telecharger(`${BASE}/telecharger?source=locale&fichier=${encodeURIComponent(f.nom)}`, f.nom).catch(erreur) },
           ],
         });
-        const m = ui.modal({ titre: `Copies locales (${locales.length})`, taille: 'tres-large', contenu: frag(el('p', { class: 'texte-2 texte-petit', style: { marginTop: '0' } }, 'Dossier : ', el('code', null, (etat.serveur || {}).dossierLocal || '—')), t.el), boutons: [{ label: 'Fermer' }] });
+        const nbAvant = locales.filter((f) => f.etatPrecedent).length;
+        const m = ui.modal({ titre: `Copies locales (${locales.length})`, taille: 'tres-large', contenu: frag(
+          el('p', { class: 'texte-2 texte-petit', style: { marginTop: '0' } }, 'Dossier : ', el('code', null, (etat.serveur || {}).dossierLocal || '—'), nbAvant ? ` — ${nbAvant} copie${nbAvant > 1 ? 's' : ''} de l'état précédent (faite${nbAvant > 1 ? 's' : ''} avant une restauration ou un import) : la restaurer annule l'opération correspondante.` : ''), t.el), boutons: [{ label: 'Fermer' }] });
       }
       function carteRestauration() {
         const locales = etat.locales || [];
         return ui.carte('Restauration', frag(
-          el('p', { class: 'texte-2 texte-petit', style: { marginTop: '0' } }, 'Restaurez une copie locale, une sauvegarde d\'une destination (bouton « Voir les fichiers »), une sauvegarde reçue d\'un autre site, ou un fichier récupéré sur une clé USB. L\'empreinte SHA-256 est vérifiée et une copie de l\'état actuel est faite avant toute restauration.'),
+          el('p', { class: 'texte-2 texte-petit', style: { marginTop: '0' } }, 'Restaurez une copie locale, une sauvegarde d\'une destination (bouton « Voir les fichiers »), une sauvegarde reçue d\'un autre site, ou un fichier récupéré sur une clé USB. L\'empreinte SHA-256 est vérifiée et une copie de l\'état actuel est faite avant toute restauration ; pour revenir en arrière, restaurez cette copie « État avant restauration » depuis « Copies locales » ou le détail de l\'historique.'),
           el('div', { class: 'sav-actions-carte' },
             ui.bouton(`Copies locales (${locales.length})`, { icone: 'dossier', classe: 'btn-sm', onClic: voirLocales, disabled: !(etat.serveur || {}).dossierLocal }),
             restaurable() ? ui.bouton('Restaurer depuis un fichier…', { icone: 'import', classe: 'btn-sm', onClic: restaurerFichier }) : null),
@@ -683,14 +903,14 @@
       // ----- Historique -----
       function carteHistorique() {
         const histo = etat.historique || [];
-        let filtreType = '';
-        let filtreRes = '';
         const selType = el('select', { 'aria-label': 'Type d\'opération' }, el('option', { value: '' }, 'Toutes les opérations'), Object.entries(TYPES_HISTO).map(([k, v]) => el('option', { value: k }, v.label + 's')));
         const selRes = el('select', { 'aria-label': 'Résultat' }, el('option', { value: '' }, 'Tous les résultats'), el('option', { value: 'ok' }, 'Réussies'), el('option', { value: 'ko' }, 'En échec'));
-        const filtrer = () => histo.filter((h) => (!filtreType || h.type === filtreType) && (!filtreRes || (filtreRes === 'ok' ? h.ok : !h.ok)));
+        selType.value = filtresHisto.type;
+        selRes.value = filtresHisto.resultat;
+        const filtrer = () => histo.filter((h) => (!filtresHisto.type || h.type === filtresHisto.type) && (!filtresHisto.resultat || (filtresHisto.resultat === 'ok' ? h.ok : !h.ok)));
         const qui = (h) => (h.type === 'reception' ? (h.source || 'Autre site') : (h.userNom || (h.declencheur === 'automatique' ? 'Planification automatique' : '—')));
         const tableau = ui.table({
-          lignes: histo, compact: true, recherche: 'Rechercher dans l\'historique…', pagination: true, tailleParPage: 10, exportCsv: 'historique-sauvegardes.csv',
+          lignes: filtrer(), compact: true, recherche: 'Rechercher dans l\'historique…', pagination: true, tailleParPage: 10, exportCsv: 'historique-sauvegardes.csv',
           vide: 'Aucune opération enregistrée.', outils: [selType, selRes],
           onClic: (h) => detailHistorique(h),
           colonnes: [
@@ -704,8 +924,9 @@
             { cle: 'dureeMs', label: 'Durée', aligner: 'droite', rendu: (h) => (h.dureeMs != null ? formatDureeMs(h.dureeMs) : '—'), valeurTri: (h) => h.dureeMs || 0 },
           ],
         });
-        selType.addEventListener('change', () => { filtreType = selType.value; tableau.maj(filtrer()); });
-        selRes.addEventListener('change', () => { filtreRes = selRes.value; tableau.maj(filtrer()); });
+        selType.addEventListener('change', () => { filtresHisto.type = selType.value; tableau.maj(filtrer()); });
+        selRes.addEventListener('change', () => { filtresHisto.resultat = selRes.value; tableau.maj(filtrer()); });
+        tableauHisto = tableau;
         return ui.carte(histo.length ? `Historique (${histo.length} dernière${histo.length > 1 ? 's' : ''} opération${histo.length > 1 ? 's' : ''})` : 'Historique', tableau.el);
       }
 
@@ -722,12 +943,16 @@
           h.sha256 ? { label: 'Empreinte SHA-256', valeur: el('span', { class: 'sav-mono' }, h.sha256) } : null,
           h.dureeMs != null ? { label: 'Durée', valeur: formatDureeMs(h.dureeMs) } : null,
           h.type === 'restauration' && h.origine ? { label: 'Origine', valeur: h.origine } : null,
-          h.type === 'restauration' && h.copieAvant ? { label: 'État précédent sauvegardé dans', valeur: el('span', { class: 'sav-emplacement' }, h.copieAvant) } : null,
+          h.type === 'restauration' && h.copieAvant ? { label: 'État précédent sauvegardé dans', valeur: frag(el('span', { class: 'sav-emplacement' }, h.copieAvant), ' ', badgeEtatPrecedent()) } : null,
         ]);
-        ui.modal({
+        const copieDisponible = h.type === 'restauration' && h.copieAvant && restaurable() && (etat.locales || []).some((f) => f.nom === h.copieAvant);
+        const m = ui.modal({
           titre: `${t.label} du ${ui.formatDateHeure(h.date)}`, taille: 'large',
           contenu: frag(h.type === 'sauvegarde' ? afficherResultat(h) : ui.alerte(h.message || '', h.ok ? 'ok' : 'alerte'), h.type === 'sauvegarde' ? null : infos, h.type === 'sauvegarde' ? el('div', { class: 'mt' }, ui.details([{ label: 'Par', valeur: h.userNom || (h.declencheur === 'automatique' ? 'Planification automatique' : '—') }, { label: 'Déclenchement', valeur: h.declencheur === 'automatique' ? 'Automatique' : 'Manuel' }])) : null),
-          boutons: [{ label: 'Fermer' }],
+          boutons: [
+            copieDisponible ? { label: 'Annuler cette restauration', classe: 'btn-danger', icone: 'rafraichir', onClic: () => { m.fermer(); restaurer({ source: 'locale', fichier: h.copieAvant, chiffre: false, etatPrecedent: true }); } } : null,
+            { label: 'Fermer' },
+          ],
         });
       }
 

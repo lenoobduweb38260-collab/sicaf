@@ -476,11 +476,11 @@
       else corps.appendChild(el('ul', { class: 'rh-liste-simple' }, docs.map((d) => el('li', null,
         iconeDim('piece_jointe', 18, 'var(--texte-2)'),
         el('div', { style: { flex: 1, minWidth: 0 } }, el('div', { class: 'texte-gras', style: { wordBreak: 'break-word' } }, d.nom), el('div', { class: 'texte-2 texte-petit' }, `${tailleLisible(d.taille)} · ${fmt(d.date)}${d.userNom ? ' · ' + d.userNom : ''}`)),
-        el('a', { class: 'btn btn-sm', href: `/api/rh/habilitations/${h.id}/documents/${d.index}`, target: '_blank', rel: 'noopener' }, icone('voir'), 'Ouvrir'),
-        el('button', { type: 'button', class: 'btn btn-sm', onclick: () => api.telecharger(`/api/rh/habilitations/${h.id}/documents/${d.index}?telecharger=1`, d.nom).catch(erreur) }, icone('export'), 'Télécharger'),
+        el('a', { class: 'btn btn-sm', href: `/api/rh/habilitations/${h.id}/documents/${d.uid || d.index}`, target: '_blank', rel: 'noopener' }, icone('voir'), 'Ouvrir'),
+        el('button', { type: 'button', class: 'btn btn-sm', onclick: () => api.telecharger(`/api/rh/habilitations/${h.id}/documents/${d.uid || d.index}?telecharger=1`, d.nom).catch(erreur) }, icone('export'), 'Télécharger'),
         modifiable ? el('button', { type: 'button', class: 'btn btn-sm btn-icone texte-danger', title: 'Supprimer', onclick: async () => {
           if (!(await ui.confirm({ titre: 'Supprimer la pièce jointe', message: `Supprimer « ${d.nom} » ?`, okLabel: 'Supprimer', danger: true }))) return;
-          try { const r = await api.del(`/api/rh/habilitations/${h.id}/documents/${d.index}`); docs = r.documents; modifie = true; dessiner(); toast('Pièce jointe supprimée', 'succes'); } catch (e) { erreur(e); }
+          try { const r = await api.del(`/api/rh/habilitations/${h.id}/documents/${d.uid || d.index}`); docs = r.documents; modifie = true; dessiner(); toast('Pièce jointe supprimée', 'succes'); } catch (e) { erreur(e); }
         } }, icone('supprimer')) : null))));
       if (modifiable) {
         const input = el('input', { type: 'file', accept: 'image/*,application/pdf', style: { display: 'none' }, onchange: async () => {
@@ -1313,7 +1313,7 @@
       cont.appendChild(ui.carte('Historique des renouvellements', el('ul', { class: 'chronologie' }, historique.flatMap((h) => h.historique.slice().reverse().map((x) => el('li', null,
         el('div', null, el('strong', null, h.intitule), ` : obtenue le ${fmt(x.dateObtention)}${x.dateExpiration ? `, valable jusqu'au ${fmt(x.dateExpiration)}` : ''}${x.organisme ? ' — ' + x.organisme : ''}${x.numero ? ` — n° ${x.numero}` : ''}`),
         // Pièces de la période renouvelée (archivées avec elle)
-        (x.documents || []).length ? el('div', { class: 'inline texte-petit', style: { gap: '10px', flexWrap: 'wrap', marginTop: '3px' } }, x.documents.map((d) => el('a', { href: `/api/rh/habilitations/${h.id}/historique/${x.rang}/documents/${d.index}`, target: '_blank', rel: 'noopener', title: `${tailleLisible(d.taille)} · ${fmt(d.date)}` }, icone('piece_jointe'), d.nom))) : null,
+        (x.documents || []).length ? el('div', { class: 'inline texte-petit', style: { gap: '10px', flexWrap: 'wrap', marginTop: '3px' } }, x.documents.map((d) => el('a', { href: `/api/rh/habilitations/${h.id}/historique/${x.rang}/documents/${d.uid || d.index}`, target: '_blank', rel: 'noopener', title: `${tailleLisible(d.taille)} · ${fmt(d.date)}` }, icone('piece_jointe'), d.nom))) : null,
         el('div', { class: 'chrono-date' }, `Renouvelée le ${ui.formatDate(x.remplaceeLe)}`))))), { classe: 'mt' }));
     }
     return cont;

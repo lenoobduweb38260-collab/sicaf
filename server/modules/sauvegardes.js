@@ -44,6 +44,7 @@ const { promisify } = require('util');
 const tls = require('tls');
 const net = require('net');
 const tlsGmao = require('../tls');
+const totpGmao = require('../totp');
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -485,16 +486,43 @@ function register(ctx) {
   }
   function dossierRecus() { return path.join(db.backupDir, 'recus'); }
 
-  /** Export de la base sans les secrets de sauvegarde (clés, mot de passe, destinations). */
-  function donneesASauvegarder() {
+  /** Fichier de la clé de chiffrement des secrets de double authentification (hors de la base, voir server/totp.js). */
+  const fichierCleDeuxFacteurs = () => path.join(db.dataDir, totpGmao.FICHIER_CLE);
+  /**
+   * Export de la base sans les secrets de sauvegarde (clés, mot de passe, destinations). Dans une sauvegarde CHIFFRÉE
+   * seulement, la clé de double authentification (<données>/cle-double-authentification.key) est jointe : restaurée avec
+   * la base sur un autre serveur, les codes des applications d'authentification restent vérifiables.
+   */
+  function donneesASauvegarder({ chiffre = false } = {}) {
     const d = db.exportAll();
     if (d.config && d.config.sauvegardes) {
       const s = d.config.sauvegardes;
       delete s.cleReception; delete s.motDePasseChiffrement; delete s.cleReceptionDate;
       s.destinations = [];
     }
+    delete d.cleDoubleAuthentification;
+    if (chiffre && !db.inMemory) {
+      try {
+        const hex = fs.readFileSync(fichierCleDeuxFacteurs(), 'utf8').trim();
+        if (/^[0-9a-f]{64}$/i.test(hex)) d.cleDoubleAuthentification = hex.toLowerCase();
+      } catch (e) { /* aucune clé encore créée (aucun compte avec double authentification) */ }
+    }
     d.exportGMAO = { format: FORMAT, date: new Date().toISOString(), source: nomServeur(), identifiant: identifiant(), version: ctx.version };
     return d;
+  }
+  /** Après une restauration : la clé de double authentification jointe à la sauvegarde chiffrée remplace celle du serveur. */
+  function restaurerCleDeuxFacteurs(hex) {
+    if (db.inMemory || !hex) return false;
+    const fichier = fichierCleDeuxFacteurs();
+    let actuelle = '';
+    try { actuelle = fs.readFileSync(fichier, 'utf8').trim().toLowerCase(); } catch (e) { actuelle = ''; }
+    if (actuelle === hex) return false;
+    const tmp = fichier + '.tmp-' + process.pid;
+    fs.mkdirSync(path.dirname(fichier), { recursive: true });
+    fs.writeFileSync(tmp, hex + '\n', { mode: 0o600 });
+    fs.renameSync(tmp, fichier);
+    if (ctx.deuxFacteurs && typeof ctx.deuxFacteurs.rechargerCle === 'function') ctx.deuxFacteurs.rechargerCle();
+    return true;
   }
 
   // ----- Droits, portée, multi-site -----
@@ -921,7 +949,7 @@ function register(ctx) {
     // Encodage (une seule fois pour toutes les destinations)
     let tampon, sha, fichier;
     try {
-      tampon = await encoder(donneesASauvegarder(), { compresser: compresse, chiffrer: chiffre, motDePasse: s.motDePasseChiffrement });
+      tampon = await encoder(donneesASauvegarder({ chiffre }), { compresser: compresse, chiffrer: chiffre, motDePasse: s.motDePasseChiffrement });
       sha = sha256(tampon);
       fichier = nomFichier(compresse, chiffre);
     } catch (e) {
@@ -1000,6 +1028,9 @@ function register(ctx) {
       try { decode = await decoder(buf, (typeof motDePasse === 'string' && motDePasse) || s.motDePasseChiffrement); } catch (e) { throw erreurHttp(e); }
       const { data, chiffre, compresse } = decode;
       const meta = data.exportGMAO && typeof data.exportGMAO === 'object' ? data.exportGMAO : {};
+      // Clé de double authentification jointe (sauvegarde chiffrée uniquement) : restaurée avec la base
+      const cleDeuxFacteurs = chiffre && typeof data.cleDoubleAuthentification === 'string' && /^[0-9a-f]{64}$/i.test(data.cleDoubleAuthentification.trim()) ? data.cleDoubleAuthentification.trim().toLowerCase() : null;
+      delete data.cleDoubleAuthentification;
       // Les paramètres de sauvegarde (destinations, clés) et l'historique de CE serveur sont conservés.
       const sauvegardesActuelles = db.getConfig().sauvegardes;
       const historique = db.list(COL_HISTO);
@@ -1011,6 +1042,8 @@ function register(ctx) {
       cfg.sauvegardes = sauvegardesActuelles;
       db.setConfig(cfg);
       db.replaceCollection(COL_HISTO, historique);
+      let cleRestauree = false;
+      try { cleRestauree = restaurerCleDeuxFacteurs(cleDeuxFacteurs); } catch (e) { ctx.log('Clé de double authentification non restaurée :', e.message); }
       const copieAvant = (db.listBackups().find((b) => !avant.has(b.nom) && /avant-import/.test(b.nom)) || {}).nom || null;
       // Sessions : les comptes ont pu changer ; seule la session courante est conservée si le compte est identique.
       let garder = false;
@@ -1019,7 +1052,7 @@ function register(ctx) {
         garder = !!(u && u.login === req.user.login && u.actif !== false);
       }
       for (const token of Array.from(ctx.sessions.map.keys())) if (!(garder && token === req.session.token)) ctx.sessions.destroy(token);
-      const message = `Base restaurée depuis ${fichier}` + (meta.source ? ` (sauvegarde de « ${String(meta.source).slice(0, 80)} »${meta.date ? ' du ' + new Date(meta.date).toLocaleString('fr-FR') : ''})` : '');
+      const message = `Base restaurée depuis ${fichier}` + (meta.source ? ` (sauvegarde de « ${String(meta.source).slice(0, 80)} »${meta.date ? ' du ' + new Date(meta.date).toLocaleString('fr-FR') : ''})` : '') + (cleRestauree ? ' — clé de double authentification restaurée' : '');
       const entree = ajouterHistorique({
         type: 'restauration', userId: req && req.user ? req.user.id : null, ok: true, message, origine, origineType: origineType || null, fichier,
         source: meta.source ? String(meta.source).slice(0, 80) : null, dateSauvegarde: typeof meta.date === 'string' ? meta.date : null,
@@ -1028,7 +1061,7 @@ function register(ctx) {
       ctx.audit(req, 'restauration', 'sauvegardes', entree.id, message + (copieAvant ? ` — état précédent copié dans ${copieAvant}` : ''));
       db.saveNow();
       ctx.emit('sauvegarde:restauree', { origine, fichier, source: meta.source || null });
-      return { ok: true, message, fichier, origine, chiffre, compresse, empreinteVerifiee: !!shaAttendu, copieAvant, sessionConservee: garder, source: meta.source || null, dateSauvegarde: meta.date || null };
+      return { ok: true, message, fichier, origine, chiffre, compresse, empreinteVerifiee: !!shaAttendu, copieAvant, sessionConservee: garder, source: meta.source || null, dateSauvegarde: meta.date || null, cleDeuxFacteursRestauree: cleRestauree };
     } finally { verrou = null; }
   }
 
@@ -1062,7 +1095,7 @@ function register(ctx) {
   }, { public: true });
 
   router.post('/api/replication/recevoir', async (req) => {
-    const s = authentifierReplication(req);
+    const s = req.replicationParametres || authentifierReplication(req);
     if (db.inMemory) throw new HttpError(503, 'Réception impossible : ce serveur fonctionne sans stockage sur disque');
     const source = sourceDepuisEntete(req.headers['x-gmao-source']);
     const ip = String((req.socket && req.socket.remoteAddress) || '');
@@ -1093,7 +1126,12 @@ function register(ctx) {
     ctx.audit(req, 'reception', 'sauvegardes', entree.id, `Sauvegarde reçue de « ${source.nom} » (${ip}) : ${fichier}, ${formatTaille(corps.length)}`);
     ctx.emit('sauvegarde:recue', { source: source.nom, site: source.dossier, fichier, taille: corps.length });
     return { ok: true, fichier, taille: corps.length, sha256: sha, site: nomServeur(), recuLe: entree.date, conservees: Math.min(conserver, listerFichiersGmao(dossier).length) };
-  }, { public: true, brut: true, maxBody: MAX_RECU });
+  }, {
+    public: true, brut: true, maxBody: MAX_RECU,
+    // Réception activée, clé X-GMAO-Cle et blocage anti-force-brute contrôlés AVANT la lecture du corps : un appel non
+    // authentifié n'est jamais chargé en mémoire (jusqu'à 512 Mo) et la connexion est fermée après le refus
+    avantCorps: (req) => { req.replicationParametres = authentifierReplication(req); },
+  });
 
   /** Liste, pour le site émetteur, des sauvegardes qu'il a déposées sur ce serveur. */
   router.get('/api/replication/fichiers', async (req) => {

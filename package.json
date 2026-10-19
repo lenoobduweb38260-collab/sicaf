@@ -17,7 +17,8 @@
     "electron": "electron .",
     "dist": "electron-builder --win --publish never",
     "dist:portable": "electron-builder --win portable --publish never",
-    "manifeste": "node scripts/manifeste-maj.js dist"
+    "manifeste": "node scripts/manifeste-maj.js dist",
+    "cle-maj": "node scripts/generer-cle-maj.js"
   },
   "devDependencies": {
     "@electron/fuses": "^1.8.0",

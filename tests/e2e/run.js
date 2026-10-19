@@ -22,7 +22,8 @@ async function main() {
   seedDemo(app.ctx);
   const addr = await app.start(0);
   const base = `http://127.0.0.1:${addr.port}`;
-  const browser = await chromium.launch();
+  // Rendu WebGL logiciel : la vue Plans 3D est couverte en 3D (sans ces options, Chromium sans interface bascule en 2D)
+  const browser = await chromium.launch({ args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
   const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
   const erreurs = [];
   page.on('pageerror', (e) => erreurs.push('[pageerror] ' + e.message));

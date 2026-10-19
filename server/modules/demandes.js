@@ -8,7 +8,7 @@
  *                      refusee, convertie, cloturee) est résolue dans la liste (voir resoudreStatuts),
  *                      les codes par défaut ne servant que de repli.
  * Portée             : règle commune (ctx.canSee) + le N+1 du demandeur voit les demandes de ses subordonnés.
- * Services publiés   : ctx.services.demandes.{ get(id), lieeA(ot), ouvertesPour({ equipementId, secteurId }),
+ * Services publiés   : ctx.services.demandes.{ get(id), lieeA(ot), ouvertesPour({ equipementId, secteurId }), visible(req, d), creer(donnees, req),
  *                      peutValider(req, demande), STATUTS, resoudreStatuts(liste) }
  * Événements émis    : 'demande:soumise', 'demande:validee', 'demande:refusee', 'demande:convertie',
  *                      'demande:cloturee', 'demande:reouverte' (charge utile : la demande)
@@ -17,6 +17,11 @@
  *                      y compris après une clôture automatique), 'ot:statut' (OT réouvert → la DI validée
  *                      redevient « convertie »)
  */
+const crypto = require('crypto');
+
+/** Identifiant stable d'une ligne jointe (document) : une requête rejouée après suppression ne vise pas la ligne suivante. */
+function uid() { return 'u' + crypto.randomBytes(5).toString('hex'); }
+
 const nom = 'Demandes d\'intervention';
 const ENTITE = 'demandes';
 const TAILLE_MAX_PJ = 5 * 1024 * 1024; // 5 Mo par pièce jointe
@@ -73,11 +78,7 @@ function jourLocal(v) {
 }
 
 /** Cellule CSV : guillemets si nécessaire et neutralisation des formules (=, +, -, @, tabulation) à l'ouverture dans un tableur. */
-function csvEscape(v) {
-  let s = v == null ? '' : String(v).replace(/\r\n|\r|\n/g, ' ');
-  if (/^[=+\-@\t]/.test(s) && Number.isNaN(Number(s.replace(',', '.')))) s = '\'' + s;
-  return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
+const { csvEscape } = require('../csv');
 
 function register(ctx) {
   const { router, db, HttpError, perms } = ctx;
@@ -202,7 +203,7 @@ function register(ctx) {
     return Number(doc.userId) === req.user.id || !!(req.perms && req.perms.estAdmin) || perms.can(req.perms, ENTITE, 'valider');
   }
   function resumeDoc(doc, index, req, actions) {
-    const out = { index, nom: doc.nom, type: doc.type, taille: doc.taille, date: doc.date, userId: doc.userId, userNom: ctx.nomUser(doc.userId), description: doc.description || '' };
+    const out = { index, uid: doc.uid || null, nom: doc.nom, type: doc.type, taille: doc.taille, date: doc.date, userId: doc.userId, userNom: ctx.nomUser(doc.userId), description: doc.description || '' };
     if (req && actions) out.supprimable = peutSupprimerPj(req, doc, actions);
     return out;
   }
@@ -436,7 +437,7 @@ function register(ctx) {
     if (taille <= 0) throw new HttpError(400, 'La pièce jointe est vide');
     if (taille > TAILLE_MAX_PJ) throw new HttpError(400, `Pièce jointe trop volumineuse (${(taille / 1024 / 1024).toFixed(1)} Mo, maximum 5 Mo)`);
     const type = String(b.type || m[1] || 'application/octet-stream').slice(0, 100);
-    return { nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, date: new Date().toISOString(), userId: req.user.id, description: String(b.description || '').trim().slice(0, 500) };
+    return { uid: uid(), nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, date: new Date().toISOString(), userId: req.user.id, description: String(b.description || '').trim().slice(0, 500) };
   }
   function texteCommentaire(b, cle, obligatoire, label) {
     const t = String((b && typeof b === 'object' && b[cle]) || '').trim();
@@ -557,10 +558,15 @@ function register(ctx) {
   router.get('/api/demandes-export', async (req, res) => {
     const rows = filtrer(req);
     const cache = {};
+    // Listes de valeurs lues une seule fois avant la boucle (jamais par ligne)
+    const libelles = (nomListe) => new Map(ctx.liste(nomListe).map((x) => [x.code, x.label]));
+    const priorites = libelles('priorites');
+    const types = libelles('typesIntervention');
+    const statuts = libelles('statutsDemande');
     const cols = [
-      ['Numéro', (d) => d.numero], ['Titre', (d) => d.titre], ['Statut', (d) => libelleStatut(d.statut)],
-      ['Priorité', (d) => { const p = ctx.liste('priorites').find((x) => x.code === d.prioriteCode); return p ? p.label : d.prioriteCode; }],
-      ['Type', (d) => { const t = ctx.liste('typesIntervention').find((x) => x.code === d.typeCode); return t ? t.label : d.typeCode; }],
+      ['Numéro', (d) => d.numero], ['Titre', (d) => d.titre], ['Statut', (d) => (statuts.has(d.statut) ? statuts.get(d.statut) : String(d.statut || ''))],
+      ['Priorité', (d) => (priorites.has(d.prioriteCode) ? priorites.get(d.prioriteCode) : d.prioriteCode)],
+      ['Type', (d) => (types.has(d.typeCode) ? types.get(d.typeCode) : d.typeCode)],
       ['Équipement', (d) => { const e = equipementDe(d.equipementId, cache); return e ? `${e.numero || ''} ${e.nom}`.trim() : ''; }],
       ['Secteur', (d) => cheminSecteur(d.secteurId)], ['Demandeur', (d) => ctx.nomUser(d.demandeurId)],
       ['Date de la demande', (d) => d.dateDemande || d.createdAt || ''], ['Arrêt de production', (d) => (d.arretProduction ? 'Oui' : 'Non')],
@@ -578,11 +584,15 @@ function register(ctx) {
   router.get('/api/demandes/:id', async (req) => detail(req, getVisible(req, req.params.id)), { perm: [ENTITE, 'voir'] });
 
   // ----- Routes : création / modification / suppression ---------------------
-  router.post('/api/demandes', async (req) => {
-    const data = valider(req, req.body, null);
+  /**
+   * Création d'une demande (route POST /api/demandes et service ctx.services.demandes.creer) : validation,
+   * numérotation, pièces jointes, journal, notifications et circuit (validation automatique si configurée).
+   */
+  function creerDemande(req, corps) {
+    const data = valider(req, corps, null);
     const cfg = ctx.config();
     const wf = cfg.workflow || {};
-    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const body = corps && typeof corps === 'object' ? corps : {};
     const brutes = Array.isArray(body.pieceJointes) ? body.pieceJointes : (body.pieceJointe && typeof body.pieceJointe === 'object' ? [body.pieceJointe] : []);
     if (brutes.length > MAX_PJ) throw new HttpError(400, `Nombre maximal de pièces jointes dépassé (${MAX_PJ})`);
     const pieceJointes = brutes.filter((p) => p && typeof p === 'object' && p.contenu).map((p) => validerPieceJointe(p, req));
@@ -601,7 +611,8 @@ function register(ctx) {
       notifierValideurs(req, d);
     }
     return Object.assign(detail(req, resultat), { avertissement, otCree: resumeOt(ot) });
-  }, { perm: [ENTITE, 'creer'] });
+  }
+  router.post('/api/demandes', async (req) => creerDemande(req, req.body), { perm: [ENTITE, 'creer'] });
 
   router.put('/api/demandes/:id', async (req) => {
     const existant = getVisible(req, req.params.id);
@@ -728,12 +739,22 @@ function register(ctx) {
   }, { perm: [ENTITE, 'voir'] });
 
   // ----- Routes : pièces jointes ---------------------------------------------
-  function indexPj(req, d) {
-    const idx = Number(req.params.index);
-    const docs = d.pieceJointes || [];
-    if (!Number.isInteger(idx) || idx < 0 || idx >= docs.length) throw new HttpError(404, 'Pièce jointe introuvable');
+  /**
+   * Position d'une ligne désignée par son identifiant stable `uid` (recommandé : une requête rejouée après
+   * suppression échoue en 404 au lieu d'atteindre la ligne suivante) ou, à défaut, par son index.
+   */
+  function indexDans(liste, ref, message) {
+    const s = String(ref == null ? '' : ref).trim();
+    if (/^\d+$/.test(s)) {
+      const idx = Number(s);
+      if (idx >= (liste || []).length) throw new HttpError(404, message);
+      return idx;
+    }
+    const idx = (liste || []).findIndex((x) => x && x.uid != null && x.uid === s);
+    if (idx < 0) throw new HttpError(404, message);
     return idx;
   }
+  const indexPj = (req, d) => indexDans(d.pieceJointes, req.params.ref, 'Pièce jointe introuvable');
   router.post('/api/demandes/:id/documents', async (req) => {
     const d = getVisible(req, req.params.id);
     if (!actionsPossibles(req, d).joindre) throw new HttpError(403, 'Vous ne pouvez pas ajouter de pièce jointe à cette demande');
@@ -746,7 +767,7 @@ function register(ctx) {
     return { ok: true, document: resumeDoc(doc, maj.pieceJointes.length - 1, req, actions), pieceJointes: maj.pieceJointes.map((p, i) => resumeDoc(p, i, req, actions)) };
   }, { perm: [ENTITE, 'voir'] });
 
-  router.get('/api/demandes/:id/documents/:index', async (req, res) => {
+  router.get('/api/demandes/:id/documents/:ref', async (req, res) => {
     const d = getVisible(req, req.params.id);
     const doc = d.pieceJointes[indexPj(req, d)];
     const m = /^data:([^;,]*)(?:;[^,]*)?;base64,(.*)$/s.exec(doc.contenu || '');
@@ -764,7 +785,7 @@ function register(ctx) {
     res.end(buf);
   }, { perm: [ENTITE, 'voir'] });
 
-  router.delete('/api/demandes/:id/documents/:index', async (req) => {
+  router.delete('/api/demandes/:id/documents/:ref', async (req) => {
     const d = getVisible(req, req.params.id);
     const actions = actionsPossibles(req, d);
     if (!actions.joindre) throw new HttpError(403, 'Vous ne pouvez pas supprimer de pièce jointe sur cette demande');
@@ -797,13 +818,17 @@ function register(ctx) {
     ctx.emit('demande:cloturee', maj);
   });
 
-  /** Rattache un OT (créé ou réouvert) à la demande : lien `otId`, statut « convertie » si elle était soumise ou validée. */
-  function rattacherOt(d, ot, action, commentaire, userId) {
+  /**
+   * Rattache un OT (créé ou réouvert) à la demande : lien `otId`, puis statut « convertie » si elle est dans l'un des
+   * statuts `convertibles` (validée ; soumise aussi pour un OT réouvert). La validation reste du ressort de ce module :
+   * ni dateValidation ni validateurId ne sont déduits de l'OT. Une demande refusée ou clôturée n'est pas touchée.
+   */
+  function rattacherOt(d, ot, action, commentaire, userId, convertibles) {
+    if (estFinal(d)) return null;
     const patch = {};
     if (d.otId == null || Number(d.otId) !== Number(ot.id)) patch.otId = ot.id;
-    if (d.statut === st().soumise || d.statut === st().validee) {
+    if ((convertibles || [st().soumise, st().validee]).includes(d.statut)) {
       patch.statut = st().convertie;
-      if (!d.dateValidation) { patch.dateValidation = new Date().toISOString(); patch.validateurId = userId == null ? null : userId; }
       patch.historique = (d.historique || []).concat([Object.assign(entree(null, action, st().convertie, commentaire), { otId: ot.id, userId: userId == null ? null : userId })]);
     }
     return Object.keys(patch).length ? db.update(ENTITE, d.id, patch) : null;
@@ -817,13 +842,17 @@ function register(ctx) {
   /** Statut d'OT final (liste `statutsOT`) ? */
   const codeOtFinal = (code) => { const s = ctx.liste('statutsOT').find((x) => x.code === code); return !!(s && s.final); };
 
-  /** OT créé depuis une demande (par le module OT lui-même) → synchronisation du lien et du statut. */
+  /**
+   * OT créé depuis une demande (par le module OT lui-même) → synchronisation du lien et du statut. Défense en
+   * profondeur : seule une demande validée passe à « convertie » ; une demande encore soumise reçoit le lien
+   * seulement (sa validation, avec date et valideur, reste faite ici), une demande refusée ou clôturée est ignorée.
+   */
   ctx.on('ot:cree', (data) => {
     const ot = otDe(data);
     if (!ot || ot.id == null || ot.demandeId == null) return;
     const d = db.get(ENTITE, ot.demandeId);
     if (!d || (d.otId != null && Number(d.otId) !== Number(ot.id))) return;
-    rattacherOt(d, ot, 'conversion', `Ordre de travail ${ot.numero || ot.id} créé depuis la demande`, ot.createdBy);
+    rattacherOt(d, ot, 'conversion', `Ordre de travail ${ot.numero || ot.id} créé depuis la demande`, ot.createdBy, [st().validee]);
   });
 
   /**
@@ -899,6 +928,17 @@ function register(ctx) {
     },
     /** L'utilisateur de la requête peut-il valider cette demande ? */
     peutValider: (req, d) => peutValider(req, typeof d === 'object' ? d : db.get(ENTITE, d)),
+    /** Règle de visibilité d'une demande (portée, puis N+1 du demandeur) — reprise par le module OT. */
+    visible: (req, d) => visible(req, typeof d === 'object' ? d : db.get(ENTITE, d)),
+    /**
+     * Crée une demande au nom de l'utilisateur de la requête (droit demandes › créer exigé) : mêmes contrôles,
+     * numérotation, journal, notifications et circuit que POST /api/demandes ; renvoie la demande créée (détail).
+     */
+    creer: (donnees, req) => {
+      if (!req || !req.user || !req.perms) throw new HttpError(400, 'Création d\'une demande : requête authentifiée attendue');
+      ctx.requirePerm(req, ENTITE, 'creer');
+      return creerDemande(req, donnees);
+    },
     /** Codes de statut métier utilisés par le module. */
     get STATUTS() { return Object.assign({}, st()); },
     /** Résolution des étapes du circuit pour une liste de statuts donnée. */

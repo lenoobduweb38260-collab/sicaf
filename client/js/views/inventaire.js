@@ -388,6 +388,11 @@ ${CSS_ETIQUETTES}
   /** Gestionnaire de l'écran actif (comptage, scanner) ; sinon le scan ouvre la fiche. */
   let scanLocal = null;
   function definirScanLocal(elAncre, fn) { scanLocal = { el: elAncre, fn }; }
+  /**
+   * Gestionnaire de scan d'une autre vue : GMAO.definirScanLocal(elAncre, fn) reçoit les codes lus à la douchette tant
+   * que `elAncre` est affiché (sinon le scan global ouvre la fiche de l'élément), sans intercepter le clavier en amont.
+   */
+  GMAO.definirScanLocal = definirScanLocal;
 
   /** Module « Étiquettes & inventaire » actif dans la configuration ? */
   const moduleActif = () => { const m = typeof GMAO.moduleDef === 'function' ? GMAO.moduleDef(MODULE) : null; return !!(m && m.actif); };

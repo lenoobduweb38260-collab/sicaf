@@ -221,6 +221,21 @@ describe('Tableau de bord — base vide, droits et workflow', () => {
     assert.equal(t.listes.equipementsArret[0].nom, 'Groupe hors service');
   });
 
+  test('demandes à valider : les demandes d\'un site accessible en lecture seule sont exclues (comme le module Demandes)', async () => {
+    const site2 = srv.db.insert('secteurs', { nom: 'Usine de Valréas', code: 'VAL', type: 'site', parentId: null, actif: true, ordre: 90 });
+    const prod2 = srv.db.insert('secteurs', { nom: 'Production Valréas', code: 'VPROD', type: 'atelier', parentId: site2.id, actif: true, ordre: 91 });
+    const d = srv.db.insert('demandes', { numero: 'DI-LECT-1', titre: 'Demande du site 2', statut: 'soumise', prioriteCode: 'normale', typeCode: 'correctif', secteurId: prod2.id, demandeurId: 1, createdBy: 1, historique: [], commentaires: [], pieceJointes: [] });
+    const { c: lecture } = await utilisateur('cheflect', 'Chef de secteur', { secteurIds: [PROD], siteAcces: [{ siteId: site2.id, mode: 'lecture' }] });
+    const { c: complet } = await utilisateur('chefcomplet', 'Chef de secteur', { secteurIds: [PROD], siteAcces: [{ siteId: site2.id, mode: 'complet' }] });
+    const dl = await lecture.ok('GET', '/api/dashboard');
+    assert.equal(dl.listes.demandesAValider.some((x) => x.id === d.id), false, 'site en lecture seule : non validable');
+    assert.equal(dl.kpis.demandesAValider, (await lecture.ok('GET', '/api/demandes-compteurs')).aValider, 'cohérent avec le module Demandes');
+    const dc = await complet.ok('GET', '/api/dashboard');
+    assert.equal(dc.listes.demandesAValider.some((x) => x.id === d.id), true, 'accès complet : validable');
+    assert.equal(dc.kpis.demandesAValider, (await complet.ok('GET', '/api/demandes-compteurs')).aValider);
+    srv.db.remove('demandes', d.id);
+  });
+
   test('demandes à valider : uniquement celles que l\'utilisateur peut valider (portée, N+1)', async () => {
     const { u: uChef, c: chef } = await utilisateur('chefprod1', 'Chef de secteur', { secteurIds: [PROD] });
     const { c: chefLog } = await utilisateur('cheflog1', 'Chef de secteur', { secteurIds: [LOG] });

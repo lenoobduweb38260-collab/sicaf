@@ -655,6 +655,55 @@ describe('Maintenance préventive', () => {
     assert.deepEqual({ d: srv.db.get('plansPreventifs', q.id).derniereExecution, o: srv.db.get('plansPreventifs', q.id).dernierOtId }, { d: AUJ, o: otA.id });
   });
 
+  test('export CSV : cellules commençant par = + - @ neutralisées (injection de formules)', async () => {
+    const p = await creerPlan({ nom: '=HYPERLINK("http://exemple.invalid";"Cliquer")' });
+    const ligne = String((await resp.get('/api/preventif-export')).body).split('\r\n').find((l) => l.startsWith(p.numero + ';'));
+    assert.ok(ligne, 'ligne exportée');
+    assert.ok(ligne.includes(';"\'=HYPERLINK('), 'apostrophe devant = : ' + ligne);
+    assert.ok(!/;"?=HYPERLINK/.test(ligne), 'aucune formule exécutable');
+    await admin.ok('DELETE', '/api/preventif/' + p.id);
+  });
+
+  test('réalisation : seul un OT du plan portant sur l\'équipement du plan l\'enregistre ; relevé borné au compteur de l\'équipement', async () => {
+    const plan = await creerPlan({ nom: 'Réalisation contrôlée', equipementId: presse.id, periodicite: { type: 'compteur', valeur: 500 }, derniereExecution: 1000 });
+    const otAilleurs = srv.db.insert('ot', { numero: 'OT-REAL-1', titre: 'OT déplacé sur un autre équipement', statut: 'termine', planPreventifId: plan.id, equipementId: convoyeur.id, secteurId: PROD, dateFin: new Date().toISOString(), techniciens: [], compteurReleve: 1600, createdBy: 1 });
+    srv.ctx.emit('ot:termine', { ot: otAilleurs });
+    let p = srv.db.get('plansPreventifs', plan.id);
+    assert.notEqual(p.dernierOtId, otAilleurs.id, 'OT sur un autre équipement : aucune réalisation enregistrée');
+    assert.equal(p.derniereExecution, 1000);
+    const otPlan = srv.db.insert('ot', { numero: 'OT-REAL-2', titre: 'OT du plan', statut: 'termine', planPreventifId: plan.id, equipementId: presse.id, secteurId: PROD, dateFin: new Date().toISOString(), techniciens: [], compteurReleve: 999999, createdBy: 1 });
+    srv.ctx.emit('ot:termine', { ot: otPlan });
+    p = srv.db.get('plansPreventifs', plan.id);
+    const compteur = srv.db.get('equipements', presse.id).compteur.valeur;
+    assert.equal(p.dernierOtId, otPlan.id);
+    assert.equal(p.derniereExecution, compteur, 'relevé borné au compteur courant de l\'équipement');
+    assert.equal(p.prochaineEcheance, compteur + 500);
+    srv.db.remove('ot', otAilleurs.id); srv.db.remove('ot', otPlan.id);
+    await admin.ok('DELETE', '/api/preventif/' + plan.id);
+  });
+
+  test('portée : un plan ne peut être rattaché qu\'à un secteur modifiable (site en lecture seule refusé, portées site et perso comprises)', async () => {
+    const site2 = srv.db.insert('secteurs', { nom: 'Usine de Valréas', code: 'VAL', type: 'site', parentId: null, actif: true, ordre: 90 });
+    const prod2 = srv.db.insert('secteurs', { nom: 'Production Valréas', code: 'VPROD', type: 'atelier', parentId: site2.id, actif: true, ordre: 91 });
+    const profils = await admin.ok('GET', '/api/profils');
+    const p = (n) => profils.find((x) => x.nom === n).id;
+    const droits = { preventif: { voir: true, creer: true, modifier: true, supprimer: true } };
+    await admin.ok('POST', '/api/utilisateurs', { login: 'planif.site', nom: 'Planificateur', prenom: 'Site', profilId: p('Chef de secteur'), secteurIds: [PROD], siteAcces: [{ siteId: site2.id, mode: 'lecture' }], password: 'chef1234', doitChangerMdp: false, overrides: droits, porteeOverride: 'site' });
+    await admin.ok('POST', '/api/utilisateurs', { login: 'planif.perso', nom: 'Planificateur', prenom: 'Perso', profilId: p('Demandeur'), secteurIds: [], siteAcces: [{ siteId: site2.id, mode: 'lecture' }], password: 'chef1234', doitChangerMdp: false, overrides: droits });
+    const cSite = srv.client(); await cSite.login('planif.site', 'chef1234');
+    const cPerso = srv.client(); await cPerso.login('planif.perso', 'chef1234');
+    const base = { periodicite: { type: 'mois', valeur: 1 } };
+    const r1 = await cSite.post('/api/preventif', Object.assign({ nom: 'Plan site 2', secteurId: prod2.id }, base));
+    assert.equal(r1.status, 403, 'portée site : site en lecture seule refusé'); assert.match(r1.body.erreur, /lecture seule/);
+    const ok = await cSite.post('/api/preventif', Object.assign({ nom: 'Plan site 1', secteurId: PROD }, base));
+    assert.equal(ok.status, 200, JSON.stringify(ok.body));
+    assert.equal((await cSite.put('/api/preventif/' + ok.body.id, { secteurId: prod2.id })).status, 403, 'changement vers un secteur en lecture seule refusé');
+    assert.equal((await cPerso.post('/api/preventif', Object.assign({ nom: 'Plan perso site 2', secteurId: prod2.id }, base))).status, 403, 'portée perso sans secteur : site en lecture seule refusé');
+    const okPerso = await cPerso.post('/api/preventif', Object.assign({ nom: 'Plan perso site 1', secteurId: LOG }, base));
+    assert.equal(okPerso.status, 200, JSON.stringify(okPerso.body));
+    await admin.ok('DELETE', '/api/preventif/' + ok.body.id); await admin.ok('DELETE', '/api/preventif/' + okPerso.body.id);
+  });
+
   test('export CSV', async () => {
     await creerPlan({ nom: 'Plan exporté ; avec "guillemets"' });
     const r = await resp.get('/api/preventif-export');

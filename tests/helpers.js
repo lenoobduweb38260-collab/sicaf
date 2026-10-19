@@ -34,6 +34,11 @@ async function demarrer(options = {}) {
       async login(login, password) { const r = await call('POST', '/api/auth/login', { login, password }); if (r.status !== 200) throw new Error('Connexion échouée : ' + JSON.stringify(r.body)); return r.body; },
       /** Lève une erreur si le statut n'est pas 2xx, sinon retourne le corps. */
       async ok(method, u, b) { const r = await call(method, u, b); if (r.status < 200 || r.status >= 300) throw new Error(`${method} ${u} → ${r.status} ${JSON.stringify(r.body)}`); return r.body; },
+      /** Corps brut (Buffer) d'une requête GET : octets tels que servis, BOM UTF-8 compris (fetch().text() le retire). */
+      async brut(u) {
+        const r = await fetch(base + u, { headers: { 'x-requested-with': 'GMAO', cookie } });
+        return { status: r.status, body: Buffer.from(await r.arrayBuffer()), headers: r.headers };
+      },
     };
     return c;
   }
