@@ -69,6 +69,10 @@
   }
   const duree = (h) => (h ? ui.formatDuree(h) : '0 h');
   const pluriel = (n, mot, motPluriel) => `${n} ${n > 1 ? (motPluriel || mot + 's') : mot}`;
+  /** Référence lisible d'un OT : le préfixe « OT » n'est ajouté que si le numéro ne commence pas déjà par lui. */
+  const refOt = (numero) => { const n = String(numero == null ? '' : numero); return /^ot(?![a-zà-ÿ])/i.test(n) ? n : `OT ${n}`; };
+  /** Fond hachuré des jours d'absence (module RH). */
+  const HACHURES = 'repeating-linear-gradient(135deg, var(--surface-2) 0 6px, var(--bordure-2) 6px 8px)';
   function couleurType(code, repli) { const it = ui.itemListe('typesIntervention', code); return (it && it.couleur) || repli || '#6b7280'; }
   function couleurStatut(code, repli) { const it = ui.itemListe('statutsOT', code); return (it && it.couleur) || repli || '#6b7280'; }
   function lireLocal(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
@@ -121,12 +125,42 @@
     let techniciens = [];
     let jeton = 0;
     let glisse = null; // { id, source } pendant un glisser-déposer
+    let absIdx = new Map(); // « userId|jour » → absence validée (module RH) sur la période affichée
 
     const droits = () => (donnees && donnees.droits) || {};
     const peutModifier = () => GMAO.can(MODULE, 'modifier') && !!droits().modifier;
+    const peutAffecter = () => peutModifier() && !!droits().affecter;
     const peutGenerer = () => GMAO.can(MODULE, 'modifier') && !!droits().generer;
     const peutCreerOt = () => GMAO.can('ot', 'creer');
     const echeancesVisibles = () => (etat.echeances && donnees ? donnees.echeances : []);
+
+    // ----- Absences (module RH) : renvoyées par /api/planning pour les techniciens de la période ------
+    const absencesVisibles = () => (donnees && Array.isArray(donnees.absences) ? donnees.absences : []);
+    function indexerAbsences() {
+      absIdx = new Map();
+      if (!donnees) return;
+      for (const a of absencesVisibles()) {
+        if (a.userId == null || !RE_DATE.test(a.dateDebut || '') || !RE_DATE.test(a.dateFin || '')) continue;
+        for (let j = a.dateDebut > donnees.du ? a.dateDebut : donnees.du; j <= a.dateFin && j <= donnees.au; j = ajouterJours(j, 1)) absIdx.set(`${a.userId}|${j}`, a);
+      }
+    }
+    const absenceDe = (uid, jour) => (uid == null || !jour ? null : absIdx.get(`${uid}|${jour}`) || null);
+    const absentsDuJour = (jour) => absencesVisibles().filter((a) => a.userId != null && a.dateDebut <= jour && a.dateFin >= jour);
+    const libelleAbsence = (a) => `${a.libelle || 'Absent'}${a.demiJournee ? ' (demi-journée)' : ''}`;
+    const titreAbsents = (absents) => 'Absents ce jour :\n' + absents.map((a) => `${a.nom || ui.nomUser(a.userId)} — ${libelleAbsence(a)}`).join('\n');
+    /** Bandeau « Absents » d'un jour (vues Mois et Semaine). */
+    function bandeauAbsents(jour, detaille) {
+      const absents = absentsDuJour(jour);
+      if (!absents.length) return null;
+      const noms = absents.map((a) => a.nom || ui.nomUser(a.userId)).join(', ');
+      return el('div', { class: 'cal-absents texte-2', dataset: { absents: String(absents.length) }, title: titreAbsents(absents), style: Object.assign({ fontSize: '10.5px', lineHeight: 1.4, padding: '0 4px', marginBottom: '2px', borderRadius: '3px', background: HACHURES }, ELLIPSE) },
+        icone('utilisateur'), ' ', detaille ? `Absent${absents.length > 1 ? 's' : ''} : ${noms}` : pluriel(absents.length, 'absent'));
+    }
+    /** Marqueur « responsable absent ce jour » devant un OT. */
+    function marqueurAbsent(o) {
+      const a = absenceDe(o.technicienId, o.jour);
+      return a ? el('span', { class: 'cal-resp-absent', title: `${o.technicienNom || 'Responsable'} absent ce jour (${libelleAbsence(a)})` }, icone('alerte'), ' ') : null;
+    }
 
     // ----- Période ---------------------------------------------------------------------------------
     function bornes() {
@@ -210,6 +244,7 @@
       if (etat.projection && etat.echeances) legende.appendChild(echantillon({ border: '1px dashed var(--texte-2)', opacity: 0.6 }, 'Prévisionnel'));
       legende.appendChild(echantillon({ background: '#9ca3af', boxShadow: `0 0 0 2px ${ROUGE}` }, 'En retard'));
       legende.appendChild(echantillon({ background: '#9ca3af', opacity: 0.45 }, 'Clôturé'));
+      if (absencesVisibles().length) legende.appendChild(echantillon({ background: HACHURES, border: '1px solid var(--bordure-2)' }, 'Absence (RH)'));
       legende.appendChild(el('span', null, 'Bordure gauche = statut de l\'OT'));
     }
 
@@ -277,7 +312,7 @@
     async function deplacer(g, jour, technicienId) {
       const o = trouverOt(g.id);
       if (!o) return;
-      if (!o.deplacable) { toast(`L'OT ${o.numero} ne peut pas être replanifié`, 'alerte'); return; }
+      if (!o.deplacable) { toast(`${refOt(o.numero)} ne peut pas être replanifié`, 'alerte'); return; }
       const body = {};
       const jourActuel = jourDe(o.datePrevue);
       if (jour !== undefined && jour !== jourActuel) body.datePrevue = jour;
@@ -287,12 +322,21 @@
         if (changeLigne) body.technicienId = technicienId;
       }
       if (!Object.keys(body).length) return;
+      if (body.technicienId !== undefined && !peutAffecter()) { toast('Le changement de responsable nécessite le droit Ordres de travail › Affecter', 'alerte'); return; }
+      // Technicien absent (absence validée par le service RH) le jour visé : confirmation avant de replanifier
+      const techCible = body.technicienId !== undefined ? body.technicienId : o.technicienId;
+      const jourCible = body.datePrevue !== undefined ? body.datePrevue : jourActuel;
+      const absence = absenceDe(techCible, jourCible);
+      if (absence) {
+        const ok = await ui.confirm({ titre: 'Technicien absent', message: `${absence.nom || ui.nomUser(techCible)} est absent le ${libelleJour(jourCible)} (${libelleAbsence(absence)}). Planifier quand même ${refOt(o.numero)} ce jour-là ?`, okLabel: 'Planifier quand même' });
+        if (!ok) return;
+      }
       try {
         const r = await api.put('/api/planning/ot/' + o.id, body);
         let msg;
-        if (body.datePrevue === null) msg = `OT ${r.numero} retiré du planning`;
-        else if (body.datePrevue) msg = `OT ${r.numero} planifié le ${libelleJour(body.datePrevue, false)}`;
-        else msg = `OT ${r.numero}`;
+        if (body.datePrevue === null) msg = `${refOt(r.numero)} retiré du planning`;
+        else if (body.datePrevue) msg = `${refOt(r.numero)} planifié le ${libelleJour(body.datePrevue, false)}`;
+        else msg = refOt(r.numero);
         if (body.technicienId !== undefined) msg += body.technicienId == null ? ' — responsable retiré' : ` — confié à ${r.technicienNom || ui.nomUser(body.technicienId)}`;
         toast(msg, 'succes');
         await charger();
@@ -311,7 +355,7 @@
           boxShadow: o.enRetard ? `0 0 0 2px ${ROUGE}` : '', outline: opts.intervenant ? '1px dotted rgba(255,255,255,0.9)' : '', outlineOffset: '-3px',
         }, ELLIPSE),
         onclick: (ev) => { ev.stopPropagation(); GMAO.navigate('#/ot/' + o.id); },
-      }, o.sansDate ? el('span', { title: 'En cours, sans date prévue' }, icone('lecture'), ' ') : null, o.heure ? el('strong', null, o.heure + ' ') : null, opts.avecNumero ? el('strong', null, o.numero + ' ') : null, o.titre);
+      }, o.sansDate ? el('span', { title: 'En cours, sans date prévue' }, icone('lecture'), ' ') : null, marqueurAbsent(o), o.heure ? el('strong', null, o.heure + ' ') : null, opts.avecNumero ? el('strong', null, o.numero + ' ') : null, o.titre);
       if (opts.glissable) rendreGlissable(n, o, opts.source);
       return n;
     }
@@ -340,7 +384,7 @@
       el('div', { style: FLEX({ justifyContent: 'space-between', gap: '4px', flexWrap: 'wrap' }) },
         el('span', { class: 'texte-2 texte-gras', style: Object.assign({ fontSize: '11px', minWidth: 0, flex: '1 1 auto' }, ELLIPSE) }, (o.heure ? o.heure + ' · ' : '') + o.numero),
         petitBadge(opts.priorite ? ui.badgeListe('priorites', o.prioriteCode) : ui.badgeListe('statutsOT', o.statut))),
-      el('div', { style: { fontWeight: 600, margin: '2px 0', lineHeight: 1.3, textDecoration: o.annule ? 'line-through' : '', wordBreak: 'break-word' } }, o.titre),
+      el('div', { style: { fontWeight: 600, margin: '2px 0', lineHeight: 1.3, textDecoration: o.annule ? 'line-through' : '', wordBreak: 'break-word' } }, marqueurAbsent(o), o.titre),
       o.equipementNom ? el('div', { class: 'texte-2', style: ELLIPSE, title: o.equipementNom }, o.equipementNom) : (o.secteurNom ? el('div', { class: 'texte-2', style: ELLIPSE }, o.secteurNom) : null),
       el('div', { style: FLEX({ justifyContent: 'space-between', marginTop: '4px', gap: '2px 6px', flexWrap: 'wrap' }) },
         o.technicienId != null
@@ -404,6 +448,8 @@
         cell.appendChild(el('div', { style: FLEX({ justifyContent: 'space-between', marginBottom: '2px' }) },
           el('span', { class: 'cal-num', style: { cursor: 'pointer', marginBottom: 0 }, title: `Détail du ${libelleJour(jour)}`, onclick: (ev) => { ev.stopPropagation(); ouvrirJour(jour); } }, String(versDate(jour).getDate())),
           total ? el('span', { class: 'texte-2', style: { fontSize: '10.5px', whiteSpace: 'nowrap' }, title: 'Durée estimée des OT du jour' }, duree(total)) : null));
+        const absentsMois = horsMois ? null : bandeauAbsents(jour, false);
+        if (absentsMois) cell.appendChild(absentsMois);
         const tous = items.ot.map((o) => ({ k: 'ot', v: o })).concat(items.ech.map((e) => ({ k: 'ech', v: e })));
         const limite = tous.length > MAX_EVT_JOUR + 1 ? MAX_EVT_JOUR : tous.length;
         for (const it of tous.slice(0, limite)) cell.appendChild(it.k === 'ot' ? evtOt(it.v, { glissable: peutModifier() && it.v.deplacable }) : evtEcheance(it.v));
@@ -442,6 +488,8 @@
           class: 'cal-jour' + (jour === donnees.aujourdhui ? ' aujourdhui' : ''), dataset: { jour },
           style: Object.assign({ minHeight: '380px', padding: '6px', minWidth: 0 }, jourSemaine(jour) >= 5 ? { background: 'var(--surface-2)' } : {}),
         });
+        const absentsSemaine = bandeauAbsents(jour, true);
+        if (absentsSemaine) cell.appendChild(absentsSemaine);
         items.ot.forEach((o) => cell.appendChild(carteOt(o, { glissable: peutModifier() && o.deplacable })));
         items.ech.forEach((e) => cell.appendChild(carteEcheance(e)));
         if (!items.ot.length && !items.ech.length) cell.appendChild(el('div', { class: 'texte-2 texte-petit texte-centre', style: { paddingTop: '24px' } }, peutModifier() ? 'Déposez un OT ici' : '—'));
@@ -513,14 +561,18 @@
           const c = cellules.get(`${l.userId == null ? 'aucun' : l.userId}|${jour}`) || { ot: [], ech: [] };
           const h = heuresDe(c.ot.map((x) => x.o));
           heuresSemaine += h;
-          const surcharge = l.userId != null && h > hpj;
+          const absence = absenceDe(l.userId, jour);
+          const surcharge = l.userId != null && (h > hpj || (absence && h > 0));
           const td = el('td', {
-            dataset: { jour }, style: {
+            dataset: Object.assign({ jour }, absence ? { absent: '1' } : {}),
+            title: absence ? `${l.nom} : ${libelleAbsence(absence)} du ${ui.formatDate(absence.dateDebut)} au ${ui.formatDate(absence.dateFin)}` : null,
+            style: {
               verticalAlign: 'top', padding: '4px', minWidth: 0, borderLeft: '1px solid var(--bordure)', height: '64px',
-              background: surcharge ? teinte(ROUGE, 0.08) : (jourSemaine(jour) >= 5 ? 'var(--surface-2)' : ''),
+              background: absence ? HACHURES : (surcharge ? teinte(ROUGE, 0.08) : (jourSemaine(jour) >= 5 ? 'var(--surface-2)' : '')),
             },
           });
-          if (h) td.appendChild(el('div', { style: { textAlign: 'right', fontSize: '10.5px', color: surcharge ? 'var(--danger)' : 'var(--texte-2)', fontWeight: surcharge ? 600 : 400 }, title: surcharge ? `Surcharge : plus de ${duree(hpj)} prévues ce jour` : 'Durée estimée du jour' }, duree(h)));
+          if (absence) td.appendChild(el('div', { class: 'cal-absent texte-petit texte-gras', style: Object.assign({ fontSize: '10.5px', lineHeight: 1.3, marginBottom: '2px', color: absence.couleur || 'var(--texte-2)' }, ELLIPSE) }, libelleAbsence(absence)));
+          if (h) td.appendChild(el('div', { style: { textAlign: 'right', fontSize: '10.5px', color: surcharge ? 'var(--danger)' : 'var(--texte-2)', fontWeight: surcharge ? 600 : 400 }, title: absence ? 'Intervention prévue un jour d\'absence' : (surcharge ? `Surcharge : plus de ${duree(hpj)} prévues ce jour` : 'Durée estimée du jour') }, duree(h)));
           c.ot.forEach(({ o, responsable }) => td.appendChild(evtOt(o, { intervenant: !responsable, glissable: responsable && peutModifier() && o.deplacable, source: l.userId })));
           c.ech.forEach((e) => td.appendChild(evtEcheance(e)));
           if (peutModifier()) cibleDepot(td, (g) => deplacer(g, jour, l.userId));
@@ -534,11 +586,15 @@
           tdCharge.appendChild(el('div', { class: h ? 'texte-gras texte-alerte' : 'texte-2' }, h ? `${duree(h)} à affecter` : 'Rien à affecter'));
           if (hPrev) tdCharge.appendChild(el('div', { class: 'texte-2 texte-petit' }, `+ ${duree(hPrev)} d'échéances préventives`));
         } else {
-          const pct = capacite ? Math.round((h / capacite) * 100) : 0;
+          // Capacité de la semaine renvoyée par le serveur : jours ouvrés moins les jours d'absence validés (RH)
+          const joursAbs = ch ? Number(ch.joursAbsents) || 0 : 0;
+          const capTech = ch && Number.isFinite(Number(ch.capacite)) ? Number(ch.capacite) : capacite;
+          const pct = capTech ? Math.round((h / capTech) * 100) : (h ? 101 : 0);
           const coul = pct > 100 ? 'var(--danger)' : (pct >= 80 ? 'var(--alerte)' : 'var(--ok)');
-          tdCharge.appendChild(el('div', { style: FLEX({ justifyContent: 'space-between' }) }, el('span', { class: 'texte-gras' }, `${duree(h)} / ${duree(capacite)}`), el('span', { class: pct > 100 ? 'texte-danger texte-gras' : 'texte-2' }, `${pct} %`)));
-          tdCharge.appendChild(el('div', { class: 'barre-progression', style: { margin: '5px 0 3px' }, title: `Charge : ${pct} % de la capacité hebdomadaire (${duree(hpj)} × 5 jours)` }, el('div', { style: { width: Math.min(100, pct) + '%', background: coul } })));
+          tdCharge.appendChild(el('div', { style: FLEX({ justifyContent: 'space-between' }) }, el('span', { class: 'texte-gras' }, `${duree(h)} / ${duree(capTech)}`), el('span', { class: pct > 100 ? 'texte-danger texte-gras' : 'texte-2' }, capTech ? `${pct} %` : 'absent')));
+          tdCharge.appendChild(el('div', { class: 'barre-progression', style: { margin: '5px 0 3px' }, title: `Charge : ${pct} % de la capacité de la semaine (${duree(hpj)} × ${ui.formatNombre(Math.max(0, 5 - joursAbs))} jour${5 - joursAbs > 1 ? 's' : ''} ouvré${5 - joursAbs > 1 ? 's' : ''}${joursAbs ? ', absences déduites' : ''})` }, el('div', { style: { width: Math.min(100, pct) + '%', background: coul } })));
           tdCharge.appendChild(el('div', { class: 'texte-2 texte-petit' }, ch && ch.nbOt ? pluriel(ch.nbOt, 'OT', 'OT') : 'Aucun OT', hPrev ? ` · + ${duree(hPrev)} préventif` : ''));
+          if (joursAbs) tdCharge.appendChild(el('div', { class: 'texte-2 texte-petit cal-jours-absents' }, `${ui.formatNombre(joursAbs)} jour${joursAbs > 1 ? 's' : ''} d'absence`));
         }
         tr.appendChild(tdCharge);
         tbody.appendChild(tr);
@@ -637,7 +693,7 @@
       rendreLegende();
       ui.vider(zoneAlerte);
       if (donnees && !droits().voirOt) zoneAlerte.appendChild(ui.alerte('Vous n\'avez pas accès aux ordres de travail : seules les échéances préventives sont affichées.', 'info'));
-      if (donnees) { rendreKpis(); rendreCalendrier(); }
+      if (donnees) { indexerAbsences(); rendreKpis(); rendreCalendrier(); }
       rendrePanneau();
     }
 
@@ -817,7 +873,9 @@
           if (etat.masquerVides && !cellules.some((c) => c.length)) continue;
           const ch = (donnees.charge || []).find((c) => (c.userId == null ? null : c.userId) === l.userId);
           const h = ch ? Number(ch.heures) || 0 : 0;
-          grille += `<tr><td><b>${esc(l.nom)}</b></td>${cellules.map((c) => `<td>${c.map((x) => ligneItem(x, false)).join('') || '&nbsp;'}</td>`).join('')}<td>${esc(duree(h))}${l.userId != null ? ' / ' + esc(duree(capacite)) + ` (${capacite ? Math.round((h / capacite) * 100) : 0} %)` : ''}</td></tr>`;
+          const capTech = ch && Number.isFinite(Number(ch.capacite)) ? Number(ch.capacite) : capacite;
+          const celluleHtml = (c, j) => { const a = absenceDe(l.userId, j); return `<td>${a ? `<i style="color:#888">${esc(libelleAbsence(a))}</i>` : ''}${c.map((x) => ligneItem(x, false)).join('') || (a ? '' : '&nbsp;')}</td>`; };
+          grille += `<tr><td><b>${esc(l.nom)}</b></td>${cellules.map((c, i) => celluleHtml(c, jours[i])).join('')}<td>${esc(duree(h))}${l.userId != null ? ' / ' + esc(duree(capTech)) + ` (${capTech ? Math.round((h / capTech) * 100) : 0} %)` : ''}</td></tr>`;
         }
         grille += '</tbody></table>';
       }

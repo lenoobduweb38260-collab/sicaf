@@ -484,7 +484,8 @@ function register(ctx) {
     let alertes = null;
     const s = ctx.services.stock;
     if (s && typeof s.alertes === 'function') { try { const r = s.alertes(req); if (Array.isArray(r)) alertes = r; } catch (e) { alertes = null; } }
-    if (!alertes) alertes = ctx.scope(req, db.list('articles', (a) => a.actif !== false && num(a.quantite) <= num(a.seuilMin)));
+    // Repli sans le module Stock : même règle que lui (un article sans seuil n'est pas suivi)
+    if (!alertes) alertes = ctx.scope(req, db.list('articles', (a) => a.actif !== false && num(a.seuilMin) > 0 && num(a.quantite) <= num(a.seuilMin)));
     const ratio = (a) => (num(a.seuilMin) > 0 ? num(a.quantite) / num(a.seuilMin) : (num(a.quantite) <= 0 ? -1 : 1));
     out.kpis.articlesSousSeuil = alertes.length;
     out.compteurs.articlesRupture = alertes.filter((a) => num(a.quantite) <= 0).length;

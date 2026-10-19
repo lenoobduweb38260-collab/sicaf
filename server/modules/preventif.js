@@ -9,7 +9,8 @@
  *   periodicite { type: jours|semaines|mois|compteur, valeur }, dateDebut, derniereExecution (date ou
  *   valeur compteur), derniereExecutionDate, prochaineEcheance (date ISO ou valeur compteur),
  *   gamme [{ ordre, libelle, duree }], dureeEstimee, technicienId, pieces [{ articleId, quantite }],
- *   actif, genererJoursAvant (vide = config.preventif.horizonJours), champs, dernierOtId, derniereGeneration.
+ *   actif, genererJoursAvant (vide = config.preventif.horizonJours), champs, dernierOtId, derniereGeneration,
+ *   realisationPrecedente (état du plan avant la dernière réalisation, rétabli si son OT est réouvert ou annulé).
  *
  * État calculé : 'a_jour' | 'proche' (échéance ≤ aujourd'hui + horizon) | 'en_retard' (échéance dépassée,
  * ou compteur atteint) | 'inactif'. Pour un plan sur compteur, la date d'échéance est estimée à partir
@@ -23,7 +24,9 @@
  *                      etat(plan), calculerProchaineEcheance(plan, base), periodiciteLibelle(periodicite, unite) }
  * Événements émis    : 'preventif:genere' ({ plan, ot }), 'preventif:cree', 'preventif:modifie',
  *                      'preventif:supprime', 'preventif:realise' ({ plan, ot }) ; 'ot:cree' en mode autonome.
- * Événements écoutés : 'ot:termine' (derniereExecution / prochaineEcheance recalculées depuis la réalisation).
+ * Événements écoutés : 'ot:termine' (derniereExecution / prochaineEcheance recalculées depuis la réalisation),
+ *                      'ot:statut' et 'ot:supprime' (l'OT de la dernière réalisation réouvert, annulé ou supprimé :
+ *                      le plan retrouve l'état antérieur à cette réalisation).
  * Services consommés : ctx.services.ot.{ creerDepuisPlan | creer }, ctx.services.equipements.visible.
  */
 const nom = 'Maintenance préventive';
@@ -113,6 +116,8 @@ function formatNombre(n) {
   return (v < 0 ? '-' : '') + ent.replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + (dec ? ',' + dec : '');
 }
 function formatDateFr(s) { const j = jourDe(s); return j ? j.split('-').reverse().join('/') : ''; }
+/** Référence lisible d'un OT : le préfixe « OT » n'est ajouté que si le numéro ne commence pas déjà par lui. */
+function refOt(numero) { const n = String(numero == null ? '' : numero); return /^ot(?![a-zà-ÿ])/i.test(n) ? n : `OT ${n}`; }
 function infoUnite(unite) { const u = String(unite || 'heures').trim(); return Object.assign({ libelle: u }, UNITES[u.toLowerCase()] || { feminin: false }); }
 function abregeUnite(unite) { const i = infoUnite(unite); return i.abrege || i.libelle; }
 /** Périodicité lisible : « tous les 3 mois », « toutes les semaines », « toutes les 500 h ». */
@@ -509,6 +514,9 @@ function register(ctx) {
           otOuvertStatut: k === 0 && ouvert ? ouvert.statut : null,
         }));
       };
+      // Les occurrences suivantes (k ≥ 1) partent de la réalisation attendue : une échéance dépassée sera faite au
+      // plus tôt aujourd'hui (ou au compteur actuel), jamais à sa date passée. Aucune projection n'est donc datée
+      // dans le passé, ni comptée parmi les retards ou dans la charge.
       if (p.type === 'compteur') {
         const rythme = rythmeCompteur(eq);
         if (!rythme) {
@@ -516,17 +524,20 @@ function register(ctx) {
           else if (nonDatees || a.etat === 'proche') pousser(0, null, a.echeance, false);
           continue;
         }
+        const baseValeur = a.compteurActuel != null && Number(a.echeance) < a.compteurActuel ? a.compteurActuel : Number(a.echeance);
         for (let k = 0; k < MAX_OCCURRENCES; k++) {
-          const valeur = arrondi(Number(a.echeance) + k * Number(p.valeur || 0), 3);
+          const valeur = arrondi(k === 0 ? Number(a.echeance) : baseValeur + k * Number(p.valeur || 0), 3);
           let date = k === 0 ? a.echeanceDate : estimerDate(rythme, valeur);
           if (k === 0 && a.etat === 'en_retard' && (!date || date > c.aujourdhui)) date = c.aujourdhui;
+          if (k > 0 && date < c.aujourdhui) date = c.aujourdhui;
           if (date > fin) break;
           pousser(k, date, valeur, true);
           if (!projection) break;
         }
       } else {
+        const baseDate = a.echeance < c.aujourdhui ? c.aujourdhui : a.echeance;
         for (let k = 0; k < MAX_OCCURRENCES; k++) {
-          const date = k === 0 ? a.echeance : ajouterPeriode(a.echeance, p, k);
+          const date = k === 0 ? a.echeance : ajouterPeriode(baseDate, p, k);
           if (date > fin) break;
           pousser(k, date, null, false);
           if (!projection) break;
@@ -593,7 +604,7 @@ function register(ctx) {
       historique: [{ date: new Date().toISOString(), userId: req && req.user ? req.user.id : null, action: 'creation', libelle: 'Ordre de travail créé', statut, commentaire: commentaire || '' }],
     };
     const o = db.insert('ot', record);
-    ctx.audit(req, 'creation', 'ot', o.id, `OT ${o.numero} : ${o.titre} (plan ${plan.numero})`);
+    ctx.audit(req, 'creation', 'ot', o.id, `${refOt(o.numero)} : ${o.titre} (plan ${plan.numero})`);
     const acteur = req && req.user ? req.user.id : null;
     const cibles = technicienId != null ? [technicienId] : ctx.usersAvecDroit(MODULE, 'modifier', (u, p) => p.portee === 'tous' || o.secteurId == null || p.secteurIds.includes(Number(o.secteurId))).map((u) => u.id);
     const notifies = cibles.filter((id) => id !== acteur);
@@ -630,7 +641,7 @@ function register(ctx) {
     if (!ot.datePrevue && datePrevue) patch.datePrevue = datePrevue;
     ot = db.update('ot', ot.id, patch) || ot;
     const maj = db.update(ENTITE, plan.id, { derniereGeneration: new Date().toISOString(), dernierOtGenereId: ot.id });
-    ctx.audit(req, 'generation', ENTITE, plan.id, `Plan ${plan.numero} : OT ${ot.numero} généré${auto ? ' automatiquement' : ''} (${lib})`);
+    ctx.audit(req, 'generation', ENTITE, plan.id, `Plan ${plan.numero} : ${refOt(ot.numero)} généré${auto ? ' automatiquement' : ''} (${lib})`);
     ctx.emit('preventif:genere', { plan: maj || plan, ot });
     return ot;
   }
@@ -659,7 +670,7 @@ function register(ctx) {
       if (eq && eq.actif === false) { rapport.ignores.push(Object.assign(ref, { motif: `L'équipement « ${eq.nom} » est inactif` })); continue; }
       if (!force) {
         const annule = otAnnulePourEcheance(plan, a.echeance, c);
-        if (annule) { rapport.ignores.push(Object.assign(ref, { otId: annule.id, motif: `L'OT ${annule.numero} généré pour cette échéance a été annulé : générez-le manuellement ou reportez l'échéance` })); continue; }
+        if (annule) { rapport.ignores.push(Object.assign(ref, { otId: annule.id, motif: `L'ordre de travail ${annule.numero} généré pour cette échéance a été annulé : générez-le manuellement ou reportez l'échéance` })); continue; }
       }
       try {
         const ot = creerOt(plan, eq, a, { req, datePrevue: force ? (datePrevue || c.aujourdhui) : a.datePrevue, auto });
@@ -686,15 +697,14 @@ function register(ctx) {
     try { return genererInterne({ auto: true }); } catch (e) { ctx.log('Préventif : erreur de génération automatique', e && e.message); return null; } finally { generationEnCours = false; }
   }
 
-  // ----- Réalisation (écoute de 'ot:termine') -----------------------------------------------------
-  function enregistrerRealisation(plan, o) {
+  // ----- Réalisation (écoute de 'ot:termine', 'ot:statut' et 'ot:supprime') -------------------------
+  /** Dernière exécution et prochaine échéance induites par un OT terminé ; null si cette réalisation est antérieure à la dernière connue. */
+  function calculRealisation(plan, o) {
     const p = plan.periodicite || {};
     const dateReal = jourDe(o.dateFin) || jourDe(o.dateCloture) || dateLocale();
-    const patch = { dernierOtId: o.id, derniereExecutionDate: dateReal };
-    let unite = null;
+    const patch = { derniereExecutionDate: dateReal };
     if (p.type === 'compteur') {
       const eq = plan.equipementId != null ? db.get('equipements', plan.equipementId) : null;
-      unite = eq && eq.compteur ? eq.compteur.unite : null;
       let valeur = nombreOuNull(o.compteurReleve);
       if (valeur == null && eq && eq.compteur) valeur = nombreOuNull(eq.compteur.valeur);
       const ancienne = nombreOuNull(plan.derniereExecution);
@@ -709,18 +719,85 @@ function register(ctx) {
       patch.derniereExecution = dateReal;
       patch.prochaineEcheance = ajouterPeriode(dateReal, p);
     }
+    return patch;
+  }
+  /** État du plan susceptible d'être rétabli si la réalisation est remise en cause. */
+  const etatRealisation = (src) => ({
+    derniereExecution: src.derniereExecution == null ? null : src.derniereExecution, derniereExecutionDate: src.derniereExecutionDate || null,
+    prochaineEcheance: src.prochaineEcheance == null ? null : src.prochaineEcheance, dernierOtId: src.dernierOtId == null ? null : src.dernierOtId,
+  });
+  function uniteDe(plan) {
+    if ((plan.periodicite || {}).type !== 'compteur') return null;
+    const eq = plan.equipementId != null ? db.get('equipements', plan.equipementId) : null;
+    return eq && eq.compteur ? eq.compteur.unite : null;
+  }
+
+  function enregistrerRealisation(plan, o) {
+    const p = plan.periodicite || {};
+    const patch = calculRealisation(plan, o);
+    if (!patch) return null;
+    Object.assign(patch, { dernierOtId: o.id, realisationPrecedente: etatRealisation(plan) });
     const maj = db.update(ENTITE, plan.id, patch);
     const acteur = o.cloturePar != null ? db.get('users', o.cloturePar) : null;
-    ctx.audit(acteur ? { user: acteur } : null, 'modification', ENTITE, plan.id, `Plan ${plan.numero} : réalisation enregistrée (OT ${o.numero || o.id}) — prochaine ${libelleEcheance(p, maj.prochaineEcheance, unite)}`);
+    ctx.audit(acteur ? { user: acteur } : null, 'modification', ENTITE, plan.id, `Plan ${plan.numero} : réalisation enregistrée (${refOt(o.numero || o.id)}) — prochaine ${libelleEcheance(p, maj.prochaineEcheance, uniteDe(plan))}`);
     ctx.emit('preventif:realise', { plan: maj, ot: o });
     return maj;
   }
+
+  /**
+   * L'OT de la dernière réalisation n'est plus terminé (réouvert, annulé ou supprimé) : la maintenance n'est plus
+   * considérée comme faite. Le plan retrouve l'état mémorisé avant cette réalisation ; à défaut (données plus
+   * anciennes), il est recalculé depuis l'OT terminé précédent, sinon depuis l'échéance pour laquelle l'OT avait
+   * été généré.
+   */
+  function annulerRealisation(plan, o, motif) {
+    const p = plan.periodicite || {};
+    const memo = plan.realisationPrecedente;
+    let patch;
+    if (memo && typeof memo === 'object' && !Array.isArray(memo)) {
+      patch = Object.assign(etatRealisation(memo), { realisationPrecedente: null });
+    } else {
+      const termines = new Set(statutsOt().filter((s) => s.final && !estAnnulationOt(s)).map((s) => s.code));
+      const finDe = (x) => jourDe(x.dateFin) || jourDe(x.dateCloture) || '';
+      const precedent = db.list('ot', (x) => Number(x.planPreventifId) === plan.id && Number(x.id) !== Number(o.id) && termines.has(x.statut) && !!finDe(x))
+        .sort((x, y) => finDe(y).localeCompare(finDe(x)) || y.id - x.id)[0] || null;
+      if (precedent) {
+        patch = Object.assign({ derniereExecution: null }, calculRealisation(Object.assign({}, plan, { derniereExecution: null }), precedent), { dernierOtId: precedent.id, realisationPrecedente: null });
+      } else {
+        const ech = p.type === 'compteur' ? nombreOuNull(o.echeancePreventif) : jourDe(o.echeancePreventif);
+        const sansExecution = Object.assign({}, plan, { derniereExecution: null });
+        patch = { derniereExecution: null, derniereExecutionDate: null, prochaineEcheance: ech != null ? ech : calculerProchaineEcheance(sansExecution, p.type === 'compteur' ? null : (jourDe(plan.dateDebut) || dateLocale())), dernierOtId: null, realisationPrecedente: null };
+      }
+    }
+    const maj = db.update(ENTITE, plan.id, patch);
+    ctx.audit(null, 'modification', ENTITE, plan.id, `Plan ${plan.numero} : réalisation annulée (${refOt(o.numero || o.id)} ${motif}) — prochaine ${libelleEcheance(p, maj.prochaineEcheance, uniteDe(plan))}`);
+    ctx.emit('preventif:modifie', { plan: maj, ancien: plan, champsModifies: Object.keys(patch).filter((k) => k !== 'realisationPrecedente') });
+    return maj;
+  }
+
+  const otDe = (data) => (data && data.ot && typeof data.ot === 'object' ? data.ot : data);
   ctx.on('ot:termine', (data) => {
-    const o = data && data.ot && typeof data.ot === 'object' ? data.ot : data;
+    const o = otDe(data);
     if (!o || o.planPreventifId == null) return;
     const plan = db.get(ENTITE, o.planPreventifId);
     if (plan) enregistrerRealisation(plan, o);
   });
+  /** La réalisation est remise en cause si l'OT qui l'a enregistrée quitte un statut « terminé » ou disparaît. */
+  function remettreEnCause(data, motif) {
+    const o = otDe(data);
+    if (!o || o.id == null || o.planPreventifId == null) return;
+    const plan = db.get(ENTITE, o.planPreventifId);
+    if (!plan || plan.dernierOtId == null || Number(plan.dernierOtId) !== Number(o.id)) return;
+    annulerRealisation(plan, o, motif);
+  }
+  ctx.on('ot:statut', (data) => {
+    const o = otDe(data);
+    if (!o) return;
+    const st = statutsOt().find((s) => s.code === o.statut);
+    if (st && st.final && !estAnnulationOt(st)) return; // toujours terminé
+    remettreEnCause(data, st && estAnnulationOt(st) ? 'annulé' : 'réouvert');
+  });
+  ctx.on('ot:supprime', (data) => remettreEnCause(data, 'supprimé'));
 
   // ----- Détail ------------------------------------------------------------------------------
   function resumeOt(o, c) {

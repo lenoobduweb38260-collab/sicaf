@@ -25,6 +25,11 @@
 
   // ----- Utilitaires d'affichage ----------------------------------------------------------
   function lienVue(href, label) { return el('a', { href, onclick: (ev) => ev.stopPropagation(), style: { whiteSpace: 'nowrap' } }, label); }
+  /** Colonne OT d'un mouvement : lien vers l'OT, ou mention neutre quand l'OT est hors de la portée du lecteur. */
+  function celluleOt(m) {
+    if (m.otMasque) return el('span', { class: 'texte-2', title: 'Ordre de travail hors de votre périmètre' }, 'Hors périmètre');
+    return m.otId ? lienVue('#/ot/' + m.otId, m.otNumero || 'OT #' + m.otId) : el('span', { class: 'texte-2' }, '—');
+  }
   /** Contenu sans retour à la ligne (montants, dates, numéros). */
   const nowrap = (x, style) => el('span', { style: Object.assign({ whiteSpace: 'nowrap' }, style || {}) }, x);
   /** Texte tronqué sur une ligne avec infobulle. */
@@ -135,7 +140,7 @@
         ? { nom: 'quantite', label: 'Quantité initiale en stock', type: 'nombre', min: 0, step: 'any', aide: 'Enregistrée comme un mouvement d\'inventaire' }
         : { nom: 'quantiteLecture', label: 'Quantité en stock', type: 'lecture', valeur: frag(el('span', { class: 'texte-gras' }, qte(source.quantite, source.uniteCode)), el('span', { class: 'texte-2 texte-petit' }, ' — modifiable uniquement par un mouvement (entrée, sortie, inventaire)')) },
       { nom: 'emplacement', label: 'Emplacement', type: 'texte', placeholder: 'ex. Magasin central — A1 — Étagère 2', suggestions: refs.emplacements || [], maxLength: 120 },
-      { nom: 'seuilMin', label: 'Seuil minimum', type: 'nombre', min: 0, step: 'any', aide: 'Alerte de réapprovisionnement quand le stock atteint ce seuil' },
+      { nom: 'seuilMin', label: 'Seuil minimum', type: 'nombre', min: 0, step: 'any', aide: 'Alerte de réapprovisionnement quand le stock atteint ce seuil (0 : article non suivi, aucune alerte)' },
       { nom: 'quantiteCommande', label: 'Quantité de réapprovisionnement', type: 'nombre', min: 0, step: 'any', aide: 'Quantité habituellement commandée (à commander = max(cette quantité, 2 × seuil − stock))' },
       { nom: 'prixUnitaire', label: `Prix unitaire HT (${((GMAO.config || {}).general || {}).devise || '€'})`, type: 'nombre', min: 0, step: 0.01, aide: 'Mis à jour au coût moyen pondéré lors des réceptions' },
       { nom: 'secteurId', label: 'Magasin / secteur', type: 'select', options: optionsSect, aide: 'Restreint la visibilité de l\'article aux utilisateurs de ce secteur' },
@@ -424,7 +429,7 @@
           { cle: 'quantite', label: 'Quantité', aligner: 'droite', rendu: (m) => nowrap(frag(mouvementSigne(m), m.uniteCode ? el('span', { class: 'texte-2 texte-petit' }, ' ' + m.uniteCode) : null)), valeurTri: (m) => Number(m.ecart) || 0 },
           { cle: 'quantiteApres', label: 'Stock', aligner: 'droite', rendu: (m) => el('span', { class: 'texte-2', style: { whiteSpace: 'nowrap' } }, `${ui.formatNombre(m.quantiteAvant)} → `, el('span', { class: 'texte-gras', style: { color: 'var(--texte)' } }, ui.formatNombre(m.quantiteApres))) },
           colMontant('valeur', 'Valeur', { rendu: (m) => el('span', { style: { whiteSpace: 'nowrap' }, title: `${ui.formatNombre(m.quantite)} × ${ui.formatMontant(m.prixUnitaire || 0)}` }, ui.formatMontant(m.valeur || 0)) }),
-          { cle: 'otNumero', label: 'OT', rendu: (m) => (m.otId ? lienVue('#/ot/' + m.otId, m.otNumero || 'OT #' + m.otId) : el('span', { class: 'texte-2' }, '—')) },
+          { cle: 'otNumero', label: 'OT', rendu: celluleOt },
           { cle: 'motif', label: 'Motif', rendu: (m) => tronque(m.fournisseurNom && m.type === 'entree' ? `${m.motif ? m.motif + ' · ' : ''}${m.fournisseurNom}` : (m.motif || ''), '180px') },
           { cle: 'userNom', label: 'Par', rendu: (m) => nowrap(m.userNom || '') },
         ],
@@ -688,7 +693,7 @@
         { label: 'Prix unitaire (CUMP)', valeur: ui.formatMontant(a.prixUnitaire) },
         { label: 'Seuil minimum', valeur: qte(a.seuilMin, a.uniteCode) },
         { label: 'Quantité de réapprovisionnement', valeur: qte(a.quantiteCommande, a.uniteCode) },
-        { label: 'À commander maintenant', valeur: a.sousSeuil && a.actif !== false ? el('span', { class: 'texte-danger texte-gras' }, qte(a.quantiteACommander, a.uniteCode)) : el('span', { class: 'texte-2' }, 'rien (stock au-dessus du seuil)') },
+        { label: 'À commander maintenant', valeur: a.sousSeuil && a.actif !== false ? el('span', { class: 'texte-danger texte-gras' }, qte(a.quantiteACommander, a.uniteCode)) : el('span', { class: 'texte-2' }, Number(a.seuilMin) > 0 ? 'rien (stock au-dessus du seuil)' : 'rien (aucun seuil défini : article non suivi)') },
         { label: 'Entrées sur 90 jours', valeur: qte(st.entrees90j || 0, a.uniteCode) },
       ])));
   }
@@ -703,7 +708,7 @@
         { cle: 'quantite', label: 'Quantité', aligner: 'droite', rendu: (m) => nowrap(mouvementSigne(m)), valeurTri: (m) => Number(m.ecart) || 0 },
         { cle: 'quantiteApres', label: 'Stock avant → après', aligner: 'droite', rendu: (m) => el('span', { class: 'texte-2', style: { whiteSpace: 'nowrap' } }, `${ui.formatNombre(m.quantiteAvant)} → `, el('span', { class: 'texte-gras', style: { color: 'var(--texte)' } }, ui.formatNombre(m.quantiteApres))) },
         colMontant('prixUnitaire', 'Prix unit.'),
-        { cle: 'otNumero', label: 'OT', rendu: (m) => (m.otId ? lienVue('#/ot/' + m.otId, m.otNumero || 'OT #' + m.otId) : el('span', { class: 'texte-2' }, '—')) },
+        { cle: 'otNumero', label: 'OT', rendu: celluleOt },
         { cle: 'motif', label: 'Motif', rendu: (m) => tronque(m.type === 'entree' && m.fournisseurNom ? `${m.motif ? m.motif + ' · ' : ''}${m.fournisseurNom}` : m.motif || '', '320px') },
         { cle: 'userNom', label: 'Par', rendu: (m) => nowrap(m.userNom || '') },
       ].filter(Boolean),
@@ -724,7 +729,7 @@
       const derniers = lignes.slice(0, 20).reverse();
       cont.appendChild(ui.carte(`Niveau de stock (${derniers.length} derniers mouvements)`, ui.graphiqueBarres(derniers.map((m) => ({
         label: ui.formatDate(m.date), valeur: Math.max(0, Number(m.quantiteApres) || 0),
-        couleur: Number(m.quantiteApres) <= Number(a.seuilMin) ? ROUGE : (TYPES[m.type] || {}).couleur,
+        couleur: Number(a.seuilMin) > 0 && Number(m.quantiteApres) <= Number(a.seuilMin) ? ROUGE : (TYPES[m.type] || {}).couleur,
       })), { hauteur: 170 }), { actions: el('span', { class: 'texte-2 texte-petit' }, 'Rouge : niveau au seuil ou en dessous') }));
     }
     cont.appendChild(el('div', { class: 'barre-outils' },
@@ -807,7 +812,7 @@
     if (a.description) html += `<h2>Description</h2><p style="white-space:pre-wrap">${esc(a.description)}</p>`;
     if ((a.equipements || []).length) html += `<h2>Équipements compatibles</h2><table><thead><tr><th>Numéro</th><th>Équipement</th><th>Secteur</th></tr></thead><tbody>${a.equipements.map((e) => `<tr><td>${esc(e.numero)}</td><td>${esc(e.nom)}</td><td>${esc(e.secteurId != null ? ui.cheminSecteur(e.secteurId) : '')}</td></tr>`).join('')}</tbody></table>`;
     const mv = (a.mouvements || []).slice(0, 20);
-    if (mv.length) html += `<h2>Derniers mouvements</h2><table><thead><tr><th>Date</th><th>Type</th><th>Quantité</th><th>Stock après</th><th>OT</th><th>Motif</th><th>Par</th></tr></thead><tbody>${mv.map((m) => `<tr><td>${esc(ui.formatDateHeure(m.date))}</td><td>${esc((TYPES[m.type] || {}).label || m.type)}</td><td>${esc(m.type === 'inventaire' ? '= ' + ui.formatNombre(m.quantite) : ((m.type === 'sortie' ? '−' : '+') + ui.formatNombre(m.quantite)))}</td><td>${esc(ui.formatNombre(m.quantiteApres))}</td><td>${esc(m.otNumero || '')}</td><td>${esc(m.motif || '')}</td><td>${esc(m.userNom || '')}</td></tr>`).join('')}</tbody></table>`;
+    if (mv.length) html += `<h2>Derniers mouvements</h2><table><thead><tr><th>Date</th><th>Type</th><th>Quantité</th><th>Stock après</th><th>OT</th><th>Motif</th><th>Par</th></tr></thead><tbody>${mv.map((m) => `<tr><td>${esc(ui.formatDateHeure(m.date))}</td><td>${esc((TYPES[m.type] || {}).label || m.type)}</td><td>${esc(m.type === 'inventaire' ? '= ' + ui.formatNombre(m.quantite) : ((m.type === 'sortie' ? '−' : '+') + ui.formatNombre(m.quantite)))}</td><td>${esc(ui.formatNombre(m.quantiteApres))}</td><td>${esc(m.otNumero || (m.otMasque ? 'Hors périmètre' : ''))}</td><td>${esc(m.motif || '')}</td><td>${esc(m.userNom || '')}</td></tr>`).join('')}</tbody></table>`;
     ui.imprimer(`Fiche article ${a.code}`, html);
   }
 

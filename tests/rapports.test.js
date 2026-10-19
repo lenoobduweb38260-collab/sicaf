@@ -143,7 +143,7 @@ describe('Rapports & historique', () => {
       assert.deepEqual(s.stock.consommationTop10, []);
       assert.deepEqual(s.equipements.nbPannes, []);
       assert.deepEqual(s.equipements.disponibilite, []);
-      assert.deepEqual(s.acces, { ot: true, demandes: true, stock: true, preventif: true, equipements: true, exporter: true });
+      assert.deepEqual(s.acces, { ot: true, demandes: true, stock: true, preventif: true, equipements: true, exporter: true, exporterOt: true, exporterStock: true });
       sansNaN(await c.ok('GET', '/api/rapports/synthese?du=2024-01-01&au=2024-12-31&technicienId=1'));
       assert.deepEqual(await c.ok('GET', '/api/rapports/historique'), []);
       const refs = await c.ok('GET', '/api/rapports/references');
@@ -509,6 +509,85 @@ describe('Rapports & historique', () => {
     assert.equal(chefH.length - 1, 3);
     // Lecteur sans accès aux OT
     assert.equal((await lecteur.get(`/api/rapports/export?type=equipements&${MARS}`)).status, 403);
+  });
+
+  // ----- Cohérence synthèse / fiche de vie, délais des demandes, droits d'export ------------------------------
+  test('fiche de vie : sur une période, même fenêtre d\'observation que la synthèse (MTBF identique)', async () => {
+    const s = await admin.ok('GET', `/api/rapports/synthese?${MARS}`);
+    // Presse : mêmes pannes (A, B, E) et mêmes arrêts dans les deux écrans → même MTBF, fenêtre = la période entière
+    const presseMars = await admin.ok('GET', `/api/rapports/equipement/${presse.id}?${MARS}`);
+    const dp = s.equipements.disponibilite.find((x) => x.equipementId === presse.id);
+    assert.deepEqual({ pannes: presseMars.totaux.nbPannes, arret: presseMars.totaux.heuresArret }, { pannes: dp.nbPannes, arret: dp.heuresArret });
+    assert.equal(presseMars.totaux.mtbfJours, dp.mtbfJours, `MTBF presse : fiche ${presseMars.totaux.mtbfJours} / synthèse ${dp.mtbfJours}`);
+    proche(presseMars.totaux.joursObserves, 31, 'période entière observée, même si le premier OT de la période est du 3 mars');
+    // Chariot : fenêtre bornée par la mise en service du 10 mars (la fiche retient en plus l'OT I, terminé en mars)
+    const chariotMars = await admin.ok('GET', `/api/rapports/equipement/${chariot.id}?${MARS}`);
+    const obsChariot = (new Date(2025, 3, 1) - new Date(2025, 2, 10)) / 3600000;
+    proche(chariotMars.totaux.joursObserves, 22, 'fenêtre bornée par la mise en service du 10 mars');
+    proche(chariotMars.totaux.mtbfJours, (obsChariot - chariotMars.totaux.heuresArret) / chariotMars.totaux.nbPannes / 24, 'MTBF chariot sur la fenêtre de la synthèse');
+    // Sans période (toute la durée de vie) : du premier OT connu (C, créé le 20 février) à maintenant
+    const vie = await admin.ok('GET', `/api/rapports/equipement/${presse.id}`);
+    assert.ok(Math.abs(vie.totaux.joursObserves - (Date.now() - new Date(2025, 1, 20, 9).getTime()) / 86400000) < 0.06, `durée de vie observée : ${vie.totaux.joursObserves}`);
+    assert.ok(vie.totaux.mtbfJours > 0);
+  });
+
+  test('respect des délais : pour un OT issu d\'une demande, le délai court depuis le dépôt de la demande', async () => {
+    const depot = new Date(Date.now() - 6 * 3600000).toISOString();
+    const creation = new Date(Date.now() - 3600000).toISOString();
+    const fin = new Date().toISOString();
+    const base = { equipementId: presse.id, secteurId: PROD, prioriteCode: 'urgente', createdAt: creation, dateDebut: creation, dateFin: fin, technicienId: tech1.id, techniciens: [tech1.id] };
+    const di = demande({ secteurId: PROD, equipementId: presse.id, statut: 'convertie', prioriteCode: 'urgente', dateDemande: depot, dateValidation: creation, validateurId: 1 });
+    const lie = ot('K', Object.assign({}, base, { demandeId: di.id }));
+    const seul = ot('L', Object.assign({}, base));
+    const parOtId = ot('M', Object.assign({}, base));
+    const di2 = demande({ secteurId: PROD, equipementId: presse.id, statut: 'convertie', prioriteCode: 'urgente', dateDemande: depot, dateValidation: creation, validateurId: 1, otId: parOtId.id });
+    try {
+      const q = `du=${jourLocal(-1)}&au=${jourLocal(1)}`;
+      const h = await admin.ok('GET', `/api/rapports/historique?${q}`);
+      assert.equal(h.find((x) => x.id === lie.id).dansDelai, false, '6 h depuis le dépôt de la demande > 4 h (urgente)');
+      assert.equal(h.find((x) => x.id === seul.id).dansDelai, true, '1 h depuis la création ≤ 4 h');
+      assert.equal(h.find((x) => x.id === parOtId.id).dansDelai, false, 'demande liée par son otId');
+      // La demande elle-même est jugée depuis son dépôt par le module Demandes : même verdict
+      const d = await admin.ok('GET', `/api/demandes/${di.id}`);
+      assert.ok(d.echeance < creation, 'échéance de la demande dépassée avant même la création de l\'OT');
+      const s = await admin.ok('GET', `/api/rapports/synthese?${q}`);
+      assert.equal(s.ot.nbEvaluesDelai, 3);
+      assert.equal(s.ot.nbDansDelai, 1);
+    } finally {
+      for (const o of [lie, seul, parOtId]) srv.db.remove('ot', o.id);
+      srv.db.remove('demandes', di.id); srv.db.remove('demandes', di2.id);
+    }
+  });
+
+  test('exports : le détail des OT exige ot.exporter, le stock stock.exporter ; la synthèse agrégée rapports.exporter seul', async () => {
+    const profils = await admin.ok('GET', '/api/profils');
+    const achId = profils.find((x) => x.nom === 'Acheteur / comptabilité').id;
+    // Profil par défaut Acheteur / comptabilité : ot.voir, rapports.exporter et stock.exporter, sans ot.exporter
+    await admin.ok('POST', '/api/utilisateurs', { login: 'acheteur', nom: 'Achats', prenom: 'Anne', profilId: achId, secteurIds: [PROD], password: 'test1234', doitChangerMdp: false });
+    await admin.ok('POST', '/api/utilisateurs', { login: 'acheteur2', nom: 'Achats', prenom: 'Sans stock', profilId: achId, secteurIds: [PROD], password: 'test1234', doitChangerMdp: false, overrides: { stock: { exporter: false } } });
+    const ach = srv.client(); await ach.login('acheteur', 'test1234');
+    const ach2 = srv.client(); await ach2.login('acheteur2', 'test1234');
+    assert.equal((await ach.get('/api/ot-export')).status, 403, 'le module OT refuse déjà l\'export à ce profil');
+    const nbEvenements = evenements.length;
+    for (const type of ['historique', 'equipements', 'techniciens', 'couts']) {
+      const r = await ach.get(`/api/rapports/export?type=${type}&${MARS}`);
+      assert.equal(r.status, 403, type);
+      assert.match(r.body.erreur, /Ordres de travail › Exporter/);
+    }
+    const fiche = await ach.get(`/api/rapports/export?type=fiche&equipementId=${presse.id}`);
+    assert.equal(fiche.status, 403);
+    assert.match(fiche.body.erreur, /Ordres de travail › Exporter/);
+    assert.equal(evenements.length, nbEvenements, 'aucun export réalisé');
+    assert.equal((await ach.get(`/api/rapports/export?type=synthese&${MARS}`)).status, 200, 'synthèse agrégée : rapports.exporter suffit');
+    assert.equal((await ach.get(`/api/rapports/export?type=stock&${MARS}`)).status, 200, 'consommation de pièces : stock.exporter');
+    const st2 = await ach2.get(`/api/rapports/export?type=stock&${MARS}`);
+    assert.equal(st2.status, 403);
+    assert.match(st2.body.erreur, /Exporter/);
+    const s = await ach.ok('GET', `/api/rapports/synthese?${MARS}`);
+    assert.deepEqual({ exporter: s.acces.exporter, exporterOt: s.acces.exporterOt, exporterStock: s.acces.exporterStock }, { exporter: true, exporterOt: false, exporterStock: true });
+    // Avec ot.exporter (chef de secteur), l'export détaillé reste possible dans sa portée
+    assert.equal((await chefProd.get(`/api/rapports/export?type=historique&${MARS}`)).status, 200);
+    assert.equal((await chefProd.ok('GET', `/api/rapports/synthese?${MARS}`)).acces.exporterOt, true);
   });
 
   // ----- Service publié et données de démonstration -------------------------------------------------------

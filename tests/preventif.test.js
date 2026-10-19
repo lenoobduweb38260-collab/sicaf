@@ -580,6 +580,81 @@ describe('Maintenance préventive', () => {
     assert.deepEqual(fiche.prochainesEcheances.slice(0, 3).map((x) => x.date), [2, 9, 16].map(jourLocal));
   });
 
+  test('échéancier : les occurrences projetées d\'un plan en retard partent de la réalisation attendue, jamais du passé', async () => {
+    const il = (j) => new Date(Date.now() - j * 86400000).toISOString();
+    // Compteur de la presse : 200 h il y a 100 jours, 1 200 h aujourd'hui (10 h par jour), comme à l'installation
+    srv.db.update('equipements', presse.id, { compteur: { valeur: 1200, unite: 'heures' }, compteurReleves: [{ date: il(100), valeur: 200 }, { date: il(0), valeur: 1200 }] });
+    const hebdo = await creerPlan({ nom: 'Hebdomadaire en retard de dix semaines', periodicite: { type: 'semaines', valeur: 1 }, prochaineEcheance: jourLocal(-70) });
+    const cpt = await creerPlan({ nom: 'Vidange en retard sur compteur', periodicite: { type: 'compteur', valeur: 300 }, prochaineEcheance: 700 });
+    try {
+      const occ = (await resp.ok('GET', '/api/preventif-echeances?jours=30')).filter((x) => x.planId === hebdo.id);
+      assert.equal(occ[0].occurrence, 0);
+      assert.equal(occ[0].date, jourLocal(-70));
+      assert.equal(occ[0].etat, 'en_retard');
+      assert.ok(occ[0].enRetard, 'seule l\'échéance dépassée est un retard');
+      assert.deepEqual(occ.slice(1).map((x) => x.date), [7, 14, 21, 28].map(jourLocal), 'projections à partir d\'aujourd\'hui, réalisation attendue de l\'échéance dépassée');
+      assert.ok(occ.slice(1).every((x) => x.date >= AUJ && !x.enRetard && x.etat === 'proche'), 'aucune projection dans le passé');
+      // Plan sur compteur en retard (échéance 700 h, compteur à 1 200 h) : seuils suivants au-delà du compteur actuel
+      const oc = (await resp.ok('GET', '/api/preventif-echeances?jours=100')).filter((x) => x.planId === cpt.id);
+      assert.equal(oc[0].valeurCompteur, 700);
+      assert.equal(oc[0].etat, 'en_retard');
+      assert.ok(oc.length >= 3, `occurrences sur compteur : ${oc.length}`);
+      assert.deepEqual(oc.slice(1, 3).map((x) => x.valeurCompteur), [1500, 1800]);
+      assert.deepEqual(oc.slice(1, 3).map((x) => x.date), [jourLocal(30), jourLocal(60)], 'estimées à 10 h par jour depuis aujourd\'hui');
+      assert.ok(oc.slice(1).every((x) => x.date >= AUJ), 'aucune projection sur compteur dans le passé');
+      // Fiche du plan : prochaines échéances cohérentes
+      const fiche = await resp.ok('GET', `/api/preventif/${hebdo.id}`);
+      assert.equal(fiche.prochainesEcheances[0].date, jourLocal(-70));
+      assert.ok(fiche.prochainesEcheances.slice(1).every((x) => x.date >= AUJ));
+    } finally { srv.db.remove('plansPreventifs', hebdo.id); srv.db.remove('plansPreventifs', cpt.id); }
+  });
+
+  test('réalisation remise en cause : réouverture, annulation ou suppression de l\'OT rétablit l\'état du plan', async () => {
+    const p = await creerPlan({ nom: 'Plan réalisé puis remis en cause', prochaineEcheance: jourLocal(2), derniereExecution: jourLocal(-28) });
+    const { ot } = await resp.ok('POST', `/api/preventif/${p.id}/generer`, {});
+    await resp.ok('POST', `/api/ot/${ot.id}/cloturer`, { rapport: 'Gamme réalisée.' });
+    let plan = srv.db.get('plansPreventifs', p.id);
+    assert.equal(plan.derniereExecution, AUJ);
+    assert.equal(plan.dernierOtId, ot.id);
+    assert.deepEqual(plan.realisationPrecedente, { derniereExecution: jourLocal(-28), derniereExecutionDate: jourLocal(-28), prochaineEcheance: jourLocal(2), dernierOtId: null }, 'état antérieur mémorisé');
+    // Réouverture de l'OT : la maintenance n'est plus considérée comme faite
+    const nbEvt = evenements.length;
+    await resp.ok('POST', `/api/ot/${ot.id}/reouvrir`, { motif: 'Clôturée par erreur' });
+    plan = srv.db.get('plansPreventifs', p.id);
+    assert.deepEqual({ d: plan.derniereExecution, dd: plan.derniereExecutionDate, e: plan.prochaineEcheance, o: plan.dernierOtId, m: plan.realisationPrecedente }, { d: jourLocal(-28), dd: jourLocal(-28), e: jourLocal(2), o: null, m: null });
+    assert.ok(auditDe('modification', p.id).some((a) => /réalisation annulée/.test(a.details) && /réouvert/.test(a.details)), 'journal d\'activité');
+    assert.ok(evenements.slice(nbEvt).some((x) => x.evt === 'preventif:modifie' && x.data.plan.id === p.id && x.data.champsModifies.includes('prochaineEcheance')));
+    assert.equal((await resp.ok('GET', `/api/preventif/${p.id}`)).etat, 'proche');
+    // Annulation de l'OT réouvert : l'état rétabli est conservé ; une nouvelle génération reste possible
+    await resp.ok('POST', `/api/ot/${ot.id}/statut`, { statut: 'annule', commentaire: 'Sans objet' });
+    plan = srv.db.get('plansPreventifs', p.id);
+    assert.deepEqual({ d: plan.derniereExecution, e: plan.prochaineEcheance, o: plan.dernierOtId }, { d: jourLocal(-28), e: jourLocal(2), o: null });
+    const { ot: ot2 } = await resp.ok('POST', `/api/preventif/${p.id}/generer`, {});
+    await resp.ok('POST', `/api/ot/${ot2.id}/cloturer`, { rapport: 'Gamme réalisée.' });
+    plan = srv.db.get('plansPreventifs', p.id);
+    assert.deepEqual({ d: plan.derniereExecution, e: plan.prochaineEcheance, o: plan.dernierOtId }, { d: AUJ, e: ajouterPeriode(AUJ, { type: 'mois', valeur: 1 }), o: ot2.id });
+    // Sans état mémorisé (données plus anciennes) et sans autre OT terminé : retour à l'échéance de génération de l'OT
+    srv.db.update('plansPreventifs', p.id, { realisationPrecedente: null });
+    await resp.ok('POST', `/api/ot/${ot2.id}/reouvrir`, { motif: 'Reprise' });
+    plan = srv.db.get('plansPreventifs', p.id);
+    assert.deepEqual({ d: plan.derniereExecution, e: plan.prochaineEcheance, o: plan.dernierOtId }, { d: null, e: jourLocal(2), o: null });
+    await resp.ok('POST', `/api/ot/${ot2.id}/cloturer`, { rapport: 'Gamme réalisée, pour de bon.' });
+    assert.equal(srv.db.get('plansPreventifs', p.id).dernierOtId, ot2.id);
+    // Sans état mémorisé mais avec un OT terminé précédent : recalcul depuis cette réalisation
+    const q = await creerPlan({ nom: 'Plan à deux réalisations', prochaineEcheance: jourLocal(1) });
+    const { ot: otA } = await resp.ok('POST', `/api/preventif/${q.id}/generer`, {});
+    await resp.ok('POST', `/api/ot/${otA.id}/cloturer`, { rapport: 'Première réalisation.' });
+    const { ot: otB } = await resp.ok('POST', `/api/preventif/${q.id}/generer`, {});
+    await resp.ok('POST', `/api/ot/${otB.id}/cloturer`, { rapport: 'Seconde réalisation.' });
+    srv.db.update('plansPreventifs', q.id, { realisationPrecedente: null });
+    await resp.ok('POST', `/api/ot/${otB.id}/reouvrir`, { motif: 'Reprise' });
+    plan = srv.db.get('plansPreventifs', q.id);
+    assert.deepEqual({ d: plan.derniereExecution, e: plan.prochaineEcheance, o: plan.dernierOtId }, { d: AUJ, e: ajouterPeriode(AUJ, { type: 'mois', valeur: 1 }), o: otA.id });
+    // Un changement de statut d'un OT qui n'est pas celui de la dernière réalisation ne change rien
+    srv.ctx.emit('ot:statut', { id: otB.id, numero: otB.numero, planPreventifId: q.id, statut: 'annule', ancien: 'en_cours', nouveau: 'annule' });
+    assert.deepEqual({ d: srv.db.get('plansPreventifs', q.id).derniereExecution, o: srv.db.get('plansPreventifs', q.id).dernierOtId }, { d: AUJ, o: otA.id });
+  });
+
   test('export CSV', async () => {
     await creerPlan({ nom: 'Plan exporté ; avec "guillemets"' });
     const r = await resp.get('/api/preventif-export');

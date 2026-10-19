@@ -13,7 +13,9 @@
  * Événements émis    : 'demande:soumise', 'demande:validee', 'demande:refusee', 'demande:convertie',
  *                      'demande:cloturee', 'demande:reouverte' (charge utile : la demande)
  * Événements écoutés : 'ot:termine' (clôture la DI liée si config.workflow.cloturerDemandeAvecOt),
- *                      'ot:cree' (synchronise otId / statut « convertie »), 'ot:annule' (la DI redevient validée)
+ *                      'ot:cree' (synchronise otId / statut « convertie »), 'ot:annule' (la DI redevient validée,
+ *                      y compris après une clôture automatique), 'ot:statut' (OT réouvert → la DI validée
+ *                      redevient « convertie »)
  */
 const nom = 'Demandes d\'intervention';
 const ENTITE = 'demandes';
@@ -59,6 +61,7 @@ function resoudreStatuts(liste) {
 const LIBELLES_ETAPES = {
   creation: 'Demande soumise', validation: 'Demande validée', refus: 'Demande refusée', conversion: 'Convertie en ordre de travail',
   cloture: 'Demande clôturée', reouverture: 'Demande réouverte', modification: 'Demande modifiée', ot_annule: 'Ordre de travail annulé',
+  ot_reouvert: 'Ordre de travail réouvert', pj_supprimee: 'Pièce jointe supprimée',
 };
 const LIBELLES_CHAMPS = { titre: 'titre', description: 'description', equipementId: 'équipement', secteurId: 'secteur', prioriteCode: 'priorité', typeCode: 'type', arretProduction: 'arrêt de production', demandeurId: 'demandeur', dateDemande: 'date', champs: 'champs personnalisés' };
 
@@ -69,8 +72,10 @@ function jourLocal(v) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+/** Cellule CSV : guillemets si nécessaire et neutralisation des formules (=, +, -, @, tabulation) à l'ouverture dans un tableur. */
 function csvEscape(v) {
-  const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
+  let s = v == null ? '' : String(v).replace(/\r\n|\r|\n/g, ' ');
+  if (/^[=+\-@\t]/.test(s) && Number.isNaN(Number(s.replace(',', '.')))) s = '\'' + s;
   return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
@@ -115,7 +120,11 @@ function register(ctx) {
   const scope = (req, rows) => (rows || []).filter((d) => visible(req, d));
   function getVisible(req, id) {
     const d = db.get(ENTITE, id);
-    if (!d || !visible(req, d)) throw new HttpError(404, 'Demande introuvable');
+    if (!d || !visible(req, d)) {
+      // Demande d'un site accessible en lecture seule : message explicite plutôt qu'un « introuvable »
+      if (d && req.ecriture && perms.canSeeRecord(req.perms, req.user, d)) throw new HttpError(403, 'Ce site est accessible en lecture seule pour vous : modification impossible');
+      throw new HttpError(404, 'Demande introuvable');
+    }
     return d;
   }
   /** Visibilité d'un équipement (déléguée au module Équipements lorsqu'il est présent). */
@@ -142,7 +151,8 @@ function register(ctx) {
     wf = wf || ctx.config().workflow || {};
     const dem = demandeurDe(d);
     const estSuperieur = !!(dem && dem.managerId != null && Number(dem.managerId) === user.id);
-    if (!estSuperieur && !perms.canSeeRecord(p, user, d)) return false;
+    // Valider est une écriture : une demande d'un site accessible en lecture seule n'est pas validable
+    if (!estSuperieur && !perms.canSeeRecord(p, user, d, { ecriture: true })) return false;
     if (wf.validerParSuperieurUniquement && !p.estAdmin && !estSuperieur) return false;
     return true;
   }
@@ -186,8 +196,15 @@ function register(ctx) {
     if (!ot) return null;
     return { id: ot.id, numero: ot.numero, titre: ot.titre, statut: ot.statut, technicienId: ot.technicienId == null ? null : ot.technicienId, datePrevue: ot.datePrevue || null, dateDebut: ot.dateDebut || null, dateFin: ot.dateFin || null, dateCloture: ot.dateCloture || null };
   }
-  function resumeDoc(doc, index) {
-    return { index, nom: doc.nom, type: doc.type, taille: doc.taille, date: doc.date, userId: doc.userId, userNom: ctx.nomUser(doc.userId), description: doc.description || '' };
+  /** Une pièce jointe n'est retirée que par son auteur, un valideur habilité ou un administrateur (`actions` : actionsPossibles). */
+  function peutSupprimerPj(req, doc, actions) {
+    if (!actions || !actions.joindre) return false;
+    return Number(doc.userId) === req.user.id || !!(req.perms && req.perms.estAdmin) || perms.can(req.perms, ENTITE, 'valider');
+  }
+  function resumeDoc(doc, index, req, actions) {
+    const out = { index, nom: doc.nom, type: doc.type, taille: doc.taille, date: doc.date, userId: doc.userId, userNom: ctx.nomUser(doc.userId), description: doc.description || '' };
+    if (req && actions) out.supprimable = peutSupprimerPj(req, doc, actions);
+    return out;
   }
   function enrichCommentaire(c) { return Object.assign({}, c, { userNom: ctx.nomUser(c.userId) }); }
   function cheminSecteur(id) {
@@ -195,24 +212,55 @@ function register(ctx) {
     while (cur && !vus.has(cur.id)) { parts.unshift(cur.nom); vus.add(cur.id); cur = cur.parentId != null ? db.get('secteurs', cur.parentId) : null; }
     return parts.join(' › ');
   }
+  /** Élément de la liste `statutsOT` d'un OT (liste mémorisée dans le cache d'une requête). */
+  function statutOt(o, cache) {
+    if (!o) return null;
+    const l = cache && cache.statutsOT ? cache.statutsOT : ctx.liste('statutsOT');
+    if (cache && !cache.statutsOT) cache.statutsOT = l;
+    return l.find((x) => x.code === o.statut) || null;
+  }
+  /** Un OT est-il clôturé (statut final de la liste `statutsOT`) ? */
+  function otFinal(o, cache) { const s = statutOt(o, cache); return !!(s && s.final); }
   /** Un OT est-il annulé (statut final de la liste `statutsOT` correspondant à une annulation) ? */
-  function otAnnule(o) {
-    const s = o ? ctx.liste('statutsOT').find((x) => x.code === o.statut) : null;
+  function otAnnule(o, cache) {
+    const s = statutOt(o, cache);
     return !!(s && s.final && (s.code === 'annule' || /annul/i.test(s.label || '')));
   }
   /**
-   * OT lié à la demande : par `otId`, sinon par `demandeId` côté OT (lien persisté à la volée). Un OT annulé n'est pas rattaché (la demande
-   * redevient « validée » et peut être reconvertie) ; `inclureAnnules` le retourne tout de même (ex. pour
-   * interdire la suppression d'une demande encore référencée).
+   * Index des OT pour une requête : par identifiant et, pour les OT encore ouverts, par demande d'origine.
+   * Construit une seule fois par liste ou export (au lieu d'un parcours de la collection par demande).
    */
-  function otLie(d, { inclureAnnules = false } = {}) {
-    let ot = d.otId != null ? db.get('ot', d.otId) : null;
+  function indexOt(cache) {
+    if (cache.ots) return cache.ots;
+    const parId = new Map(); const ouvertsParDemande = new Map();
+    for (const o of db.list('ot')) {
+      parId.set(o.id, o);
+      if (o.demandeId != null && !otFinal(o, cache)) { const k = Number(o.demandeId); if (!ouvertsParDemande.has(k)) ouvertsParDemande.set(k, o); }
+    }
+    cache.ots = { parId, ouvertsParDemande };
+    return cache.ots;
+  }
+  /**
+   * OT lié à la demande : par `otId`, sinon un OT encore ouvert qui la référence (`demandeId`). Un OT clôturé ou
+   * annulé non référencé par `otId` est une intervention passée (demande réouverte) : il n'est pas rattaché ;
+   * `inclureAnnules` retourne tout OT référençant la demande (ex. pour interdire sa suppression). Aucune
+   * écriture ici : le lien `otId` est posé par les écouteurs d'événements et par la reprise au démarrage.
+   */
+  function otLie(d, { inclureAnnules = false, cache = null } = {}) {
+    let ot = null;
+    if (d.otId != null) ot = cache ? (indexOt(cache).parId.get(Number(d.otId)) || null) : db.get('ot', d.otId);
     if (!ot) {
-      ot = db.findOne('ot', (o) => Number(o.demandeId) === d.id && !otAnnule(o));
-      if (ot && d.otId == null) db.update(ENTITE, d.id, { otId: ot.id });
+      ot = cache ? (indexOt(cache).ouvertsParDemande.get(d.id) || null) : db.findOne('ot', (o) => Number(o.demandeId) === d.id && !otFinal(o));
       if (!ot && inclureAnnules) ot = db.findOne('ot', (o) => Number(o.demandeId) === d.id);
     }
     return ot;
+  }
+  /** Équipement d'une demande (table construite une fois par requête). */
+  function equipementDe(id, cache) {
+    if (id == null) return null;
+    if (!cache) return db.get('equipements', id);
+    if (!cache.equipements) cache.equipements = new Map(db.list('equipements').map((e) => [e.id, e]));
+    return cache.equipements.get(Number(id)) || null;
   }
   function demandeLieeA(ot) {
     if (!ot || ot.id == null) return null;
@@ -256,8 +304,8 @@ function register(ctx) {
     const finaux = cache.finaux || (cache.finaux = codesFinaux());
     const wf = cache.wf || (cache.wf = ctx.config().workflow || {});
     const { pieceJointes, commentaires, historique, ...reste } = d;
-    const e = d.equipementId != null ? db.get('equipements', d.equipementId) : null;
-    const ot = otLie(d);
+    const e = equipementDe(d.equipementId, cache);
+    const ot = otLie(d, { cache });
     const echeance = echeanceDe(d, priorites);
     const final = finaux.has(d.statut);
     return Object.assign(reste, {
@@ -274,9 +322,11 @@ function register(ctx) {
     });
   }
   function detail(req, d) {
-    const e = d.equipementId != null ? db.get('equipements', d.equipementId) : null;
-    const base = resume(req, d);
-    const ot = otLie(d);
+    const cache = {};
+    const e = equipementDe(d.equipementId, cache);
+    const base = resume(req, d, cache);
+    const ot = otLie(d, { cache });
+    const actions = actionsPossibles(req, d);
     return Object.assign(base, {
       description: d.description || '',
       equipement: e ? { id: e.id, numero: e.numero, nom: e.nom, typeCode: e.typeCode, etatCode: e.etatCode, criticiteCode: e.criticiteCode, secteurId: e.secteurId == null ? null : e.secteurId, localisation: e.localisation || '', parentId: e.parentId == null ? null : e.parentId, actif: e.actif !== false } : null,
@@ -284,10 +334,10 @@ function register(ctx) {
       demandeur: miniUser(demandeurDe(d)),
       validateur: miniUser(d.validateurId != null ? db.get('users', d.validateurId) : null),
       commentaires: (d.commentaires || []).map(enrichCommentaire),
-      pieceJointes: (d.pieceJointes || []).map(resumeDoc),
+      pieceJointes: (d.pieceJointes || []).map((p, i) => resumeDoc(p, i, req, actions)),
       historique: (d.historique || []).map((h) => Object.assign({}, h, { userNom: h.userId != null ? ctx.nomUser(h.userId) : 'Système' })),
       valideurs: d.statut === st().soumise ? valideursAttendus(d).map(miniUser) : [],
-      actions: actionsPossibles(req, d),
+      actions,
     });
   }
 
@@ -334,23 +384,45 @@ function register(ctx) {
     out.typeCode = codeValide('typesIntervention', b.typeCode, existant ? existant.typeCode : undefined, 'correctif', 'Type d\'intervention');
     out.arretProduction = b.arretProduction === undefined ? (existant ? !!existant.arretProduction : false) : !!b.arretProduction;
 
-    // Demandeur : l'utilisateur courant, sauf si le créateur a le droit « modifier » et en désigne un autre
+    // Demandeur : l'utilisateur courant, sauf si l'auteur a le droit « modifier » (encadrant) et en désigne un autre
     const peutDesigner = perms.can(req.perms, ENTITE, 'modifier');
     if (b.demandeurId !== undefined && b.demandeurId !== null && b.demandeurId !== '') {
       const u = db.get('users', Number(b.demandeurId));
       if (!u) throw new HttpError(400, 'Demandeur invalide');
-      if (!peutDesigner && u.id !== req.user.id) throw new HttpError(403, 'Vous ne pouvez pas créer une demande au nom d\'un autre utilisateur');
+      const inchange = existant && Number(existant.demandeurId) === u.id;
+      if (u.id !== req.user.id && !inchange) {
+        if (!peutDesigner) throw new HttpError(403, existant ? 'Vous ne pouvez pas changer le demandeur de cette demande' : 'Vous ne pouvez pas créer une demande au nom d\'un autre utilisateur');
+        verifierDemandeurDesigne(req, u, existant);
+      }
       out.demandeurId = u.id;
     } else if (!existant) out.demandeurId = req.user.id;
 
     if (b.dateDemande !== undefined && b.dateDemande !== null && b.dateDemande !== '' && peutDesigner) {
       const dt = new Date(b.dateDemande);
       if (Number.isNaN(dt.getTime())) throw new HttpError(400, 'Date de demande invalide');
+      if (dt.getTime() > Date.now() + 5 * 60000) throw new HttpError(400, 'La date de la demande ne peut pas être dans le futur');
       out.dateDemande = dt.toISOString();
     } else if (!existant) out.dateDemande = new Date().toISOString();
 
     if (b.champs !== undefined || !existant) out.champs = ctx.champsPerso(ENTITE, b.champs || (existant && existant.champs) || {});
     return out;
+  }
+  /**
+   * Désignation d'un autre demandeur : compte actif, dans le périmètre de l'auteur (secteurs modifiables, site courant ;
+   * un subordonné direct l'est toujours) et, quand la validation est réservée au supérieur hiérarchique, le demandeur
+   * d'une demande soumise n'est changé que par son N+1 ou un administrateur : la réattribuer à son propre subordonné
+   * ne permet pas de devenir son valideur.
+   */
+  function verifierDemandeurDesigne(req, u, existant) {
+    const p = req.perms || {};
+    if (u.actif === false) throw new HttpError(400, `Le compte de ${ctx.nomUser(u.id)} est désactivé : il ne peut pas être désigné comme demandeur`);
+    const subordonne = u.managerId != null && Number(u.managerId) === req.user.id;
+    if (!p.estAdmin && p.portee !== 'tous' && !subordonne && !ctx.utilisateurVisible(req.user, p, u, true)) throw new HttpError(403, `${ctx.nomUser(u.id)} n'est pas dans votre périmètre : vous ne pouvez pas le désigner comme demandeur`);
+    if (!existant || existant.statut !== st().soumise || p.estAdmin) return;
+    const wf = ctx.config().workflow || {};
+    if (!wf.validerParSuperieurUniquement) return;
+    const dem = demandeurDe(existant);
+    if (!(dem && dem.managerId != null && Number(dem.managerId) === req.user.id)) throw new HttpError(403, 'La validation est réservée au supérieur hiérarchique : seul le supérieur du demandeur actuel (ou un administrateur) peut changer le demandeur d\'une demande soumise');
   }
   function validerPieceJointe(b, req) {
     if (!b || typeof b !== 'object') throw new HttpError(400, 'Pièce jointe invalide');
@@ -484,15 +556,16 @@ function register(ctx) {
 
   router.get('/api/demandes-export', async (req, res) => {
     const rows = filtrer(req);
+    const cache = {};
     const cols = [
       ['Numéro', (d) => d.numero], ['Titre', (d) => d.titre], ['Statut', (d) => libelleStatut(d.statut)],
       ['Priorité', (d) => { const p = ctx.liste('priorites').find((x) => x.code === d.prioriteCode); return p ? p.label : d.prioriteCode; }],
       ['Type', (d) => { const t = ctx.liste('typesIntervention').find((x) => x.code === d.typeCode); return t ? t.label : d.typeCode; }],
-      ['Équipement', (d) => { const e = d.equipementId != null ? db.get('equipements', d.equipementId) : null; return e ? `${e.numero || ''} ${e.nom}`.trim() : ''; }],
+      ['Équipement', (d) => { const e = equipementDe(d.equipementId, cache); return e ? `${e.numero || ''} ${e.nom}`.trim() : ''; }],
       ['Secteur', (d) => cheminSecteur(d.secteurId)], ['Demandeur', (d) => ctx.nomUser(d.demandeurId)],
       ['Date de la demande', (d) => d.dateDemande || d.createdAt || ''], ['Arrêt de production', (d) => (d.arretProduction ? 'Oui' : 'Non')],
       ['Validateur', (d) => ctx.nomUser(d.validateurId)], ['Date de validation', (d) => d.dateValidation || ''], ['Motif de refus', (d) => d.motifRefus || ''],
-      ['OT lié', (d) => { const ot = otLie(d); return ot ? ot.numero : ''; }], ['Date de clôture', (d) => d.dateCloture || ''],
+      ['OT lié', (d) => { const ot = otLie(d, { cache }); return ot ? ot.numero : ''; }], ['Date de clôture', (d) => d.dateCloture || ''],
       ['Description', (d) => d.description || ''],
     ];
     for (const cp of ((ctx.config().champsPersonnalises || {})[ENTITE] || [])) cols.push([cp.label, (d) => ((d.champs || {})[cp.cle] == null ? '' : (d.champs || {})[cp.cle])]);
@@ -625,7 +698,14 @@ function register(ctx) {
     const commentaire = texteCommentaire(req.body, 'commentaire', false, 'Le commentaire');
     const patch = { dateCloture: null };
     if (d.statut === st().refusee) { patch.statut = st().soumise; patch.validateurId = null; patch.dateValidation = null; patch.motifRefus = ''; }
-    else { const ot = otLie(d); patch.statut = ot ? st().convertie : (d.dateValidation ? st().validee : st().soumise); }
+    else {
+      // Un OT terminé ne peut pas « redevenir » l'intervention en cours : il est réouvert d'abord (la demande suit alors
+      // le circuit normal), sinon une nouvelle demande est créée. Un OT annulé n'est plus rattaché.
+      const ot = otLie(d);
+      if (ot && otFinal(ot) && !otAnnule(ot)) throw new HttpError(400, `L'ordre de travail ${ot.numero || ot.id} lié à cette demande est terminé : réouvrez d'abord l'ordre de travail, puis la demande ; sinon créez une nouvelle demande`);
+      if (ot && !otAnnule(ot)) patch.statut = st().convertie;
+      else { patch.statut = d.dateValidation ? st().validee : st().soumise; patch.otId = null; }
+    }
     patch.historique = (d.historique || []).concat([entree(req, 'reouverture', patch.statut, commentaire)]);
     const maj = db.update(ENTITE, d.id, patch);
     ctx.audit(req, 'reouverture', ENTITE, d.id, `Demande ${d.numero} réouverte (${libelleStatut(maj.statut)})${commentaire ? ' : ' + commentaire : ''}`);
@@ -662,7 +742,8 @@ function register(ctx) {
     const doc = validerPieceJointe(req.body, req);
     const maj = db.update(ENTITE, d.id, { pieceJointes: docs.concat([doc]) });
     ctx.audit(req, 'document', ENTITE, d.id, `Pièce jointe ajoutée à ${d.numero} : ${doc.nom} (${Math.round(doc.taille / 1024)} Ko)`);
-    return { ok: true, document: resumeDoc(doc, maj.pieceJointes.length - 1), pieceJointes: maj.pieceJointes.map(resumeDoc) };
+    const actions = actionsPossibles(req, maj);
+    return { ok: true, document: resumeDoc(doc, maj.pieceJointes.length - 1, req, actions), pieceJointes: maj.pieceJointes.map((p, i) => resumeDoc(p, i, req, actions)) };
   }, { perm: [ENTITE, 'voir'] });
 
   router.get('/api/demandes/:id/documents/:index', async (req, res) => {
@@ -685,13 +766,17 @@ function register(ctx) {
 
   router.delete('/api/demandes/:id/documents/:index', async (req) => {
     const d = getVisible(req, req.params.id);
-    if (!actionsPossibles(req, d).joindre) throw new HttpError(403, 'Vous ne pouvez pas supprimer de pièce jointe sur cette demande');
+    const actions = actionsPossibles(req, d);
+    if (!actions.joindre) throw new HttpError(403, 'Vous ne pouvez pas supprimer de pièce jointe sur cette demande');
     const idx = indexPj(req, d);
     const docs = d.pieceJointes.slice();
-    const [sup] = docs.splice(idx, 1);
-    const maj = db.update(ENTITE, d.id, { pieceJointes: docs });
-    ctx.audit(req, 'document', ENTITE, d.id, `Pièce jointe supprimée de ${d.numero} : ${sup.nom}`);
-    return { ok: true, pieceJointes: maj.pieceJointes.map(resumeDoc) };
+    const sup = docs[idx];
+    if (!peutSupprimerPj(req, sup, actions)) throw new HttpError(403, 'Vous ne pouvez supprimer que les pièces jointes que vous avez ajoutées');
+    docs.splice(idx, 1);
+    const auteur = sup.userId != null && Number(sup.userId) !== req.user.id ? ` (ajoutée par ${ctx.nomUser(sup.userId)})` : '';
+    const maj = db.update(ENTITE, d.id, { pieceJointes: docs, historique: (d.historique || []).concat([entree(req, 'pj_supprimee', null, `${sup.nom}${auteur}`)]) });
+    ctx.audit(req, 'document', ENTITE, d.id, `Pièce jointe supprimée de ${d.numero} : ${sup.nom}${auteur}`);
+    return { ok: true, pieceJointes: maj.pieceJointes.map((p, i) => resumeDoc(p, i, req, actions)) };
   }, { perm: [ENTITE, 'voir'] });
 
   // ----- Événements inter-modules -------------------------------------------
@@ -706,11 +791,31 @@ function register(ctx) {
     const d = demandeLieeA(ot);
     if (!d || estFinal(d)) return;
     const now = new Date().toISOString();
-    const maj = db.update(ENTITE, d.id, { statut: st().cloturee, dateCloture: now, otId: d.otId == null ? ot.id : d.otId, historique: (d.historique || []).concat([entree(null, 'cloture', st().cloturee, `Clôture automatique : ordre de travail ${ot.numero || ot.id} terminé`)]) });
+    const maj = db.update(ENTITE, d.id, { statut: st().cloturee, dateCloture: now, otId: d.otId == null ? ot.id : d.otId, historique: (d.historique || []).concat([Object.assign(entree(null, 'cloture', st().cloturee, `Clôture automatique : ordre de travail ${ot.numero || ot.id} terminé`), { otId: ot.id, auto: true })]) });
     ctx.audit(null, 'cloture', ENTITE, d.id, `Demande ${d.numero} clôturée automatiquement (OT ${ot.numero || ot.id} terminé)`);
     if (maj.demandeurId != null) ctx.notify([maj.demandeurId], { titre: `Demande ${maj.numero} clôturée`, message: `L'intervention ${ot.numero || ot.id} est terminée${ot.rapport ? ' — ' + String(ot.rapport).slice(0, 200) : ''}`, lien: `#/demandes/${maj.id}`, type: 'info' });
     ctx.emit('demande:cloturee', maj);
   });
+
+  /** Rattache un OT (créé ou réouvert) à la demande : lien `otId`, statut « convertie » si elle était soumise ou validée. */
+  function rattacherOt(d, ot, action, commentaire, userId) {
+    const patch = {};
+    if (d.otId == null || Number(d.otId) !== Number(ot.id)) patch.otId = ot.id;
+    if (d.statut === st().soumise || d.statut === st().validee) {
+      patch.statut = st().convertie;
+      if (!d.dateValidation) { patch.dateValidation = new Date().toISOString(); patch.validateurId = userId == null ? null : userId; }
+      patch.historique = (d.historique || []).concat([Object.assign(entree(null, action, st().convertie, commentaire), { otId: ot.id, userId: userId == null ? null : userId })]);
+    }
+    return Object.keys(patch).length ? db.update(ENTITE, d.id, patch) : null;
+  }
+  /** La demande a-t-elle été clôturée automatiquement par la clôture de cet OT (et non à la main) ? */
+  function clotureeParOt(d, ot) {
+    const h = (d.historique || []).slice().reverse().find((x) => x.action === 'cloture');
+    if (!h || h.userId != null) return false;
+    return h.otId == null ? /automatique/i.test(h.commentaire || '') : Number(h.otId) === Number(ot.id);
+  }
+  /** Statut d'OT final (liste `statutsOT`) ? */
+  const codeOtFinal = (code) => { const s = ctx.liste('statutsOT').find((x) => x.code === code); return !!(s && s.final); };
 
   /** OT créé depuis une demande (par le module OT lui-même) → synchronisation du lien et du statut. */
   ctx.on('ot:cree', (data) => {
@@ -718,25 +823,68 @@ function register(ctx) {
     if (!ot || ot.id == null || ot.demandeId == null) return;
     const d = db.get(ENTITE, ot.demandeId);
     if (!d || (d.otId != null && Number(d.otId) !== Number(ot.id))) return;
-    const patch = {};
-    if (d.otId == null) patch.otId = ot.id;
-    if (d.statut === st().soumise || d.statut === st().validee) {
-      patch.statut = st().convertie;
-      if (!d.dateValidation) { patch.dateValidation = new Date().toISOString(); patch.validateurId = ot.createdBy == null ? null : ot.createdBy; }
-      patch.historique = (d.historique || []).concat([Object.assign(entree(null, 'conversion', st().convertie, `Ordre de travail ${ot.numero || ot.id} créé depuis la demande`), { otId: ot.id, userId: ot.createdBy == null ? null : ot.createdBy })]);
-    }
-    if (Object.keys(patch).length) db.update(ENTITE, d.id, patch);
+    rattacherOt(d, ot, 'conversion', `Ordre de travail ${ot.numero || ot.id} créé depuis la demande`, ot.createdBy);
   });
 
-  /** OT annulé → la demande convertie redevient validée (pour être reconvertie ou clôturée). */
+  /**
+   * OT annulé → la demande convertie redevient validée (pour être reconvertie ou clôturée) ; une demande clôturée
+   * automatiquement par cet OT (OT terminé puis réouvert et annulé) redevient validée elle aussi ; une clôture
+   * manuelle (problème disparu) est conservée.
+   */
   ctx.on('ot:annule', (data) => {
     const ot = otDe(data);
     const d = demandeLieeA(ot);
-    if (!d || d.statut !== st().convertie) return;
-    const maj = db.update(ENTITE, d.id, { statut: st().validee, otId: null, historique: (d.historique || []).concat([entree(null, 'ot_annule', st().validee, `Ordre de travail ${ot.numero || ot.id} annulé : la demande redevient validée`)]) });
+    if (!d || (d.otId != null && Number(d.otId) !== Number(ot.id))) return;
+    const convertie = d.statut === st().convertie;
+    if (!convertie && !(d.statut === st().cloturee && clotureeParOt(d, ot))) return;
+    const commentaire = convertie ? `Ordre de travail ${ot.numero || ot.id} annulé : la demande redevient validée` : `Ordre de travail ${ot.numero || ot.id} annulé après la clôture automatique : la demande redevient validée`;
+    const maj = db.update(ENTITE, d.id, { statut: st().validee, otId: null, dateCloture: null, historique: (d.historique || []).concat([entree(null, 'ot_annule', st().validee, commentaire)]) });
     ctx.audit(null, 'statut', ENTITE, d.id, `Demande ${d.numero} : OT ${ot.numero || ot.id} annulé, retour au statut validée`);
-    if (maj.demandeurId != null) ctx.notify([maj.demandeurId], { titre: `Demande ${maj.numero} : intervention annulée`, message: `L'ordre de travail ${ot.numero || ot.id} a été annulé ; votre demande reste validée`, lien: `#/demandes/${maj.id}`, type: 'alerte' });
+    if (maj.demandeurId != null) ctx.notify([maj.demandeurId], { titre: `Demande ${maj.numero} : intervention annulée`, message: `L'ordre de travail ${ot.numero || ot.id} a été annulé ; votre demande ${convertie ? 'reste' : 'redevient'} validée`, lien: `#/demandes/${maj.id}`, type: 'alerte' });
+    if (!convertie) ctx.emit('demande:reouverte', maj);
   });
+
+  /** OT réouvert (statut final → ouvert) → la demande validée (ou soumise) qu'il réalise redevient « convertie ». */
+  ctx.on('ot:statut', (data) => {
+    const ot = otDe(data);
+    if (!ot || ot.id == null || !data || data.ancien == null || data.nouveau == null) return;
+    if (!codeOtFinal(data.ancien) || codeOtFinal(data.nouveau)) return;
+    const d = demandeLieeA(ot);
+    if (!d || (d.otId != null && Number(d.otId) !== Number(ot.id))) return;
+    if (d.statut !== st().validee && d.statut !== st().soumise) return;
+    const maj = rattacherOt(d, ot, 'ot_reouvert', `Ordre de travail ${ot.numero || ot.id} réouvert : la demande est de nouveau en cours de traitement`, null);
+    if (!maj) return;
+    ctx.audit(null, 'statut', ENTITE, d.id, `Demande ${d.numero} : OT ${ot.numero || ot.id} réouvert, retour au statut convertie`);
+    if (maj.demandeurId != null) ctx.notify([maj.demandeurId], { titre: `Demande ${maj.numero} : intervention reprise`, message: `L'ordre de travail ${ot.numero || ot.id} a été réouvert ; votre demande est de nouveau en cours de traitement`, lien: `#/demandes/${maj.id}`, type: 'info' });
+    ctx.emit('demande:convertie', maj);
+  });
+
+  // ----- Reprise au démarrage ---------------------------------------------------
+  /**
+   * Bases antérieures : les demandes sans `otId` sont liées une fois à l'OT qui les référence (un OT clôturé n'est
+   * rattaché qu'à une demande convertie ou clôturée : pour une demande validée, c'est une intervention passée).
+   */
+  function relierOtAuDemarrage() {
+    const sans = db.list(ENTITE, (d) => d.otId == null);
+    if (!sans.length) return 0;
+    const cache = {};
+    const parDemande = new Map();
+    for (const o of db.list('ot')) {
+      if (o.demandeId == null || otAnnule(o, cache)) continue;
+      const k = Number(o.demandeId); const prec = parDemande.get(k);
+      if (!prec || (otFinal(prec, cache) && !otFinal(o, cache))) parDemande.set(k, o);
+    }
+    let n = 0;
+    for (const d of sans) {
+      const o = parDemande.get(d.id);
+      if (!o) continue;
+      if (otFinal(o, cache) && d.statut !== st().convertie && d.statut !== st().cloturee) continue;
+      db.update(ENTITE, d.id, { otId: o.id }); n++;
+    }
+    if (n) ctx.log(`Demandes : ${n} lien(s) vers un ordre de travail complété(s) au démarrage`);
+    return n;
+  }
+  relierOtAuDemarrage();
 
   // ----- Services publiés -----------------------------------------------------
   ctx.services.demandes = {

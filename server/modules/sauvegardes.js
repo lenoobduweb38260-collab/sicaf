@@ -18,9 +18,15 @@
  *
  * Droits (pôle informatique) : Système › Voir pour consulter ; Système › Modifier pour le reste :
  * le module manipule la base complète (équivalent export / import).
- * Les opérations globales (paramètres, clé de réception, restauration) exigent l'accès à tous les sites.
- * Multi-site : une destination peut être rattachée à un site (`secteurId`) ; elle n'est alors visible
- * et modifiable que selon la portée et le site courant de l'utilisateur.
+ * Les opérations globales (paramètres, clé de réception, restauration, et la gestion des destinations :
+ * chaque fichier contient la base entière, quel que soit le site) exigent l'accès à tous les sites.
+ * Multi-site : une destination peut être rattachée à un site (`secteurId`) ; elle n'est alors visible,
+ * testable et utilisable (sauvegarde manuelle) que selon la portée et le site courant de l'utilisateur.
+ * Une sauvegarde lancée avec le sélecteur de site positionné sur un site n'est pas « complète » :
+ * elle ne met pas à jour la planification.
+ * Serveur distant en HTTPS (application de bureau) : le certificat auto-signé est épinglé par son
+ * empreinte (champ `empreinte` de la destination, confirmée par le pôle informatique) et vérifié avant
+ * tout envoi, clé de réception comprise ; un certificat renouvelé avec la même clé est reconnu.
  *
  * Secrets (config.sauvegardes) gérés UNIQUEMENT ici, jamais renvoyés au client :
  *   destinations[].cle, cleReception (empreinte SHA-256 de la clé), motDePasseChiffrement.
@@ -34,8 +40,10 @@ const os = require('os');
 const zlib = require('zlib');
 const crypto = require('crypto');
 const http = require('http');
-const https = require('https');
 const { promisify } = require('util');
+const tls = require('tls');
+const net = require('net');
+const tlsGmao = require('../tls');
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -67,6 +75,8 @@ const LIEN_UI = '#/systeme?onglet=donnees';
 /** gmao-<identifiant>-AAAAMMJJ-HHMMSS[-n].json[.gz][.enc] */
 const RE_FICHIER = /^gmao-([A-Za-z0-9_-]{1,60})-(\d{8})-(\d{6})(?:-(\d{1,3}))?\.json(\.gz)?(\.enc)?$/;
 const RE_SITE = /^[A-Za-z0-9_-]{1,60}$/;
+/** Copie de l'état précédent faite par la base avant un import ou une restauration : gmao-avant-import-<horodatage ISO>.json */
+const RE_COPIE_AVANT = /^gmao-avant-(import|restauration)-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z\.json$/;
 
 const PARAMS_DEFAUT = {
   automatique: true, frequenceHeures: 24, heure: '22:00', conserverLocal: 30, compresser: true, chiffrer: false,
@@ -149,6 +159,7 @@ function messageReseau(e, url) {
   if (c === 'ETIMEDOUT' || c === 'ESOCKETTIMEDOUT') return `Délai de connexion dépassé vers ${hote}`;
   if (c === 'ECONNRESET' || c === 'EPIPE') return `Connexion interrompue par ${hote}`;
   if (c === 'EHOSTUNREACH' || c === 'ENETUNREACH') return `Serveur ${hote} injoignable (liaison réseau ou VPN entre les sites ?)`;
+  if (c === 'EPROTO' || /wrong version number|packet length too long/i.test(String(e && e.message))) return `${hote} ne propose pas de connexion chiffrée (HTTPS) sur ce port : utilisez une adresse http://`;
   if (/CERT|SSL|TLS/i.test(String(c || '')) || /certificate/i.test(String(e && e.message))) return `Certificat HTTPS de ${hote} refusé`;
   return (e && e.message) || String(e);
 }
@@ -310,44 +321,95 @@ function lireFichierSauvegarde(fichier) {
 
 /**
  * Requête HTTP(S) avec délai d'inactivité, délai total et taille de réponse limitée.
- * Les redirections ne sont jamais suivies (refus explicite).
+ * Les redirections ne sont jamais suivies ; une redirection d'une adresse http:// vers https:// sur le même
+ * hôte est signalée (code REDIRECTION_HTTPS, `adresseHttps`) pour proposer la bascule d'adresse.
+ * En HTTPS, le certificat présenté est vérifié par épinglage (`epinglage` : { empreinte, empreinteCle }) à la
+ * fin de la poignée de main, avant l'envoi du moindre en-tête : sans empreinte confirmée (code
+ * EMPREINTE_NON_CONFIRMEE) ou avec une empreinte différente (code EMPREINTE_DIFFERENTE), rien n'est envoyé et
+ * l'empreinte présentée est jointe à l'erreur. La réponse porte `certificat` { empreinte, empreinteCle, parCle }.
  */
-function requete(urlTexte, { methode = 'GET', entetes = {}, corps = null, delaiMs = DELAI_INACTIVITE_MS, delaiTotalMs = DELAI_TOTAL_MS, maxReponse = 5 * 1024 * 1024, userAgent = 'GMAO-SICAF-Replication' } = {}) {
+function requete(urlTexte, { methode = 'GET', entetes = {}, corps = null, delaiMs = DELAI_INACTIVITE_MS, delaiTotalMs = DELAI_TOTAL_MS, maxReponse = 5 * 1024 * 1024, userAgent = 'GMAO-SICAF-Replication', epinglage = null } = {}) {
   return new Promise((resolve, reject) => {
     let u;
     try { u = new URL(urlTexte); } catch (e) { reject(new Error('Adresse du serveur invalide')); return; }
-    const mod = u.protocol === 'https:' ? https : http;
-    const h = Object.assign({ 'User-Agent': userAgent, Accept: 'application/json' }, entetes);
+    const chiffre = u.protocol === 'https:';
+    const hote = u.hostname.replace(/^\[|\]$/g, '');
+    const port = Number(u.port) || (chiffre ? 443 : 80);
+    const h = Object.assign({ Host: u.host, 'User-Agent': userAgent, Accept: 'application/json' }, entetes);
     if (corps) h['Content-Length'] = String(corps.length);
     let fini = false;
-    const terminer = (fn, v) => { if (fini) return; fini = true; clearTimeout(minuteur); fn(v); };
-    const req = mod.request(u, { method: methode, headers: h, timeout: delaiMs }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400) {
-        res.resume();
-        terminer(reject, new Error(`Redirection refusée (HTTP ${res.statusCode}) : indiquez l'adresse exacte du serveur GMAO`));
-        req.destroy();
+    let req = null;
+    let socket = null;
+    const terminer = (fn, v) => { if (fini) return; fini = true; clearTimeout(minuteur); if (req) req.destroy(); if (socket) socket.destroy(); fn(v); };
+    const minuteur = setTimeout(() => terminer(reject, new Error(`Délai total dépassé (${Math.round(delaiTotalMs / 1000)} s)`)), delaiTotalMs);
+    if (minuteur.unref) minuteur.unref();
+    const echec = (e) => terminer(reject, Object.assign(new Error(messageReseau(e, urlTexte)), { code: (e && e.code) || undefined }));
+    const inactif = () => terminer(reject, new Error(`Délai dépassé (${Math.round(delaiMs / 1000)} s) : le serveur distant ne répond pas`));
+    const envoyer = (creerConnexion, certificat) => {
+      const opts = { host: hote, port, path: u.pathname + u.search, method: methode, headers: h, timeout: delaiMs };
+      if (creerConnexion) opts.createConnection = creerConnexion; // sans agent : la connexion vérifiée est utilisée telle quelle
+      req = http.request(opts, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400) {
+          res.resume();
+          let loc = null;
+          try { loc = new URL(String(res.headers.location || ''), u); } catch (e) { loc = null; }
+          if (!chiffre && loc && loc.protocol === 'https:' && loc.hostname === u.hostname) {
+            const s = new URL(u.toString());
+            s.protocol = 'https:';
+            s.port = loc.port;
+            // Adresse de la destination (sans le chemin de l'API de réplication ajouté par l'appelant)
+            const adresseHttps = (s.origin + s.pathname.replace(/\/api\/replication\/[^/]*$/, '')).replace(/\/+$/, '');
+            terminer(reject, Object.assign(new Error(`Ce serveur exige une connexion chiffrée : utilisez l'adresse ${adresseHttps}`), { code: 'REDIRECTION_HTTPS', adresseHttps }));
+            return;
+          }
+          terminer(reject, new Error(`Redirection refusée (HTTP ${res.statusCode}) : indiquez l'adresse exacte du serveur GMAO`));
+          return;
+        }
+        const morceaux = [];
+        let taille = 0;
+        res.on('data', (c) => {
+          taille += c.length;
+          if (taille > maxReponse) { terminer(reject, new Error('Réponse du serveur distant trop volumineuse')); return; }
+          morceaux.push(c);
+        });
+        res.on('end', () => {
+          const buf = Buffer.concat(morceaux);
+          let json = null;
+          try { json = JSON.parse(buf.toString('utf8')); } catch (e) { json = null; }
+          terminer(resolve, { status: res.statusCode, json, certificat: certificat || null });
+        });
+        res.on('error', echec);
+      });
+      req.on('timeout', inactif);
+      req.on('error', echec);
+      if (corps) req.end(corps); else req.end();
+    };
+    if (!chiffre) { envoyer(null, null); return; }
+    // HTTPS : connexion TLS d'abord, certificat vérifié, puis seulement la requête sur cette connexion
+    socket = tls.connect({ host: hote, port, servername: net.isIP(hote) ? undefined : hote, rejectUnauthorized: false, minVersion: 'TLSv1.2', ALPNProtocols: ['http/1.1'] });
+    socket.setTimeout(delaiMs, inactif);
+    socket.once('error', echec);
+    socket.once('secureConnect', () => {
+      const pc = socket.getPeerCertificate(true);
+      if (!pc || !pc.raw) { terminer(reject, Object.assign(new Error(`Certificat HTTPS de ${u.host} absent`), { code: 'CERTIFICAT' })); return; }
+      const attendu = epinglage && (epinglage.empreinte || epinglage.empreinteCle) ? epinglage : null;
+      const v = tlsGmao.verifierEpinglage(pc.raw, attendu || {});
+      if (!v.empreinte) { terminer(reject, Object.assign(new Error(`Certificat HTTPS de ${u.host} illisible`), { code: 'CERTIFICAT' })); return; }
+      const presente = { empreinte: v.empreinte, empreinteCle: v.empreinteCle, parCle: v.parCle };
+      if (!attendu) {
+        terminer(reject, Object.assign(new Error(`Certificat HTTPS de ${u.host} non confirmé (empreinte ${v.empreinte}) : comparez-la avec celle affichée sur le poste serveur de l'autre site, puis enregistrez-la dans la destination. Rien n'a été envoyé.`), { code: 'EMPREINTE_NON_CONFIRMEE' }, presente));
         return;
       }
-      const morceaux = [];
-      let taille = 0;
-      res.on('data', (c) => {
-        taille += c.length;
-        if (taille > maxReponse) { terminer(reject, new Error('Réponse du serveur distant trop volumineuse')); req.destroy(); return; }
-        morceaux.push(c);
-      });
-      res.on('end', () => {
-        const buf = Buffer.concat(morceaux);
-        let json = null;
-        try { json = JSON.parse(buf.toString('utf8')); } catch (e) { json = null; }
-        terminer(resolve, { status: res.statusCode, json });
-      });
-      res.on('error', (e) => terminer(reject, new Error(messageReseau(e, urlTexte))));
+      if (!v.ok) {
+        terminer(reject, Object.assign(new Error(`Certificat HTTPS de ${u.host} différent de l'empreinte confirmée (présentée : ${v.empreinte}) : usurpation possible ou serveur réinstallé. Rien n'a été envoyé.`), { code: 'EMPREINTE_DIFFERENTE' }, presente));
+        return;
+      }
+      const s = socket;
+      socket = null; // la requête prend possession de la connexion vérifiée
+      s.setTimeout(0);
+      envoyer(() => s, presente);
+      req.once('close', () => s.destroy());
     });
-    const minuteur = setTimeout(() => { terminer(reject, new Error(`Délai total dépassé (${Math.round(delaiTotalMs / 1000)} s)`)); req.destroy(); }, delaiTotalMs);
-    if (minuteur.unref) minuteur.unref();
-    req.on('timeout', () => { terminer(reject, new Error(`Délai dépassé (${Math.round(delaiMs / 1000)} s) : le serveur distant ne répond pas`)); req.destroy(); });
-    req.on('error', (e) => terminer(reject, new Error(messageReseau(e, urlTexte))));
-    if (corps) req.end(corps); else req.end();
   });
 }
 
@@ -440,9 +502,10 @@ function register(ctx) {
   const exigerModif = (req) => ctx.requirePerm(req, 'systeme', 'modifier');
   const estGlobal = (req) => !!(req && req.perms && (req.perms.estAdmin || req.perms.portee === 'tous'));
   const peutModifier = (req) => !!(req && req.perms && perms.can(req.perms, 'systeme', 'modifier'));
-  function exigerGlobal(req, quoi) {
-    if (!estGlobal(req)) throw new HttpError(403, `${quoi} concerne tout le serveur : réservé aux utilisateurs ayant accès à tous les sites`);
+  function exigerGlobal(req, quoi, pourquoi) {
+    if (!estGlobal(req)) throw new HttpError(403, `${quoi} concerne tout le serveur${pourquoi ? ' (' + pourquoi + ')' : ''} : réservé aux utilisateurs ayant accès à tous les sites`);
   }
+  const exigerGestionDestinations = (req) => exigerGlobal(req, 'La gestion des destinations de sauvegarde', 'chaque sauvegarde contient la base complète de tous les sites');
   /** Destination visible (une destination commune, sans site, est visible de tous ceux qui ont le droit). */
   function voitDest(req, d) { return d.secteurId == null || ctx.canSee(req, d); }
   function trouverDestination(req, id, ecriture) {
@@ -490,11 +553,18 @@ function register(ctx) {
     if (s.length < 16 || s.length > 200 || !/^[\x21-\x7e]+$/.test(s)) throw new HttpError(400, 'Clé de réception invalide : copiez la clé générée sur le serveur de l\'autre site (au moins 16 caractères, sans espace)');
     return s;
   }
-  function validerNomFichier(v) {
+  /** Nom d'un fichier de sauvegarde ; `copieAvant` accepte aussi les copies de l'état précédent (dossier local seulement). */
+  function validerNomFichier(v, { copieAvant = false } = {}) {
     let n = String(v == null ? '' : v);
     try { n = decodeURIComponent(n); } catch (e) { throw new HttpError(400, 'Nom de fichier de sauvegarde invalide'); }
-    if (!n || n.length > 160 || /[\\/\u0000]/.test(n) || n.includes('..') || !RE_FICHIER.test(n)) throw new HttpError(400, 'Nom de fichier de sauvegarde invalide');
+    if (!n || n.length > 160 || /[\\/\u0000]/.test(n) || n.includes('..') || !(RE_FICHIER.test(n) || (copieAvant && RE_COPIE_AVANT.test(n)))) throw new HttpError(400, 'Nom de fichier de sauvegarde invalide');
     return n;
+  }
+  function validerEmpreinte(v) {
+    if (v === null || v === undefined || v === '') return '';
+    const e = typeof v === 'string' ? tlsGmao.normaliserEmpreinte(v) : '';
+    if (!e) throw new HttpError(400, 'Empreinte du certificat invalide : 64 caractères hexadécimaux (ex. AB:CD:…), telle qu\'affichée sur le poste serveur de l\'autre site');
+    return e;
   }
   function validerSite(v) {
     const s = String(v == null ? '' : v);
@@ -537,8 +607,15 @@ function register(ctx) {
       if (typeof b.cle === 'string' && b.cle.trim()) out.cle = validerCle(b.cle);
       else if (b.cle !== undefined && b.cle !== null && b.cle !== '') throw new HttpError(400, 'Clé de réception invalide');
       if (!out.cle) throw new HttpError(400, 'La clé de réception du serveur distant est obligatoire (elle est générée sur l\'autre site)');
+      if (b.empreinte !== undefined) {
+        const e = validerEmpreinte(b.empreinte);
+        if (e !== (out.empreinte || '')) out.empreinteCle = ''; // nouvelle empreinte confirmée : la clé associée sera réapprise
+        out.empreinte = e;
+      }
+      if (!out.empreinte) { out.empreinte = ''; out.empreinteCle = ''; }
       delete out.chemin;
     }
+    if (out.type === 'dossier') { delete out.empreinte; delete out.empreinteCle; }
     if (out.secteurId == null && !estGlobal(req)) throw new HttpError(403, 'Rattachez la destination à l\'un de vos sites : une destination commune à tous les sites est réservée aux utilisateurs ayant accès à tous les sites');
     const doublon = destinations().find((d) => d.id !== out.id && String(d.nom).toLowerCase() === out.nom.toLowerCase());
     if (doublon) throw new HttpError(400, `Une destination nommée « ${out.nom} » existe déjà`);
@@ -552,6 +629,7 @@ function register(ctx) {
       id: d.id, nom: d.nom, type: d.type, actif: d.actif !== false, conserver: d.conserver || 10,
       chemin: d.type === 'dossier' ? (d.chemin || '') : '', url: d.type === 'serveur' ? (d.url || '') : '',
       cleDefinie: !!d.cle, secteurId: d.secteurId == null ? null : d.secteurId, notes: d.notes || '',
+      empreinte: d.type === 'serveur' ? (d.empreinte || '') : '', empreinteCle: d.type === 'serveur' ? (d.empreinteCle || '') : '',
       derniere: d.derniere || null, derniereVerification: d.derniereVerification || null,
       demo: !!d.demo, createdAt: d.createdAt || null, updatedAt: d.updatedAt || null, createdBy: d.createdBy == null ? null : d.createdBy,
     };
@@ -570,22 +648,33 @@ function register(ctx) {
       prochaineExecution: p ? p.toISOString() : null,
     };
   }
+  /** Origine d'une restauration sans nom de destination ni de site (accès non globaux). */
+  function origineGenerique(h) {
+    const o = String(h.origine || '');
+    const t = h.origineType || (/^destination/.test(o) ? 'destination' : /^sauvegarde reçue/.test(o) ? 'recue' : /^fichier/.test(o) ? 'fichier' : 'locale');
+    return { destination: 'destination de sauvegarde', recue: 'sauvegarde reçue d\'un autre site', fichier: 'fichier téléversé', locale: 'copie locale' }[t] || 'copie locale';
+  }
   function histoPublic(req, h) {
     const e = Object.assign({}, h);
     if (Array.isArray(h.resultats)) {
       e.resultats = h.resultats.filter((r) => r.secteurId == null || ctx.canSee(req, { secteurId: r.secteurId }));
       if (h.resultats.length && !e.resultats.length && !h.local) return null;
     }
+    if (h.type === 'restauration' && !estGlobal(req)) e.origine = origineGenerique(h);
     e.userNom = h.userId != null ? ctx.nomUser(h.userId) : (h.declencheur === 'automatique' ? 'Planification automatique' : '');
     return e;
   }
+  /** Ce serveur répond-il en HTTPS (certificat du poste, écoute mixte de l'application de bureau) ? */
+  function serveurChiffre(req) { return !!((req && req.socket && req.socket.encrypted) || ctx.empreinteCertificat); }
+  /** Adresses à communiquer aux autres sites, avec le protocole réellement servi. */
   function adressesServeur(req) {
     const port = req && req.socket && req.socket.localPort;
+    const proto = serveurChiffre(req) ? 'https' : 'http';
     const out = [];
     for (const liste of Object.values(os.networkInterfaces())) {
-      for (const i of liste || []) if (i.family === 'IPv4' && !i.internal) out.push(`http://${i.address}:${port}`);
+      for (const i of liste || []) if ((i.family === 'IPv4' || i.family === 4) && !i.internal) out.push(`${proto}://${i.address}:${port}`);
     }
-    out.push(`http://${os.hostname()}:${port}`);
+    out.push(`${proto}://${os.hostname()}:${port}`);
     return Array.from(new Set(out));
   }
   function listerRecues() {
@@ -606,7 +695,28 @@ function register(ctx) {
       };
     }).sort((a, b) => String(a.nom).localeCompare(String(b.nom)));
   }
-  function listerLocales() { return db.inMemory ? [] : listerFichiersGmao(db.backupDir).slice(0, 200); }
+  /** Copies de l'état précédent faites par la base avant un import ou une restauration (restaurables : retour en arrière). */
+  function listerCopiesAvant(dossier) {
+    let noms;
+    try { noms = fs.readdirSync(dossier); } catch (e) { return []; }
+    return noms.map((n) => {
+      const m = RE_COPIE_AVANT.exec(n);
+      if (!m) return null;
+      let st;
+      try { st = fs.statSync(path.join(dossier, n)); } catch (e) { return null; }
+      if (!st.isFile()) return null;
+      const d = new Date(Date.UTC(Number(m[2]), Number(m[3]) - 1, Number(m[4]), Number(m[5]), Number(m[6]), Number(m[7]), Number(m[8])));
+      return {
+        nom: n, identifiant: identifiant(), horodatage: `${m[2]}${m[3]}${m[4]}-${m[5]}${m[6]}${m[7]}-000`,
+        date: Number.isNaN(d.getTime()) ? st.mtime.toISOString() : d.toISOString(), modifie: st.mtime.toISOString(),
+        taille: st.size, compresse: false, chiffre: false, sha256: null, etatPrecedent: m[1],
+      };
+    }).filter(Boolean);
+  }
+  function listerLocales() {
+    if (db.inMemory) return [];
+    return listerFichiersGmao(db.backupDir).concat(listerCopiesAvant(db.backupDir)).sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 200);
+  }
 
   // ----- Historique -----
   function ajouterHistorique(entree) {
@@ -615,11 +725,25 @@ function register(ctx) {
     if (col && col.length > HISTO_MAX) { col.splice(0, col.length - HISTO_MAX); db.touch(); }
     return e;
   }
-  function notifierEchec(titre, message) {
-    const ids = new Set();
-    for (const u of ctx.usersAvecDroit('systeme', 'modifier')) ids.add(u.id);
-    for (const u of ctx.usersAvecDroit('systeme', 'modifier')) ids.add(u.id);
-    if (ids.size) ctx.notify(Array.from(ids), { titre, message: String(message).slice(0, 500), lien: LIEN_UI, type: 'alerte' });
+  /**
+   * Alerte le pôle informatique (Système › Modifier) d'un échec. Chaque destinataire ne reçoit que le détail des
+   * destinations qu'il peut voir (portée, sites) ; les autres sont seulement comptées.
+   */
+  function notifierEchec(titre, { generique = '', local = null, resultats = [] } = {}) {
+    const config = db.getConfig();
+    const echecs = resultats.filter((r) => !r.ok);
+    const groupes = new Map(); // message → destinataires
+    for (const u of ctx.usersAvecDroit('systeme', 'modifier')) {
+      const p = perms.effectivePermissions(db, u, null, config);
+      const voit = (r) => r.secteurId == null || perms.canSeeRecord(p, u, { secteurId: r.secteurId });
+      const lignes = [local && !local.ok ? local.message : null].concat(echecs.filter(voit).map((r) => `${r.nom} : ${r.message}`)).filter(Boolean);
+      const caches = echecs.filter((r) => !voit(r)).length;
+      if (caches) lignes.push(`${caches} destination${caches > 1 ? 's' : ''} d'un autre site en échec`);
+      const message = (lignes.length ? lignes.join(' · ') : String(generique)).slice(0, 500);
+      if (!groupes.has(message)) groupes.set(message, []);
+      groupes.get(message).push(u.id);
+    }
+    for (const [message, ids] of groupes) ctx.notify(ids, { titre, message, lien: LIEN_UI, type: 'alerte' });
   }
 
   // ----- Planification -----
@@ -631,48 +755,57 @@ function register(ctx) {
     return d;
   }
   function frequence(s) { return Math.min(720, Math.max(1, Math.round(Number(s.frequenceHeures) || 24))); }
+  /** Fréquence d'au moins un jour, en jours entiers (24 h → 1, 48 h → 2 ; une valeur intermédiaire est arrondie au jour supérieur). */
+  function joursFrequence(freq) { return Math.max(1, Math.ceil(freq / 24)); }
   function dateDerniere(s) {
     const d = s && s.derniereExecution && s.derniereExecution.date ? new Date(s.derniereExecution.date) : null;
     return d && !Number.isNaN(d.getTime()) ? d : null;
   }
+  /** Essais déjà faits dans le cycle courant (depuis la dernière échéance planifiée) ; anciennes données : échecs consécutifs. */
+  function essaisDuCycle(s) { return s && s.essaisCycle != null ? (Number(s.essaisCycle) || 0) : (Number(s && s.echecsConsecutifs) || 0); }
+  /** Créneaux quotidiens écoulés entre la dernière exécution et maintenant (insensible aux changements d'heure). */
+  function creneauxEcoules(der, now, heure) { return Math.round((dernierCreneau(now, heure).getTime() - dernierCreneau(der, heure).getTime()) / 86400000); }
   /**
-   * Une sauvegarde automatique est-elle due ?
+   * Pourquoi une sauvegarde automatique est due : 'planifiee', 'nouvel_essai', ou null.
    *  - fréquence < 24 h : dès que la dernière exécution date de plus de `frequenceHeures` ;
-   *  - fréquence ≥ 24 h : au créneau quotidien `heure`, si la dernière exécution précède ce créneau
-   *    (de `frequenceHeures − 24` heures supplémentaires pour une fréquence de plusieurs jours) ;
-   *  - après un échec : nouvel essai 1 h plus tard (3 essais au plus avant le créneau suivant).
+   *  - fréquence ≥ 24 h : au créneau quotidien `heure`, une fois écoulé le nombre de jours de la fréquence depuis
+   *    le créneau de la dernière exécution (serveur arrêté au créneau : rattrapage au démarrage) ;
+   *  - après un échec : nouvel essai 1 h plus tard, 3 essais au plus par cycle (le compteur d'essais repart à
+   *    chaque échéance planifiée, quel que soit le nombre total d'échecs consécutifs).
    */
-  function estDue(s, now = new Date()) {
-    if (!s || !s.automatique) return false;
+  function raisonDue(s, now = new Date()) {
+    if (!s || !s.automatique) return null;
     const freq = frequence(s);
     const der = dateDerniere(s);
-    if (!der) return true;
-    if (s.derniereExecution.ok === false && (Number(s.echecsConsecutifs) || 0) < ESSAIS_MAX && now - der >= NOUVEL_ESSAI_MS) return true;
-    if (freq < 24) return now - der >= freq * 3600 * 1000 - 2 * 60 * 1000;
-    const creneau = dernierCreneau(now, s.heure);
-    return der.getTime() < creneau.getTime() - (freq - 24) * 3600 * 1000;
+    if (!der) return 'planifiee';
+    const planifiee = freq < 24 ? now - der >= freq * 3600 * 1000 - 2 * 60 * 1000 : creneauxEcoules(der, now, s.heure) >= joursFrequence(freq);
+    if (planifiee) return 'planifiee';
+    if (s.derniereExecution.ok === false && essaisDuCycle(s) < ESSAIS_MAX && now - der >= NOUVEL_ESSAI_MS) return 'nouvel_essai';
+    return null;
   }
+  function estDue(s, now = new Date()) { return raisonDue(s, now) != null; }
   function prochaineExecution(s, now = new Date()) {
     if (!s || !s.automatique) return null;
     const freq = frequence(s);
     const der = dateDerniere(s);
     if (!der) return new Date(now.getTime());
-    if (s.derniereExecution.ok === false && (Number(s.echecsConsecutifs) || 0) < ESSAIS_MAX) return new Date(der.getTime() + NOUVEL_ESSAI_MS);
-    if (freq < 24) return new Date(der.getTime() + freq * 3600 * 1000);
-    const base = new Date(der.getTime() + (freq - 24) * 3600 * 1000);
-    const m = /^(\d{1,2}):(\d{2})$/.exec(String(s.heure || '22:00')) || [null, '22', '00'];
-    const t = new Date(base.getTime());
-    t.setHours(Math.min(23, Number(m[1])), Math.min(59, Number(m[2])), 0, 0);
-    if (t.getTime() <= base.getTime()) t.setDate(t.getDate() + 1);
-    return t;
+    let planifiee;
+    if (freq < 24) planifiee = new Date(der.getTime() + freq * 3600 * 1000);
+    else { planifiee = dernierCreneau(der, s.heure); planifiee.setDate(planifiee.getDate() + joursFrequence(freq)); }
+    if (s.derniereExecution.ok === false && essaisDuCycle(s) < ESSAIS_MAX) {
+      const essai = new Date(der.getTime() + NOUVEL_ESSAI_MS);
+      if (essai.getTime() < planifiee.getTime()) return essai;
+    }
+    return planifiee;
   }
   async function verifierPlanification(now = new Date()) {
     if (verrou) return false;
     const s = lireSauvegardes();
-    if (!estDue(s, now)) return false;
+    const raison = raisonDue(s, now);
+    if (!raison) return false;
     const actives = destinations().filter((d) => d.actif !== false);
     if (!actives.length && (db.inMemory || !(Number(s.conserverLocal) > 0))) return false;
-    try { await executer({ declencheur: 'automatique' }); } catch (e) { ctx.log('Sauvegarde automatique impossible :', e.message); }
+    try { await executer({ declencheur: 'automatique', nouvelEssai: raison === 'nouvel_essai' }); } catch (e) { ctx.log('Sauvegarde automatique impossible :', e.message); }
     return true;
   }
 
@@ -693,53 +826,94 @@ function register(ctx) {
   function entetesReplication(d) {
     return { 'X-GMAO-Cle': d.cle || '', 'X-GMAO-Source': encodeURIComponent(nomServeur()), 'X-GMAO-Format': String(FORMAT) };
   }
+  /** Épinglage attendu pour une destination « serveur » en HTTPS (null tant qu'aucune empreinte n'est confirmée). */
+  function epinglageDe(d) { return d.empreinte || d.empreinteCle ? { empreinte: d.empreinte || '', empreinteCle: d.empreinteCle || '' } : null; }
+  /** Après une connexion HTTPS vérifiée : mémorise l'empreinte de la clé (renouvellement reconnu) et suit un certificat renouvelé. */
+  function memoriserCertificat(d, certificat) {
+    if (!d || !certificat || !d.empreinte) return;
+    if (certificat.parCle && certificat.empreinte) d.empreinte = certificat.empreinte;
+    if (certificat.empreinteCle && (!d.empreinteCle || certificat.parCle)) d.empreinteCle = certificat.empreinteCle;
+  }
+  const CODES_TEST = ['EMPREINTE_NON_CONFIRMEE', 'EMPREINTE_DIFFERENTE', 'REDIRECTION_HTTPS'];
   async function pingServeur(d) {
-    const r = await requete(d.url + '/api/replication/ping', { entetes: entetesReplication(d), delaiMs: DELAI_PING_MS, delaiTotalMs: DELAI_PING_MS * 2, userAgent: `GMAO-SICAF-Replication/${ctx.version}` });
+    const r = await requete(d.url + '/api/replication/ping', { entetes: entetesReplication(d), delaiMs: DELAI_PING_MS, delaiTotalMs: DELAI_PING_MS * 2, userAgent: `GMAO-SICAF-Replication/${ctx.version}`, epinglage: epinglageDe(d) });
     if (r.status !== 200 || !r.json || r.json.ok !== true) throw new Error(messageDistant(r));
     const site = String(r.json.site || '').slice(0, 80);
     const version = String(r.json.version || '').slice(0, 20);
-    return { ok: true, site, version, message: `Connexion réussie au serveur GMAO « ${site || d.url} »${version ? ` (version ${version})` : ''} — réception des sauvegardes active` };
+    return { ok: true, site, version, certificat: r.certificat, message: `Connexion réussie au serveur GMAO « ${site || d.url} »${version ? ` (version ${version})` : ''} — réception des sauvegardes active${r.certificat ? ', certificat HTTPS vérifié' : ''}` };
+  }
+  /** Empreinte SHA-256 d'un fichier relu en flux (vérification après écriture sur le support). */
+  function empreinteFichier(chemin) {
+    return new Promise((resolve, reject) => {
+      const h = crypto.createHash('sha256');
+      const flux = fs.createReadStream(chemin);
+      flux.on('error', reject);
+      flux.on('data', (c) => h.update(c));
+      flux.on('end', () => resolve(h.digest('hex')));
+    });
+  }
+  /**
+   * Écrit la sauvegarde et son .sha256 dans un dossier, puis relit le fichier écrit : une empreinte différente
+   * (écriture incomplète, support défaillant) supprime le fichier et lève une erreur.
+   */
+  async function copierVerifiee(dossier, fichier, tampon, sha) {
+    ecrireDansDossier(dossier, fichier, tampon, sha);
+    const chemin = path.join(dossier, fichier);
+    let relu = null;
+    try { relu = await empreinteFichier(chemin); } catch (e) { relu = null; }
+    if (relu !== sha) {
+      try { fs.unlinkSync(chemin); } catch (e) { /* ignore */ }
+      try { fs.unlinkSync(chemin + '.sha256'); } catch (e) { /* ignore */ }
+      throw new Error('Empreinte différente après relecture du fichier écrit : écriture incomplète ou support défaillant (fichier supprimé)');
+    }
   }
   async function envoyerVers(d, tampon, fichier, sha) {
     if (d.type === 'dossier') {
       validerChemin(d.chemin);
       try {
-        ecrireDansDossier(d.chemin, fichier, tampon, sha);
-        const relu = lireSha(path.join(d.chemin, fichier));
-        if (relu !== sha) throw new Error('Empreinte relue différente');
+        await copierVerifiee(d.chemin, fichier, tampon, sha);
         const supprimes = appliquerRetention(d.chemin, d.conserver || 10, identifiant());
-        return { message: `Copiée dans ${d.chemin}` + (supprimes.length ? ` (${supprimes.length} ancienne${supprimes.length > 1 ? 's' : ''} supprimée${supprimes.length > 1 ? 's' : ''})` : '') };
+        return { message: `Copiée dans ${d.chemin} (empreinte vérifiée après relecture)` + (supprimes.length ? ` (${supprimes.length} ancienne${supprimes.length > 1 ? 's' : ''} supprimée${supprimes.length > 1 ? 's' : ''})` : '') };
       } catch (e) { throw new Error(messageFs(e)); }
     }
     const entetes = Object.assign(entetesReplication(d), {
       'Content-Type': 'application/octet-stream', 'X-GMAO-Fichier': fichier, 'X-GMAO-Sha256': sha, 'X-GMAO-Conserver': String(d.conserver || 10),
     });
-    const r = await requete(d.url + '/api/replication/recevoir', { methode: 'POST', entetes, corps: tampon, userAgent: `GMAO-SICAF-Replication/${ctx.version}` });
+    const r = await requete(d.url + '/api/replication/recevoir', { methode: 'POST', entetes, corps: tampon, userAgent: `GMAO-SICAF-Replication/${ctx.version}`, epinglage: epinglageDe(d) });
     if (r.status !== 200 || !r.json || r.json.ok !== true) throw new Error(messageDistant(r));
     if (r.json.sha256 && r.json.sha256 !== sha) throw new Error('Empreinte SHA-256 différente côté serveur distant : transfert corrompu');
-    return { message: `Envoyée au serveur « ${String(r.json.site || d.url).slice(0, 80)} » (empreinte vérifiée)` };
+    return { message: `Envoyée au serveur « ${String(r.json.site || d.url).slice(0, 80)} » (empreinte vérifiée${r.certificat ? ', connexion chiffrée' : ''})`, certificat: r.certificat };
+  }
+  /** Message d'erreur quand aucune cible n'est disponible pour une sauvegarde. */
+  function messageRienASauvegarder({ global, filtreSite, s }) {
+    const actives = destinations().filter((d) => d.actif !== false).length;
+    if (!global) return actives ? 'Aucune destination active dans votre périmètre (site sélectionné compris) : les destinations communes à tous les sites et la copie locale sont réservées aux utilisateurs ayant accès à tous les sites' : 'Aucune destination active : demandez l\'ajout d\'une destination à un utilisateur ayant accès à tous les sites';
+    if (filtreSite && actives) return 'Aucune destination active pour le site sélectionné : choisissez « Tous les sites » dans l\'en-tête, ou rattachez une destination active à ce site';
+    if (db.inMemory) return 'Aucune destination active : ajoutez une destination (dossier ou serveur d\'un autre site)';
+    return Number(s.conserverLocal) > 0 ? 'Aucune destination active : ajoutez une destination (dossier ou serveur d\'un autre site)' : 'Aucune destination active et copie locale désactivée : rien à sauvegarder';
   }
 
   // ----- Exécution d'une sauvegarde -----
-  async function executer({ req = null, destinationId = null, declencheur = 'manuel' } = {}) {
+  async function executer({ req = null, destinationId = null, declencheur = 'manuel', nouvelEssai = false } = {}) {
     if (verrou) throw new HttpError(409, 'Une sauvegarde ou une restauration est déjà en cours, réessayez dans quelques instants');
     verrou = { type: 'sauvegarde', debut: Date.now() };
-    try { return await executerInterne({ req, destinationId, declencheur }); } finally { verrou = null; }
+    try { return await executerInterne({ req, destinationId, declencheur, nouvelEssai }); } finally { verrou = null; }
   }
 
-  async function executerInterne({ req, destinationId, declencheur }) {
+  async function executerInterne({ req, destinationId, declencheur, nouvelEssai }) {
     const debut = Date.now();
     const dateDebut = new Date().toISOString();
     const s = lireSauvegardes();
     const global = !req || estGlobal(req);
+    const filtreSite = !!(req && req.perms && Array.isArray(req.perms.siteFiltre)); // sélecteur de site positionné sur un site
     let cibles;
     if (destinationId != null) cibles = [req ? trouverDestination(req, destinationId, true) : destinations().find((d) => d.id === Number(destinationId))].filter(Boolean);
     else cibles = destinations().filter((d) => d.actif !== false && (!req || (voitDest(req, d) && (d.secteurId != null || global))));
     const faireLocal = destinationId == null && global && !db.inMemory && Number(s.conserverLocal) > 0;
-    const complete = destinationId == null && global; // exécution « complète » (prise en compte par la planification)
-    if (!cibles.length && !faireLocal) {
-      throw new HttpError(400, db.inMemory ? 'Aucune destination active : ajoutez une destination (dossier ou serveur d\'un autre site)' : 'Aucune destination active et copie locale désactivée : rien à sauvegarder');
-    }
+    // Exécution « complète » (toutes les destinations actives, prise en compte par la planification) : accès à tous les
+    // sites sans filtre de site ; avec le sélecteur sur un site, les destinations des autres sites ne sont pas tentées.
+    const complete = destinationId == null && global && !filtreSite;
+    if (!cibles.length && !faireLocal) throw new HttpError(400, messageRienASauvegarder({ global, filtreSite, s }));
     const userId = req && req.user ? req.user.id : null;
     const compresse = s.compresser !== false;
     const chiffre = !!s.chiffrer;
@@ -753,9 +927,9 @@ function register(ctx) {
     } catch (e) {
       const message = 'Préparation de la sauvegarde impossible : ' + e.message;
       const entree = ajouterHistorique({ type: 'sauvegarde', declencheur, userId, ok: false, message, dureeMs: Date.now() - debut, resultats: [], local: null, destinationId: destinationId == null ? null : Number(destinationId) });
-      if (complete) majSauvegardes((x) => { x.derniereExecution = { date: dateDebut, ok: false, message }; x.echecsConsecutifs = (Number(x.echecsConsecutifs) || 0) + 1; });
+      if (complete) majSauvegardes((x) => { x.derniereExecution = { date: dateDebut, ok: false, message }; x.echecsConsecutifs = (Number(x.echecsConsecutifs) || 0) + 1; x.essaisCycle = nouvelEssai ? (Number(x.essaisCycle) || 0) + 1 : 1; });
       ctx.audit(req, 'sauvegarde', 'sauvegardes', entree.id, message);
-      notifierEchec('Échec de la sauvegarde de la base', message);
+      notifierEchec('Échec de la sauvegarde de la base', { generique: message });
       ctx.emit('sauvegarde:echec', entree);
       throw erreurHttp(e);
     }
@@ -763,18 +937,20 @@ function register(ctx) {
     let local = null;
     if (faireLocal) {
       try {
-        ecrireDansDossier(db.backupDir, fichier, tampon, sha);
+        await copierVerifiee(db.backupDir, fichier, tampon, sha);
         const supprimes = appliquerRetention(db.backupDir, Number(s.conserverLocal), identifiant());
         local = { ok: true, message: 'Copie locale enregistrée' + (supprimes.length ? ` (${supprimes.length} ancienne${supprimes.length > 1 ? 's' : ''} supprimée${supprimes.length > 1 ? 's' : ''})` : ''), dossier: db.backupDir };
       } catch (e) { local = { ok: false, message: 'Copie locale impossible : ' + messageFs(e), dossier: db.backupDir }; }
     }
 
     // Envoi : un échec n'empêche pas les autres destinations
+    const certificats = new Map(); // destination → certificat HTTPS vérifié
     const resultats = await Promise.all(cibles.map(async (d) => {
       const t0 = Date.now();
       const base = { destinationId: d.id, nom: d.nom, type: d.type, secteurId: d.secteurId == null ? null : d.secteurId, emplacement: d.type === 'dossier' ? d.chemin : d.url };
       try {
         const r = await envoyerVers(d, tampon, fichier, sha);
+        if (r.certificat) certificats.set(d.id, r.certificat);
         return Object.assign(base, { ok: true, message: r.message, taille: tampon.length, dureeMs: Date.now() - t0 });
       } catch (e) {
         return Object.assign(base, { ok: false, message: (e && e.message) || String(e), taille: 0, dureeMs: Date.now() - t0 });
@@ -791,28 +967,29 @@ function register(ctx) {
     majSauvegardes((x) => {
       for (const r of resultats) {
         const d = x.destinations.find((y) => y.id === r.destinationId);
-        if (d) d.derniere = { date: dateDebut, ok: r.ok, message: r.message, taille: r.taille, dureeMs: r.dureeMs, fichier: r.ok ? fichier : null };
+        if (!d) continue;
+        d.derniere = { date: dateDebut, ok: r.ok, message: r.message, taille: r.taille, dureeMs: r.dureeMs, fichier: r.ok ? fichier : null };
+        memoriserCertificat(d, certificats.get(d.id));
       }
       if (complete) {
         x.derniereExecution = { date: dateDebut, ok, message };
-        if (ok) { x.derniereReussite = dateDebut; x.echecsConsecutifs = 0; } else x.echecsConsecutifs = (Number(x.echecsConsecutifs) || 0) + 1;
+        if (ok) { x.derniereReussite = dateDebut; x.echecsConsecutifs = 0; x.essaisCycle = 0; } else { x.echecsConsecutifs = (Number(x.echecsConsecutifs) || 0) + 1; x.essaisCycle = nouvelEssai ? (Number(x.essaisCycle) || 0) + 1 : 1; }
       }
     });
     const entree = ajouterHistorique({
       type: 'sauvegarde', date: dateDebut, declencheur, userId, ok, message, fichier, taille: tampon.length, sha256: sha, compresse, chiffre, dureeMs,
-      local, resultats, destinationId: destinationId == null ? null : Number(destinationId),
+      local, resultats, destinationId: destinationId == null ? null : Number(destinationId), complete, siteCourantId: filtreSite ? req.perms.siteCourantId : null,
     });
-    ctx.audit(req, 'sauvegarde', 'sauvegardes', entree.id, `${declencheur === 'automatique' ? 'Sauvegarde automatique' : 'Sauvegarde'} ${fichier} : ${message}` + (resultats.length ? ' — ' + resultats.map((r) => `${r.nom} ${r.ok ? 'OK' : 'ÉCHEC'}`).join(', ') : ''));
+    ctx.audit(req, 'sauvegarde', 'sauvegardes', entree.id, `${declencheur === 'automatique' ? 'Sauvegarde automatique' : 'Sauvegarde'} ${fichier} : ${message}` + (filtreSite ? ' (site sélectionné uniquement)' : '') + (resultats.length ? ' — ' + resultats.map((r) => `${r.nom} ${r.ok ? 'OK' : 'ÉCHEC'}`).join(', ') : ''));
     if (!ok) {
-      const detail = [local && !local.ok ? local.message : null].concat(resultats.filter((r) => !r.ok).map((r) => `${r.nom} : ${r.message}`)).filter(Boolean).join(' · ');
-      notifierEchec(declencheur === 'automatique' ? 'Échec de la sauvegarde automatique' : 'Échec de sauvegarde', detail || message);
+      notifierEchec(declencheur === 'automatique' ? 'Échec de la sauvegarde automatique' : 'Échec de sauvegarde', { generique: message, local, resultats });
       ctx.emit('sauvegarde:echec', entree);
     } else ctx.emit('sauvegarde:terminee', entree);
-    return { ok, message, fichier, taille: tampon.length, sha256: sha, compresse, chiffre, dureeMs, local, resultats, historiqueId: entree.id };
+    return { ok, message, fichier, taille: tampon.length, sha256: sha, compresse, chiffre, dureeMs, local, resultats, complete, historiqueId: entree.id };
   }
 
   // ----- Restauration -----
-  async function restaurer(req, buf, { shaAttendu, motDePasse, origine, fichier }) {
+  async function restaurer(req, buf, { shaAttendu, motDePasse, origine, origineType, fichier }) {
     if (verrou) throw new HttpError(409, 'Une sauvegarde ou une restauration est déjà en cours, réessayez dans quelques instants');
     verrou = { type: 'restauration', debut: Date.now() };
     try {
@@ -844,7 +1021,7 @@ function register(ctx) {
       for (const token of Array.from(ctx.sessions.map.keys())) if (!(garder && token === req.session.token)) ctx.sessions.destroy(token);
       const message = `Base restaurée depuis ${fichier}` + (meta.source ? ` (sauvegarde de « ${String(meta.source).slice(0, 80)} »${meta.date ? ' du ' + new Date(meta.date).toLocaleString('fr-FR') : ''})` : '');
       const entree = ajouterHistorique({
-        type: 'restauration', userId: req && req.user ? req.user.id : null, ok: true, message, origine, fichier,
+        type: 'restauration', userId: req && req.user ? req.user.id : null, ok: true, message, origine, origineType: origineType || null, fichier,
         source: meta.source ? String(meta.source).slice(0, 80) : null, dateSauvegarde: typeof meta.date === 'string' ? meta.date : null,
         sha256: empreinte, empreinteVerifiee: !!shaAttendu, chiffre, compresse, taille: buf.length, copieAvant,
       });
@@ -942,9 +1119,10 @@ function register(ctx) {
       serveur: {
         nom: nomServeur(), identifiant: identifiant(), version: ctx.version, memoire: !!db.inMemory, plateforme: process.platform,
         dossierLocal: db.inMemory ? null : db.backupDir, dossierRecus: db.inMemory ? null : dossierRecus(),
-        adresses: adressesServeur(req), enCours: verrou ? verrou.type : null, planification: !db.inMemory,
+        adresses: adressesServeur(req), protocole: serveurChiffre(req) ? 'https' : 'http', empreinte: ctx.empreinteCertificat || '',
+        enCours: verrou ? verrou.type : null, planification: !db.inMemory,
       },
-      droits: { modifier: peutModifier(req), global: estGlobal(req), restaurer: peutModifier(req) && estGlobal(req) },
+      droits: { modifier: peutModifier(req), global: estGlobal(req), restaurer: peutModifier(req) && estGlobal(req), destinations: peutModifier(req) && estGlobal(req) },
     };
   }, { perm: ['systeme', 'voir'] });
 
@@ -956,7 +1134,10 @@ function register(ctx) {
     const actuel = lireSauvegardes();
     const maj = {};
     if (b.automatique !== undefined) maj.automatique = booleen(b.automatique, 'Sauvegarde automatique');
-    if (b.frequenceHeures !== undefined) maj.frequenceHeures = entier(b.frequenceHeures, 1, 720, 'Fréquence (heures)');
+    if (b.frequenceHeures !== undefined) {
+      maj.frequenceHeures = entier(b.frequenceHeures, 1, 720, 'Fréquence (heures)');
+      if (maj.frequenceHeures > 24 && maj.frequenceHeures % 24 !== 0) throw new HttpError(400, 'Fréquence (heures) : au-delà d\'un jour, indiquez un nombre entier de jours (48, 72, 168…), la sauvegarde ayant lieu au créneau quotidien');
+    }
     if (b.heure !== undefined) {
       if (typeof b.heure !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(b.heure)) throw new HttpError(400, 'Heure invalide (format HH:MM)');
       maj.heure = b.heure;
@@ -991,6 +1172,7 @@ function register(ctx) {
 
   router.post('/api/sauvegardes-avancees/destinations', async (req) => {
     exigerModif(req);
+    exigerGestionDestinations(req);
     const d = validerDestination(req, req.body, null);
     if (destinations().length >= MAX_DESTINATIONS) throw new HttpError(400, `${MAX_DESTINATIONS} destinations au maximum`);
     let cree;
@@ -1008,10 +1190,11 @@ function register(ctx) {
 
   router.put('/api/sauvegardes-avancees/destinations/:id', async (req) => {
     exigerModif(req);
+    exigerGestionDestinations(req);
     const avant = trouverDestination(req, req.params.id, true);
     const apres = validerDestination(req, req.body, avant);
     majSauvegardes((s) => { const i = s.destinations.findIndex((x) => x.id === avant.id); if (i >= 0) s.destinations[i] = apres; });
-    const champs = ['nom', 'type', 'actif', 'conserver', 'chemin', 'url', 'secteurId', 'notes'].filter((k) => JSON.stringify(avant[k]) !== JSON.stringify(apres[k]));
+    const champs = ['nom', 'type', 'actif', 'conserver', 'chemin', 'url', 'secteurId', 'notes', 'empreinte'].filter((k) => JSON.stringify(avant[k]) !== JSON.stringify(apres[k]));
     if (apres.cle !== avant.cle) champs.push('clé');
     ctx.audit(req, 'modification', 'sauvegardes', avant.id, `Destination « ${apres.nom} »` + (champs.length ? ' : ' + champs.join(', ') : ' (inchangée)'));
     return publierDestination(apres);
@@ -1019,6 +1202,7 @@ function register(ctx) {
 
   router.delete('/api/sauvegardes-avancees/destinations/:id', async (req) => {
     exigerModif(req);
+    exigerGestionDestinations(req);
     const d = trouverDestination(req, req.params.id, true);
     majSauvegardes((s) => { s.destinations = s.destinations.filter((x) => x.id !== d.id); });
     ctx.audit(req, 'suppression', 'sauvegardes', d.id, `Destination de sauvegarde « ${d.nom} » supprimée (les fichiers déjà copiés sont conservés)`);
@@ -1030,9 +1214,19 @@ function register(ctx) {
     const d = trouverDestination(req, req.params.id, true);
     const t0 = Date.now();
     let r;
-    try { r = d.type === 'dossier' ? testerDossier(d.chemin) : await pingServeur(d); } catch (e) { r = { ok: false, message: d.type === 'dossier' ? messageFs(e) : ((e && e.message) || String(e)) }; }
+    try { r = d.type === 'dossier' ? testerDossier(d.chemin) : await pingServeur(d); } catch (e) {
+      r = { ok: false, message: d.type === 'dossier' ? messageFs(e) : ((e && e.message) || String(e)) };
+      // Certificat non confirmé ou différent, redirection vers https:// : l'interface propose l'action adaptée
+      if (e && CODES_TEST.includes(e.code)) Object.assign(r, { code: e.code, empreintePresentee: e.empreinte || '', empreinteClePresentee: e.empreinteCle || '', adresseHttps: e.adresseHttps || '' });
+    }
     r.dureeMs = Date.now() - t0;
-    majSauvegardes((s) => { const x = s.destinations.find((y) => y.id === d.id); if (x) x.derniereVerification = { date: new Date().toISOString(), ok: r.ok, message: r.message }; });
+    majSauvegardes((s) => {
+      const x = s.destinations.find((y) => y.id === d.id);
+      if (!x) return;
+      x.derniereVerification = { date: new Date().toISOString(), ok: r.ok, message: r.message };
+      if (r.ok) memoriserCertificat(x, r.certificat);
+    });
+    delete r.certificat;
     return r;
   }, { perm: ['systeme', 'modifier'] });
 
@@ -1047,7 +1241,7 @@ function register(ctx) {
       return { destination: publierDestination(d), emplacement: d.chemin, fichiers: fichiers.slice(0, 200).map((f) => Object.assign(f, { ceServeur: f.identifiant === ident })), restaurable: true };
     }
     let r;
-    try { r = await requete(d.url + '/api/replication/fichiers', { entetes: entetesReplication(d), delaiMs: DELAI_PING_MS, delaiTotalMs: DELAI_PING_MS * 2, userAgent: `GMAO-SICAF-Replication/${ctx.version}` }); } catch (e) { throw new HttpError(502, e.message); }
+    try { r = await requete(d.url + '/api/replication/fichiers', { entetes: entetesReplication(d), delaiMs: DELAI_PING_MS, delaiTotalMs: DELAI_PING_MS * 2, userAgent: `GMAO-SICAF-Replication/${ctx.version}`, epinglage: epinglageDe(d) }); } catch (e) { throw new HttpError(502, e.message); }
     if (r.status !== 200 || !r.json || !Array.isArray(r.json.fichiers)) throw new HttpError(502, messageDistant(r));
     const fichiers = r.json.fichiers.slice(0, 200).map((f) => ({
       nom: String(f.nom || '').slice(0, 160), date: typeof f.date === 'string' ? f.date : null, taille: Number(f.taille) || 0,
@@ -1072,7 +1266,7 @@ function register(ctx) {
       if (d.type !== 'dossier') throw new HttpError(400, 'La restauration directe n\'est possible que depuis un dossier. Pour un serveur d\'un autre site, utilisez les sauvegardes reçues sur ce serveur ou téléchargez le fichier.');
       validerChemin(d.chemin);
       const n = validerNomFichier(b.fichier);
-      return { chemin: path.join(d.chemin, n), fichier: n, origine: `destination « ${d.nom} »` };
+      return { chemin: path.join(d.chemin, n), fichier: n, origine: `destination « ${d.nom} »`, origineType: 'destination' };
     }
     if (source === 'recue') {
       let site = b.site;
@@ -1083,12 +1277,13 @@ function register(ctx) {
       if (db.inMemory) throw new HttpError(404, 'Fichier de sauvegarde introuvable');
       const chemin = path.join(dossierRecus(), site, n);
       if (!dans(chemin, dossierRecus())) throw new HttpError(400, 'Nom de fichier de sauvegarde invalide');
-      return { chemin, fichier: n, origine: `sauvegarde reçue (${site})` };
+      return { chemin, fichier: n, origine: `sauvegarde reçue (${site})`, origineType: 'recue' };
     }
     if (source === 'locale') {
-      const n = validerNomFichier(b.fichier);
+      const n = validerNomFichier(b.fichier, { copieAvant: true });
       if (db.inMemory) throw new HttpError(404, 'Fichier de sauvegarde introuvable');
-      return { chemin: path.join(db.backupDir, n), fichier: n, origine: 'copie locale' };
+      const avant = RE_COPIE_AVANT.test(n);
+      return { chemin: path.join(db.backupDir, n), fichier: n, origine: avant ? 'copie locale de l\'état précédent (faite avant une restauration ou un import)' : 'copie locale', origineType: 'locale' };
     }
     throw new HttpError(400, 'Source de restauration invalide (destination, recue ou locale)');
   }
@@ -1099,7 +1294,7 @@ function register(ctx) {
     const b = req.body || {};
     const src = cheminSource(req, b);
     const buf = (() => { try { return lireFichierSauvegarde(src.chemin); } catch (e) { throw erreurHttp(e); } })();
-    return restaurer(req, buf, { shaAttendu: lireSha(src.chemin), motDePasse: typeof b.motDePasse === 'string' ? b.motDePasse : '', origine: src.origine, fichier: src.fichier });
+    return restaurer(req, buf, { shaAttendu: lireSha(src.chemin), motDePasse: typeof b.motDePasse === 'string' ? b.motDePasse : '', origine: src.origine, origineType: src.origineType, fichier: src.fichier });
   }, { perm: ['systeme', 'modifier'] });
 
   /** Restauration depuis un fichier téléversé (ex. sauvegarde récupérée sur une clé USB ou chez un autre site). */
@@ -1114,7 +1309,7 @@ function register(ctx) {
     try { mdp = decodeURIComponent(String(req.headers['x-gmao-mot-de-passe'] || '')); n = decodeURIComponent(String(req.headers['x-gmao-fichier'] || '')); } catch (e) { throw new HttpError(400, 'En-têtes invalides'); }
     n = n.replace(/[\\/\u0000-\u001f]/g, '_').slice(0, 160) || 'fichier téléversé';
     const sha = String(req.headers['x-gmao-sha256'] || '').trim().toLowerCase();
-    return restaurer(req, buf, { shaAttendu: /^[a-f0-9]{64}$/.test(sha) ? sha : null, motDePasse: mdp, origine: 'fichier téléversé', fichier: n });
+    return restaurer(req, buf, { shaAttendu: /^[a-f0-9]{64}$/.test(sha) ? sha : null, motDePasse: mdp, origine: 'fichier téléversé', origineType: 'fichier', fichier: n });
   }, { perm: ['systeme', 'modifier'], brut: true, maxBody: MAX_RECU });
 
   /** Téléchargement d'un fichier de sauvegarde (équivalent d'un export : Système › Modifier). */
@@ -1209,4 +1404,4 @@ function seedDemo(ctx) {
   return `${exemples.length} destinations d'exemple (désactivées)`;
 }
 
-module.exports = { nom, register, seedDemo, encoder, decoder, assainirSegment, cleValide, RE_FICHIER };
+module.exports = { nom, register, seedDemo, encoder, decoder, assainirSegment, cleValide, RE_FICHIER, RE_COPIE_AVANT };

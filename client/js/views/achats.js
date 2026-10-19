@@ -16,12 +16,21 @@
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const STATUTS_CMD_OUVERTS = ['validee', 'envoyee', 'partielle'];
 
-  /** Filtres conservés entre deux affichages (session). */
-  const memo = {
-    periode: '12m',
-    cmd: { statut: '', fournisseurId: '', secteurId: '', categorieCode: '', du: '', au: '', enRetard: false },
-    fac: { statut: '', fournisseurId: '', secteurId: '', categorieCode: '', du: '', au: '', echeanceDepassee: false, aPayer: false },
-  };
+  const STATUTS_CMD_ENGAGES = ['validee', 'envoyee', 'partielle', 'recue'];
+  const STATUTS_CMD_IMPRIMABLES = STATUTS_CMD_ENGAGES;
+  const FILTRES_CMD = () => ({ statut: '', fournisseurId: '', secteurId: '', categorieCode: '', du: '', au: '', enRetard: false });
+  const FILTRES_FAC = () => ({ statut: '', fournisseurId: '', secteurId: '', categorieCode: '', du: '', au: '', echeanceDepassee: false, aPayer: false });
+  /** Filtres conservés entre deux affichages, pour un utilisateur et un site affiché donnés. */
+  const memo = { periode: '12m', cmd: FILTRES_CMD(), fac: FILTRES_FAC(), contexte: '' };
+  /** Remet les filtres à zéro au changement d'utilisateur ou de site affiché (la page n'est pas rechargée). */
+  function filtres() {
+    const contexte = `${(GMAO.user || {}).id || ''}|${GMAO.siteCourant() || ''}`;
+    if (memo.contexte !== contexte) { memo.contexte = contexte; memo.periode = '12m'; memo.cmd = FILTRES_CMD(); memo.fac = FILTRES_FAC(); }
+    return memo;
+  }
+  /** Une valeur mémorisée absente des options proposées (secteur d'un autre site, fournisseur supprimé…) est abandonnée. */
+  function purgerFiltre(f, cle, options) { if (f[cle] !== '' && !options.some((o) => String(o.value) === String(f[cle]))) f[cle] = ''; }
+  const filtreActif = (f) => Object.values(f).some((v) => v !== '' && v !== false && v != null);
 
   // ----- Styles locaux (thèmes clair et sombre via les variables CSS de l'application) -------------
   (function styles() {
@@ -36,8 +45,26 @@
 .ach-kpis.k4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 @media (max-width: 1100px) { .ach-kpis.k3, .ach-kpis.k4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 700px) { .ach-kpis.k3, .ach-kpis.k4 { grid-template-columns: 1fr; } }
-.ach-liste table.tableau td { white-space: nowrap; }
+.ach-liste table.tableau td { vertical-align: top; }
+.ach-liste table.tableau td .nowrap, .ach-liste table.tableau td.num { white-space: nowrap; }
 .ach-liste .ach-objet { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 1500px) { .ach-liste th.ach-col-secondaire, .ach-liste td.ach-col-secondaire { display: none; } }
+.ach-bulle .ach-bulle-serie { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.ach-recherche-article { position: relative; flex: 1; min-width: 260px; max-width: 460px; }
+.ach-recherche-article input { width: 100%; }
+.ach-suggestions { position: absolute; left: 0; right: 0; top: 100%; z-index: 20; max-height: 280px; overflow: auto; background: var(--surface); border: 1px solid var(--bordure-2); border-radius: 6px; box-shadow: var(--ombre-2); margin-top: 2px; }
+.ach-suggestion { display: block; width: 100%; text-align: left; border: 0; background: transparent; color: var(--texte); padding: 6px 10px; font-size: 13px; cursor: pointer; border-bottom: 1px solid var(--bordure); }
+.ach-suggestion:last-child { border-bottom: 0; }
+.ach-suggestion:hover, .ach-suggestion.actif { background: var(--primaire-clair); }
+.ach-suggestion .s { display: block; font-size: 11.5px; color: var(--texte-2); }
+.ach-lignes input.invalide { border-color: var(--danger); box-shadow: 0 0 0 2px rgba(220, 38, 38, .15); }
+.ach-lignes .ach-erreur { font-size: 11.5px; color: var(--danger); margin-top: 2px; text-align: right; }
+.ach-scan { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ach-scan input { max-width: 280px; }
+.ach-scan .ach-scan-info { font-size: 12.5px; color: var(--texte-2); }
+.ach-scan .ach-scan-info.ko { color: var(--danger); }
+.ach-scan .ach-scan-info.ok { color: var(--ok); }
+.ach-groupe-kpi { font-size: 12px; color: var(--texte-2); text-transform: uppercase; letter-spacing: .4px; margin: 2px 0 6px; }
 .alerte a.ach-lien-alerte { color: inherit; text-decoration: underline; font-weight: 600; }
 .ach-pdf-repli { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 34px 16px; border: 1px dashed var(--bordure-2); border-radius: 8px; background: var(--surface-2); text-align: center; color: var(--texte-2); }
 .ach-etapes { display: flex; align-items: center; gap: 0; margin: 0 0 16px; flex-wrap: wrap; row-gap: 8px; }
@@ -163,6 +190,39 @@
   }
   const invaliderRefs = () => { refsCache = null; };
 
+  /** Pastille du menu : commandes et factures à valider (droit valider) et factures en retard — dès la connexion et après chaque action. */
+  let badgeEnCours = null;
+  function majBadge() {
+    if (!GMAO.user || !can('voir')) return Promise.resolve();
+    if (!badgeEnCours) {
+      badgeEnCours = api.get('/api/achats/compteurs', null, { silent401: true }).then((k) => GMAO.setNavBadge(MODULE, k.total || 0)).catch(() => {}).then(() => { badgeEnCours = null; });
+    }
+    return badgeEnCours;
+  }
+  // Dès la connexion (y compris après un changement de mot de passe imposé, qui ne repasse pas par onConnexion),
+  // puis à chaque changement de vue au plus une fois par minute
+  let dernierBadge = { t: 0, user: null };
+  function majBadgeSiBesoin(force) {
+    if (!GMAO.user || GMAO.changementMdpRequis()) return;
+    const maintenant = Date.now();
+    if (!force && dernierBadge.user === GMAO.user.id && maintenant - dernierBadge.t < 60000) return;
+    dernierBadge = { t: maintenant, user: GMAO.user.id };
+    majBadge();
+  }
+  GMAO.onConnexion(() => majBadgeSiBesoin(true));
+  window.addEventListener('hashchange', () => majBadgeSiBesoin(false));
+  (function attendreConnexion() { if (GMAO.user && !GMAO.changementMdpRequis()) majBadgeSiBesoin(true); else setTimeout(attendreConnexion, 1500); })();
+
+  /** Une seule ouverture de fenêtre à la fois (double clic pendant le chargement des références). */
+  let ouvertureEnCours = false;
+  async function ouvrirUnique(fn) {
+    if (ouvertureEnCours) return;
+    ouvertureEnCours = true;
+    try { await fn(); } finally { ouvertureEnCours = false; }
+  }
+  /** Peut-on créer une commande ou une facture sur le site affiché (au moins un site / service modifiable) ? */
+  const creationPossible = () => can('creer') && optionsSecteursEcriture().some((o) => o.value !== '');
+
   // ----- Étapes du circuit -------------------------------------------------------------------------
   function etapes(liste, courant, { echec } = {}) {
     const cont = el('div', { class: 'ach-etapes' });
@@ -220,7 +280,7 @@
         zone.setAttribute('style', 'fill: var(--primaire-clair); opacity: .35');
         ui.vider(bulle);
         bulle.appendChild(el('b', null, new Date(a, m - 1, 1).toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' })));
-        series.forEach((se) => bulle.appendChild(el('div', { class: 'inline', style: { gap: '6px' } }, el('i', { style: { width: '9px', height: '9px', borderRadius: '2px', background: se.couleur, display: 'inline-block' } }), `${se.label} : `, el('strong', null, montant(d[se.cle])))));
+        series.forEach((se) => bulle.appendChild(el('div', { class: 'ach-bulle-serie' }, el('i', { style: { width: '9px', height: '9px', borderRadius: '2px', background: se.couleur, display: 'inline-block' } }), `${se.label} : `, el('strong', null, montant(d[se.cle])))));
         bulle.style.display = 'block';
         const r = racine.getBoundingClientRect();
         const px = ((x0 + col / 2) / W) * r.width;
@@ -283,7 +343,7 @@
   async function rendreTableau(cont, ong) {
     const selPeriode = el('select', { title: 'Période analysée' },
       [['12m', '12 derniers mois'], ['3m', '3 derniers mois'], ['annee', 'Année en cours'], ['annee_prec', 'Année précédente']].map(([v, l]) => el('option', { value: v }, l)));
-    selPeriode.value = memo.periode;
+    selPeriode.value = filtres().periode;
     const zone = el('div');
     selPeriode.addEventListener('change', () => { memo.periode = selPeriode.value; charger(); });
     cont.appendChild(el('div', { class: 'barre-outils' }, el('label', { class: 'inline' }, iconeDim('calendrier', 16, 'var(--texte-2)'), selPeriode), el('span', { class: 'espace' }),
@@ -299,13 +359,20 @@
       const k = t.kpis;
       GMAO.setNavBadge(MODULE, (can('valider') ? k.nbCommandesAValider + k.nbFacturesAValider : 0) + k.nbEnRetard);
       const per = `${dateFr(t.periode.du)} – ${dateFr(t.periode.au)}`;
+      // Les listes ouvertes depuis un indicateur reprennent sa définition (statuts et période) ; « à recevoir » et les
+      // indicateurs de la seconde ligne décrivent la situation du jour, indépendante de la période
+      const periode = { du: t.periode.du, au: t.periode.au };
+      const facturesNonAnnulees = GMAO.liste('statutsFacture').map((s) => s.code).filter((x) => x !== 'annulee').join(',');
+      zone.appendChild(el('div', { class: 'ach-groupe-kpi' }, `Sur la période · ${per}`));
       zone.appendChild(el('div', { class: 'ach-kpis k3' },
-        ui.kpi({ label: 'Engagé (HT)', valeur: montant(k.engageHT), icone: 'achats', detail: `${pluriel(k.nbCommandes, 'commande validée', 'commandes validées')} · ${montant(k.enCoursHT)} à recevoir`, onClic: allerOnglet('commandes', { statut: '' }) }),
-        ui.kpi({ label: 'Facturé (HT)', valeur: montant(k.factureHT), icone: 'facture', couleur: '#6250d6', detail: `${pluriel(k.nbFactures, 'facture')} · ${montant(k.factureTTC)} TTC`, onClic: allerOnglet('factures', { statut: '', echeanceDepassee: false, aPayer: false }) }),
-        ui.kpi({ label: 'Payé (TTC)', valeur: montant(k.payeTTC), icone: 'check', couleur: '#16a34a', detail: `${pluriel(k.nbPayees, 'facture réglée', 'factures réglées')} sur la période`, onClic: allerOnglet('factures', { statut: 'payee', echeanceDepassee: false, aPayer: false }) }),
-        ui.kpi({ label: 'À payer (TTC)', valeur: montant(k.aPayerTTC), icone: 'euro', couleur: '#0891b2', detail: `${pluriel(k.nbAPayer, 'facture')} dont ${montant(k.bonAPayerTTC)} bon à payer`, onClic: () => ong.activer('echeancier') }),
-        ui.kpi({ label: 'En retard de paiement', valeur: montant(k.enRetardTTC), icone: 'alerte', couleur: k.nbEnRetard ? '#dc2626' : '#16a34a', detail: k.nbEnRetard ? pluriel(k.nbEnRetard, 'facture échue', 'factures échues') : 'aucune facture échue', onClic: allerOnglet('factures', { statut: '', echeanceDepassee: true, aPayer: false }) }),
-        ui.kpi({ label: 'Commandes à valider', valeur: ui.formatNombre(k.nbCommandesAValider), icone: 'horloge', couleur: k.nbCommandesAValider ? '#f59e0b' : '#16a34a', detail: k.nbCommandesAValider ? `${montant(k.commandesAValiderHT)} HT en attente` : 'aucune en attente', onClic: allerOnglet('commandes', { statut: 'a_valider' }) })));
+        ui.kpi({ label: 'Engagé (HT)', valeur: montant(k.engageHT), icone: 'achats', detail: `${pluriel(k.nbCommandes, 'commande validée', 'commandes validées')} sur la période · ${montant(k.enCoursHT)} à recevoir à ce jour`, onClic: allerOnglet('commandes', Object.assign(FILTRES_CMD(), periode, { statut: STATUTS_CMD_ENGAGES.join(',') })) }),
+        ui.kpi({ label: 'Facturé (HT)', valeur: montant(k.factureHT), icone: 'facture', couleur: '#6250d6', detail: `${pluriel(k.nbFactures, 'facture')} hors annulées · ${montant(k.factureTTC)} TTC`, onClic: allerOnglet('factures', Object.assign(FILTRES_FAC(), periode, { statut: facturesNonAnnulees })) }),
+        ui.kpi({ label: 'Payé (TTC)', valeur: montant(k.payeTTC), icone: 'check', couleur: '#16a34a', detail: `${pluriel(k.nbPayees, 'facture réglée', 'factures réglées')} sur la période`, onClic: allerOnglet('factures', Object.assign(FILTRES_FAC(), periode, { statut: 'payee' })) })));
+      zone.appendChild(el('div', { class: 'ach-groupe-kpi' }, 'Situation à ce jour'));
+      zone.appendChild(el('div', { class: 'ach-kpis k3' },
+        ui.kpi({ label: 'À payer (TTC)', valeur: montant(k.aPayerTTC), icone: 'euro', couleur: '#0891b2', detail: `${pluriel(k.nbAPayer, 'facture')} dont ${montant(k.bonAPayerTTC)} bon à payer${k.nbLitiges ? ` · hors ${montant(k.litigesTTC)} en litige` : ''}`, onClic: () => ong.activer('echeancier') }),
+        ui.kpi({ label: 'En retard de paiement', valeur: montant(k.enRetardTTC), icone: 'alerte', couleur: k.nbEnRetard ? '#dc2626' : '#16a34a', detail: k.nbEnRetard ? pluriel(k.nbEnRetard, 'facture échue', 'factures échues') : 'aucune facture échue', onClic: allerOnglet('factures', Object.assign(FILTRES_FAC(), { echeanceDepassee: true })) }),
+        ui.kpi({ label: 'Commandes à valider', valeur: ui.formatNombre(k.nbCommandesAValider), icone: 'horloge', couleur: k.nbCommandesAValider ? '#f59e0b' : '#16a34a', detail: k.nbCommandesAValider ? `${montant(k.commandesAValiderHT)} HT en attente` : 'aucune en attente', onClic: allerOnglet('commandes', Object.assign(FILTRES_CMD(), { statut: 'a_valider' })) })));
 
       const alertes = [];
       if (k.nbLitiges) alertes.push(ui.alerte(el('div', { class: 'ach-alerte-ligne' }, iconeDim('alerte', 16), el('strong', null, pluriel(k.nbLitiges, 'facture en litige', 'factures en litige')), `(${montant(k.litigesTTC)} TTC) : réglez le différend avec le fournisseur avant paiement.`, el('a', { href: '#', class: 'ach-lien-alerte', onclick: (ev) => { ev.preventDefault(); allerOnglet('factures', { statut: 'litige', echeanceDepassee: false, aPayer: false })(); } }, 'Voir les litiges')), 'alerte'));
@@ -315,7 +382,7 @@
       const series = [{ cle: 'engageHT', label: 'Commandé (HT)', couleur: 'var(--serie-1)' }, { cle: 'factureHT', label: 'Facturé (HT)', couleur: 'var(--serie-2)' }];
       const totalCat = t.parCategorie.reduce((s, x) => s + num(x.factureHT), 0);
       zone.appendChild(el('div', { class: 'grille grille-2', style: { alignItems: 'start' } },
-        ui.carte('Commandes et factures par mois', frag(el('div', { class: 'texte-2 texte-petit', style: { marginTop: '-6px', marginBottom: '8px' } }, `Montants HT · ${per}`), t.parMois.some((m) => m.engageHT || m.factureHT) ? graphiqueMois(t.parMois, series) : ui.vide('Aucune commande ni facture sur la période', 'rapports'))),
+        ui.carte('Commandes et factures par mois', frag(el('div', { class: 'texte-2 texte-petit', style: { marginTop: '-6px', marginBottom: '8px' } }, `Montants HT · ${per}${t.serieMoisLimitee ? ' · 36 derniers mois' : ''}`), t.parMois.some((m) => m.engageHT || m.factureHT) ? graphiqueMois(t.parMois, series) : ui.vide('Aucune commande ni facture sur la période', 'rapports'))),
         ui.carte('Dépenses facturées par catégorie', frag(el('div', { class: 'texte-2 texte-petit', style: { marginTop: '-6px', marginBottom: '8px' } }, `${montant(totalCat)} HT facturés · ${per}`),
           t.parCategorie.filter((x) => x.factureHT > 0).length ? barresH(t.parCategorie.filter((x) => x.factureHT > 0).map((x) => Object.assign({}, x, { valeur: x.factureHT, couleur: x.couleur || '#6b7280' }))) : ui.vide('Aucune facture sur la période', 'facture')))));
 
@@ -350,28 +417,40 @@
 
   function progression(pct) {
     const p = Math.max(0, Math.min(100, num(pct)));
-    return el('div', { class: 'ach-progression' }, el('div', { class: 'barre-progression' }, el('div', { style: { width: p + '%', background: p >= 100 ? 'var(--ok)' : 'var(--primaire)' } })), el('span', null, `${Math.round(p)} %`));
+    return el('div', { class: 'ach-progression', title: 'Taux de réception en valeur (montant reçu / montant commandé)' }, el('div', { class: 'barre-progression' }, el('div', { style: { width: p + '%', background: p >= 100 ? 'var(--ok)' : 'var(--primaire)' } })), el('span', null, `${Math.round(p)} %`));
+  }
+
+  /** Texte du champ de recherche d'un tableau (transmis aux exports pour exporter ce qui est affiché). */
+  const rechercheTableau = (tableau) => { const i = tableau.el.querySelector('input[type=search]'); return i ? i.value.trim() : ''; };
+  /** Bouton « Réinitialiser les filtres », affiché seulement quand un filtre est actif. */
+  function boutonReinitialiser(f, defauts, rendre) {
+    if (!filtreActif(f)) return null;
+    return ui.bouton('Réinitialiser les filtres', { icone: 'fermer', classe: 'btn-sm btn-lien', onClic: () => { Object.assign(f, defauts()); rendre(); } });
   }
 
   async function rendreCommandes(cont) {
     const refs = await references().catch(() => ({ fournisseurs: [] }));
-    const f = memo.cmd;
+    const f = filtres().cmd;
     const resume = el('span', { class: 'texte-2 texte-petit' });
-    const optsStatut = [{ value: '', label: 'Tous les statuts' }, { value: STATUTS_CMD_OUVERTS.join(','), label: 'En cours (validées, envoyées, partielles)' }].concat(GMAO.liste('statutsCommande').map((s) => ({ value: s.code, label: s.label })));
+    const optsStatut = [{ value: '', label: 'Tous les statuts' }, { value: STATUTS_CMD_OUVERTS.join(','), label: 'En cours (validées, envoyées, partielles)' }, { value: STATUTS_CMD_ENGAGES.join(','), label: 'Engagées (validées à reçues)' }].concat(GMAO.liste('statutsCommande').map((s) => ({ value: s.code, label: s.label })));
+    const optsFournisseurs = [{ value: '', label: 'Tous les fournisseurs' }].concat((refs.fournisseurs || []).map((x) => ({ value: x.id, label: x.nom + (x.actif ? '' : ' (désactivé)') })));
+    const optsSecteurs = ui.optionsSecteurs({ vide: 'Tous les sites / services' });
+    const optsCategories = ui.optionsListe('categoriesDepense', { vide: 'Toutes les catégories' });
+    purgerFiltre(f, 'statut', optsStatut); purgerFiltre(f, 'fournisseurId', optsFournisseurs); purgerFiltre(f, 'secteurId', optsSecteurs); purgerFiltre(f, 'categorieCode', optsCategories);
     const tableau = ui.table({
-      lignes: [], recherche: 'Rechercher (n°, objet, fournisseur, article)…', triInitial: { cle: 'dateCommande', sens: 'desc' }, vide: 'Aucune commande ne correspond aux filtres',
+      lignes: [], recherche: 'Rechercher (n°, objet, fournisseur…)', triInitial: { cle: 'dateCommande', sens: 'desc' }, vide: 'Aucune commande ne correspond aux filtres',
       onClic: (c) => GMAO.navigate('#/achats/commande/' + c.id),
       ligneClasse: (c) => (c.statut === 'annulee' ? 'inactif' : ''),
       rechercheDans: (c) => [c.objet, c.fournisseurNom, (c.lignes || []).map((l) => `${l.designation} ${l.referenceFournisseur || ''}`).join(' ')].join(' '),
       colonnes: [
-        { cle: 'dateCommande', label: 'Commande', rendu: (c) => frag(el('div', { class: 'cellule-principale' }, c.numero), secondaire(dateFr(c.dateCommande))), valeurTri: (c) => `${c.dateCommande || ''}|${c.numero}` },
-        { cle: 'fournisseurNom', label: 'Fournisseur / objet', rendu: (c) => frag(el('div', null, c.fournisseurNom), objetCourt(c.objet || ui.libelle('categoriesDepense', c.categorieCode), 220)), valeurTri: (c) => normalTri(c.fournisseurNom) },
-        { cle: 'secteurNom', label: 'Site / service', rendu: (c) => frag(texteCourt(c.secteurNom, 160), secondaire(c.siteNom && c.siteNom !== c.secteurNom ? c.siteNom : '')) },
+        { cle: 'dateCommande', label: 'Commande', rendu: (c) => frag(el('div', { class: 'cellule-principale nowrap' }, c.numero), secondaire(dateFr(c.dateCommande))), valeurTri: (c) => `${c.dateCommande || ''}|${c.numero}` },
+        { cle: 'fournisseurNom', label: 'Fournisseur / objet', rendu: (c) => frag(el('div', null, c.fournisseurNom), objetCourt(c.objet || ui.libelle('categoriesDepense', c.categorieCode), 200)), valeurTri: (c) => normalTri(c.fournisseurNom) },
+        { cle: 'secteurNom', label: 'Site / service', rendu: (c) => frag(texteCourt(c.secteurNom, 140), secondaire(c.siteNom && c.siteNom !== c.secteurNom ? c.siteNom : '')) },
         { cle: 'statut', label: 'Statut', liste: 'statutsCommande' },
-        { cle: 'totaux.ht', label: 'Montant HT', aligner: 'droite', rendu: (c) => el('span', { class: 'texte-gras' }, montant(c.totaux.ht)), valeurTri: (c) => num(c.totaux.ht), exportValeur: (c) => ui.formatNombre(c.totaux.ht, 2) },
-        { cle: 'dateLivraisonPrevue', label: 'Livraison', rendu: (c) => (c.dateLivraisonPrevue ? frag(el('div', { class: c.enRetardLivraison ? 'texte-danger texte-gras' : '' }, dateFr(c.dateLivraisonPrevue)), c.enRetardLivraison ? el('div', { class: 'cellule-secondaire texte-danger' }, `retard ${c.joursRetardLivraison} j`) : null) : el('span', { class: 'texte-2' }, '—')), valeurTri: (c) => c.dateLivraisonPrevue || '9999' },
+        { cle: 'totaux.ht', label: 'Montant HT', aligner: 'droite', rendu: (c) => el('span', { class: 'texte-gras nowrap' }, montant(c.totaux.ht)), valeurTri: (c) => num(c.totaux.ht), exportValeur: (c) => ui.formatNombre(c.totaux.ht, 2) },
+        { cle: 'dateLivraisonPrevue', label: 'Livraison', rendu: (c) => (c.dateLivraisonPrevue ? frag(el('div', { class: (c.enRetardLivraison ? 'texte-danger texte-gras ' : '') + 'nowrap' }, dateFr(c.dateLivraisonPrevue)), c.enRetardLivraison ? el('div', { class: 'cellule-secondaire texte-danger' }, `retard ${c.joursRetardLivraison} j`) : null) : el('span', { class: 'texte-2' }, '—')), valeurTri: (c) => c.dateLivraisonPrevue || '9999' },
         { cle: 'tauxReception', label: 'Réception', rendu: (c) => (['brouillon', 'a_valider', 'annulee'].includes(c.statut) ? el('span', { class: 'texte-2' }, '—') : progression(c.tauxReception)), valeurTri: (c) => num(c.tauxReception) },
-        { cle: 'montantFactureHT', label: 'Facturé HT', aligner: 'droite', rendu: (c) => (c.montantFactureHT ? montant(c.montantFactureHT) : el('span', { class: 'texte-2' }, '—')), valeurTri: (c) => num(c.montantFactureHT) },
+        { cle: 'montantFactureHT', label: 'Facturé HT', aligner: 'droite', classe: 'ach-col-secondaire', rendu: (c) => (c.montantFactureHT ? el('span', { class: 'nowrap' }, montant(c.montantFactureHT)) : el('span', { class: 'texte-2' }, '—')), valeurTri: (c) => num(c.montantFactureHT) },
       ],
     });
     const charger = async () => {
@@ -382,18 +461,20 @@
         resume.textContent = `${pluriel(rows.length, 'commande')} · ${montant(ht)} HT (hors annulées)`;
       } catch (e) { erreur(e); }
     };
+    const rendre = () => { ui.vider(cont); rendreCommandes(cont); };
     const maj = (k) => (v) => { f[k] = v; charger(); };
     cont.appendChild(el('div', { class: 'barre-outils' },
       selectFiltre(optsStatut, f.statut, maj('statut'), 'Statut'),
-      selectFiltre([{ value: '', label: 'Tous les fournisseurs' }].concat((refs.fournisseurs || []).map((x) => ({ value: x.id, label: x.nom + (x.actif ? '' : ' (désactivé)') }))), f.fournisseurId, maj('fournisseurId'), 'Fournisseur'),
-      selectFiltre(ui.optionsSecteurs({ vide: 'Tous les sites / services' }), f.secteurId, maj('secteurId'), 'Site / service'),
-      selectFiltre(ui.optionsListe('categoriesDepense', { vide: 'Toutes les catégories' }), f.categorieCode, maj('categorieCode'), 'Catégorie de dépense'),
+      selectFiltre(optsFournisseurs, f.fournisseurId, maj('fournisseurId'), 'Fournisseur'),
+      selectFiltre(optsSecteurs, f.secteurId, maj('secteurId'), 'Site / service'),
+      selectFiltre(optsCategories, f.categorieCode, maj('categorieCode'), 'Catégorie de dépense'),
       el('label', { class: 'inline' }, 'Du', champDate(f.du, maj('du'), 'Date de commande à partir du')),
       el('label', { class: 'inline' }, 'au', champDate(f.au, maj('au'), 'Date de commande jusqu\'au')),
       caseFiltre('Livraison en retard', f.enRetard, maj('enRetard')),
+      boutonReinitialiser(f, FILTRES_CMD, rendre),
       el('span', { class: 'espace' }),
-      can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', classe: 'btn-sm', onClic: () => exporter('commandes', f) }) : null,
-      can('exporter') ? ui.bouton('Lignes (CSV)', { icone: 'liste', classe: 'btn-sm', titre: 'Export détaillé des lignes de commande', onClic: () => exporter('lignes', f) }) : null));
+      can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', classe: 'btn-sm', titre: 'Commandes affichées (filtres et recherche)', onClic: () => exporter('commandes', Object.assign({}, f, { recherche: rechercheTableau(tableau) })) }) : null,
+      can('exporter') ? ui.bouton('Lignes (CSV)', { icone: 'liste', classe: 'btn-sm', titre: 'Export détaillé des lignes des commandes affichées', onClic: () => exporter('lignes', Object.assign({}, f, { recherche: rechercheTableau(tableau) })) }) : null));
     cont.appendChild(el('div', { class: 'barre-outils', style: { marginTop: '-6px' } }, resume));
     tableau.el.classList.add('ach-liste'); cont.appendChild(tableau.el);
     await charger();
@@ -412,19 +493,24 @@
 
   async function rendreFactures(cont) {
     const refs = await references().catch(() => ({ fournisseurs: [] }));
-    const f = memo.fac;
+    const f = filtres().fac;
     const resume = el('span', { class: 'texte-2 texte-petit' });
-    const optsStatut = [{ value: '', label: 'Tous les statuts' }].concat(GMAO.liste('statutsFacture').map((s) => ({ value: s.code, label: s.label })));
+    const nonAnnulees = GMAO.liste('statutsFacture').map((s) => s.code).filter((x) => x !== 'annulee').join(',');
+    const optsStatut = [{ value: '', label: 'Tous les statuts' }, { value: nonAnnulees, label: 'Tous sauf annulées' }].concat(GMAO.liste('statutsFacture').map((s) => ({ value: s.code, label: s.label })));
+    const optsFournisseurs = [{ value: '', label: 'Tous les fournisseurs' }].concat((refs.fournisseurs || []).map((x) => ({ value: x.id, label: x.nom })));
+    const optsSecteurs = ui.optionsSecteurs({ vide: 'Tous les sites / services' });
+    const optsCategories = ui.optionsListe('categoriesDepense', { vide: 'Toutes les catégories' });
+    purgerFiltre(f, 'statut', optsStatut); purgerFiltre(f, 'fournisseurId', optsFournisseurs); purgerFiltre(f, 'secteurId', optsSecteurs); purgerFiltre(f, 'categorieCode', optsCategories);
     const tableau = ui.table({
-      lignes: [], recherche: 'Rechercher (n°, fournisseur, objet, commande)…', triInitial: { cle: 'dateFacture', sens: 'desc' }, vide: 'Aucune facture ne correspond aux filtres',
+      lignes: [], recherche: 'Rechercher (n°, fournisseur, objet…)', triInitial: { cle: 'dateFacture', sens: 'desc' }, vide: 'Aucune facture ne correspond aux filtres',
       onClic: (x) => GMAO.navigate('#/achats/facture/' + x.id),
       ligneClasse: (x) => (x.statut === 'annulee' ? 'inactif' : ''),
       colonnes: [
-        { cle: 'dateFacture', label: 'Facture', rendu: (x) => frag(el('div', { class: 'cellule-principale inline', style: { gap: '5px' } }, x.numero, x.nbDocuments ? el('span', { title: `${x.nbDocuments} pièce(s) jointe(s)`, class: 'inline', style: { color: x.aPdf ? 'var(--danger)' : 'var(--texte-2)' } }, iconeDim('piece_jointe', 13)) : null), objetCourt(`n° ${x.numeroFournisseur} · ${dateFr(x.dateFacture)}`, 200)), valeurTri: (x) => `${x.dateFacture || ''}|${x.numero}` },
-        { cle: 'fournisseurNom', label: 'Fournisseur / objet', rendu: (x) => frag(el('div', null, x.fournisseurNom), objetCourt(x.objet || ui.libelle('categoriesDepense', x.categorieCode), 200)), valeurTri: (x) => normalTri(x.fournisseurNom) },
-        { cle: 'commandeNumero', label: 'Imputation', rendu: (x) => frag(x.commandeNumero ? el('div', null, lienVue('#/achats/commande/' + x.commandeId, x.commandeNumero)) : null, x.otNumero ? el('div', { class: 'cellule-secondaire' }, /^OT/i.test(x.otNumero) ? x.otNumero : `OT ${x.otNumero}`) : null, x.personnelNom ? el('div', { class: 'cellule-secondaire' }, x.personnelNom) : null, !x.commandeNumero && !x.otNumero && !x.personnelNom ? el('span', { class: 'texte-2' }, '—') : null), valeurTri: (x) => x.commandeNumero || x.otNumero || '' },
-        { cle: 'secteurNom', label: 'Site / service', rendu: (x) => frag(texteCourt(x.secteurNom, 150), secondaire(x.siteNom && x.siteNom !== x.secteurNom ? x.siteNom : '')) },
-        { cle: 'montantTTC', label: 'Montant', aligner: 'droite', rendu: (x) => frag(el('div', { class: 'texte-gras' }, `${montant(x.montantTTC)} TTC`), el('div', { class: 'cellule-secondaire' }, `${montant(x.montantHT)} HT`)), valeurTri: (x) => num(x.montantTTC) },
+        { cle: 'dateFacture', label: 'Facture', rendu: (x) => frag(el('div', { class: 'cellule-principale inline nowrap', style: { gap: '5px' } }, x.numero, x.nbDocuments ? el('span', { title: `${x.nbDocuments} pièce(s) jointe(s)`, class: 'inline', style: { color: x.aPdf ? 'var(--danger)' : 'var(--texte-2)' } }, iconeDim('piece_jointe', 13)) : null), objetCourt(`n° ${x.numeroFournisseur} · ${dateFr(x.dateFacture)}`, 170)), valeurTri: (x) => `${x.dateFacture || ''}|${x.numero}` },
+        { cle: 'fournisseurNom', label: 'Fournisseur / objet', rendu: (x) => frag(el('div', null, x.fournisseurNom), objetCourt(x.objet || ui.libelle('categoriesDepense', x.categorieCode), 190)), valeurTri: (x) => normalTri(x.fournisseurNom) },
+        { cle: 'commandeNumero', label: 'Imputation', classe: 'ach-col-secondaire', rendu: (x) => frag(x.commandeNumero ? el('div', { class: 'nowrap' }, lienVue('#/achats/commande/' + x.commandeId, x.commandeNumero)) : null, x.otNumero ? el('div', { class: 'cellule-secondaire nowrap' }, /^OT/i.test(x.otNumero) ? x.otNumero : `OT ${x.otNumero}`) : null, x.personnelNom ? el('div', { class: 'cellule-secondaire' }, x.personnelNom) : null, !x.commandeNumero && !x.otNumero && !x.personnelNom ? el('span', { class: 'texte-2' }, '—') : null), valeurTri: (x) => x.commandeNumero || x.otNumero || '' },
+        { cle: 'secteurNom', label: 'Site / service', rendu: (x) => frag(texteCourt(x.secteurNom, 140), secondaire(x.siteNom && x.siteNom !== x.secteurNom ? x.siteNom : '')) },
+        { cle: 'montantTTC', label: 'Montant', aligner: 'droite', rendu: (x) => frag(el('div', { class: 'texte-gras nowrap' }, `${montant(x.montantTTC)} TTC`), el('div', { class: 'cellule-secondaire nowrap' }, `${montant(x.montantHT)} HT`)), valeurTri: (x) => num(x.montantTTC) },
         { cle: 'dateEcheance', label: 'Échéance', rendu: celluleEcheance, valeurTri: (x) => x.dateEcheance || '' },
         { cle: 'statut', label: 'Statut', liste: 'statutsFacture', rendu: (x) => frag(ui.badgeListe('statutsFacture', x.statut), x.rapprochement && !x.rapprochement.conforme && !['payee', 'annulee'].includes(x.statut) ? el('div', { class: 'cellule-secondaire texte-alerte', title: 'Écart de rapprochement avec la commande' }, `écart ${montant(x.rapprochement.ecartHT)}`) : null) },
       ],
@@ -437,18 +523,20 @@
         resume.textContent = `${pluriel(rows.length, 'facture')} · ${montant(valides.reduce((s, x) => s + num(x.montantHT), 0))} HT · ${montant(valides.reduce((s, x) => s + num(x.montantTTC), 0))} TTC (hors annulées)`;
       } catch (e) { erreur(e); }
     };
+    const rendre = () => { ui.vider(cont); rendreFactures(cont); };
     const maj = (k) => (v) => { f[k] = v; charger(); };
     cont.appendChild(el('div', { class: 'barre-outils' },
       selectFiltre(optsStatut, f.statut, maj('statut'), 'Statut'),
-      selectFiltre([{ value: '', label: 'Tous les fournisseurs' }].concat((refs.fournisseurs || []).map((x) => ({ value: x.id, label: x.nom }))), f.fournisseurId, maj('fournisseurId'), 'Fournisseur'),
-      selectFiltre(ui.optionsSecteurs({ vide: 'Tous les sites / services' }), f.secteurId, maj('secteurId'), 'Site / service'),
-      selectFiltre(ui.optionsListe('categoriesDepense', { vide: 'Toutes les catégories' }), f.categorieCode, maj('categorieCode'), 'Catégorie de dépense'),
+      selectFiltre(optsFournisseurs, f.fournisseurId, maj('fournisseurId'), 'Fournisseur'),
+      selectFiltre(optsSecteurs, f.secteurId, maj('secteurId'), 'Site / service'),
+      selectFiltre(optsCategories, f.categorieCode, maj('categorieCode'), 'Catégorie de dépense'),
       el('label', { class: 'inline' }, 'Du', champDate(f.du, maj('du'), 'Date de facture à partir du')),
       el('label', { class: 'inline' }, 'au', champDate(f.au, maj('au'), 'Date de facture jusqu\'au')),
       caseFiltre('Échéance dépassée', f.echeanceDepassee, maj('echeanceDepassee')),
       caseFiltre('À payer', f.aPayer, maj('aPayer')),
+      boutonReinitialiser(f, FILTRES_FAC, rendre),
       el('span', { class: 'espace' }),
-      can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', classe: 'btn-sm', onClic: () => exporter('factures', f) }) : null));
+      can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', classe: 'btn-sm', titre: 'Factures affichées (filtres et recherche)', onClic: () => exporter('factures', Object.assign({}, f, { recherche: rechercheTableau(tableau) })) }) : null));
     cont.appendChild(el('div', { class: 'barre-outils', style: { marginTop: '-6px' } }, resume));
     tableau.el.classList.add('ach-liste'); cont.appendChild(tableau.el);
     await charger();
@@ -462,8 +550,11 @@
     try { e = await api.get('/api/achats/echeancier'); } catch (err) { cont.appendChild(ui.alerte(err.message, 'danger')); return; }
     const semaineCourante = e.semaines.find((s) => s.courante);
     const quatre = e.semaines.filter((s) => s.debut <= ajouterJours(e.aujourdhui, 28)).reduce((s, x) => s + num(x.total), 0);
+    // Même définition que le tableau de bord : les factures en litige sont comptées à part
+    const litiges = e.enRetard.factures.concat(...e.semaines.map((s) => s.factures)).filter((x) => x.statut === 'litige');
+    const litigeTTC = litiges.reduce((s, x) => s + num(x.montantTTC), 0);
     cont.appendChild(el('div', { class: 'ach-kpis k4' },
-      ui.kpi({ label: 'Total à payer (TTC)', valeur: montant(e.total), icone: 'euro', detail: pluriel(e.nbFactures, 'facture non réglée', 'factures non réglées') }),
+      ui.kpi({ label: 'Total à payer (TTC)', valeur: montant(e.total), icone: 'euro', detail: `${pluriel(e.nbFactures, 'facture non réglée', 'factures non réglées')}${litiges.length ? ` · dont ${montant(litigeTTC)} en litige` : ' · aucune en litige'}` }),
       ui.kpi({ label: 'Échu non payé', valeur: montant(e.enRetard.total), icone: 'alerte', couleur: e.enRetard.factures.length ? '#dc2626' : '#16a34a', detail: e.enRetard.factures.length ? pluriel(e.enRetard.factures.length, 'facture') : 'aucune' }),
       ui.kpi({ label: 'Cette semaine', valeur: montant(semaineCourante ? semaineCourante.total : 0), icone: 'calendrier', couleur: '#f59e0b', detail: semaineCourante ? pluriel(semaineCourante.factures.length, 'échéance') : 'aucune échéance' }),
       ui.kpi({ label: 'Dans les 4 semaines', valeur: montant(quatre), icone: 'horloge', couleur: '#0891b2', detail: 'hors factures échues' })));
@@ -473,13 +564,13 @@
     const tableSemaine = (factures, retard) => ui.table({
       lignes: factures, recherche: false, pagination: false, compact: true, triInitial: { cle: 'dateEcheance', sens: 'asc' }, onClic: (x) => GMAO.navigate('#/achats/facture/' + x.id),
       colonnes: [
-        { cle: 'dateEcheance', label: 'Échéance', rendu: (x) => el('span', { class: retard ? 'texte-danger texte-gras' : '' }, dateFr(x.dateEcheance)), valeurTri: (x) => x.dateEcheance },
-        { cle: 'fournisseurNom', label: 'Fournisseur', rendu: (x) => frag(el('div', { class: 'cellule-principale' }, x.fournisseurNom), secondaire(x.objet)) },
+        { cle: 'dateEcheance', label: 'Échéance', rendu: (x) => el('span', { class: (retard ? 'texte-danger texte-gras ' : '') + 'nowrap' }, dateFr(x.dateEcheance)), valeurTri: (x) => x.dateEcheance },
+        { cle: 'fournisseurNom', label: 'Fournisseur', rendu: (x) => frag(el('div', { class: 'cellule-principale' }, x.fournisseurNom), objetCourt(x.objet, 180)) },
         { cle: 'numeroFournisseur', label: 'N° fournisseur', rendu: (x) => frag(el('div', null, x.numeroFournisseur), secondaire(x.numero)) },
         { cle: 'siteNom', label: 'Site', rendu: (x) => x.siteNom || x.secteurNom },
         { cle: 'statut', label: 'Statut', liste: 'statutsFacture' },
         retard ? { cle: 'joursRetard', label: 'Retard', aligner: 'droite', rendu: (x) => el('span', { class: 'texte-danger texte-gras' }, `${x.joursRetard} j`) } : null,
-        { cle: 'montantTTC', label: 'Montant TTC', aligner: 'droite', rendu: (x) => el('span', { class: 'texte-gras' }, montant(x.montantTTC)), valeurTri: (x) => num(x.montantTTC) },
+        { cle: 'montantTTC', label: 'Montant TTC', aligner: 'droite', rendu: (x) => el('span', { class: 'texte-gras nowrap' }, montant(x.montantTTC)), valeurTri: (x) => num(x.montantTTC) },
       ].filter(Boolean),
       actions: [{ icone: 'euro', titre: 'Enregistrer le paiement', classe: 'texte-ok', visible: (x) => can('valider') && x.statut === 'validee' && !GMAO.siteLectureSeule(x.secteurId), onClic: (x) => ouvrirPaiement(x, recharger) }],
     }).el;
@@ -508,23 +599,58 @@
     const optOts = [{ value: '', label: '—' }].concat(otsOuverts.map((o) => ({ value: o.id, label: `${o.numero} — ${o.titre}`.slice(0, 70) })));
     const parId = new Map((articles || []).map((a) => [a.id, a]));
 
-    const selArticle = el('select', { style: { maxWidth: '420px' }, disabled: verrouille });
-    function remplirArticles() {
-      ui.vider(selArticle);
-      selArticle.appendChild(el('option', { value: '' }, '+ Ajouter un article du stock…'));
+    // Recherche d'un article du stock (code, désignation, référence) validée par Entrée ou par un clic : une
+    // frappe au clavier ou un scan à la douchette n'ajoute jamais de ligne par touche ; un code exact (douchette)
+    // ajoute l'article directement, et un article déjà présent voit sa quantité augmentée.
+    const champArticle = el('input', { type: 'text', placeholder: '+ Ajouter un article du stock : code, désignation ou référence…', disabled: verrouille, autocomplete: 'off', dataset: { achArticle: '1' }, title: 'Tapez ou scannez un code article, puis Entrée ; ou choisissez dans les propositions' });
+    const suggestions = el('div', { class: 'ach-suggestions masque' });
+    let candidats = []; let actif = -1;
+    const cle = (s) => normalTri(s).replace(/\s+/g, ' ').trim();
+    function chercher(texte) {
+      const mots = cle(texte).split(' ').filter(Boolean);
       const fid = Number(getFournisseurId()) || null;
-      const duFour = (articles || []).filter((a) => fid && a.fournisseurId === fid);
-      const autres = (articles || []).filter((a) => !fid || a.fournisseurId !== fid);
-      const opt = (a) => el('option', { value: String(a.id) }, `${a.code ? a.code + ' — ' : ''}${a.designation} · ${montant(a.prixUnitaire)}${a.quantite <= a.seuilMin ? ' · sous le seuil' : ''}`);
-      if (duFour.length) selArticle.appendChild(el('optgroup', { label: 'Articles habituels de ce fournisseur' }, duFour.map(opt)));
-      if (autres.length) selArticle.appendChild(el('optgroup', { label: duFour.length ? 'Autres articles' : 'Articles du stock' }, autres.map(opt)));
+      const liste = (articles || []).filter((a) => { const t = cle(`${a.code} ${a.designation} ${a.referenceFournisseur}`); return mots.every((m) => t.includes(m)); });
+      return liste.sort((a, b) => ((b.fournisseurId === fid) - (a.fournisseurId === fid)) || a.designation.localeCompare(b.designation, 'fr')).slice(0, 12);
     }
-    selArticle.addEventListener('change', () => {
-      const a = parId.get(Number(selArticle.value));
-      if (a) rows.push({ articleId: a.id, designation: a.designation, referenceFournisseur: a.referenceFournisseur || '', quantite: Math.max(1, num(a.seuilMin) * 2 - num(a.quantite)) || 1, prixUnitaireHT: num(a.prixUnitaire), tauxTVA: tvaDefaut, otId: null, uniteCode: a.uniteCode || '' });
-      selArticle.value = '';
+    function masquerSuggestions() { suggestions.classList.add('masque'); ui.vider(suggestions); candidats = []; actif = -1; }
+    function afficherSuggestions() {
+      const texte = champArticle.value;
+      if (!cle(texte)) { masquerSuggestions(); return; }
+      candidats = chercher(texte); actif = candidats.length ? 0 : -1;
+      ui.vider(suggestions);
+      if (!candidats.length) suggestions.appendChild(el('div', { class: 'ach-suggestion texte-2' }, 'Aucun article ne correspond'));
+      const fid = Number(getFournisseurId()) || null;
+      candidats.forEach((a, i) => suggestions.appendChild(el('button', { type: 'button', class: 'ach-suggestion' + (i === actif ? ' actif' : ''), dataset: { id: a.id }, onclick: () => ajouterArticle(a) },
+        `${a.code ? a.code + ' — ' : ''}${a.designation}`,
+        el('span', { class: 's' }, [`${montant(a.prixUnitaire)} HT`, `stock ${ui.formatNombre(a.quantite)} ${libUnite(a.uniteCode)}`.trim(), a.quantite <= a.seuilMin ? 'sous le seuil' : '', a.referenceFournisseur ? `réf. ${a.referenceFournisseur}` : '', fid && a.fournisseurId === fid ? 'fournisseur habituel' : ''].filter(Boolean).join(' · ')))));
+      suggestions.classList.remove('masque');
+    }
+    function surligner() { suggestions.querySelectorAll('.ach-suggestion').forEach((b, i) => b.classList.toggle('actif', i === actif)); const b = suggestions.children[actif]; if (b && b.scrollIntoView) b.scrollIntoView({ block: 'nearest' }); }
+    function ajouterArticle(a) {
+      const existante = rows.find((l) => Number(l.articleId) === a.id);
+      if (existante) { existante.quantite = num(existante.quantite) + 1; toast(`${a.designation} : quantité portée à ${ui.formatNombre(existante.quantite)}`, 'info'); }
+      else rows.push({ articleId: a.id, designation: a.designation, referenceFournisseur: a.referenceFournisseur || '', quantite: Math.max(1, num(a.seuilMin) * 2 - num(a.quantite)) || 1, prixUnitaireHT: num(a.prixUnitaire), tauxTVA: tvaDefaut, otId: null, uniteCode: a.uniteCode || '' });
+      champArticle.value = ''; masquerSuggestions();
       rendre(true);
+      champArticle.focus();
+    }
+    champArticle.addEventListener('input', afficherSuggestions);
+    champArticle.addEventListener('focus', () => { if (cle(champArticle.value)) afficherSuggestions(); });
+    champArticle.addEventListener('keydown', (ev) => {
+      if (ev.key === 'ArrowDown' && candidats.length) { ev.preventDefault(); actif = (actif + 1) % candidats.length; surligner(); }
+      else if (ev.key === 'ArrowUp' && candidats.length) { ev.preventDefault(); actif = (actif - 1 + candidats.length) % candidats.length; surligner(); }
+      else if (ev.key === 'Enter') {
+        ev.preventDefault(); ev.stopPropagation();
+        const code = cle(champArticle.value);
+        if (!code) return;
+        const exact = (articles || []).find((a) => cle(a.code) === code || cle(a.referenceFournisseur) === code);
+        const choix = exact || (candidats.length ? candidats[Math.max(0, actif)] : null);
+        if (choix) ajouterArticle(choix); else toast(`Aucun article du stock ne correspond à « ${champArticle.value.trim()} »`, 'alerte');
+      } else if (ev.key === 'Escape' && !suggestions.classList.contains('masque')) { ev.stopPropagation(); masquerSuggestions(); }
     });
+    champArticle.addEventListener('blur', () => setTimeout(masquerSuggestions, 150));
+    suggestions.addEventListener('mousedown', (ev) => ev.preventDefault()); // le clic sur une proposition garde la saisie active
+    function remplirArticles() { if (!suggestions.classList.contains('masque')) afficherSuggestions(); }
     const btnLibre = ui.bouton('Ligne libre', { icone: 'plus', classe: 'btn-sm', disabled: verrouille, onClic: () => { rows.push({ articleId: null, designation: '', referenceFournisseur: '', quantite: 1, prixUnitaireHT: 0, tauxTVA: tvaDefaut, otId: null, uniteCode: 'u' }); rendre(true); const inputs = corps.querySelectorAll('input[data-champ="designation"]'); if (inputs.length) inputs[inputs.length - 1].focus(); } });
 
     function calcul() {
@@ -542,8 +668,9 @@
       messageSeuil.className = 'texte-petit ' + (t.ht >= seuil ? 'texte-alerte' : 'texte-2');
       messageSeuil.textContent = t.ht >= seuil ? `Montant ≥ ${montant(seuil)} HT : la commande devra être validée par un valideur (autre que le demandeur).` : `Sous le seuil de ${montant(seuil)} HT : validation automatique à la soumission.`;
       corps.querySelectorAll('[data-montant]').forEach((td) => { const l = rows[Number(td.dataset.montant)]; if (l) td.textContent = montant(arrondi(num(l.quantite) * num(l.prixUnitaireHT))); });
-      if (onChange) onChange(t);
+      if (onChange) onChange(t, valeurs());
     }
+    const valeurs = () => rows.map((l) => ({ articleId: l.articleId == null ? null : Number(l.articleId), designation: String(l.designation || '').trim(), referenceFournisseur: String(l.referenceFournisseur || '').trim(), quantite: num(l.quantite), prixUnitaireHT: num(l.prixUnitaireHT), tauxTVA: num(l.tauxTVA), otId: l.otId == null || l.otId === '' ? null : Number(l.otId), uniteCode: l.uniteCode || '' }));
     function input(l, champ, attrs) {
       const i = el('input', Object.assign({ value: l[champ] == null ? '' : String(l[champ]), disabled: verrouille, dataset: { champ } }, attrs));
       i.addEventListener('input', () => { l[champ] = attrs && attrs.type === 'number' ? (i.value === '' ? '' : Number(i.value)) : i.value; majTotaux(); });
@@ -569,10 +696,10 @@
           el('td', { style: { width: '34px' } }, verrouille ? null : el('button', { type: 'button', class: 'btn btn-icone btn-sm texte-danger', title: 'Supprimer la ligne', onclick: () => { rows.splice(i, 1); rendre(true); } }, icone('supprimer')))));
       });
       majTotaux();
-      if (changement && onChange) onChange(calcul());
+      if (changement && onChange) onChange(calcul(), valeurs());
     }
     remplirArticles();
-    racine.appendChild(el('div', { class: 'barre-outils', style: { marginBottom: '8px' } }, selArticle, btnLibre, el('span', { class: 'espace' }), el('span', { class: 'texte-2 texte-petit' }, 'Prix et références repris de la fiche article ; TVA par défaut ', `${ui.formatNombre(tvaDefaut)} %`)));
+    racine.appendChild(el('div', { class: 'barre-outils', style: { marginBottom: '8px' } }, el('div', { class: 'ach-recherche-article' }, champArticle, suggestions), btnLibre, el('span', { class: 'espace' }), el('span', { class: 'texte-2 texte-petit' }, 'Prix et références repris de la fiche article ; TVA par défaut ', `${ui.formatNombre(tvaDefaut)} %`)));
     racine.appendChild(el('div', { class: 'tableau-conteneur', style: { boxShadow: 'none' } }, el('table', { class: 'ach-lignes' },
       el('thead', null, el('tr', null, el('th', null, '#'), el('th', null, 'Désignation'), el('th', null, 'Réf. fournisseur'), el('th', { class: 'num' }, 'Qté'), el('th', { class: 'num' }, 'PU HT'), el('th', { class: 'num' }, 'TVA %'), el('th', null, 'OT'), el('th', { class: 'num' }, 'Montant HT'), el('th', null, ''))),
       corps)));
@@ -593,14 +720,15 @@
         }
         return '';
       },
-      valeurs: () => rows.map((l) => ({ articleId: l.articleId == null ? null : Number(l.articleId), designation: String(l.designation || '').trim(), referenceFournisseur: String(l.referenceFournisseur || '').trim(), quantite: num(l.quantite), prixUnitaireHT: num(l.prixUnitaireHT), tauxTVA: num(l.tauxTVA), otId: l.otId == null || l.otId === '' ? null : Number(l.otId), uniteCode: l.uniteCode || '' })),
+      valeurs,
     };
   }
 
   // =================================================================================================
   // FORMULAIRE COMMANDE
   // =================================================================================================
-  async function ouvrirFormCommande(existant, options = {}) {
+  function ouvrirFormCommande(existant, options = {}) { return ouvrirUnique(() => formCommande(existant, options)); }
+  async function formCommande(existant, options = {}) {
     let refs;
     try { refs = await references(true); } catch (e) { erreur(e); return; }
     const creation = !existant;
@@ -622,8 +750,10 @@
       { nom: 'dateCommande', label: 'Date de commande', type: 'date', requis: true, disabled: verrouillee },
       { nom: 'dateLivraisonPrevue', label: 'Livraison souhaitée', type: 'date', onChange: () => { livraisonTouchee = true; } },
       { type: 'separateur', label: 'Lignes de commande' },
+      // Empreinte des lignes : une ligne ajoutée ou modifiée compte comme une saisie à ne pas perdre (confirmation avant fermeture)
+      { nom: 'lignesEmpreinte', type: 'cache' },
       { type: 'html', rendu: (form) => {
-        editeur = editeurLignes({ lignes: base.lignes || [], articles: refs.articles, ots: refs.ot, getFournisseurId: () => form.get('fournisseurId'), verrouille: verrouillee });
+        editeur = editeurLignes({ lignes: base.lignes || [], articles: refs.articles, ots: refs.ot, getFournisseurId: () => form.get('fournisseurId'), verrouille: verrouillee, onChange: (t, lignes) => form.set('lignesEmpreinte', JSON.stringify(lignes)) });
         return frag(verrouillee ? ui.alerte('Commande validée : les lignes, le fournisseur et le site ne sont plus modifiables. Seuls l\'objet, la catégorie, la livraison, les conditions et le commentaire peuvent être mis à jour.', 'info') : null, editeur.el);
       } },
       { type: 'separateur', label: 'Livraison et conditions' },
@@ -636,6 +766,7 @@
       fournisseurId: base.fournisseurId || '', secteurId: secteurParDefaut, categorieCode: base.categorieCode || ((GMAO.liste('categoriesDepense').find((x) => x.code === 'pieces') || GMAO.liste('categoriesDepense')[0] || {}).code || ''),
       objet: base.objet || '', dateCommande: (existant && existant.dateCommande) || aujourdhui(), dateLivraisonPrevue: base.dateLivraisonPrevue || '',
       adresseLivraison: base.adresseLivraison || '', conditions: base.conditions || '', commentaire: base.commentaire || '',
+      lignesEmpreinte: JSON.stringify((base.lignes || []).map((l) => ({ articleId: l.articleId == null ? null : Number(l.articleId), designation: String(l.designation || '').trim(), referenceFournisseur: String(l.referenceFournisseur || '').trim(), quantite: num(l.quantite), prixUnitaireHT: num(l.prixUnitaireHT), tauxTVA: num(l.tauxTVA), otId: l.otId == null || l.otId === '' ? null : Number(l.otId), uniteCode: l.uniteCode || '' }))),
     }, ui.champsPersoInitiaux(base));
     async function envoyer(v, soumettre) {
       const err = editeur.valider();
@@ -645,7 +776,7 @@
       if (creation && soumettre) body.soumettre = true;
       let res = creation ? await api.post('/api/commandes', body) : await api.put('/api/commandes/' + existant.id, body);
       if (!creation && soumettre) res = await api.post(`/api/commandes/${res.id}/soumettre`);
-      invaliderRefs();
+      invaliderRefs(); majBadge();
       toast(soumettre ? (res.statut === 'a_valider' ? `Commande ${res.numero} soumise à validation` : `Commande ${res.numero} validée (sous le seuil)`) : (creation ? `Commande ${res.numero} enregistrée en brouillon` : `Commande ${res.numero} enregistrée`), 'succes');
       if (options.apres) options.apres(res); else GMAO.navigate('#/achats/commande/' + res.id);
       return true;
@@ -663,7 +794,8 @@
   // =================================================================================================
   // COMMANDER LES ALERTES DE STOCK
   // =================================================================================================
-  async function ouvrirAlertesStock(apres) {
+  function ouvrirAlertesStock(apres) { return ouvrirUnique(() => alertesStock(apres)); }
+  async function alertesStock(apres) {
     let alertes;
     try { alertes = await api.get('/api/achats/alertes-stock'); } catch (e) { erreur(e); return; }
     if (!alertes.length) { ui.modal({ titre: 'Commander les alertes de stock', taille: 'petite', contenu: ui.vide('Aucun article n\'est sous son seuil minimum.', 'check'), boutons: [{ label: 'Fermer' }] }); return; }
@@ -681,13 +813,22 @@
       const sans = !liste[0].fournisseurId;
       const tbody = el('tbody');
       for (const a of liste) {
-        const cb = el('input', { type: 'checkbox', checked: choix.has(a.id), disabled: sans || a.fournisseurActif === false });
-        const q = el('input', { type: 'number', min: 0, step: 'any', value: String(a.resteACommander || a.quantiteACommander), disabled: sans, style: { width: '90px', textAlign: 'right' } });
+        // Quantité proposée = besoin restant, déduction faite des commandes en cours (0 si le besoin est déjà couvert)
+        const couvert = a.dejaEnCommande > 0 && !(a.resteACommander > 0);
+        const cb = el('input', { type: 'checkbox', checked: choix.has(a.id), disabled: sans || a.fournisseurActif === false || !(a.resteACommander > 0) });
+        const q = el('input', { type: 'number', min: 0, step: 'any', value: String(a.resteACommander), disabled: sans, style: { width: '90px', textAlign: 'right' } });
         const mt = el('td', { class: 'num' }, montant(num(q.value) * num(a.prixUnitaire)));
         cb.addEventListener('change', () => { if (cb.checked && num(q.value) > 0) choix.set(a.id, num(q.value)); else choix.delete(a.id); majTotal(); });
-        q.addEventListener('input', () => { mt.textContent = montant(num(q.value) * num(a.prixUnitaire)); if (cb.checked) { if (num(q.value) > 0) choix.set(a.id, num(q.value)); else choix.delete(a.id); } majTotal(); });
+        q.addEventListener('input', () => {
+          mt.textContent = montant(num(q.value) * num(a.prixUnitaire));
+          cb.disabled = sans || a.fournisseurActif === false || !(num(q.value) > 0);
+          if (cb.disabled) cb.checked = false;
+          if (cb.checked) { if (num(q.value) > 0) choix.set(a.id, num(q.value)); else choix.delete(a.id); } else choix.delete(a.id);
+          majTotal();
+        });
         tbody.appendChild(el('tr', null, el('td', null, cb),
-          el('td', null, el('div', { class: 'texte-gras' }, a.designation), el('div', { class: 'ach-info' }, [a.code, a.referenceFournisseur ? `réf. ${a.referenceFournisseur}` : '', a.emplacement].filter(Boolean).join(' · '))),
+          el('td', null, el('div', { class: 'texte-gras' }, a.designation), el('div', { class: 'ach-info' }, [a.code, a.referenceFournisseur ? `réf. ${a.referenceFournisseur}` : '', a.emplacement].filter(Boolean).join(' · ')),
+            couvert ? el('div', { class: 'ach-info texte-ok' }, `Besoin couvert par ${(a.commandesEnCours || []).length ? (a.commandesEnCours || []).map((c) => c.numero).join(', ') : 'une commande en cours'}`) : null),
           el('td', { class: 'num' }, el('span', { class: a.quantite <= 0 ? 'texte-danger texte-gras' : 'texte-alerte texte-gras' }, ui.formatNombre(a.quantite)), el('span', { class: 'texte-2' }, ` / ${ui.formatNombre(a.seuilMin)} ${libUnite(a.uniteCode)}`)),
           el('td', { class: 'num' }, a.dejaEnCommande ? el('span', { title: (a.commandesEnCours || []).map((c) => c.numero).join(', ') }, ui.formatNombre(a.dejaEnCommande), el('div', { class: 'ach-info' }, (a.commandesEnCours || []).map((c) => c.numero).join(', '))) : el('span', { class: 'texte-2' }, '—')),
           el('td', { class: 'num' }, q),
@@ -908,44 +1049,98 @@
   function ouvrirReception(c, apres) {
     const lignes = (c.lignes || []).filter((l) => l.resteARecevoir > 0);
     if (!lignes.length) { toast('Toutes les lignes ont été reçues', 'info'); return; }
-    const saisies = new Map(lignes.map((l) => [l.index, l.resteARecevoir]));
     const inputs = [];
+    const recap = el('div', { class: 'texte-2 texte-petit', style: { marginTop: '6px', textAlign: 'right' } });
+    /** Quantité saisie d'une ligne : nombre ≥ 0 et ≤ reste à recevoir, sinon message d'erreur (null). */
+    function lire(i, l) {
+      const brut = String(i.value || '').trim().replace(',', '.');
+      const q = brut === '' ? 0 : Number(brut);
+      if (!Number.isFinite(q) || q < 0) return { erreur: 'Quantité invalide : saisissez un nombre positif ou 0' };
+      if (q > num(l.resteARecevoir) + 1e-9) return { erreur: `Au plus ${ui.formatNombre(l.resteARecevoir)} (reste à recevoir)` };
+      return { quantite: q };
+    }
+    function controler(afficher) {
+      let nb = 0; let ht = 0; let erreurs = 0;
+      for (const [i, l, err] of inputs) {
+        const r = lire(i, l);
+        if (afficher) { i.classList.toggle('invalide', !!r.erreur); err.textContent = r.erreur || ''; }
+        if (r.erreur) erreurs++; else if (r.quantite > 0) { nb++; ht += arrondi(r.quantite * num(l.prixUnitaireHT)); }
+      }
+      recap.className = 'texte-petit ' + (erreurs ? 'texte-danger' : 'texte-2');
+      recap.textContent = erreurs ? `${pluriel(erreurs, 'ligne')} à corriger` : (nb ? `Seront réceptionnées : ${pluriel(nb, 'ligne')} sur ${lignes.length} · ${montant(ht)} HT` : 'Aucune quantité reçue saisie');
+      return { nb, erreurs };
+    }
     const tbody = el('tbody', null, lignes.map((l) => {
       const i = el('input', { type: 'number', min: 0, max: l.resteARecevoir, step: 'any', value: String(l.resteARecevoir), style: { width: '100px', textAlign: 'right' } });
-      i.addEventListener('input', () => saisies.set(l.index, num(i.value)));
-      inputs.push([i, l]);
+      const err = el('div', { class: 'ach-erreur' });
+      i.addEventListener('input', () => { const r = lire(i, l); i.classList.toggle('invalide', !!r.erreur); err.textContent = r.erreur || ''; controler(false); });
+      inputs.push([i, l, err]);
       return el('tr', null,
         el('td', null, el('div', { class: 'texte-gras' }, `${l.index + 1}. ${l.designation}`), el('div', { class: 'ach-info' }, [l.referenceFournisseur, l.articleCode ? `article ${l.articleCode}` : 'ligne libre (hors stock)'].filter(Boolean).join(' · '))),
         el('td', { class: 'num' }, ui.formatNombre(l.quantite)), el('td', { class: 'num' }, ui.formatNombre(l.quantiteRecue)),
-        el('td', { class: 'num texte-gras' }, ui.formatNombre(l.resteARecevoir)), el('td', { class: 'num' }, i), el('td', null, libUnite(l.uniteCode)));
+        el('td', { class: 'num texte-gras' }, ui.formatNombre(l.resteARecevoir)), el('td', { class: 'num' }, i, err), el('td', null, libUnite(l.uniteCode)));
     }));
+    const tout = (valeur) => { inputs.forEach(([i, l]) => { i.value = valeur == null ? String(l.resteARecevoir) : valeur; }); controler(true); };
+    // Douchette : un code article (ou une référence fournisseur) reconnu ajoute 1 à la ligne correspondante
+    const champScan = el('input', { type: 'text', placeholder: 'Scanner ou saisir un code article', autocomplete: 'off', dataset: { scan: '1' } });
+    const infoScan = el('span', { class: 'ach-scan-info' });
+    const bip = (ok) => { try { if (window.CodeBarre && CodeBarre.bip) CodeBarre.bip(ok); } catch (e) { /* audio indisponible */ } };
+    function scanner(code) {
+      const c0 = normalTri(code).trim();
+      if (!c0) return;
+      const cible = inputs.find(([, l]) => normalTri(l.articleCode) === c0 || (l.referenceFournisseur && normalTri(l.referenceFournisseur) === c0));
+      infoScan.className = 'ach-scan-info ' + (cible ? 'ok' : 'ko');
+      if (!cible) { infoScan.textContent = `« ${code.trim()} » : aucune ligne de cette commande`; bip(false); return; }
+      const [i, l] = cible;
+      const actuel = lire(i, l);
+      const q = (actuel.erreur ? 0 : actuel.quantite) + 1;
+      if (q > num(l.resteARecevoir) + 1e-9) { infoScan.textContent = `${l.designation} : reste à recevoir atteint (${ui.formatNombre(l.resteARecevoir)})`; bip(false); return; }
+      i.value = String(q); i.dispatchEvent(new Event('input'));
+      infoScan.textContent = `${l.designation} : ${ui.formatNombre(q)} ${libUnite(l.uniteCode)}`.trim();
+      bip(true);
+    }
+    champScan.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); scanner(champScan.value); champScan.value = ''; } });
+    let arreterDouchette = () => {};
     const f = ui.form({ colonnes: 3, champs: [
-      { nom: 'date', label: 'Date de réception', type: 'date', requis: true, valeur: aujourdhui(), max: aujourdhui() },
+      { nom: 'date', label: 'Date de réception', type: 'date', requis: true, valeur: aujourdhui(), max: aujourdhui(), min: c.dateCommande || undefined },
       { nom: 'bonLivraison', label: 'N° de bon de livraison', type: 'texte', placeholder: 'ex. BL-458721', maxLength: 100 },
       { nom: 'commentaire', label: 'Commentaire', type: 'texte', placeholder: 'ex. colis abîmé, reliquat annoncé…', maxLength: 1000 },
     ] });
-    ui.modal({
+    const m = ui.modal({
       titre: `Réceptionner la commande ${c.numero}`, taille: 'large',
+      onFermer: () => arreterDouchette(),
       contenu: frag(f.el,
         el('div', { class: 'barre-outils mt', style: { marginBottom: '6px' } }, el('strong', null, 'Quantités livrées'), el('span', { class: 'espace' }),
-          ui.bouton('Tout reçu', { classe: 'btn-sm', onClic: () => inputs.forEach(([i, l]) => { i.value = String(l.resteARecevoir); saisies.set(l.index, l.resteARecevoir); }) }),
-          ui.bouton('Remettre à zéro', { classe: 'btn-sm', onClic: () => inputs.forEach(([i, l]) => { i.value = '0'; saisies.set(l.index, 0); }) })),
+          ui.bouton('Tout reçu', { classe: 'btn-sm', onClic: () => tout(null) }),
+          ui.bouton('Remettre à zéro', { classe: 'btn-sm', onClic: () => tout('0') })),
+        lignes.some((l) => l.articleCode) ? el('div', { class: 'ach-scan mb' }, iconeDim('codebarre', 16, 'var(--texte-2)'), champScan, infoScan) : null,
         el('div', { class: 'tableau-conteneur', style: { boxShadow: 'none' } }, el('table', { class: 'ach-lignes' }, el('thead', null, el('tr', null, el('th', null, 'Ligne'), el('th', { class: 'num' }, 'Commandé'), el('th', { class: 'num' }, 'Déjà reçu'), el('th', { class: 'num' }, 'Reste'), el('th', { class: 'num' }, 'Reçu ce jour'), el('th', null, ''))), tbody)),
+        recap,
         c.entreeStockAReception ? el('p', { class: 'texte-2 texte-petit mt' }, 'Les lignes liées à un article du stock feront l\'objet d\'une entrée en stock automatique au prix de la commande.') : null),
       boutons: [{ label: 'Annuler' }, { label: 'Enregistrer la réception', icone: 'check', classe: 'btn-primaire', onClic: async () => {
+        const ctrl = controler(true);
+        if (ctrl.erreurs) { toast(`${pluriel(ctrl.erreurs, 'quantité invalide', 'quantités invalides')} : corrigez les lignes signalées`, 'erreur'); return false; }
         if (!f.valider()) return false;
         const v = f.valeurs();
-        const lignesRecues = Array.from(saisies.entries()).filter(([, q]) => num(q) > 0).map(([index, quantite]) => ({ index, quantite: num(quantite) }));
+        const lignesRecues = inputs.map(([i, l]) => ({ index: l.index, quantite: lire(i, l).quantite })).filter((x) => x.quantite > 0);
         if (!lignesRecues.length) { toast('Saisissez au moins une quantité reçue', 'alerte'); return false; }
         const res = await api.post(`/api/commandes/${c.id}/receptionner`, { date: v.date, bonLivraison: v.bonLivraison, commentaire: v.commentaire, lignes: lignesRecues });
         toast(`${res.statut === 'recue' ? 'Commande entièrement reçue' : 'Réception partielle enregistrée'}${res.nbEntreesStock ? ` · ${pluriel(res.nbEntreesStock, 'entrée')} en stock` : ''}`, 'succes');
         (res.avertissements || []).forEach((a) => toast(a, 'alerte'));
+        majBadge();
         if (apres) apres(res);
       } }],
     });
+    controler(false);
+    if (window.CodeBarre && typeof CodeBarre.ecouterDouchette === 'function') {
+      arreterDouchette = CodeBarre.ecouterDouchette((code) => scanner(code), { actif: () => m.el.isConnected && document.querySelector('.modal-fond:last-of-type') === m.el });
+    }
   }
 
-  /** Bon de commande imprimable avec l'en-tête de la société (config.societe). */
+  /**
+   * Bon de commande imprimable avec l'en-tête de la société (config.societe). Seule une commande validée (validée,
+   * envoyée, reçue) produit un bon ; sinon le document est un projet de travail, marqué « NON VALIDÉ » ou « ANNULÉE ».
+   */
   function imprimerBonCommande(c) {
     const esc = ui.esc;
     const soc = GMAO.config.societe || {};
@@ -953,9 +1148,14 @@
     const parTaux = new Map();
     for (const l of c.lignes || []) { const k = num(l.tauxTVA); const ht = num(l.montantHT); parTaux.set(k, (parTaux.get(k) || 0) + ht); }
     const nl = (s) => esc(s || '').replace(/\n/g, '<br>');
-    const lignes = (c.lignes || []).map((l) => `<tr><td>${esc(l.referenceFournisseur || '')}</td><td>${esc(l.designation)}${l.otNumero ? `<div class="petit">Imputation : OT ${esc(l.otNumero)}</div>` : ''}</td><td class="num">${esc(ui.formatNombre(l.quantite))}</td><td>${esc(libUnite(l.uniteCode))}</td><td class="num">${esc(montant(l.prixUnitaireHT))}</td><td class="num">${esc(ui.formatNombre(l.tauxTVA))} %</td><td class="num">${esc(montant(l.montantHT))}</td></tr>`).join('');
+    const bloc = (...parts) => parts.filter((p) => p != null && p !== '').join('<br>');
+    const bon = STATUTS_CMD_IMPRIMABLES.includes(c.statut);
+    const annulee = c.statut === 'annulee';
+    const mention = annulee ? `COMMANDE ANNULÉE${c.dateAnnulation ? ' LE ' + esc(ui.formatDate(c.dateAnnulation)).toUpperCase() : ''}` : (bon ? '' : `PROJET — NON VALIDÉ (${esc(String(c.statutLibelle || lib('statutsCommande', c.statut, c.statut)).toUpperCase())})`);
+    const validation = bon && !c.validationAuto && c.valideurNom ? `<br>Commande validée par ${esc(c.valideurNom)} le ${esc(ui.formatDate(c.dateValidation))}.` : '';
+    const lignes = (c.lignes || []).map((l) => `<tr><td>${esc(l.referenceFournisseur || '')}</td><td>${esc(l.designation)}${l.otNumero ? `<div class="petit">Imputation : ${esc(/^OT/i.test(l.otNumero) ? l.otNumero : 'OT ' + l.otNumero)}</div>` : ''}</td><td class="num">${esc(ui.formatNombre(l.quantite))}</td><td>${esc(libUnite(l.uniteCode))}</td><td class="num">${esc(montant(l.prixUnitaireHT))}</td><td class="num">${esc(ui.formatNombre(l.tauxTVA))} %</td><td class="num">${esc(montant(l.montantHT))}</td></tr>`).join('');
     const tva = Array.from(parTaux.entries()).sort((a, b) => a[0] - b[0]).map(([t, ht]) => `<tr><td>TVA ${esc(ui.formatNombre(t))} % (base ${esc(montant(ht))})</td><td class="num">${esc(montant(arrondi((ht * t) / 100)))}</td></tr>`).join('');
-    const html = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>Bon de commande ${esc(c.numero)}</title><style>
+    const html = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>${bon ? 'Bon de commande' : 'Projet de commande'} ${esc(c.numero)}</title><style>
       @page { size: A4; margin: 14mm; } body{font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#111;margin:0}
       .entete{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;border-bottom:3px solid #1f2937;padding-bottom:12px;margin-bottom:16px}
       .soc{display:flex;gap:12px;align-items:flex-start}.soc img{max-height:60px;max-width:150px}.soc .nom{font-size:18px;font-weight:700}.soc .coord{color:#444;line-height:1.45}
@@ -965,17 +1165,20 @@
       .num{text-align:right;white-space:nowrap}.petit{font-size:10.5px;color:#555}
       .totaux{width:320px;margin:10px 0 0 auto;border-collapse:collapse}.totaux td{padding:4px 7px;border-bottom:1px solid #ddd}.totaux tr.ttc td{font-size:14px;font-weight:700;border-top:2px solid #111;border-bottom:0}
       .cond{margin-top:16px;border-top:1px solid #bbb;padding-top:8px;line-height:1.5}.sign{display:flex;gap:30px;margin-top:30px}.sign div{flex:1;border-top:1px solid #111;padding-top:5px;min-height:60px}
-      .pied{margin-top:24px;font-size:10px;color:#666;text-align:center}@media screen{body{margin:24px auto;max-width:860px}}@media print{.noprint{display:none}}</style></head><body>
-      <div class="entete"><div class="soc">${soc.logo ? `<img src="${esc(soc.logo)}" alt="">` : ''}<div><div class="nom">${esc(soc.nom || '')}</div><div class="coord">${nl(soc.adresse)}${soc.telephone ? `<br>Tél. ${esc(soc.telephone)}` : ''}${soc.email ? `<br>${esc(soc.email)}` : ''}</div></div></div>
-      <div class="titre"><h1>BON DE COMMANDE</h1><div class="num">N° ${esc(c.numero)}</div><div>du ${esc(dateFr(c.dateCommande))}</div></div></div>
-      <div class="blocs"><div class="bloc"><h3>Fournisseur</h3><strong>${esc(four.nom || '')}</strong><br>${nl(four.adresse)}${four.contact ? `<br>À l'attention de : ${esc(four.contact)}` : ''}${four.telephone ? `<br>Tél. ${esc(four.telephone)}` : ''}${four.email ? `<br>${esc(four.email)}` : ''}${four.siret ? `<br><span class="petit">SIRET ${esc(four.siret)}</span>` : ''}</div>
-      <div class="bloc"><h3>Livraison</h3><strong>${esc(c.secteurChemin || '')}</strong><br>${nl(c.adresseLivraison || soc.adresse || '')}${c.dateLivraisonPrevue ? `<br>Livraison souhaitée le <strong>${esc(dateFr(c.dateLivraisonPrevue))}</strong>` : ''}<br>Demandeur : ${esc(c.demandeurNom || '')}</div></div>
+      .pied{margin-top:24px;font-size:10px;color:#666;text-align:center}@media screen{body{margin:24px auto;max-width:860px}}@media print{.noprint{display:none}}
+      .bandeau{border:3px solid #b91c1c;color:#b91c1c;font-weight:700;font-size:15px;letter-spacing:1px;text-align:center;padding:8px;margin:0 0 14px}
+      .filigrane{position:fixed;top:40%;left:0;right:0;text-align:center;font-size:72px;font-weight:700;color:#b91c1c;opacity:.13;transform:rotate(-28deg);pointer-events:none;letter-spacing:4px}</style></head><body>
+      ${mention ? `<div class="filigrane">${annulee ? 'ANNULÉE' : 'PROJET'}</div><div class="bandeau">${mention}</div>` : ''}
+      <div class="entete"><div class="soc">${soc.logo ? `<img src="${esc(soc.logo)}" alt="">` : ''}<div><div class="nom">${esc(soc.nom || '')}</div><div class="coord">${bloc(nl(soc.adresse), soc.telephone ? `Tél. ${esc(soc.telephone)}` : '', esc(soc.email || ''))}</div></div></div>
+      <div class="titre"><h1>${bon ? 'BON DE COMMANDE' : 'PROJET DE COMMANDE'}</h1><div class="num">N° ${esc(c.numero)}</div><div>du ${esc(dateFr(c.dateCommande))}</div></div></div>
+      <div class="blocs"><div class="bloc"><h3>Fournisseur</h3>${bloc(`<strong>${esc(four.nom || '')}</strong>`, nl(four.adresse), four.contact ? `À l'attention de : ${esc(four.contact)}` : '', four.telephone ? `Tél. ${esc(four.telephone)}` : '', esc(four.email || ''), four.siret ? `<span class="petit">SIRET ${esc(four.siret)}</span>` : '')}</div>
+      <div class="bloc"><h3>Livraison</h3>${bloc(`<strong>${esc(c.secteurChemin || '')}</strong>`, nl(c.adresseLivraison || soc.adresse || ''), c.dateLivraisonPrevue ? `Livraison souhaitée le <strong>${esc(dateFr(c.dateLivraisonPrevue))}</strong>` : '', `Demandeur : ${esc(c.demandeurNom || '')}`)}</div></div>
       ${c.objet ? `<p><strong>Objet :</strong> ${esc(c.objet)}</p>` : ''}
       <table class="l"><thead><tr><th style="width:110px">Réf. fournisseur</th><th>Désignation</th><th class="num">Qté</th><th>Unité</th><th class="num">PU HT</th><th class="num">TVA</th><th class="num">Montant HT</th></tr></thead><tbody>${lignes}</tbody></table>
       <table class="totaux"><tr><td>Total HT</td><td class="num">${esc(montant(c.totaux.ht))}</td></tr>${tva}<tr class="ttc"><td>Total TTC</td><td class="num">${esc(montant(c.totaux.ttc))}</td></tr></table>
-      <div class="cond">${c.conditions ? `<strong>Conditions particulières :</strong> ${nl(c.conditions)}<br>` : ''}Merci de rappeler le numéro de commande <strong>${esc(c.numero)}</strong> sur le bon de livraison et la facture.${c.validationAuto ? '' : (c.valideurNom ? `<br>Commande validée par ${esc(c.valideurNom)} le ${esc(ui.formatDate(c.dateValidation))}.` : '')}</div>
-      <div class="sign"><div>Émetteur<br><span class="petit">${esc(c.demandeurNom || '')}</span></div><div>Bon pour accord<br><span class="petit">${esc(c.validationAuto ? '' : (c.valideurNom || ''))}</span></div><div>Accusé de réception du fournisseur<br><span class="petit">date, cachet et signature</span></div></div>
-      <div class="pied">${esc(soc.nom || '')} — Bon de commande ${esc(c.numero)} — imprimé le ${esc(ui.formatDateHeure(new Date()))}</div>
+      <div class="cond">${c.conditions ? `<strong>Conditions particulières :</strong> ${nl(c.conditions)}<br>` : ''}${bon ? `Merci de rappeler le numéro de commande <strong>${esc(c.numero)}</strong> sur le bon de livraison et la facture.` : (annulee ? 'Cette commande a été annulée : ce document ne vaut pas commande.' : 'Document de travail : cette commande n\'a pas été validée et ne vaut pas commande.')}${validation}</div>
+      <div class="sign"><div>Émetteur<br><span class="petit">${esc(c.demandeurNom || '')}</span></div><div>Bon pour accord<br><span class="petit">${esc(bon && !c.validationAuto ? (c.valideurNom || '') : '')}</span></div><div>Accusé de réception du fournisseur<br><span class="petit">date, cachet et signature</span></div></div>
+      <div class="pied">${esc(soc.nom || '')} — ${bon ? 'Bon de commande' : 'Projet de commande'} ${esc(c.numero)} — imprimé le ${esc(ui.formatDateHeure(new Date()))}</div>
       </body></html>`;
     const w = window.open('', '_blank', 'width=900,height=1000');
     if (!w) { toast('Fenêtre bloquée : autorisez les fenêtres surgissantes pour imprimer', 'alerte'); return; }
@@ -998,7 +1201,15 @@
     const recharger = () => GMAO.navigate(location.hash.split('?')[0] === '#/achats/commande/' + c.id ? location.hash : '#/achats/commande/' + c.id);
     const ro = lectureSeule(c);
     const a = ro ? {} : (c.actions || {});
-    const action = (url, corps, message) => async () => { try { const r = await api.post(url, corps || {}); invaliderRefs(); toast(typeof message === 'function' ? message(r) : message, 'succes'); recharger(); } catch (e) { erreur(e); } };
+    // Une action à la fois : les boutons de la fiche sont désactivés pendant l'appel (double clic)
+    let actionEnCours = false;
+    const action = (url, corps, message) => async () => {
+      if (actionEnCours) return;
+      actionEnCours = true;
+      const boutons = container.querySelectorAll('.page-actions button, .barre-outils button');
+      boutons.forEach((b) => { b.disabled = true; });
+      try { const r = await api.post(url, corps || {}); invaliderRefs(); majBadge(); toast(typeof message === 'function' ? message(r) : message, 'succes'); recharger(); } catch (e) { erreur(e); boutons.forEach((b) => { b.disabled = false; }); } finally { actionEnCours = false; }
+    };
     const soumettre = async () => {
       const auDela = c.validationRequise;
       if (!(await ui.confirm({ titre: 'Soumettre la commande', message: auDela ? `Le montant (${montant(c.totaux.ht)} HT) atteint le seuil de validation : la commande sera transmise aux valideurs.` : `Montant ${montant(c.totaux.ht)} HT inférieur au seuil de ${montant(c.seuilValidationHT)} HT : la commande sera validée automatiquement.`, okLabel: 'Soumettre' }))) return;
@@ -1034,9 +1245,11 @@
       sousTitre: [c.fournisseurNom, c.secteurChemin, `commandée le ${dateFr(c.dateCommande)}`, c.objet].filter(Boolean).join(' · '),
       actions,
     }));
+    const bonImprimable = STATUTS_CMD_IMPRIMABLES.includes(c.statut);
     zone.appendChild(el('div', { class: 'barre-outils' },
-      ui.bouton('Imprimer le bon de commande', { icone: 'imprimer', classe: 'btn-sm', onClic: () => imprimerBonCommande(c) }),
-      can('creer') ? ui.bouton('Dupliquer', { icone: 'copier', classe: 'btn-sm', titre: 'Nouvelle commande reprenant le fournisseur et les lignes', onClic: () => ouvrirFormCommande(null, { modele: { fournisseurId: c.fournisseurId, secteurId: c.secteurId, categorieCode: c.categorieCode, objet: c.objet, adresseLivraison: c.adresseLivraison, conditions: c.conditions, lignes: (c.lignes || []).map((l) => ({ articleId: l.articleId, designation: l.designation, referenceFournisseur: l.referenceFournisseur, quantite: l.quantite, prixUnitaireHT: l.prixUnitaireHT, tauxTVA: l.tauxTVA, otId: null, uniteCode: l.uniteCode })) } }) }) : null,
+      bonImprimable ? ui.bouton('Imprimer le bon de commande', { icone: 'imprimer', classe: 'btn-sm', onClic: () => imprimerBonCommande(c) })
+        : ui.bouton('Imprimer un projet', { icone: 'imprimer', classe: 'btn-sm', titre: c.statut === 'annulee' ? 'Commande annulée : document marqué « annulée », sans valeur de commande' : 'Commande non validée : document de travail marqué « projet — non validé »', onClic: () => imprimerBonCommande(c) }),
+      can('creer') && !ro && creationPossible() ? ui.bouton('Dupliquer', { icone: 'copier', classe: 'btn-sm', titre: 'Nouvelle commande reprenant le fournisseur et les lignes', onClic: () => ouvrirFormCommande(null, { modele: { fournisseurId: c.fournisseurId, secteurId: c.secteurId, categorieCode: c.categorieCode, objet: c.objet, adresseLivraison: c.adresseLivraison, conditions: c.conditions, lignes: (c.lignes || []).map((l) => ({ articleId: l.articleId, designation: l.designation, referenceFournisseur: l.referenceFournisseur, quantite: l.quantite, prixUnitaireHT: l.prixUnitaireHT, tauxTVA: l.tauxTVA, otId: null, uniteCode: l.uniteCode })) } }) }) : null,
       el('span', { class: 'espace' }),
       a.solder ? ui.bouton('Solder le reliquat', { icone: 'check', classe: 'btn-sm', onClic: solder }) : null,
       a.annuler ? ui.bouton('Annuler la commande', { icone: 'fermer', classe: 'btn-sm', onClic: annuler }) : null,
@@ -1046,10 +1259,11 @@
     if (c.statut === 'brouillon' && c.motifRefus) zone.appendChild(ui.alerte(frag(el('strong', null, 'Commande refusée : '), c.motifRefus, ' — modifiez-la puis soumettez-la à nouveau.'), 'danger'));
     if (c.statut === 'annulee') zone.appendChild(ui.alerte(frag(el('strong', null, 'Commande annulée'), c.motifAnnulation ? ` : ${c.motifAnnulation}` : ''), 'alerte'));
     if (c.solde) zone.appendChild(ui.alerte(frag(el('strong', null, 'Commande soldée : '), c.motifSolde || 'reliquat abandonné'), 'info'));
+    if (!ro && c.nbFacturesActives && !['recue', 'annulee'].includes(c.statut)) zone.appendChild(ui.alerte(`${pluriel(c.nbFacturesActives, 'facture rattachée', 'factures rattachées')} : la commande ne peut plus être annulée tant qu'elles ne sont pas annulées.`, 'info'));
     zone.appendChild(etapesCommande(c));
     zone.appendChild(el('div', { class: 'ach-kpis k4' },
       ui.kpi({ label: 'Montant HT', valeur: montant(c.totaux.ht), icone: 'euro', detail: `${montant(c.totaux.ttc)} TTC · ${pluriel((c.lignes || []).length, 'ligne')}` }),
-      ui.kpi({ label: 'Réception', valeur: `${c.tauxReception} %`, icone: 'stock', couleur: c.tauxReception >= 100 ? '#16a34a' : '#0891b2', detail: c.nbReceptions ? `${pluriel(c.nbReceptions, 'réception')} · ${montant(c.montantRecuHT)} HT reçus` : 'aucune réception' }),
+      ui.kpi({ label: 'Réception (en valeur)', valeur: `${c.tauxReception} %`, icone: 'stock', couleur: c.tauxReception >= 100 ? '#16a34a' : '#0891b2', detail: c.nbReceptions ? `${pluriel(c.nbReceptions, 'réception')} · ${montant(c.montantRecuHT)} HT reçus sur ${montant(c.totaux.ht)}` : 'aucune réception' }),
       ui.kpi({ label: 'Facturé HT', valeur: montant(c.montantFactureHT), icone: 'facture', couleur: '#6250d6', detail: c.nbFactures ? pluriel(c.nbFactures, 'facture') : 'aucune facture' }),
       ui.kpi({ label: 'Livraison souhaitée', valeur: c.dateLivraisonPrevue ? dateFr(c.dateLivraisonPrevue) : '—', icone: 'calendrier', couleur: c.enRetardLivraison ? '#dc2626' : '#6b7280', detail: c.enRetardLivraison ? `en retard de ${c.joursRetardLivraison} j` : (c.fournisseur && c.fournisseur.delaiLivraisonJours != null ? `délai fournisseur ${c.fournisseur.delaiLivraisonJours} j` : '') })));
     zone.appendChild(ui.onglets([
@@ -1064,7 +1278,8 @@
   // =================================================================================================
   // FORMULAIRE FACTURE
   // =================================================================================================
-  async function ouvrirFormFacture(existant, options = {}) {
+  function ouvrirFormFacture(existant, options = {}) { return ouvrirUnique(() => formFacture(existant, options)); }
+  async function formFacture(existant, options = {}) {
     let refs;
     try { refs = await references(true); } catch (e) { erreur(e); return; }
     const creation = !existant;
@@ -1165,9 +1380,11 @@
       const reste = arrondi((num(commandeInitiale.montantRecuHT) > 0 ? num(commandeInitiale.montantRecuHT) : num(commandeInitiale.totaux.ht)) - num(commandeInitiale.montantFactureHT));
       if (reste > 0) { valeurs.montantHT = reste; valeurs.montantTVA = arrondi((reste * num(valeurs.tauxTVA)) / 100); valeurs.montantTTC = arrondi(reste + valeurs.montantTVA); }
     }
+    const nbLignesDetail = existant ? (existant.lignes || []).length : 0;
     const m = ui.formModal({
       titre: creation ? 'Saisir une facture fournisseur' : `Modifier la facture ${existant.numero}`, taille: 'large', champs, valeurs,
-      avant: verrouillee ? ui.alerte('Facture validée (bon à payer) : les montants et références sont verrouillés. Mettez-la en litige pour les corriger.', 'info') : null,
+      avant: frag(verrouillee ? ui.alerte('Facture validée (bon à payer) : les montants et références sont verrouillés. Mettez-la en litige pour les corriger.', 'info') : null,
+        nbLignesDetail && !verrouillee ? ui.alerte(`Cette facture comporte un détail de ${pluriel(nbLignesDetail, 'ligne')} (total ${montant(existant.montantHT)} HT). Si vous modifiez le montant HT, ce détail sera retiré de la facture (le montant corrigé fait foi).`, 'info') : null),
       submitLabel: creation ? 'Enregistrer la facture' : 'Enregistrer',
       onSubmit: async (v) => {
         const body = {
@@ -1181,7 +1398,7 @@
         if (creation && v.fichier && v.fichier.contenu) {
           try { await api.post(`/api/factures/${res.id}/documents`, { nom: v.fichier.nom, type: v.fichier.type, contenu: v.fichier.contenu, description: 'Facture du fournisseur' }); } catch (e) { toast('Facture enregistrée, mais la pièce jointe a été refusée : ' + e.message, 'alerte', 8000); }
         }
-        invaliderRefs();
+        invaliderRefs(); majBadge();
         toast(creation ? `Facture ${res.numero} enregistrée${res.rapprochement && !res.rapprochement.conforme ? ` — écart de rapprochement ${montant(res.rapprochement.ecartHT)} HT` : ''}` : `Facture ${res.numero} enregistrée`, res.rapprochement && !res.rapprochement.conforme ? 'alerte' : 'succes');
         if (options.apres && !creation) options.apres(res); else GMAO.navigate('#/achats/facture/' + res.id);
       },
@@ -1202,6 +1419,7 @@
         submitLabel: 'Enregistrer le paiement',
         onSubmit: async (v) => {
           await api.post(`/api/factures/${f.id}/payer`, v);
+          invaliderRefs(); majBadge();
           toast(`Facture ${f.numero} payée`, 'succes');
           if (apres) apres();
         },
@@ -1243,7 +1461,8 @@
     ui.modal({
       titre: `Rapprochement ${d.facture.numero} ↔ ${d.commande ? d.commande.numero : ''}`, taille: 'large',
       contenu: frag(
-        ui.table({ lignes: d.lignes, recherche: false, pagination: false, compact: true, cleId: 'index', colonnes: [
+        d.commande && d.commande.visible === false ? ui.alerte(`La commande ${d.commande.numero} est hors de votre périmètre : seuls les montants du rapprochement sont affichés.`, 'info') : null,
+        ui.table({ lignes: d.lignes, recherche: false, pagination: false, compact: true, cleId: 'index', vide: d.commande && d.commande.visible === false ? 'Détail des lignes non disponible' : undefined, colonnes: [
           { cle: 'designation', label: 'Ligne de commande', rendu: (l) => `${l.index + 1}. ${l.designation}` },
           { cle: 'quantite', label: 'Commandé', aligner: 'droite', rendu: (l) => ui.formatNombre(l.quantite) },
           { cle: 'quantiteRecue', label: 'Reçu', aligner: 'droite', rendu: (l) => ui.formatNombre(l.quantiteRecue) },
@@ -1270,10 +1489,13 @@
     const liste = el('div', { class: 'commentaires' }, (f.commentaires || []).length ? f.commentaires.slice().reverse().map((x) => el('div', { class: 'commentaire' }, el('div', null, el('span', { class: 'c-auteur' }, x.userNom || '—'), el('span', { class: 'c-date' }, ui.formatDateHeure(x.date))), el('div', { style: { whiteSpace: 'pre-wrap' } }, x.texte))) : el('p', { class: 'texte-2' }, 'Aucun commentaire.'));
     if (f.actions && f.actions.commenter && !lectureSeule(f)) {
       const zone = el('textarea', { rows: 2, placeholder: 'Ajouter un commentaire (relance, accord, justification…)', maxlength: 2000 });
-      cont.appendChild(el('div', { class: 'mb' }, zone, el('div', { class: 'texte-droite', style: { marginTop: '6px' } }, ui.bouton('Ajouter', { icone: 'commentaire', classe: 'btn-sm btn-primaire', onClic: async () => {
-        if (!zone.value.trim()) return;
-        try { await api.post(`/api/factures/${f.id}/commentaires`, { texte: zone.value.trim() }); toast('Commentaire ajouté', 'succes'); recharger(); } catch (e) { erreur(e); }
-      } }))));
+      let envoi = false;
+      const btn = ui.bouton('Ajouter', { icone: 'commentaire', classe: 'btn-sm btn-primaire', onClic: async () => {
+        if (!zone.value.trim() || envoi) return;
+        envoi = true; btn.disabled = true;
+        try { await api.post(`/api/factures/${f.id}/commentaires`, { texte: zone.value.trim() }); toast('Commentaire ajouté', 'succes'); recharger(); } catch (e) { erreur(e); envoi = false; btn.disabled = false; }
+      } });
+      cont.appendChild(el('div', { class: 'mb' }, zone, el('div', { class: 'texte-droite', style: { marginTop: '6px' } }, btn)));
     }
     cont.appendChild(liste);
     return cont;
@@ -1293,7 +1515,15 @@
     const recharger = () => GMAO.navigate(location.hash.split('?')[0] === '#/achats/facture/' + f.id ? location.hash : '#/achats/facture/' + f.id);
     const ro = lectureSeule(f);
     const a = ro ? {} : (f.actions || {});
-    const post = async (url, corps, message) => { const r = await api.post(url, corps || {}); invaliderRefs(); toast(message, 'succes'); recharger(); return r; };
+    // Une action à la fois : les boutons de la fiche sont désactivés pendant l'appel (double clic)
+    let actionEnCours = false;
+    const post = async (url, corps, message) => {
+      if (actionEnCours) return null;
+      actionEnCours = true;
+      const boutons = container.querySelectorAll('.page-actions button, .barre-outils button');
+      boutons.forEach((b) => { b.disabled = true; });
+      try { const r = await api.post(url, corps || {}); invaliderRefs(); majBadge(); toast(message, 'succes'); recharger(); return r; } catch (e) { boutons.forEach((b) => { b.disabled = false; }); throw e; } finally { actionEnCours = false; }
+    };
     const valider = async () => {
       const rap = f.rapprochement;
       if (rap && !rap.conforme) {
@@ -1338,6 +1568,7 @@
     if (ro) zone.appendChild(ui.alerte('Ce site est accessible en lecture seule pour vous : consultation uniquement.', 'info'));
     if (f.enRetard) zone.appendChild(ui.alerte(frag(el('strong', null, 'Échéance dépassée : '), `la facture devait être réglée le ${dateFr(f.dateEcheance)} (${f.joursRetard} j de retard).${f.statut === 'validee' ? ' Elle est bonne à payer.' : ''}`), 'danger'));
     if (f.statut === 'litige') zone.appendChild(ui.alerte(frag(el('strong', null, 'En litige : '), f.motifLitige || '', ' — paiement suspendu.'), 'alerte'));
+    if (!ro && f.actions && f.actions.validationPropreInterdite) zone.appendChild(ui.alerte(`Vous avez saisi cette facture de ${montant(f.montantHT)} HT (≥ seuil de ${montant(cfg().seuilValidationHT)} HT) : le bon à payer doit être donné par un autre valideur.`, 'alerte'));
     if (f.statut === 'annulee') zone.appendChild(ui.alerte(frag(el('strong', null, 'Facture annulée'), f.motifAnnulation ? ` : ${f.motifAnnulation}` : ''), 'alerte'));
     if (f.rapprochement && !f.rapprochement.conforme && !['payee', 'annulee'].includes(f.statut)) zone.appendChild(ui.alerte(`Écart de rapprochement de ${f.rapprochement.ecartHT > 0 ? '+' : ''}${montant(f.rapprochement.ecartHT)} HT avec la commande ${f.rapprochement.commandeNumero} : la validation devra être justifiée.`, 'alerte'));
     zone.appendChild(etapesFacture(f));
@@ -1388,6 +1619,7 @@
   // VUE
   // =================================================================================================
   async function afficherAccueil(container, query) {
+    filtres();
     // Filtres transmis par lien (ex. #/achats?onglet=factures&filtre=retard)
     if (query.filtre === 'retard') Object.assign(memo.fac, { statut: '', echeanceDepassee: true, aPayer: false });
     if (query.filtre === 'apayer') Object.assign(memo.fac, { statut: '', echeanceDepassee: false, aPayer: true });
@@ -1397,15 +1629,19 @@
     if (query.statutFacture) memo.fac.statut = query.statutFacture;
     let ong = null;
     const rafraichir = () => { if (ong) ong.activer(ong.actif); };
+    // Sur un site affiché en lecture seule, aucun site / service n'est modifiable : les créations sont masquées
+    const creer = creationPossible();
     container.appendChild(ui.pageEntete({
       titre: GMAO.moduleLabel(MODULE), icone: 'achats',
       sousTitre: 'Commandes fournisseurs, réceptions, factures et échéances de paiement',
       actions: [
-        can('creer') ? ui.bouton('Commander les alertes de stock', { icone: 'stock', onClic: () => ouvrirAlertesStock(() => { memo.cmd.statut = 'brouillon'; ong.activer('commandes'); }) }) : null,
-        can('creer') ? ui.bouton('Saisir une facture', { icone: 'facture', onClic: () => ouvrirFormFacture(null, {}) }) : null,
-        can('creer') ? ui.bouton('Nouvelle commande', { icone: 'plus', classe: 'btn-primaire', onClic: () => ouvrirFormCommande(null) }) : null,
+        creer ? ui.bouton('Commander les alertes de stock', { icone: 'stock', onClic: () => ouvrirAlertesStock(() => { memo.cmd.statut = 'brouillon'; ong.activer('commandes'); }) }) : null,
+        creer ? ui.bouton('Saisir une facture', { icone: 'facture', onClic: () => ouvrirFormFacture(null, {}) }) : null,
+        creer ? ui.bouton('Nouvelle commande', { icone: 'plus', classe: 'btn-primaire', onClic: () => ouvrirFormCommande(null) }) : null,
       ],
     }));
+    if (can('creer') && !creer) container.appendChild(ui.alerte('Le site affiché est accessible en lecture seule pour vous : aucune commande ni facture ne peut y être créée. Choisissez un autre site dans l\'en-tête pour saisir.', 'info'));
+    majBadge();
     // Les onglets asynchrones construisent leur contenu hors du DOM puis le renvoient (ui.onglets remplace le corps à la résolution)
     const asynchrone = (fn) => () => { const c = el('div'); return fn(c).then(() => c); };
     ong = ui.onglets([
@@ -1415,9 +1651,9 @@
       { cle: 'echeancier', label: 'Échéancier', icone: 'calendrier', rendu: asynchrone((c) => rendreEcheancier(c, rafraichir)) },
     ], { hash: true });
     container.appendChild(ong.el);
-    if (can('creer') && query.nouveau === 'commande') ouvrirFormCommande(null);
-    if (can('creer') && query.nouveau === 'facture') ouvrirFormFacture(null, { commandeId: query.commandeId ? Number(query.commandeId) : null, otId: query.otId ? Number(query.otId) : null });
-    if (can('creer') && query.alertes === '1') ouvrirAlertesStock(() => ong.activer('commandes'));
+    if (creer && query.nouveau === 'commande') ouvrirFormCommande(null);
+    if (creer && query.nouveau === 'facture') ouvrirFormFacture(null, { commandeId: query.commandeId ? Number(query.commandeId) : null, otId: query.otId ? Number(query.otId) : null });
+    if (creer && query.alertes === '1') ouvrirAlertesStock(() => ong.activer('commandes'));
   }
 
   GMAO.registerView(MODULE, {

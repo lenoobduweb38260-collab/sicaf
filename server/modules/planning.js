@@ -9,24 +9,30 @@
  *
  * Routes :
  *   GET  /api/planning?du=AAAA-MM-JJ&au=AAAA-MM-JJ&secteurId&technicienId&typeCode&finaux=0&projection=1
- *        → { du, au, aujourdhui, heuresParJour, joursOuvres, ot, echeances, nonPlanifies, charge,
+ *        → { du, au, aujourdhui, heuresParJour, joursOuvres, ot, echeances, nonPlanifies, charge, absences,
  *            enRetard: { ot, echeances }, totaux, droits, legende }
  *   GET  /api/planning-techniciens              utilisateurs actifs ayant le droit ot.voir, dans la portée
- *   PUT  /api/planning/ot/:id                   { datePrevue, technicienId?, planifier? } (droit planning.modifier)
+ *   PUT  /api/planning/ot/:id                   { datePrevue, technicienId?, planifier? } (planning.modifier ; la date
+ *                                               prévue exige ot.modifier ou ot.affecter, le responsable ot.affecter)
  *   POST /api/planning/preventif/:id/generer    { datePrevue? } (planning.modifier + ot.creer + preventif.voir)
  *
  * Droits : planning.voir (consultation ; les OT exigent en plus ot.voir et les échéances preventif.voir),
- *   planning.modifier (déplacement d'un OT, changement de technicien, génération d'un OT préventif).
+ *   planning.modifier (déplacement d'un OT, changement de technicien, génération d'un OT préventif), avec la même
+ *   matrice que le module Ordres de travail : ot.modifier ou ot.affecter pour replanifier un OT, ot.affecter pour
+ *   en changer le responsable.
  * Portée : OT selon la portée de l'utilisateur, étendue aux OT dont il est créateur ou intervenant
  *   (même règle que le module Ordres de travail) ; plans préventifs via ctx.scope ; techniciens
  *   limités aux secteurs de l'utilisateur (portée « secteurs ») ou à lui-même (portée « perso »).
+ * Absences : les absences validées du module RH sont renvoyées pour les techniciens de la période (droit rh.voir, ou
+ *   pour tous si config.rh.afficherAbsencesPlanning ; sans droit RH, seule la mention « Absent » est communiquée)
+ *   et leurs jours ouvrés sont retirés de la capacité de chaque technicien (charge).
  *
  * Services publiés   : ctx.services.planning.{ periode(req, options), charge({ du, au, req? }), techniciens(req) }
  * Événements émis    : 'ot:modifie' ({ ot, champsModifies, source: 'planning' }), 'ot:statut' ({ ot, ancien, nouveau })
  *                      lors de la planification automatique, 'planning:replanifie' ({ ot, ancien, nouveau, userId }) ;
  *                      en l'absence du module Préventif : 'preventif:genere' ({ plan, ot }) et, sans module OT, 'ot:cree'.
  * Services consommés : ctx.services.preventif.{ genererRapport | generer, analyser, periodiciteLibelle },
- *                      ctx.services.ot.creer (repli de génération).
+ *                      ctx.services.ot.creer (repli de génération), ctx.services.rh.absencesEntre (absences).
  */
 const nom = 'Planning';
 const MODULE = 'planning';
@@ -103,6 +109,8 @@ function joursOuvres(du, au) {
   return n;
 }
 function formatDateFr(v) { const j = jourDe(v); return j ? j.split('-').reverse().join('/') : ''; }
+/** Référence lisible d'un OT : le préfixe « OT » n'est ajouté que si le numéro ne commence pas déjà par lui. */
+function refOt(numero) { const n = String(numero == null ? '' : numero); return /^ot(?![a-zà-ÿ])/i.test(n) ? n : `OT ${n}`; }
 function arrondi(n, dec = 2) { const f = 10 ** dec; return Math.round((Number(n) || 0) * f) / f; }
 function objet(b) { return b && typeof b === 'object' && !Buffer.isBuffer(b) && !Array.isArray(b) ? b : {}; }
 function nombreOuNull(v) { if (v === null || v === undefined || v === '' || typeof v === 'boolean') return null; const n = Number(v); return Number.isFinite(n) ? n : null; }
@@ -160,8 +168,11 @@ function register(ctx) {
   function droits(req) {
     const voirOt = can(req, 'ot', 'voir');
     const voirPreventif = can(req, 'preventif', 'voir');
-    const modifier = can(req, MODULE, 'modifier') && voirOt;
-    return { voirOt, voirPreventif, modifier, generer: modifier && voirPreventif && can(req, 'ot', 'creer'), creerOt: can(req, 'ot', 'creer') };
+    const planning = can(req, MODULE, 'modifier') && voirOt;
+    // Même matrice que le module OT : replanifier exige ot.modifier ou ot.affecter, changer le responsable ot.affecter
+    const affecter = planning && can(req, 'ot', 'affecter');
+    const modifier = planning && (affecter || can(req, 'ot', 'modifier'));
+    return { voirOt, voirPreventif, modifier, affecter, generer: planning && voirPreventif && can(req, 'ot', 'creer'), creerOt: can(req, 'ot', 'creer') };
   }
 
   /** Techniciens possibles : utilisateurs actifs ayant le droit ot.voir, dans la portée de l'utilisateur. */
@@ -327,14 +338,14 @@ function register(ctx) {
       if (filtres.technicienId != null && Number(plan.technicienId) !== filtres.technicienId) continue;
       if (filtres.typeCode && plan.typeCode !== filtres.typeCode) continue;
       const p = plan.periodicite || {};
-      let date = null; let estimee = false; let valeurCompteur = null; let unite = null; let rythme = null;
+      let date = null; let estimee = false; let valeurCompteur = null; let unite = null; let rythme = null; let compteurActuel = null;
       if (p.type === 'compteur') {
         // Échéance sur compteur : date estimée par le module Préventif (rythme d'utilisation)
         if (!sPrev || typeof sPrev.analyser !== 'function') continue;
         let a = null;
         try { a = sPrev.analyser(plan); } catch (e) { a = null; }
         if (!a || !a.echeanceDate) continue;
-        date = jourDe(a.echeanceDate); estimee = !!a.estimee; valeurCompteur = a.echeance; unite = a.unite; rythme = Number(a.rythmeJour) || null;
+        date = jourDe(a.echeanceDate); estimee = !!a.estimee; valeurCompteur = a.echeance; unite = a.unite; rythme = Number(a.rythmeJour) || null; compteurActuel = nombreOuNull(a.compteurActuel);
       } else date = jourDe(plan.prochaineEcheance);
       if (!date) continue;
       const e = plan.equipementId != null ? refs.equipements.get(Number(plan.equipementId)) : null;
@@ -364,19 +375,48 @@ function register(ctx) {
         }
       }
       if (!projection) continue;
+      // Les occurrences suivantes partent de la réalisation attendue : une échéance dépassée sera faite au plus tôt
+      // aujourd'hui (ou au compteur actuel). Aucune projection n'est datée dans le passé ni comptée dans la charge.
+      const baseJour = date < refs.aujourdhui ? refs.aujourdhui : date;
+      const baseValeur = compteurActuel != null && Number(valeurCompteur) < compteurActuel ? compteurActuel : Number(valeurCompteur);
       for (let k = 1; k <= MAX_OCCURRENCES; k++) {
         let jour = null; let valeur = null;
         if (p.type === 'compteur') {
           if (!rythme || !(Number(p.valeur) > 0)) break;
-          valeur = arrondi(Number(valeurCompteur) + k * Number(p.valeur), 3);
-          jour = ajouterJours(date, Math.max(1, Math.round((k * Number(p.valeur)) / rythme)));
-        } else jour = ajouterPeriode(date, p, k);
+          valeur = arrondi(baseValeur + k * Number(p.valeur), 3);
+          jour = ajouterJours(baseJour, Math.max(1, Math.round((k * Number(p.valeur)) / rythme)));
+        } else jour = ajouterPeriode(baseJour, p, k);
         if (!jour || jour > au || !(Number(p.valeur) > 0)) break;
         if (jour >= du) pousser(k, jour, valeur);
       }
     }
     const tri = (a, b) => String(a.date).localeCompare(String(b.date)) || String(a.numero).localeCompare(String(b.numero), 'fr', { numeric: true }) || a.occurrence - b.occurrence;
     return { periode: periode.sort(tri), enRetard: enRetard.sort(tri) };
+  }
+
+  // ----- Absences (module RH) ----------------------------------------------------------------------------
+  /**
+   * Absences validées des techniciens sur [du, au] qui les rendent indisponibles (une astreinte n'en est pas une),
+   * avec leurs jours ouvrés dans la période. Visibles avec le droit rh.voir ou, pour tous, si
+   * config.rh.afficherAbsencesPlanning ; sans droit RH, la nature de l'absence n'est pas communiquée.
+   */
+  function absencesPeriode(req, du, au, userIds, refs) {
+    const rh = ctx.services.rh;
+    if (!rh || typeof rh.absencesEntre !== 'function' || !userIds.length) return [];
+    const voirRh = can(req, 'rh', 'voir');
+    if (!voirRh && (ctx.config().rh || {}).afficherAbsencesPlanning === false) return [];
+    let rows = [];
+    try { rows = rh.absencesEntre(du, au, { userIds: Array.from(new Set(userIds.map(Number))) }) || []; } catch (e) { ctx.log('Planning : absences RH indisponibles', e && e.message); return []; }
+    return rows.filter((a) => a && a.userId != null && a.absent !== false).map((a) => {
+      const debut = a.dateDebut > du ? a.dateDebut : du;
+      const fin = a.dateFin < au ? a.dateFin : au;
+      const ouvres = fin < debut ? 0 : (a.demiJournee ? (jourSemaine(debut) < 5 ? 0.5 : 0) : joursOuvres(debut, fin));
+      return {
+        id: a.id, userId: Number(a.userId), nom: a.nom || nomDe(refs, a.userId), dateDebut: a.dateDebut, dateFin: a.dateFin, demiJournee: a.demiJournee || null,
+        typeCode: voirRh ? a.typeCode || null : null, libelle: voirRh ? a.libelle || 'Absent' : 'Absent', couleur: voirRh ? a.couleur || COULEUR_DEFAUT : COULEUR_DEFAUT,
+        joursOuvres: ouvres,
+      };
+    });
   }
 
   // ----- Calcul de la période -----------------------------------------------------------------------
@@ -454,16 +494,23 @@ function register(ctx) {
       const l = ligne(uid);
       l.heuresPreventif += Number(e.dureeEstimee) || 0; l.nbEcheances += 1;
     }
-    const capacite = arrondi(hpj * nbOuvres);
+    // Absences validées (module RH) : leurs jours ouvrés sont retirés de la capacité de chaque technicien
+    const absences = absencesPeriode(req, du, au, Array.from(parUser.values()).map((l) => l.userId).filter((x) => x != null), refs);
+    const joursAbsents = new Map();
+    for (const a of absences) joursAbsents.set(a.userId, (joursAbsents.get(a.userId) || 0) + a.joursOuvres);
     const charge = Array.from(parUser.values())
       .filter((l) => l.userId != null || l.nbOt || l.nbEcheances)
-      .map((l) => Object.assign(l, { heures: arrondi(l.heures), heuresPreventif: arrondi(l.heuresPreventif), capacite, taux: capacite > 0 ? Math.round((l.heures / capacite) * 100) : null }))
+      .map((l) => {
+        const absents = l.userId != null ? Math.min(nbOuvres, arrondi(joursAbsents.get(l.userId) || 0, 1)) : 0;
+        const capacite = arrondi(hpj * (nbOuvres - absents));
+        return Object.assign(l, { heures: arrondi(l.heures), heuresPreventif: arrondi(l.heuresPreventif), joursAbsents: absents, capacite, taux: capacite > 0 ? Math.round((l.heures / capacite) * 100) : null });
+      })
       .sort((a, b) => (a.userId == null ? 1 : 0) - (b.userId == null ? 1 : 0) || a.nom.localeCompare(b.nom, 'fr'));
 
     const actifs = ot.filter((o) => !o.annule);
     return {
       du, au, aujourdhui, heuresParJour: hpj, joursOuvres: nbOuvres, projection,
-      ot, echeances: ech.periode, nonPlanifies, charge,
+      ot, echeances: ech.periode, nonPlanifies, charge, absences,
       enRetard: { ot: otEnRetard, echeances: ech.enRetard },
       totaux: {
         nbOt: ot.length, heures: arrondi(actifs.reduce((s, o) => s + (Number(o.dureeEstimee) || 0), 0)),
@@ -526,6 +573,8 @@ function register(ctx) {
     if (body.technicienId !== undefined) {
       const tid = idRef(body.technicienId, 'Technicien');
       if (tid !== ancienTech) {
+        // Même matrice de droits que le module Ordres de travail : changer le responsable exige « Affecter »
+        ctx.requirePerm(req, 'ot', 'affecter');
         if (tid != null) {
           const u = db.get('users', tid);
           if (!u || u.actif === false) throw new HttpError(400, 'Technicien introuvable ou désactivé');
@@ -541,6 +590,8 @@ function register(ctx) {
       }
     }
     const dateChange = patch.datePrevue !== undefined;
+    // … et replanifier (date prévue) exige « Modifier » ou « Affecter », comme PUT /api/ot/:id et /api/ot/:id/affecter
+    if (dateChange && !can(req, 'ot', 'modifier') && !can(req, 'ot', 'affecter')) throw new HttpError(403, 'Droit insuffisant : Ordres de travail › Modifier ou Affecter (nécessaire pour changer la date prévue)');
     if (!dateChange && !techChange) return itemOt(o, references(), droits(req), undefined, req);
 
     // Planification automatique : un OT au statut initial daté passe « planifié » (et inversement)
@@ -563,21 +614,21 @@ function register(ctx) {
     patch.historique = historique;
     const maj = db.update('ot', o.id, patch);
 
-    ctx.audit(req, techChange ? 'affectation' : 'modification', 'ot', o.id, `OT ${o.numero} replanifié depuis le planning — ${resumeModif}`);
-    if (nouveauStatut) ctx.audit(req, 'statut', 'ot', o.id, `OT ${o.numero} : ${st.libelle(o.statut)} → ${st.libelle(nouveauStatut)} (planning)`);
+    ctx.audit(req, techChange ? 'affectation' : 'modification', 'ot', o.id, `${refOt(o.numero)} replanifié depuis le planning — ${resumeModif}`);
+    if (nouveauStatut) ctx.audit(req, 'statut', 'ot', o.id, `${refOt(o.numero)} : ${st.libelle(o.statut)} → ${st.libelle(nouveauStatut)} (planning)`);
 
     // Notifications
     const quand = maj.datePrevue ? ` — prévu le ${libelleDate(maj.datePrevue)}` : ' — non planifié';
     const notifies = new Set();
     if (techChange && maj.technicienId != null) {
-      notifier([maj.technicienId], req.user.id, { titre: `Affectation : OT ${maj.numero}`, message: `${maj.titre}${quand}`, lien: `#/ot/${maj.id}`, type: 'info' }).forEach((id) => notifies.add(id));
+      notifier([maj.technicienId], req.user.id, { titre: `Affectation : ${refOt(maj.numero)}`, message: `${maj.titre}${quand}`, lien: `#/ot/${maj.id}`, type: 'info' }).forEach((id) => notifies.add(id));
     }
     if (techChange && ancienTech != null) {
-      notifier([ancienTech], req.user.id, { titre: `OT ${maj.numero} réaffecté`, message: `${maj.titre} — ${maj.technicienId != null ? 'confié à ' + ctx.nomUser(maj.technicienId) : 'vous n\'en êtes plus responsable'}`, lien: `#/ot/${maj.id}`, type: 'info' }).forEach((id) => notifies.add(id));
+      notifier([ancienTech], req.user.id, { titre: `${refOt(maj.numero)} réaffecté`, message: `${maj.titre} — ${maj.technicienId != null ? 'confié à ' + ctx.nomUser(maj.technicienId) : 'vous n\'en êtes plus responsable'}`, lien: `#/ot/${maj.id}`, type: 'info' }).forEach((id) => notifies.add(id));
     }
     if (dateChange) {
       const autres = [maj.technicienId].concat(maj.techniciens || []).filter((id) => id != null && !notifies.has(Number(id)));
-      notifier(autres, req.user.id, { titre: `OT ${maj.numero} replanifié`, message: `${maj.titre} — ${maj.datePrevue ? 'nouvelle date prévue : ' + libelleDate(maj.datePrevue) : 'retiré du planning (non planifié)'}`, lien: `#/ot/${maj.id}`, type: 'info' });
+      notifier(autres, req.user.id, { titre: `${refOt(maj.numero)} replanifié`, message: `${maj.titre} — ${maj.datePrevue ? 'nouvelle date prévue : ' + libelleDate(maj.datePrevue) : 'retiré du planning (non planifié)'}`, lien: `#/ot/${maj.id}`, type: 'info' });
     }
 
     const champsModifies = Object.keys(patch).filter((k) => k !== 'historique');
@@ -623,7 +674,7 @@ function register(ctx) {
         historique: [entreeHistorique(req, 'creation', 'Ordre de travail créé', st.initial, commentaire)],
       };
       ot = db.insert('ot', record);
-      ctx.audit(req, 'creation', 'ot', ot.id, `OT ${ot.numero} : ${ot.titre} (plan ${plan.numero || plan.id}, depuis le planning)`);
+      ctx.audit(req, 'creation', 'ot', ot.id, `${refOt(ot.numero)} : ${ot.titre} (plan ${plan.numero || plan.id}, depuis le planning)`);
       if (technicienId != null) notifier([technicienId], req.user.id, { titre: `Nouvel ordre de travail : ${ot.numero}`, message: `${ot.titre} — prévu le ${formatDateFr(datePrevue)}`, lien: `#/ot/${ot.id}`, type: 'info' });
       ctx.emit('ot:cree', Object.assign({}, ot, { ot, source: 'plan' }));
     }
@@ -633,7 +684,7 @@ function register(ctx) {
     if (!ot.datePrevue && datePrevue) patchOt.datePrevue = datePrevue;
     ot = db.update('ot', ot.id, patchOt) || ot;
     const majPlan = db.update('plansPreventifs', plan.id, { derniereGeneration: maintenant(), dernierOtGenereId: ot.id });
-    ctx.audit(req, 'generation', 'plansPreventifs', plan.id, `Plan ${plan.numero || plan.id} : OT ${ot.numero} généré depuis le planning (échéance du ${formatDateFr(echeance) || '—'})`);
+    ctx.audit(req, 'generation', 'plansPreventifs', plan.id, `Plan ${plan.numero || plan.id} : ${refOt(ot.numero)} généré depuis le planning (échéance du ${formatDateFr(echeance) || '—'})`);
     ctx.emit('preventif:genere', { plan: majPlan || plan, ot });
     return ot;
   }

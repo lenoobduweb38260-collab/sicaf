@@ -100,7 +100,7 @@
       { type: 'separateur', label: 'Rattachement' },
       { nom: 'parentId', label: 'Équipement parent', type: 'select', options: optionsParents, aide: 'Pour un sous-équipement (ex. moteur d\'une ligne). Le secteur du parent est repris si aucun secteur n\'est choisi.',
         onChange: (v, f) => { if (v !== '' && v != null && !f.get('secteurId')) { const p = equipements.find((x) => x.id === Number(v)); if (p && p.secteurId != null) f.set('secteurId', p.secteurId); } } },
-      { nom: 'secteurId', label: 'Secteur', type: 'select', options: ui.optionsSecteurs({ vide: '— Hérité de l\'équipement parent —' }), aide: 'Obligatoire pour un équipement principal ; détermine qui voit la fiche (portée).' },
+      { nom: 'secteurId', label: 'Secteur', type: 'select', options: ui.optionsSecteurs({ vide: '— Hérité de l\'équipement parent —' }), aide: 'Obligatoire pour un équipement principal ; détermine qui voit la fiche (portée). En cas de changement, les OT en cours, plans préventifs et demandes ouvertes de l\'équipement suivent le nouveau secteur.' },
       { nom: 'localisation', label: 'Localisation', type: 'texte', placeholder: 'ex. Hall A, travée 2', pleineLargeur: true },
       { type: 'separateur', label: 'Caractéristiques' },
       { nom: 'marque', label: 'Marque', type: 'texte' },

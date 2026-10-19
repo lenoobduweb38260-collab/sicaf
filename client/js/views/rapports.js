@@ -132,6 +132,10 @@
       function exporter(type, extra) {
         api.telecharger('/api/rapports/export?' + qs(Object.assign({ type }, extra || {}))).then(() => toast('Export CSV généré', 'succes')).catch(erreur);
       }
+      // Les exports qui reprennent le détail des OT (historique, fiche, équipements, techniciens, coûts) exigent aussi
+      // Ordres de travail › Exporter, et l'export du stock Stock & pièces › Exporter (mêmes règles que le serveur)
+      const peutExporterOt = () => can('exporter') && GMAO.can('ot', 'exporter');
+      const peutExporterStock = () => can('exporter') && GMAO.can('stock', 'exporter');
       const ouvrirOt = (id) => { if (GMAO.can('ot', 'voir')) GMAO.navigate('#/ot/' + id); };
 
       // ----- Chargement des indicateurs -----------------------------------------------------------------
@@ -260,7 +264,7 @@
         const cont = el('div');
         const lignes = s.equipements.disponibilite;
         cont.appendChild(barreOnglet('Fiabilité des équipements', 'Pannes = OT correctifs créés dans la période (hors annulés) · arrêts, MTTR = correctifs terminés · MTBF = temps de bon fonctionnement / pannes', [
-          can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => exporter('equipements') }) : null,
+          peutExporterOt() ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => exporter('equipements') }) : null,
           ui.bouton('Imprimer', { icone: 'imprimer', onClic: () => ui.imprimer('Fiabilité des équipements', `<h1>Fiabilité des équipements</h1><div>${esc(libelleFiltres())}</div>` + tableHtml(['N°', 'Équipement', 'Secteur', 'OT', 'Pannes', 'Heures d\'arrêt', 'MTBF', 'MTTR', 'Disponibilité', 'Coût'], lignes.map((x) => [x.numero, x.nom, x.secteurNom, x.nbOt, x.nbPannes, fmtH(x.heuresArret), x.nbPannes ? fmtJ(x.mtbfJours) : '—', x.nbReparations ? fmtH(x.mttrHeures) : '—', fmtPct(x.tauxDisponibilite), ui.formatMontant(x.cout)]))) }),
         ]));
         const totalArret = lignes.reduce((t, x) => t + x.heuresArret, 0);
@@ -298,7 +302,7 @@
         const p = s.periode;
         const lignes = s.ot.parTechnicien;
         cont.appendChild(barreOnglet('Activité des techniciens', `Heures ouvrées : ${p.joursOuvres} jour(s) ouvré(s) × ${ui.formatNombre(p.heuresParJour)} h = ${fmtH(p.heuresOuvrees)} par technicien`, [
-          can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => exporter('techniciens') }) : null,
+          peutExporterOt() ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => exporter('techniciens') }) : null,
           ui.bouton('Imprimer', { icone: 'imprimer', onClic: () => ui.imprimer('Activité des techniciens', `<h1>Activité des techniciens</h1><div>${esc(libelleFiltres())}</div><p>Heures ouvrées par technicien : ${esc(fmtH(p.heuresOuvrees))} (${p.joursOuvres} jours ouvrés)</p>` + tableHtml(['Technicien', 'OT réalisés', 'OT affectés', 'Heures saisies', 'Taux d\'occupation'], lignes.map((x) => [x.nom, x.nb, x.nbAffectes, fmtH(x.heures), fmtPct(x.tauxOccupation)]))) }),
         ]));
         const heures = lignes.reduce((t, x) => t + x.heures, 0);
@@ -335,7 +339,7 @@
         lignesMois.push({ total: true, cellules: ['Total', ui.formatMontant(c.pieces), ui.formatMontant(c.mainOeuvre), ui.formatMontant(c.externe), ui.formatMontant(c.total)] });
         const enteteMontants = [{ label: 'Pièces', num: true }, { label: 'Main d\'œuvre', num: true }, { label: 'Externe', num: true }, { label: 'Total', num: true }];
         cont.appendChild(barreOnglet('Coûts de maintenance', 'Coûts engagés dans la période : main d\'œuvre à la date des temps passés, pièces à la date de sortie, prestations à la date de fin', [
-          can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => exporter('couts') }) : null,
+          peutExporterOt() ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => exporter('couts') }) : null,
           ui.bouton('Imprimer', { icone: 'imprimer', onClic: () => ui.imprimer('Coûts de maintenance', `<h1>Coûts de maintenance</h1><div>${esc(libelleFiltres())}</div>`
             + '<h2>Par mois</h2>' + tableHtml(['Mois', 'Pièces', 'Main d\'œuvre', 'Externe', 'Total'], c.parMois.map((m) => [m.libelle, ui.formatMontant(m.pieces), ui.formatMontant(m.mainOeuvre), ui.formatMontant(m.externe), ui.formatMontant(m.total)]).concat([['Total', ui.formatMontant(c.pieces), ui.formatMontant(c.mainOeuvre), ui.formatMontant(c.externe), ui.formatMontant(c.total)]]))
             + '<h2>Par secteur</h2>' + tableHtml(['Secteur', 'OT', 'Pièces', 'Main d\'œuvre', 'Externe', 'Total'], c.parSecteur.map((x) => [x.chemin, x.nbOt, ui.formatMontant(x.pieces), ui.formatMontant(x.mainOeuvre), ui.formatMontant(x.externe), ui.formatMontant(x.total)]))
@@ -364,7 +368,7 @@
         const cont = el('div');
         const st = s.stock;
         cont.appendChild(barreOnglet('Stock et consommation de pièces', etat.secteurId || etat.technicienId ? 'Filtre actif : seules les sorties imputées aux OT filtrés sont prises en compte' : 'Valeur actuelle du stock · mouvements et consommation (sorties − retours) de la période', [
-          can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => exporter('stock') }) : null,
+          peutExporterStock() ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => exporter('stock') }) : null,
           ui.bouton('Imprimer', { icone: 'imprimer', onClic: () => ui.imprimer('Consommation de pièces', `<h1>Stock et consommation de pièces</h1><div>${esc(libelleFiltres())}</div>` + dlHtml([['Valeur du stock', ui.formatMontant(st.valeur)], ['Articles actifs', `${st.nbArticles} (dont ${st.nbSousSeuil} sous le seuil)`], ['Mouvements de la période', String(st.nbMouvements)], ['Montant consommé', ui.formatMontant(st.montantConsomme)]])
             + '<h2>Top 10 des consommations</h2>' + tableHtml(['Code', 'Désignation', 'Quantité', 'Sorties', 'Montant'], st.consommationTop10.map((x) => [x.code, x.designation, quantiteUnite(x.quantite, x.uniteCode), x.nbSorties, ui.formatMontant(x.montant)]))) }),
         ]));
@@ -394,7 +398,7 @@
         const paramsExport = () => ({ typeCode: filtresHisto.typeCode, statut: filtresHisto.statut, annules: filtresHisto.annules ? '' : '0', recherche: filtresHisto.recherche });
         let affichees = [];
         cont.appendChild(barreOnglet('Historique des interventions', 'Ordres de travail clôturés (terminés ou annulés) dont la date de fin est dans la période', [
-          can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => exporter('historique', paramsExport()) }) : null,
+          peutExporterOt() ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => exporter('historique', paramsExport()) }) : null,
           ui.bouton('Imprimer', { icone: 'imprimer', onClic: () => imprimerHistorique(affichees) }),
         ]));
         cont.appendChild(el('div', { class: 'barre-outils' }, recherche, selType, selStatut, el('label', { class: 'inline' }, cbAnnules, 'Inclure les annulés')));
@@ -461,7 +465,7 @@
         let donnees = null;
         const paramsFiche = () => Object.assign({ sousEquipements: etat.ficheSous ? '1' : '' }, etat.fichePeriode ? { du: etat.du, au: etat.au } : {});
         cont.appendChild(barreOnglet('Fiche de vie d\'un équipement', 'Chronologie complète des interventions, coûts cumulés, fiabilité, plans préventifs et compteur', [
-          can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => { if (!etat.ficheId) return toast('Choisissez d\'abord un équipement', 'alerte'); api.telecharger('/api/rapports/export?' + new URLSearchParams(Object.entries(Object.assign({ type: 'fiche', equipementId: etat.ficheId }, paramsFiche())).filter(([, v]) => v !== '' && v != null)).toString()).then(() => toast('Export CSV généré', 'succes')).catch(erreur); } }) : null,
+          peutExporterOt() ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => { if (!etat.ficheId) return toast('Choisissez d\'abord un équipement', 'alerte'); api.telecharger('/api/rapports/export?' + new URLSearchParams(Object.entries(Object.assign({ type: 'fiche', equipementId: etat.ficheId }, paramsFiche())).filter(([, v]) => v !== '' && v != null)).toString()).then(() => toast('Export CSV généré', 'succes')).catch(erreur); } }) : null,
           ui.bouton('Imprimer', { icone: 'imprimer', onClic: () => { if (!donnees) return toast('Choisissez d\'abord un équipement', 'alerte'); imprimerFiche(donnees); } }),
         ]));
         cont.appendChild(el('div', { class: 'barre-outils' }, el('span', { class: 'inline texte-2' }, ico('equipements'), 'Équipement'), selEq, selPortee, el('label', { class: 'inline' }, cbSous, 'Inclure les sous-équipements')));

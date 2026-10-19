@@ -4,7 +4,9 @@
  * (deux dossiers de données, deux ports) — Carpentras sauvegarde chez Valréas.
  * Couvre : dossiers (.gz / .enc + .sha256, rétention, restauration chiffrée), réception d'un autre site
  * (clé, empreinte, refus, traversée de chemin, anti-force-brute), secrets jamais exposés, droits (403),
- * portée par site, lecture seule, en-tête X-GMAO-Site, planification, historique.
+ * portée par site, lecture seule, en-tête X-GMAO-Site, planification, historique, gestion des destinations réservée
+ * aux accès globaux, réplication HTTPS avec épinglage du certificat, notifications filtrées, relecture après copie,
+ * copies de l'état précédent restaurables.
  */
 const { test, describe, before, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -16,6 +18,7 @@ const zlib = require('zlib');
 const crypto = require('crypto');
 const { createApp } = require('../server/server');
 const { seedDemo } = require('../server/modules/sauvegardes');
+const tlsGmao = require('../server/tls');
 
 const RE_NOM = /^gmao-([A-Za-z0-9_-]+)-(\d{8})-(\d{6})(?:-\d+)?\.json(\.gz)?(\.enc)?$/;
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -24,13 +27,66 @@ const MDP = 'Chiffrement-Carpentras-2026!';
 const temporaires = [];
 function dossierTemp(prefixe = 'gmao-') { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefixe)); temporaires.push(d); return d; }
 
-async function lancer() {
-  const dataDir = dossierTemp();
-  const app = createApp({ dataDir, log: () => {} });
+function assouplirPolitique(app) {
   // Politique de mot de passe assouplie pour les comptes de test (voir tests/helpers.js)
-  { const cfg = app.db.getConfig(); cfg.securite = Object.assign({}, cfg.securite, { longueurMinMdp: 4, complexite: false, refuserCourants: false, interdireIdentifiant: false, forcerChangementMdpInitial: false }); app.db.setConfig(cfg); }
+  const cfg = app.db.getConfig();
+  cfg.securite = Object.assign({}, cfg.securite, { longueurMinMdp: 4, complexite: false, refuserCourants: false, interdireIdentifiant: false, forcerChangementMdpInitial: false });
+  app.db.setConfig(cfg);
+}
+
+async function lancer({ memoire = false } = {}) {
+  const dataDir = memoire ? null : dossierTemp();
+  const app = createApp(memoire ? { inMemory: true, log: () => {} } : { dataDir, log: () => {} });
+  assouplirPolitique(app);
   const addr = await app.start(0);
   return { app, dataDir, base: `http://127.0.0.1:${addr.port}`, db: app.db, ctx: app.ctx };
+}
+
+/** Serveur GMAO en HTTPS avec écoute mixte, comme le poste serveur de l'application de bureau. */
+async function lancerHttps(cert, dataDir = dossierTemp('gmao-tls-')) {
+  const app = createApp({ dataDir, log: () => {}, tls: { key: cert.cle, cert: cert.certificat } });
+  assouplirPolitique(app);
+  const ecoute = await tlsGmao.ecouterMixte(app.server, 0, '127.0.0.1');
+  return { app, dataDir, port: ecoute.adresse.port, db: app.db, ctx: app.ctx, async stop() { await ecoute.fermer(); await app.stop(); } };
+}
+
+/** Client HTTPS acceptant le certificat auto-signé du serveur (poste client après confirmation de l'empreinte). */
+function clientHttps(port) {
+  const https = require('https');
+  let cookie = '';
+  function call(method, url, body) {
+    return new Promise((resolve, reject) => {
+      const headers = { 'x-requested-with': 'GMAO', cookie, host: `127.0.0.1:${port}` };
+      const payload = body === undefined ? null : JSON.stringify(body);
+      if (payload) { headers['content-type'] = 'application/json'; headers['content-length'] = String(Buffer.byteLength(payload)); }
+      const req = https.request({ host: '127.0.0.1', port, method, path: url, headers, rejectUnauthorized: false }, (res) => {
+        const sc = res.headers['set-cookie'];
+        if (sc) cookie = String(Array.isArray(sc) ? sc[0] : sc).split(';')[0];
+        const m = [];
+        res.on('data', (c) => m.push(c));
+        res.on('end', () => { const t = Buffer.concat(m).toString('utf8'); let b; try { b = JSON.parse(t); } catch (e) { b = t; } resolve({ status: res.statusCode, body: b }); });
+      });
+      req.on('error', reject);
+      if (payload) req.end(payload); else req.end();
+    });
+  }
+  return {
+    get: (u) => call('GET', u), post: (u, b) => call('POST', u, b === undefined ? {} : b), put: (u, b) => call('PUT', u, b),
+    async login(login, password) { const r = await call('POST', '/api/auth/login', { login, password }); if (r.status !== 200) throw new Error('Connexion échouée : ' + JSON.stringify(r.body)); return r.body; },
+    async ok(method, u, b) { const r = await call(method, u, b); if (r.status < 200 || r.status >= 300) throw new Error(`${method} ${u} → ${r.status} ${JSON.stringify(r.body)}`); return r.body; },
+  };
+}
+
+/** Faux « serveur GMAO » qui accepte tout et conserve ce qu'il reçoit (exfiltration). */
+async function serveurLeurre() {
+  const recus = [];
+  const srv = http.createServer((req, res) => {
+    const m = [];
+    req.on('data', (c) => m.push(c));
+    req.on('end', () => { const corps = Buffer.concat(m); recus.push({ url: req.url, corps }); res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: true, site: 'Leurre', version: '1', sha256: sha256(corps), fichiers: [] })); });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  return { url: `http://127.0.0.1:${srv.address().port}`, recus, fermer: () => new Promise((r) => srv.close(r)) };
 }
 
 /** Client HTTP conservant le cookie de session, avec en-tête de site optionnel et envoi brut. */
@@ -71,6 +127,7 @@ async function envoyerBrut(srv, { cle, fichier, contenu, sha, source = 'Site tes
 describe('Sauvegardes multi-destinations et multi-sites', () => {
   let A, B, adminA, adminB, dossierD, siteA, siteB, prodA;
   let destD, destServeur, cleB, fichierChiffre;
+  let uC, uL, destV, destC, dossierV, dossierC;
 
   before(async () => {
     A = await lancer();
@@ -545,15 +602,15 @@ describe('Sauvegardes multi-destinations et multi-sites', () => {
   test('multi-site : portée par site, lecture seule (403), en-tête X-GMAO-Site', async () => {
     siteB = await adminA.ok('POST', '/api/secteurs', { nom: 'Usine de Valréas', code: 'VAL', type: 'site' });
     const prodB = await adminA.ok('POST', '/api/secteurs', { nom: 'Production Valréas', code: 'VAL-PROD', type: 'service', parentId: siteB.id });
-    const dossierV = dossierTemp('gmao-val-');
-    const dossierC = dossierTemp('gmao-carp-');
-    const destV = await adminA.ok('POST', '/api/sauvegardes-avancees/destinations', { nom: 'NAS de Valréas', type: 'dossier', chemin: dossierV, secteurId: siteB.id });
-    const destC = await adminA.ok('POST', '/api/sauvegardes-avancees/destinations', { nom: 'NAS de Carpentras', type: 'dossier', chemin: dossierC, secteurId: prodA.id });
+    dossierV = dossierTemp('gmao-val-');
+    dossierC = dossierTemp('gmao-carp-');
+    destV = await adminA.ok('POST', '/api/sauvegardes-avancees/destinations', { nom: 'NAS de Valréas', type: 'dossier', chemin: dossierV, secteurId: siteB.id });
+    destC = await adminA.ok('POST', '/api/sauvegardes-avancees/destinations', { nom: 'NAS de Carpentras', type: 'dossier', chemin: dossierC, secteurId: prodA.id });
     const profil = await adminA.ok('POST', '/api/profils', { nom: 'Informatique de site', niveau: 2, portee: 'site', permissions: { configuration: { voir: true, modifier: true }, systeme: { voir: true, modifier: true } } });
     await adminA.ok('POST', '/api/utilisateurs', { login: 'infocarp', nom: 'Info Carpentras', profilId: profil.id, secteurIds: [prodA.id], password: 'pass1234', doitChangerMdp: false });
     await adminA.ok('POST', '/api/utilisateurs', { login: 'infolect', nom: 'Info lecture', profilId: profil.id, secteurIds: [prodA.id], siteAcces: [{ siteId: siteB.id, mode: 'lecture' }], password: 'pass1234', doitChangerMdp: false });
-    const uC = client(A); await uC.login('infocarp', 'pass1234');
-    const uL = client(A); await uL.login('infolect', 'pass1234');
+    uC = client(A); await uC.login('infocarp', 'pass1234');
+    uL = client(A); await uL.login('infolect', 'pass1234');
 
     // Site 1 uniquement : la destination de Valréas est invisible
     let g = await uC.ok('GET', '/api/sauvegardes-avancees');
@@ -563,13 +620,25 @@ describe('Sauvegardes multi-destinations et multi-sites', () => {
     assert.ok(ids.includes(destServeur.id), 'destination commune visible');
     assert.equal(g.droits.global, false);
     assert.equal(g.droits.restaurer, false);
-    assert.equal((await uC.put(`/api/sauvegardes-avancees/destinations/${destV.id}`, { nom: 'Piratée' })).status, 404);
     assert.equal((await uC.get(`/api/sauvegardes-avancees/destinations/${destV.id}/fichiers`)).status, 404);
     assert.equal((await uC.post(`/api/sauvegardes-avancees/destinations/${destV.id}/tester`)).status, 404);
-    assert.equal((await uC.post('/api/sauvegardes-avancees/destinations', { nom: 'Chez Valréas', type: 'dossier', chemin: dossierV, secteurId: siteB.id })).status, 403);
-    assert.equal((await uC.post('/api/sauvegardes-avancees/destinations', { nom: 'Commune', type: 'dossier', chemin: dossierC })).status, 403, 'destination commune réservée');
-    assert.equal((await uC.put(`/api/sauvegardes-avancees/destinations/${destServeur.id}`, { conserver: 3 })).status, 403, 'destination commune non modifiable');
-    assert.equal((await uC.ok('PUT', `/api/sauvegardes-avancees/destinations/${destC.id}`, { conserver: 4 })).conserver, 4);
+    // La gestion des destinations (création, modification, suppression) est réservée aux accès globaux :
+    // chaque sauvegarde contient la base complète de tous les sites
+    assert.equal(g.droits.destinations, false);
+    for (const [m, u, b] of [
+      ['PUT', `/api/sauvegardes-avancees/destinations/${destV.id}`, { nom: 'Piratée' }],
+      ['POST', '/api/sauvegardes-avancees/destinations', { nom: 'Chez Valréas', type: 'dossier', chemin: dossierV, secteurId: siteB.id }],
+      ['POST', '/api/sauvegardes-avancees/destinations', { nom: 'Commune', type: 'dossier', chemin: dossierC }],
+      ['POST', '/api/sauvegardes-avancees/destinations', { nom: 'Sur mon site', type: 'dossier', chemin: dossierC, secteurId: prodA.id }],
+      ['PUT', `/api/sauvegardes-avancees/destinations/${destServeur.id}`, { conserver: 3 }],
+      ['PUT', `/api/sauvegardes-avancees/destinations/${destC.id}`, { conserver: 4 }],
+      ['DELETE', `/api/sauvegardes-avancees/destinations/${destC.id}`],
+    ]) {
+      const r = await uC.call(m, u, b);
+      assert.equal(r.status, 403, `${m} ${u} → ${JSON.stringify(r.body)}`);
+      assert.match(r.body.erreur, /base complète/);
+    }
+    assert.ok((await adminA.ok('GET', '/api/sauvegardes-avancees')).destinations.some((d) => d.id === destC.id && d.conserver === 10), 'rien n\'a été modifié');
     // Opérations globales refusées
     assert.equal((await uC.put('/api/sauvegardes-avancees/parametres', { automatique: false })).status, 403);
     assert.equal((await uC.post('/api/sauvegardes-avancees/cle-reception/generer')).status, 403);
@@ -591,11 +660,11 @@ describe('Sauvegardes multi-destinations et multi-sites', () => {
     g = await uL.ok('GET', '/api/sauvegardes-avancees');
     assert.ok(g.destinations.some((d) => d.id === destV.id));
     assert.equal((await uL.get(`/api/sauvegardes-avancees/destinations/${destV.id}/fichiers`)).status, 200);
-    const refus = await uL.put(`/api/sauvegardes-avancees/destinations/${destV.id}`, { nom: 'Modifiée' });
+    assert.equal((await uL.put(`/api/sauvegardes-avancees/destinations/${destV.id}`, { nom: 'Modifiée' })).status, 403);
+    assert.equal((await uL.del(`/api/sauvegardes-avancees/destinations/${destV.id}`)).status, 403);
+    const refus = await uL.post(`/api/sauvegardes-avancees/destinations/${destV.id}/tester`);
     assert.equal(refus.status, 403);
     assert.match(refus.body.erreur, /lecture seule/);
-    assert.equal((await uL.del(`/api/sauvegardes-avancees/destinations/${destV.id}`)).status, 403);
-    assert.equal((await uL.post(`/api/sauvegardes-avancees/destinations/${destV.id}/tester`)).status, 403);
     assert.equal((await uL.post('/api/sauvegardes-avancees/executer', { destinationId: destV.id })).status, 403);
     assert.equal(A.db.getConfig().sauvegardes.destinations.find((d) => d.id === destV.id).nom, 'NAS de Valréas');
 
@@ -610,6 +679,256 @@ describe('Sauvegardes multi-destinations et multi-sites', () => {
     adminSite.setSite(siteA.id);
     assert.ok((await adminSite.ok('GET', '/api/sauvegardes-avancees')).destinations.some((d) => d.id === destC.id));
     void prodB;
+  });
+
+  test('sécurité multi-site : un accès limité à son site ne peut ni créer ni rediriger une destination (la base complète ne sort pas du périmètre)', async () => {
+    const leurre = await serveurLeurre();
+    try {
+      const r = await uC.post('/api/sauvegardes-avancees/destinations', { nom: 'Mon serveur', type: 'serveur', url: leurre.url, cle: 'gmao_cle-quelconque-0123456789', secteurId: prodA.id });
+      assert.equal(r.status, 403);
+      assert.match(r.body.erreur, /base complète/);
+      assert.equal((await uC.put(`/api/sauvegardes-avancees/destinations/${destC.id}`, { chemin: dossierTemp('gmao-exfil-') })).status, 403, 'ni rediriger une destination existante de son site');
+      assert.equal((await uC.put(`/api/sauvegardes-avancees/destinations/${destC.id}`, { type: 'serveur', url: leurre.url, cle: 'gmao_cle-quelconque-0123456789' })).status, 403);
+      assert.equal(leurre.recus.length, 0, 'rien n\'a été envoyé au serveur choisi par l\'utilisateur');
+      assert.equal(A.db.getConfig().sauvegardes.destinations.find((d) => d.id === destC.id).chemin, dossierC);
+      // Il peut toujours tester et utiliser les destinations de son site mises en place par le pôle informatique
+      assert.equal((await uC.ok('POST', `/api/sauvegardes-avancees/destinations/${destC.id}/tester`)).ok, true);
+      const ex = await uC.ok('POST', '/api/sauvegardes-avancees/executer', { destinationId: destC.id });
+      assert.equal(ex.ok, true);
+      assert.equal(ex.complete, false);
+    } finally { await leurre.fermer(); }
+  });
+
+  test('sélecteur de site : une sauvegarde limitée à un site n\'est pas une exécution complète (planification et compteur d\'échecs inchangés)', async () => {
+    const fichierKo = path.join(dossierTemp('gmao-ko-'), 'pas-un-dossier');
+    fs.writeFileSync(fichierKo, 'x');
+    const ko = await adminA.ok('POST', '/api/sauvegardes-avancees/destinations', { nom: 'NAS Carpentras en panne', type: 'dossier', chemin: fichierKo + '/x', secteurId: prodA.id });
+    const svc = A.ctx.services.sauvegardes;
+    const auto = await svc.executer({ declencheur: 'automatique' });
+    assert.equal(auto.ok, false);
+    assert.equal(auto.complete, true);
+    let s = A.db.getConfig().sauvegardes;
+    const echecs = s.echecsConsecutifs;
+    assert.ok(echecs >= 1);
+    assert.equal(svc.estDue(s, new Date(Date.now() + 61 * 60000)), true, 'nouvel essai prévu une heure plus tard');
+    // L'administrateur, sélecteur de site sur Valréas, lance « Sauvegarder maintenant vers toutes les destinations »
+    const adminSite = client(A); await adminSite.login('admin', 'admin');
+    adminSite.setSite(siteB.id);
+    const ex = await adminSite.ok('POST', '/api/sauvegardes-avancees/executer', {});
+    assert.equal(ex.ok, true);
+    assert.equal(ex.complete, false);
+    assert.ok(!ex.resultats.some((r) => r.destinationId === ko.id), 'la destination de Carpentras n\'est pas tentée');
+    s = A.db.getConfig().sauvegardes;
+    assert.equal(s.echecsConsecutifs, echecs, 'compteur d\'échecs inchangé');
+    assert.equal(s.derniereExecution.ok, false, 'la dernière exécution complète reste en échec');
+    assert.equal(svc.estDue(s, new Date(Date.now() + 61 * 60000)), true, 'le nouvel essai automatique reste prévu');
+    const h = (await adminA.ok('GET', '/api/sauvegardes-avancees')).historique.find((x) => x.id === ex.historiqueId);
+    assert.equal(h.complete, false);
+    assert.equal(h.siteCourantId, siteB.id);
+    assert.ok(A.db.list('audit').some((a) => a.entite === 'sauvegardes' && /site sélectionné uniquement/.test(a.details)));
+    await adminA.ok('DELETE', `/api/sauvegardes-avancees/destinations/${ko.id}`);
+  });
+
+  test('« rien à sauvegarder » : messages adaptés au périmètre (accès limité, site sélectionné)', async () => {
+    const S = await lancer({ memoire: true });
+    try {
+      const adm = client(S); await adm.login('admin', 'admin');
+      const sec = await adm.ok('GET', '/api/secteurs');
+      const site1 = sec.find((s) => s.code === 'SITE');
+      const val = await adm.ok('POST', '/api/secteurs', { nom: 'Usine de Valréas', code: 'VAL', type: 'site' });
+      const profil = await adm.ok('POST', '/api/profils', { nom: 'Informatique de site', niveau: 2, portee: 'site', permissions: { systeme: { voir: true, modifier: true } } });
+      await adm.ok('POST', '/api/utilisateurs', { login: 'infoval', nom: 'Info Valréas', profilId: profil.id, secteurIds: [val.id], password: 'pass1234', doitChangerMdp: false });
+      const u = client(S); await u.login('infoval', 'pass1234');
+      let r = await u.post('/api/sauvegardes-avancees/executer', {});
+      assert.equal(r.status, 400);
+      assert.match(r.body.erreur, /demandez l'ajout/);
+      await adm.ok('POST', '/api/sauvegardes-avancees/destinations', { nom: 'NAS Carpentras', type: 'dossier', chemin: dossierTemp('gmao-msg-'), secteurId: site1.id });
+      r = await u.post('/api/sauvegardes-avancees/executer', {});
+      assert.equal(r.status, 400);
+      assert.match(r.body.erreur, /votre périmètre/);
+      adm.setSite(val.id);
+      r = await adm.post('/api/sauvegardes-avancees/executer', {});
+      assert.equal(r.status, 400);
+      assert.match(r.body.erreur, /site sélectionné/);
+      adm.setSite(null);
+      assert.equal((await adm.ok('POST', '/api/sauvegardes-avancees/executer', {})).ok, true);
+    } finally { await S.app.stop(); }
+  });
+
+  test('notifications d\'échec : chaque destinataire ne voit que les destinations de son périmètre ; origine d\'une restauration masquée', async () => {
+    const fichierKo = path.join(dossierTemp('gmao-ko2-'), 'pas-un-dossier');
+    fs.writeFileSync(fichierKo, 'x');
+    const d = await adminA.ok('POST', '/api/sauvegardes-avancees/destinations', { nom: 'NAS confidentiel de Valréas', type: 'dossier', chemin: fichierKo + '/x', secteurId: siteB.id });
+    assert.equal((await uC.get(`/api/sauvegardes-avancees/destinations/${d.id}/fichiers`)).status, 404, 'destination invisible pour l\'informaticien de Carpentras');
+    const ex = await adminA.ok('POST', '/api/sauvegardes-avancees/executer', {});
+    assert.equal(ex.ok, false);
+    const nC = (await uC.ok('GET', '/api/notifications')).notifications;
+    assert.ok(!nC.some((n) => /NAS confidentiel/.test(n.message)), 'le nom de la destination d\'un autre site n\'apparaît pas');
+    assert.ok(nC.some((n) => /destination d'un autre site en échec/.test(n.message)), JSON.stringify(nC.slice(0, 2)));
+    const nA = (await adminA.ok('GET', '/api/notifications')).notifications;
+    assert.ok(nA.some((n) => /NAS confidentiel de Valréas : /.test(n.message)), 'l\'administrateur reçoit le détail');
+    // Origine d'une restauration : masquée pour un accès non global
+    const resto = (await uC.ok('GET', '/api/sauvegardes-avancees')).historique.filter((h) => h.type === 'restauration');
+    assert.ok(resto.length);
+    assert.ok(resto.every((h) => ['destination de sauvegarde', 'sauvegarde reçue d\'un autre site', 'fichier téléversé', 'copie locale'].includes(h.origine)), JSON.stringify(resto.map((h) => h.origine)));
+    assert.ok((await adminA.ok('GET', '/api/sauvegardes-avancees')).historique.some((h) => h.type === 'restauration' && /Disque D/.test(h.origine)));
+    await adminA.ok('DELETE', `/api/sauvegardes-avancees/destinations/${d.id}`);
+  });
+
+  test('planification : essais limités par cycle (compteur repris à chaque échéance), fréquences de plusieurs jours en jours entiers', async () => {
+    const svc = A.ctx.services.sauvegardes;
+    const le = (j, h, m, s = 0) => new Date(2026, 9, j, h, m, s);
+    const base = { automatique: true, frequenceHeures: 24, heure: '22:00' };
+    // Quatre échecs consécutifs (créneau du 15 en échec) mais un seul essai dans le cycle : nouvel essai une heure plus tard
+    const jour15 = Object.assign({}, base, { derniereExecution: { date: le(15, 22, 0).toISOString(), ok: false }, echecsConsecutifs: 4, essaisCycle: 1 });
+    assert.equal(svc.estDue(jour15, le(15, 23, 5)), true);
+    assert.equal(svc.prochaineExecution(jour15).getTime(), le(15, 23, 0).getTime());
+    assert.equal(svc.estDue(Object.assign({}, jour15, { essaisCycle: 3 }), le(15, 23, 5)), false, 'trois essais dans le cycle : on attend le créneau suivant');
+    assert.equal(svc.prochaineExecution(Object.assign({}, jour15, { essaisCycle: 3 })).getTime(), le(16, 22, 0).getTime());
+    assert.equal(svc.estDue(Object.assign({}, jour15, { essaisCycle: 3 }), le(16, 22, 1)), true, 'le créneau suivant relance un cycle');
+    // Fréquence intermédiaire refusée (jours entiers) ; une ancienne valeur est arrondie au jour supérieur
+    const r = await adminA.put('/api/sauvegardes-avancees/parametres', { frequenceHeures: 36 });
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /jours/);
+    const f36 = Object.assign({}, base, { frequenceHeures: 36, derniereExecution: { date: le(14, 22, 0).toISOString(), ok: true } });
+    assert.equal(svc.estDue(f36, le(15, 22, 1)), false);
+    assert.equal(svc.estDue(f36, le(16, 22, 1)), true);
+    assert.equal(svc.prochaineExecution(f36).getTime(), le(16, 22, 0).getTime());
+    assert.equal((await adminA.ok('PUT', '/api/sauvegardes-avancees/parametres', { frequenceHeures: 72 })).frequenceHeures, 72);
+    await adminA.ok('PUT', '/api/sauvegardes-avancees/parametres', { frequenceHeures: 24 });
+    // Cycle réel : échéance planifiée en échec, trois essais horaires au plus, puis reprise au créneau suivant
+    const S = await lancer();
+    try {
+      const adm = client(S); await adm.login('admin', 'admin');
+      const fichierKo = path.join(dossierTemp('gmao-ko3-'), 'pas-un-dossier');
+      fs.writeFileSync(fichierKo, 'x');
+      await adm.ok('POST', '/api/sauvegardes-avancees/destinations', { nom: 'NAS en panne', type: 'dossier', chemin: fichierKo + '/x' });
+      await adm.ok('PUT', '/api/sauvegardes-avancees/parametres', { conserverLocal: 0 });
+      const svc2 = S.ctx.services.sauvegardes;
+      const reculer = (ms) => { const cfg = S.db.getConfig(); cfg.sauvegardes.derniereExecution.date = new Date(new Date(cfg.sauvegardes.derniereExecution.date).getTime() - ms).toISOString(); S.db.setConfig(cfg); };
+      const etat = () => { const s = S.db.getConfig().sauvegardes; return [s.echecsConsecutifs, s.essaisCycle]; };
+      assert.equal(await svc2.verifierPlanification(new Date()), true, 'première échéance');
+      assert.deepEqual(etat(), [1, 1]);
+      for (let i = 2; i <= 3; i++) { reculer(61 * 60000); assert.equal(await svc2.verifierPlanification(new Date()), true, `essai ${i}`); assert.deepEqual(etat(), [i, i]); }
+      reculer(61 * 60000);
+      assert.equal(await svc2.verifierPlanification(new Date()), false, 'plus d\'essai avant le créneau suivant');
+      assert.deepEqual(etat(), [3, 3]);
+      reculer(25 * 3600000);
+      assert.equal(await svc2.verifierPlanification(new Date()), true, 'créneau suivant : nouveau cycle');
+      assert.deepEqual(etat(), [4, 1], 'échecs consécutifs cumulés, essais du cycle repris à 1');
+      reculer(61 * 60000);
+      assert.equal(await svc2.verifierPlanification(new Date()), true, 'nouvel essai possible malgré quatre échecs consécutifs');
+    } finally { await S.app.stop(); }
+  });
+
+  test('copie dans un dossier : le fichier écrit est relu et son empreinte vérifiée (écriture incomplète signalée, fichier supprimé)', async () => {
+    const dir = dossierTemp('gmao-usb-');
+    const d = await adminA.ok('POST', '/api/sauvegardes-avancees/destinations', { nom: 'Clé USB défaillante', type: 'dossier', chemin: dir });
+    const original = fs.writeFileSync;
+    // Support défaillant simulé : le fichier temporaire est tronqué à 10 octets
+    fs.writeFileSync = function (f, contenu, ...reste) {
+      if (typeof f === 'string' && f.startsWith(dir) && /\.tmp$/.test(f) && Buffer.isBuffer(contenu)) return original.call(fs, f, contenu.subarray(0, 10), ...reste);
+      return original.call(fs, f, contenu, ...reste);
+    };
+    let ex;
+    try { ex = await adminA.ok('POST', '/api/sauvegardes-avancees/executer', { destinationId: d.id }); } finally { fs.writeFileSync = original; }
+    assert.equal(ex.ok, false);
+    assert.match(ex.resultats[0].message, /relecture/);
+    assert.equal(fs.readdirSync(dir).filter((n) => RE_NOM.test(n) || n.endsWith('.sha256')).length, 0, 'fichier tronqué et empreinte supprimés');
+    const ok = await adminA.ok('POST', '/api/sauvegardes-avancees/executer', { destinationId: d.id });
+    assert.equal(ok.ok, true);
+    assert.match(ok.resultats[0].message, /empreinte vérifiée après relecture/);
+    assert.equal(sha256(fs.readFileSync(path.join(dir, ok.fichier))), ok.sha256);
+    await adminA.ok('DELETE', `/api/sauvegardes-avancees/destinations/${d.id}`);
+  });
+
+  test('copies locales : l\'état précédent copié avant une restauration est listé et restaurable (retour en arrière)', async () => {
+    const temoin = A.db.insert('fournisseurs', { nom: 'Fournisseur avant retour en arrière', actif: true });
+    const ex = await adminA.ok('POST', '/api/sauvegardes-avancees/executer', { destinationId: destD.id });
+    A.db.remove('fournisseurs', temoin.id);
+    const r1 = await adminA.ok('POST', '/api/sauvegardes-avancees/restaurer', { source: 'destination', destinationId: destD.id, fichier: ex.fichier });
+    assert.ok(A.db.get('fournisseurs', temoin.id), 'restauration : le fournisseur est revenu');
+    assert.match(r1.copieAvant, /^gmao-avant-import-/);
+    const copie = (await adminA.ok('GET', '/api/sauvegardes-avancees')).locales.find((f) => f.nom === r1.copieAvant);
+    assert.ok(copie, 'copie de l\'état précédent listée dans les copies locales');
+    assert.equal(copie.etatPrecedent, 'import');
+    assert.equal(copie.chiffre, false);
+    assert.ok(copie.taille > 0 && copie.date);
+    const dl = await adminA.call('GET', `/api/sauvegardes-avancees/telecharger?source=locale&fichier=${encodeURIComponent(r1.copieAvant)}`);
+    assert.equal(dl.status, 200);
+    const r2 = await adminA.ok('POST', '/api/sauvegardes-avancees/restaurer', { source: 'locale', fichier: r1.copieAvant });
+    assert.match(r2.origine, /état précédent/);
+    assert.ok(!A.db.get('fournisseurs', temoin.id), 'retour à l\'état qui précédait la restauration');
+    assert.equal((await adminA.ok('GET', '/api/sauvegardes-avancees')).historique[0].origine, r2.origine);
+    // Ce nom n'est accepté que pour le dossier local du serveur
+    assert.equal((await adminA.post('/api/sauvegardes-avancees/restaurer', { source: 'destination', destinationId: destD.id, fichier: r1.copieAvant })).status, 400);
+    assert.equal((await adminA.post('/api/sauvegardes-avancees/restaurer', { source: 'recue', site: 'Usine-de-Carpentras', fichier: r1.copieAvant })).status, 400);
+    assert.equal((await adminA.post('/api/sauvegardes-avancees/restaurer', { source: 'locale', fichier: 'gmao-avant-import-2026-01-01T00-00-00-000Z.json' })).status, 404);
+  });
+
+  test('réplication HTTPS (application de bureau) : adresses https://, empreinte du certificat confirmée puis vérifiée avant tout envoi, bascule http → https proposée', async () => {
+    const certB = tlsGmao.genererCertificat({ nomPoste: 'srv-valreas' });
+    const H = await lancerHttps(certB);
+    let H2 = null;
+    let hFerme = false;
+    try {
+      const b = clientHttps(H.port); await b.login('admin', 'admin');
+      const gB = await b.ok('GET', '/api/sauvegardes-avancees');
+      assert.equal(gB.serveur.protocole, 'https');
+      assert.equal(gB.serveur.empreinte, certB.empreinte);
+      assert.ok(gB.serveur.adresses.length && gB.serveur.adresses.every((a) => /^https:\/\//.test(a)), gB.serveur.adresses.join(', '));
+      const cle = (await b.ok('POST', '/api/sauvegardes-avancees/cle-reception/generer')).cle;
+      await b.ok('PUT', '/api/sauvegardes-avancees/parametres', { accepterReception: true });
+      // Adresse http:// : la redirection vers https:// est signalée avec l'adresse à utiliser
+      const d = await adminA.ok('POST', '/api/sauvegardes-avancees/destinations', { nom: 'Valréas (HTTPS)', type: 'serveur', url: `http://127.0.0.1:${H.port}`, cle });
+      let t = await adminA.ok('POST', `/api/sauvegardes-avancees/destinations/${d.id}/tester`);
+      assert.equal(t.ok, false);
+      assert.equal(t.code, 'REDIRECTION_HTTPS');
+      assert.equal(t.adresseHttps, `https://127.0.0.1:${H.port}`);
+      // Adresse https:// sans empreinte confirmée : rien n'est envoyé, l'empreinte présentée est renvoyée
+      await adminA.ok('PUT', `/api/sauvegardes-avancees/destinations/${d.id}`, { url: t.adresseHttps });
+      t = await adminA.ok('POST', `/api/sauvegardes-avancees/destinations/${d.id}/tester`);
+      assert.equal(t.ok, false);
+      assert.equal(t.code, 'EMPREINTE_NON_CONFIRMEE');
+      assert.equal(t.empreintePresentee, certB.empreinte);
+      assert.match(t.message, /non confirmé/);
+      const ex0 = await adminA.ok('POST', '/api/sauvegardes-avancees/executer', { destinationId: d.id });
+      assert.equal(ex0.ok, false);
+      assert.match(ex0.resultats[0].message, /non confirmé/);
+      // Empreinte invalide refusée ; empreinte d'un autre certificat : différence détectée, rien n'est envoyé
+      assert.equal((await adminA.put(`/api/sauvegardes-avancees/destinations/${d.id}`, { empreinte: 'pas-une-empreinte' })).status, 400);
+      const autre = tlsGmao.genererCertificat({ nomPoste: 'usurpateur' });
+      await adminA.ok('PUT', `/api/sauvegardes-avancees/destinations/${d.id}`, { empreinte: autre.empreinte });
+      t = await adminA.ok('POST', `/api/sauvegardes-avancees/destinations/${d.id}/tester`);
+      assert.equal(t.code, 'EMPREINTE_DIFFERENTE');
+      assert.equal(t.empreintePresentee, certB.empreinte);
+      assert.equal(H.db.count('sauvegardesHistorique'), 0, 'aucune requête reçue par le serveur distant : la clé n\'a jamais été envoyée');
+      assert.ok(H.db.list('audit').every((a) => a.action !== 'refus' && a.action !== 'reception'));
+      // Empreinte confirmée (saisie en minuscules sans séparateurs : normalisée), puis test, envoi et liste des fichiers
+      const pub = await adminA.ok('PUT', `/api/sauvegardes-avancees/destinations/${d.id}`, { empreinte: certB.empreinte.replace(/:/g, '').toLowerCase() });
+      assert.equal(pub.empreinte, certB.empreinte);
+      t = await adminA.ok('POST', `/api/sauvegardes-avancees/destinations/${d.id}/tester`);
+      assert.equal(t.ok, true, t.message);
+      assert.match(t.message, /certificat HTTPS vérifié/);
+      assert.equal(A.db.getConfig().sauvegardes.destinations.find((x) => x.id === d.id).empreinteCle, certB.empreinteCle, 'empreinte de la clé mémorisée');
+      const ex = await adminA.ok('POST', '/api/sauvegardes-avancees/executer', { destinationId: d.id });
+      assert.equal(ex.ok, true, JSON.stringify(ex.resultats));
+      assert.match(ex.resultats[0].message, /connexion chiffrée/);
+      assert.ok(fs.existsSync(path.join(H.dataDir, 'backups', 'recus', 'Usine-de-Carpentras', ex.fichier)));
+      assert.ok((await adminA.ok('GET', `/api/sauvegardes-avancees/destinations/${d.id}/fichiers`)).fichiers.some((f) => f.nom === ex.fichier));
+      // Certificat renouvelé avec la même clé (poste serveur redémarré) : reconnu, nouvelle empreinte suivie ; autre clé : refusée
+      const renouvele = tlsGmao.genererCertificat({ nomPoste: 'srv-valreas', cle: certB.cle });
+      await H.stop(); hFerme = true;
+      H2 = await lancerHttps(renouvele, H.dataDir);
+      await adminA.ok('PUT', `/api/sauvegardes-avancees/destinations/${d.id}`, { url: `https://127.0.0.1:${H2.port}` });
+      t = await adminA.ok('POST', `/api/sauvegardes-avancees/destinations/${d.id}/tester`);
+      assert.equal(t.ok, true, t.message);
+      assert.equal(A.db.getConfig().sauvegardes.destinations.find((x) => x.id === d.id).empreinte, renouvele.empreinte, 'empreinte du certificat renouvelé mémorisée');
+      await adminA.ok('DELETE', `/api/sauvegardes-avancees/destinations/${d.id}`);
+    } finally {
+      if (!hFerme) await H.stop();
+      if (H2) await H2.stop();
+    }
   });
 
   test('planification : échéance quotidienne, fréquence en heures, nouvel essai après échec', async () => {

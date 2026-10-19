@@ -9,15 +9,17 @@
  *    (date de fin dans la période, statut final hors annulation).
  *      · taux préventif = OT préventifs terminés / OT terminés (en %) ; un OT issu d'un plan préventif est préventif ;
  *      · respect des délais = part des OT terminés dont la durée création → fin ne dépasse pas le
- *        `delaiHeures` de leur priorité (OT dont la priorité n'a pas de délai exclus) ; pour un OT planifié à
- *        l'avance (date prévue postérieure à la création), le délai court à partir de la date prévue ;
+ *        `delaiHeures` de leur priorité (OT dont la priorité n'a pas de délai exclus) ; pour un OT issu d'une
+ *        demande d'intervention, le délai court depuis le dépôt de la demande (même règle que le module Demandes) ;
+ *        pour un OT planifié à l'avance sans demande (date prévue postérieure à la création), à partir de la date prévue ;
  *      · MTTR = moyenne début → fin des OT correctifs terminés ; durée moyenne = idem tous types.
  *  - Coûts ENGAGÉS dans la période : main d'œuvre à la date des temps passés (au prorata du coût de l'OT),
  *    pièces à la date de sortie, prestations externes à la date de fin (à défaut début, date prévue, création).
  *  - Pannes : OT correctifs (type « correctif » de la liste typesIntervention, repli sur le libellé) créés dans la
  *    période, hors annulés. Heures d'arrêt et MTTR par équipement : durées début → fin des correctifs terminés ;
  *    MTBF = (durée observée − heures d'arrêt) / nombre de pannes (durée observée = période, bornée par la mise en
- *    service et par l'instant présent).
+ *    service et par l'instant présent ; même fenêtre dans la synthèse et dans la fiche de vie d'une période ; sans
+ *    période, la fiche de vie observe du premier OT connu à maintenant).
  *  - Techniciens : OT réalisés (terminés dans la période : responsable, intervenant ou temps saisi), heures = temps
  *    saisis datés dans la période, taux d'occupation = heures / (jours ouvrés × config.general.heuresParJour).
  *  - Demandes : déposées dans la période ; délai de validation = dépôt → décision ; taux de refus = refusées / décidées.
@@ -28,6 +30,8 @@
  *
  * Routes : GET /api/rapports/synthese, /api/rapports/historique, /api/rapports/equipement/:id,
  *          /api/rapports/references, /api/rapports/export?type=historique|equipements|techniciens|couts|stock|synthese|fiche
+ *          (rapports.exporter ; les exports qui reprennent le détail des OT — historique, fiche, equipements, techniciens,
+ *          couts — exigent en plus ot.exporter, comme /api/ot-export, et le type stock exige stock.exporter)
  * Paramètres : du, au (AAAA-MM-JJ ; défaut : année en cours), secteurId (sous-secteurs inclus ; « aucun » = sans secteur),
  *          equipementId (sous-équipements inclus, sauf sousEquipements=0), technicienId.
  * Services publiés : ctx.services.rapports.{ synthese(req, query), historique(req, query), ficheVie(req, id, query),
@@ -298,8 +302,14 @@ function register(ctx) {
       users: new Map(db.list('users').map((u) => [u.id, u])),
       fournisseurs: new Map(db.list('fournisseurs').map((x) => [x.id, x])),
       demandes: new Map(db.list('demandes').map((d) => [d.id, d])),
+      demandeParOt: new Map(db.list('demandes', (d) => d.otId != null).map((d) => [Number(d.otId), d])),
       plans: new Map(db.list('plansPreventifs').map((p) => [p.id, p])),
     };
+  }
+  /** Demande d'intervention à l'origine d'un OT (liée par ot.demandeId ou par demande.otId), ou null. */
+  function demandeDe(refs, o) {
+    const parId = o.demandeId != null ? refs.demandes.get(Number(o.demandeId)) : null;
+    return parId || refs.demandeParOt.get(Number(o.id)) || null;
   }
   function nomDe(refs, id) {
     if (id == null) return '';
@@ -312,9 +322,12 @@ function register(ctx) {
     return parts.join(' › ');
   }
   function acces(req) {
+    const exporter = peut(req, MODULE, 'exporter');
     return {
       ot: peut(req, 'ot'), demandes: peut(req, 'demandes'), stock: peut(req, 'stock'), preventif: peut(req, 'preventif'),
-      equipements: peut(req, 'equipements'), exporter: peut(req, MODULE, 'exporter'),
+      equipements: peut(req, 'equipements'), exporter,
+      // Exports reprenant le détail des OT (historique, fiche, équipements, techniciens, coûts) ou du stock
+      exporterOt: exporter && peut(req, 'ot') && peut(req, 'ot', 'exporter'), exporterStock: exporter && peut(req, 'stock') && peut(req, 'stock', 'exporter'),
     };
   }
   /** Prépare le contexte commun : période, filtres, référentiels, OT visibles et filtrés (toutes dates). */
@@ -344,8 +357,10 @@ function register(ctx) {
   const estCorrectif = (b, o) => !!b.types.correctif && o.typeCode === b.types.correctif && o.planPreventifId == null;
   /**
    * L'OT terminé a-t-il respecté le délai de sa priorité ? (null si non évaluable)
-   * Le délai court de la création ; pour un OT planifié à l'avance (date prévue postérieure à la création,
-   * ex. préventif généré 30 jours avant l'échéance), il court à partir du début de la date prévue.
+   * Le délai court de la création de l'OT. Pour un OT issu d'une demande d'intervention, il court depuis le dépôt de
+   * la demande (comme l'échéance calculée par le module Demandes : une panne urgente validée tardivement n'est pas
+   * « dans les délais » pour autant). Pour un OT planifié à l'avance sans demande (date prévue postérieure à la
+   * création, ex. préventif généré 30 jours avant l'échéance), il court à partir du début de la date prévue.
    */
   function dansDelai(b, o) {
     const p = b.priorites.get(o.prioriteCode);
@@ -354,8 +369,14 @@ function register(ctx) {
     const creation = horodatage(o.createdAt);
     const fin = horodatage(finDe(o));
     if (creation == null || fin == null) return null;
-    const prevue = horodatage(jourDe(o.datePrevue));
-    const depart = prevue != null && prevue > creation ? prevue : creation;
+    let depart = creation;
+    const d = demandeDe(b.refs, o);
+    const depot = d ? horodatage(d.dateDemande || d.createdAt) : null;
+    if (depot != null) depart = Math.min(depot, creation);
+    else {
+      const prevue = horodatage(jourDe(o.datePrevue));
+      if (prevue != null && prevue > creation) depart = prevue;
+    }
     return (fin - depart) / 3600000 <= delai;
   }
   function participants(o) {
@@ -521,15 +542,25 @@ function register(ctx) {
   }
 
   // ----- Fiabilité des équipements --------------------------------------------------------------------
-  /** Fenêtre d'observation (h) d'un équipement sur la période : bornée par la mise en service et par l'instant présent. */
-  function heuresObservees(b, e) {
-    if (!b.periode) return 0;
-    let debut = debutJour(b.periode.du);
+  /**
+   * Fenêtre d'observation d'un équipement (bornes en ms et durée en heures), commune à la synthèse et à la fiche de
+   * vie : la période demandée, bornée par la mise en service et par l'instant présent ; sans période (fiche « toute
+   * la durée de vie »), du premier OT connu (au plus tôt la mise en service, à défaut la création de la fiche) à
+   * maintenant.
+   */
+  function fenetreObservation(b, e, premierOt) {
+    const maintenant = Date.now();
     const ms = e ? horodatage(e.dateMiseEnService) : null;
-    if (ms != null && ms > debut) debut = ms;
-    const fin = Math.min(finJour(b.periode.au), Date.now());
-    return fin > debut ? (fin - debut) / 3600000 : 0;
+    let debut; let fin = maintenant;
+    if (b.periode) {
+      debut = debutJour(b.periode.du);
+      if (ms != null && ms > debut) debut = ms;
+      fin = Math.min(finJour(b.periode.au), maintenant);
+    } else debut = premierOt != null ? Math.max(premierOt, ms || 0) : (ms != null ? ms : (e ? horodatage(e.createdAt) : null));
+    return { debut, fin, heures: debut != null && fin > debut ? (fin - debut) / 3600000 : 0 };
   }
+  /** Fenêtre d'observation (h) d'un équipement sur la période de la synthèse. */
+  function heuresObservees(b, e) { return b.periode ? fenetreObservation(b, e).heures : 0; }
   function sectionEquipements(b) {
     const { crees, termines } = selection(b);
     const r = imputations(b);
@@ -762,15 +793,11 @@ function register(ctx) {
     const heuresArret = dureesCorr.reduce((s, x) => s + x, 0);
     const somme = (k) => arrondi(lignes.reduce((s, l) => s + num(l[k]), 0));
     const maintenant = Date.now();
-    // Historique réellement suivi : du premier OT enregistré (au plus tôt la mise en service) à maintenant
+    // Fenêtre d'observation : la période demandée (même fenêtre que la synthèse) ; sans période, l'historique
+    // réellement suivi, du premier OT enregistré (au plus tôt la mise en service) à maintenant
     const datesPassees = lignes.map((l) => l.dateCreation || l.date).filter((x) => x && horodatage(x) != null && horodatage(x) <= maintenant).sort();
     const realisations = termines.map((o) => finDe(o)).filter(Boolean).sort();
-    const miseEnService = horodatage(e.dateMiseEnService);
-    const premierOt = horodatage(datesPassees[0]);
-    let debutObs = premierOt != null ? Math.max(premierOt, miseEnService || 0) : (miseEnService != null ? miseEnService : horodatage(e.createdAt));
-    let finObs = maintenant;
-    if (b.periode) { debutObs = Math.max(debutObs || 0, debutJour(b.periode.du)); finObs = Math.min(finObs, finJour(b.periode.au)); }
-    const obs = debutObs != null && finObs > debutObs ? (finObs - debutObs) / 3600000 : 0;
+    const obs = fenetreObservation(b, e, horodatage(datesPassees[0])).heures;
     const coutTotal = somme('coutTotal');
     const valeurAchat = e.valeurAchat == null || e.valeurAchat === '' ? null : num(e.valeurAchat);
     const totaux = {
@@ -872,6 +899,10 @@ function register(ctx) {
     const cfg = ctx.config();
     const lib = (l, c) => libelleListe(cfg, l, c);
     const oui = (v) => (v === true ? 'Oui' : v === false ? 'Non' : '');
+    // Les exports qui reprennent le détail des modules sources (numéros, techniciens, coûts, comptes rendus des OT ;
+    // articles consommés) exigent leur droit « exporter », comme /api/ot-export ; seule la synthèse agrégée n'en a pas besoin
+    if (['historique', 'fiche', 'equipements', 'techniciens', 'couts'].includes(type)) ctx.requirePerm(req, 'ot', 'exporter');
+    if (type === 'stock') ctx.requirePerm(req, 'stock', 'exporter');
     if (type === 'historique') {
       const rows = historique(req, q);
       return {

@@ -302,14 +302,16 @@ function register(ctx) {
     r.references = nbReferences(f.id);
     r.createdByNom = f.createdBy != null ? ctx.nomUser(f.createdBy) : '';
 
-    // Articles fournis (articles.fournisseurId)
+    // Articles fournis (articles.fournisseurId) — règle du seuil du module Stock (un article sans seuil n'est pas suivi)
+    const svcStock = ctx.services.stock;
+    const sousSeuil = (a) => (svcStock && typeof svcStock.estSousSeuil === 'function' ? !!svcStock.estSousSeuil(a) : (num(a.seuilMin) > 0 && num(a.quantite) <= num(a.seuilMin)));
     r.articles = (c.articles.get(f.id) || []).map((a) => {
       const quantite = num(a.quantite); const seuilMin = num(a.seuilMin); const actif = a.actif !== false;
       return {
         id: a.id, code: a.code || '', designation: a.designation || '', categorieCode: a.categorieCode || null, uniteCode: a.uniteCode || '',
         referenceFournisseur: a.referenceFournisseur || '', emplacement: a.emplacement || '', quantite, seuilMin,
         quantiteCommande: num(a.quantiteCommande), prixUnitaire: num(a.prixUnitaire), valeur: arrondi(Math.max(0, quantite) * num(a.prixUnitaire)),
-        sousSeuil: actif && quantite <= seuilMin, rupture: actif && quantite <= 0, actif, secteurId: a.secteurId == null || a.secteurId === '' ? null : Number(a.secteurId),
+        sousSeuil: actif && sousSeuil(a), rupture: actif && quantite <= 0, actif, secteurId: a.secteurId == null || a.secteurId === '' ? null : Number(a.secteurId),
       };
     }).sort((p, q) => (p.actif === q.actif ? 0 : p.actif ? -1 : 1) || p.designation.localeCompare(q.designation, 'fr'));
 

@@ -401,6 +401,155 @@ describe('Module Équipements', () => {
     srv.db.remove('plansPreventifs', plan.id); srv.db.remove('demandes', demande.id); srv.db.remove('articles', article.id);
   });
 
+  test('changement de secteur : les OT ouverts, plans préventifs et demandes ouvertes de l\'équipement suivent le nouveau secteur', async () => {
+    const presse = await admin.ok('POST', '/api/equipements', { nom: 'Presse hydraulique 250 t', secteurId: prod.id });
+    const verin = await admin.ok('POST', '/api/equipements', { nom: 'Vérin principal', parentId: presse.id });
+    const otOuvert = srv.db.insert('ot', { numero: 'OT-SECT-1', titre: 'Reprise du joint de tige', statut: 'en_cours', equipementId: presse.id, secteurId: prod.id, pieces: [], createdBy: 1 });
+    const otVerin = srv.db.insert('ot', { numero: 'OT-SECT-2', titre: 'Contrôle du vérin', statut: 'nouveau', equipementId: verin.id, secteurId: prod.id, pieces: [], createdBy: 1 });
+    const otClos = srv.db.insert('ot', { numero: 'OT-SECT-3', titre: 'Ancienne intervention', statut: 'termine', equipementId: presse.id, secteurId: prod.id, pieces: [], createdBy: 1 });
+    const plan = srv.db.insert('plansPreventifs', { numero: 'PP-SECT-1', nom: 'Contrôle réglementaire presse', equipementId: presse.id, secteurId: prod.id, periodicite: { type: 'mois', valeur: 12 }, actif: true });
+    const diOuverte = srv.db.insert('demandes', { numero: 'DI-SECT-1', titre: 'Fuite d\'huile', equipementId: presse.id, secteurId: prod.id, statut: 'soumise', demandeurId: 1, prioriteCode: 'haute' });
+    const diClose = srv.db.insert('demandes', { numero: 'DI-SECT-2', titre: 'Bruit (résolu)', equipementId: presse.id, secteurId: prod.id, statut: 'cloturee', demandeurId: 1, prioriteCode: 'basse' });
+    const techLog = await creerUtilisateur('tech.log', 'Technicien', [log.id]);
+    assert.equal((await techLog.get('/api/ot/' + otOuvert.id)).status, 404, 'avant : OT hors portée');
+    assert.equal((await techLog.get('/api/preventif/' + plan.id)).status, 404, 'avant : plan hors portée');
+    assert.equal((await techLog.get('/api/demandes/' + diOuverte.id)).status, 404, 'avant : demande hors portée');
+    const evenements = [];
+    srv.ctx.on('equipement:modifie', (d) => evenements.push(d));
+
+    const maj = await admin.ok('PUT', '/api/equipements/' + presse.id, { secteurId: log.id });
+    assert.equal(maj.secteurId, log.id);
+    assert.equal(srv.db.get('equipements', verin.id).secteurId, log.id, 'sous-équipement déplacé avec le parent');
+    assert.equal(srv.db.get('ot', otOuvert.id).secteurId, log.id, 'OT en cours rattaché au nouveau secteur');
+    assert.equal(srv.db.get('ot', otVerin.id).secteurId, log.id, 'OT du sous-équipement déplacé aussi');
+    assert.equal(srv.db.get('ot', otClos.id).secteurId, prod.id, 'OT clôturé : secteur de l\'époque conservé');
+    assert.equal(srv.db.get('plansPreventifs', plan.id).secteurId, log.id, 'plan préventif rattaché au nouveau secteur');
+    assert.equal(srv.db.get('demandes', diOuverte.id).secteurId, log.id, 'demande ouverte rattachée au nouveau secteur');
+    assert.equal(srv.db.get('demandes', diClose.id).secteurId, prod.id, 'demande close conservée');
+    assert.equal((await techLog.get('/api/ot/' + otOuvert.id)).status, 200, 'après : les techniciens du nouveau secteur voient l\'OT');
+    assert.equal((await techLog.get('/api/preventif/' + plan.id)).status, 200, 'après : le plan est visible');
+    assert.equal((await techLog.get('/api/demandes/' + diOuverte.id)).status, 200, 'après : la demande est visible');
+    assert.equal((await techLog.ok('GET', '/api/equipements/' + presse.id)).nbOtOuverts, 1, 'fiche : OT en cours compté');
+    assert.equal(evenements.length, 1, 'événement equipement:modifie émis');
+    assert.deepEqual([evenements[0].secteur.ancien, evenements[0].secteur.nouveau, evenements[0].secteur.ot, evenements[0].secteur.plans, evenements[0].secteur.demandes], [prod.id, log.id, 2, 1, 1]);
+    assert.deepEqual(evenements[0].secteur.equipementIds, [presse.id, verin.id]);
+    const journal = srv.db.list('audit', (x) => x.action === 'modification' && /déplacement de l'équipement/.test(x.details));
+    assert.equal(journal.length, 4, 'une entrée de journal par élément rattaché (2 OT, 1 plan, 1 demande)');
+    assert.ok(srv.db.list('audit', (x) => x.entite === 'equipements' && x.entiteId === presse.id).some((x) => /2 OT, 1 plan\(s\) préventif\(s\), 1 demande\(s\)/.test(x.details)), 'bilan dans le journal de l\'équipement');
+    // Sans changement de secteur : rien n'est touché
+    await admin.ok('PUT', '/api/equipements/' + presse.id, { localisation: 'Hall B' });
+    assert.equal(evenements.length, 2);
+    assert.equal(evenements[1].secteur, null);
+    assert.equal(srv.db.list('audit', (x) => /déplacement de l'équipement/.test(x.details)).length, 4);
+    for (const [col, id] of [['ot', otOuvert.id], ['ot', otVerin.id], ['ot', otClos.id], ['plansPreventifs', plan.id], ['demandes', diOuverte.id], ['demandes', diClose.id]]) srv.db.remove(col, id);
+    await admin.ok('DELETE', '/api/equipements/' + verin.id);
+    await admin.ok('DELETE', '/api/equipements/' + presse.id);
+  });
+
+  test('numérotation : une création ou une duplication refusée ne consomme pas de numéro', async () => {
+    const compteur = () => srv.db.data.meta.numeros.eq || 0;
+    const premier = await admin.ok('POST', '/api/equipements', { nom: 'Numéroté', secteurId: prod.id });
+    const n = compteur();
+    assert.equal((await admin.post('/api/equipements', { nom: 'Sans secteur' })).status, 400);
+    assert.equal((await admin.post('/api/equipements', { nom: 'Secteur inconnu', secteurId: 99999 })).status, 400);
+    assert.equal((await admin.post('/api/equipements', { nom: 'Date invalide', secteurId: prod.id, garantieFin: 'demain' })).status, 400);
+    assert.equal((await admin.post(`/api/equipements/${premier.id}/dupliquer`, { secteurId: 99999 })).status, 400, 'duplication refusée');
+    assert.equal(compteur(), n, 'aucun numéro consommé par les créations refusées');
+    const suivant = await admin.ok('POST', '/api/equipements', { nom: 'Numéroté suivant', secteurId: prod.id });
+    assert.equal(compteur(), n + 1);
+    const numeroDe = (s) => Number(String(s).replace(/\D/g, ''));
+    assert.equal(numeroDe(suivant.numero), numeroDe(premier.numero) + 1, 'numéros consécutifs');
+    await admin.ok('DELETE', '/api/equipements/' + suivant.id);
+    await admin.ok('DELETE', '/api/equipements/' + premier.id);
+  });
+
+  test('relevé de compteur : seuls un nombre (ou une chaîne décimale) et une date AAAA-MM-JJ ou ISO sont acceptés', async () => {
+    const eq = await admin.ok('POST', '/api/equipements', { nom: 'Compresseur relevés', secteurId: prod.id, compteur: { valeur: 18420, unite: 'heures' } });
+    const refus = [
+      [{ valeur: true }, 'booléen'], [{ valeur: [4321] }, 'tableau'], [{ valeur: '0x1F4' }, 'hexadécimal'], [{ valeur: '1e3' }, 'notation scientifique'], [{ valeur: { v: 1 } }, 'objet'],
+      [{ valeur: 5000, date: true }, 'date booléenne'], [{ valeur: 5000, date: 12345 }, 'date numérique'], [{ valeur: 5000, date: '12/10/2026' }, 'date au format français'],
+    ];
+    for (const [body, msg] of refus) {
+      const r = await admin.post(`/api/equipements/${eq.id}/compteur`, body);
+      assert.equal(r.status, 400, `${msg} : ${JSON.stringify(r.body)}`);
+    }
+    const brut = srv.db.get('equipements', eq.id);
+    assert.equal(brut.compteur.valeur, 18420, 'compteur intact après les refus');
+    assert.equal(brut.compteurReleves.length, 1, 'aucun relevé fantôme');
+    const r1 = await admin.ok('POST', `/api/equipements/${eq.id}/compteur`, { valeur: '18500,5' });
+    assert.equal(r1.compteur.valeur, 18500.5, 'chaîne décimale avec virgule acceptée');
+    const r2 = await admin.ok('POST', `/api/equipements/${eq.id}/compteur`, { valeur: 18450, date: '2025-01-15' });
+    const releve = r2.compteurReleves.find((x) => x.valeur === 18450);
+    assert.equal(new Date(releve.date).getFullYear(), 2025, 'relevé daté du jour demandé');
+    assert.equal(r2.compteur.valeur, 18500.5, 'un relevé antérieur ne remplace pas la valeur courante');
+    const r3 = await admin.ok('POST', `/api/equipements/${eq.id}/compteur`, { valeur: 18600, date: new Date().toISOString() });
+    assert.equal(r3.compteur.valeur, 18600, 'horodatage ISO accepté (relevé le plus récent)');
+    // Formulaire de création : mêmes règles pour le compteur et la valeur d'achat
+    assert.equal((await admin.post('/api/equipements', { nom: 'X', secteurId: prod.id, compteur: { valeur: true } })).status, 400);
+    assert.equal((await admin.post('/api/equipements', { nom: 'X', secteurId: prod.id, compteur: { valeur: '0x10' } })).status, 400);
+    assert.equal((await admin.post('/api/equipements', { nom: 'X', secteurId: prod.id, valeurAchat: [12] })).status, 400);
+    await admin.ok('DELETE', '/api/equipements/' + eq.id);
+  });
+
+  test('champs texte : booléens, tableaux et objets refusés (désignation, localisation, numéro, commentaires, documents)', async () => {
+    const eq = await admin.ok('POST', '/api/equipements', { nom: 'Presse essai', secteurId: prod.id });
+    const contenu = 'data:text/plain;base64,' + Buffer.from('x').toString('base64');
+    const cas = [
+      ['post', '/api/equipements', { nom: true, secteurId: prod.id }],
+      ['post', '/api/equipements', { nom: 12, secteurId: prod.id }],
+      ['post', '/api/equipements', { nom: 'X', secteurId: prod.id, localisation: true }],
+      ['post', '/api/equipements', { nom: 'X', secteurId: prod.id, marque: ['Atlas'] }],
+      ['post', '/api/equipements', { nom: 'X', secteurId: prod.id, numero: false }],
+      ['post', '/api/equipements', { nom: 'X', secteurId: prod.id, compteur: { valeur: 1, unite: true } }],
+      ['put', '/api/equipements/' + eq.id, { nom: 12 }],
+      ['put', '/api/equipements/' + eq.id, { notes: { texte: 'x' } }],
+      ['post', `/api/equipements/${eq.id}/dupliquer`, { nom: true }],
+      ['put', `/api/equipements/${eq.id}/etat`, { etatCode: 'arret', commentaire: true }],
+      ['post', `/api/equipements/${eq.id}/compteur`, { valeur: 10, commentaire: 123 }],
+      ['post', `/api/equipements/${eq.id}/documents`, { nom: true, contenu }],
+      ['post', `/api/equipements/${eq.id}/documents`, { nom: 'notice.txt', description: 42, contenu }],
+    ];
+    for (const [methode, url, body] of cas) {
+      const r = await admin[methode](url, body);
+      assert.equal(r.status, 400, `${methode.toUpperCase()} ${url} ${JSON.stringify(body)} : ${JSON.stringify(r.body)}`);
+      assert.match(r.body.erreur, /texte attendu/, 'message explicite');
+    }
+    assert.equal(srv.db.count('equipements', (x) => ['true', '12', 'false'].includes(String(x.nom))), 0);
+    assert.equal(srv.db.get('equipements', eq.id).nom, 'Presse essai');
+    const num = await admin.ok('POST', '/api/equipements', { nom: 'Numéro de série numérique', secteurId: prod.id, numeroSerie: 20260042, numero: 778899 });
+    assert.equal(num.numeroSerie, '20260042', 'un numéro de série numérique reste accepté');
+    assert.equal(num.numero, '778899');
+    await admin.ok('DELETE', '/api/equipements/' + num.id);
+    await admin.ok('DELETE', '/api/equipements/' + eq.id);
+  });
+
+  test('garantie : évaluée sur le jour du calendrier local, pas sur le jour UTC', async () => {
+    const { spawnSync } = require('node:child_process');
+    // Fuseau choisi pour que le jour local diffère du jour UTC au moment du test (UTC+14 l'après-midi UTC, UTC−12 le matin)
+    const tz = new Date().getUTCHours() >= 10 ? 'Etc/GMT-14' : 'Etc/GMT+12';
+    const script = `
+      const assert = require('node:assert/strict');
+      const { demarrer } = require(${JSON.stringify(require.resolve('./helpers'))});
+      const pad = (n) => String(n).padStart(2, '0');
+      const local = (d) => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+      (async () => {
+        const srv = await demarrer();
+        try {
+          const c = srv.client(); await c.login('admin', 'admin');
+          const prod = (await c.ok('GET', '/api/secteurs')).find((s) => s.code === 'PROD');
+          const now = new Date();
+          assert.notEqual(local(now), now.toISOString().slice(0, 10), 'le jour local doit différer du jour UTC');
+          const hier = await c.ok('POST', '/api/equipements', { nom: 'Garantie finie hier', secteurId: prod.id, garantieFin: local(new Date(now.getTime() - 86400000)) });
+          const auj = await c.ok('POST', '/api/equipements', { nom: 'Garantie valable ce jour', secteurId: prod.id, garantieFin: local(now) });
+          assert.equal(hier.garantie, 'expiree', 'échue la veille (jour local)');
+          assert.equal(auj.garantie, 'valide', 'échéance du jour (jour local)');
+        } finally { await srv.stop(); }
+      })().catch((e) => { console.error(e && e.message); process.exit(1); });
+    `;
+    const r = spawnSync(process.execPath, ['-e', script], { env: Object.assign({}, process.env, { TZ: tz }), encoding: 'utf8', timeout: 60000 });
+    assert.equal(r.status, 0, `TZ=${tz} : ${r.stderr || r.stdout}`);
+  });
+
   test('données de démonstration idempotentes', async () => {
     const mod = require('../server/modules/equipements');
     const avant = srv.db.count('equipements');

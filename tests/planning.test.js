@@ -518,6 +518,118 @@ describe('Planning', () => {
   });
 
   // ----- Services et démonstration ----------------------------------------------------------------------------
+  // ----- Projections, matrice des droits, absences RH ---------------------------------------------------------
+  test('projection : les occurrences d\'un plan en retard partent de la réalisation attendue, jamais du passé', async () => {
+    const hebdo = insererPlan({ nom: 'Plan hebdomadaire en retard', equipementId: presse.id, secteurId: PROD, prochaineEcheance: jourLocal(-70), periodicite: { type: 'semaines', valeur: 1 }, technicienId: uTechProd.id, dureeEstimee: 2 });
+    try {
+      const sans = await resp.ok('GET', periode());
+      const r = await resp.ok('GET', periode('&projection=1'));
+      const occ = r.echeances.filter((e) => e.planId === hebdo.id);
+      assert.deepEqual(occ.map((e) => e.date), [jourLocal(7), jourLocal(14)], 'occurrences suivantes à partir d\'aujourd\'hui');
+      assert.ok(occ.every((e) => e.projection && !e.enRetard));
+      assert.ok(r.echeances.every((e) => e.date >= DU && e.date <= AU && (!e.projection || e.date >= AUJ)), 'aucune projection avant aujourd\'hui');
+      assert.ok(r.enRetard.echeances.some((e) => e.planId === hebdo.id && e.date === jourLocal(-70) && e.enRetard), 'l\'échéance dépassée elle-même reste signalée');
+      assert.equal(r.totaux.nbEcheancesEnRetard, sans.totaux.nbEcheancesEnRetard, 'les projections n\'ajoutent aucun retard');
+      const theo = r.charge.find((c) => c.userId === uTechProd.id);
+      const theoSans = sans.charge.find((c) => c.userId === uTechProd.id);
+      assert.equal(theo.nbEcheances, theoSans.nbEcheances + 2, 'charge préventive : seules les occurrences à venir');
+      assert.equal(theo.heuresPreventif, theoSans.heuresPreventif + 4);
+    } finally { srv.db.remove('plansPreventifs', hebdo.id); }
+  });
+
+  test('PUT : même matrice de droits que le module OT (ot.affecter pour le responsable, ot.modifier ou ot.affecter pour la date)', async () => {
+    const profils = await admin.ok('GET', '/api/profils');
+    const respId = profils.find((x) => x.nom === 'Responsable maintenance').id;
+    const sansOt = { creer: false, modifier: false, affecter: false, cloturer: false, supprimer: false, exporter: false };
+    const mk = (login, prenom, ot) => admin.ok('POST', '/api/utilisateurs', { login, nom: 'Planificateur', prenom, profilId: respId, password: 'plan1234', doitChangerMdp: false, overrides: { ot } });
+    await mk('planvoir', 'Vue', sansOt);
+    await mk('planaff', 'Affecte', Object.assign({}, sansOt, { affecter: true }));
+    await mk('planmod', 'Modifie', Object.assign({}, sansOt, { modifier: true }));
+    const voir = srv.client(); await voir.login('planvoir', 'plan1234');
+    const aff = srv.client(); await aff.login('planaff', 'plan1234');
+    const mod = srv.client(); await mod.login('planmod', 'plan1234');
+    const o = insererOt({ titre: 'OT droits planning', equipementId: presse.id, secteurId: PROD, technicienId: uTechProd.id, techniciens: [uTechProd.id], datePrevue: jourLocal(2), statut: 'planifie' });
+    try {
+      // planning.modifier + ot.voir seulement : le module OT refuse, le planning aussi
+      assert.equal((await voir.post(`/api/ot/${o.id}/affecter`, { technicienId: uChefProd.id })).status, 403);
+      assert.equal((await voir.put(`/api/ot/${o.id}`, { datePrevue: jourLocal(5) })).status, 403);
+      let r = await voir.put(`/api/planning/ot/${o.id}`, { technicienId: uChefProd.id, datePrevue: jourLocal(5) });
+      assert.equal(r.status, 403);
+      assert.match(r.body.erreur, /Ordres de travail › Affecter/);
+      r = await voir.put(`/api/planning/ot/${o.id}`, { datePrevue: jourLocal(5) });
+      assert.equal(r.status, 403);
+      assert.match(r.body.erreur, /Modifier ou Affecter/);
+      const d = await voir.ok('GET', periode());
+      assert.deepEqual({ modifier: d.droits.modifier, affecter: d.droits.affecter }, { modifier: false, affecter: false });
+      assert.ok(d.ot.every((x) => x.deplacable === false), 'rien n\'est déplaçable');
+      let enBase = srv.db.get('ot', o.id);
+      assert.deepEqual({ t: enBase.technicienId, ts: enBase.techniciens, d: enBase.datePrevue }, { t: uTechProd.id, ts: [uTechProd.id], d: jourLocal(2) }, 'aucune modification');
+      // ot.modifier sans ot.affecter : la date, pas le responsable
+      r = await mod.put(`/api/planning/ot/${o.id}`, { technicienId: uChefProd.id });
+      assert.equal(r.status, 403);
+      assert.match(r.body.erreur, /Affecter/);
+      assert.equal((await mod.ok('PUT', `/api/planning/ot/${o.id}`, { datePrevue: jourLocal(4) })).jour, jourLocal(4));
+      const dm = await mod.ok('GET', periode());
+      assert.deepEqual({ modifier: dm.droits.modifier, affecter: dm.droits.affecter }, { modifier: true, affecter: false });
+      // ot.affecter sans ot.modifier : date et responsable, comme POST /api/ot/:id/affecter
+      assert.equal((await aff.ok('PUT', `/api/planning/ot/${o.id}`, { datePrevue: jourLocal(6), technicienId: uChefProd.id })).technicienId, uChefProd.id);
+      enBase = srv.db.get('ot', o.id);
+      assert.equal(enBase.datePrevue, jourLocal(6));
+      assert.ok(!enBase.techniciens.includes(uTechProd.id));
+      const da = await aff.ok('GET', periode());
+      assert.deepEqual({ modifier: da.droits.modifier, affecter: da.droits.affecter }, { modifier: true, affecter: true });
+    } finally { srv.db.remove('ot', o.id); }
+  });
+
+  test('absences RH validées : renvoyées pour les techniciens de la période et retirées de leur capacité', async () => {
+    let n = 1;
+    while (new Date(jourLocal(n) + 'T12:00:00').getDay() !== 1) n++;
+    const lundi = jourLocal(n); const mardi = jourLocal(n + 1);
+    const pers = srv.db.insert('personnel', { userId: uTechProd.id, nom: 'Technicien', prenom: 'Théo', secteurId: PROD, fonction: 'Technicien', actif: true });
+    const persLog = srv.db.insert('personnel', { userId: uTechLog.id, nom: 'Logisticien', prenom: 'Léa', secteurId: LOG, fonction: 'Technicienne', actif: true });
+    const absence = (p, patch) => srv.db.insert('absences', Object.assign({ personnelId: p.id, secteurId: p.secteurId, typeCode: 'conges', dateDebut: lundi, dateFin: mardi, demiJournee: null, commentaire: '', statut: 'validee', demandeurUserId: p.userId, valideurUserId: 1, dateValidation: new Date().toISOString(), motifDecision: '', createdBy: 1 }, patch));
+    const abs = absence(pers, {});
+    const demandee = absence(persLog, { statut: 'demandee' });
+    const astreinte = absence(persLog, { typeCode: 'astreinte', dateDebut: jourLocal(n + 2), dateFin: jourLocal(n + 2) });
+    try {
+      const r = await admin.ok('GET', periode());
+      const a = r.absences.find((x) => x.userId === uTechProd.id);
+      assert.ok(a, 'absence validée renvoyée');
+      assert.deepEqual({ dateDebut: a.dateDebut, dateFin: a.dateFin, libelle: a.libelle, typeCode: a.typeCode, joursOuvres: a.joursOuvres, nom: a.nom }, { dateDebut: lundi, dateFin: mardi, libelle: 'Congés payés', typeCode: 'conges', joursOuvres: 2, nom: 'Théo Technicien' });
+      assert.ok(!r.absences.some((x) => x.userId === uTechLog.id), 'absence non validée et astreinte ignorées');
+      const theo = r.charge.find((c) => c.userId === uTechProd.id);
+      assert.equal(theo.joursAbsents, 2);
+      assert.equal(theo.capacite, 8 * (r.joursOuvres - 2), 'capacité réduite des jours d\'absence');
+      assert.equal(theo.taux, Math.round((theo.heures / theo.capacite) * 100));
+      const lea = r.charge.find((c) => c.userId === uTechLog.id);
+      assert.deepEqual({ j: lea.joursAbsents, c: lea.capacite }, { j: 0, c: 8 * r.joursOuvres });
+      // Sans droit RH : l'absence est signalée sans sa nature
+      const t = await techProd.ok('GET', periode());
+      const at = t.absences.find((x) => x.userId === uTechProd.id);
+      assert.ok(at);
+      assert.deepEqual({ libelle: at.libelle, typeCode: at.typeCode }, { libelle: 'Absent', typeCode: null });
+      // Option désactivée : absences réservées aux profils ayant le droit RH
+      const cfg = srv.db.getConfig(); const rhAvant = cfg.rh;
+      cfg.rh = Object.assign({}, cfg.rh, { afficherAbsencesPlanning: false }); srv.db.setConfig(cfg);
+      try {
+        assert.equal((await techProd.ok('GET', periode())).absences.length, 0);
+        assert.ok((await admin.ok('GET', periode())).absences.some((x) => x.userId === uTechProd.id), 'toujours visibles avec le droit RH');
+      } finally { const c2 = srv.db.getConfig(); c2.rh = rhAvant; srv.db.setConfig(c2); }
+      // Demi-journée : une demi-journée ouvrée en moins
+      srv.db.update('absences', abs.id, { dateDebut: lundi, dateFin: lundi, demiJournee: 'matin' });
+      const demi = (await admin.ok('GET', periode())).charge.find((c) => c.userId === uTechProd.id);
+      assert.deepEqual({ j: demi.joursAbsents, c: demi.capacite }, { j: 0.5, c: 8 * (r.joursOuvres - 0.5) });
+      // Hors période : rien
+      srv.db.update('absences', abs.id, { dateDebut: jourLocal(40), dateFin: jourLocal(44), demiJournee: null });
+      const apres = await admin.ok('GET', periode());
+      assert.equal(apres.absences.length, 0);
+      assert.equal(apres.charge.find((c) => c.userId === uTechProd.id).capacite, 8 * r.joursOuvres);
+    } finally {
+      for (const x of [abs, demandee, astreinte]) srv.db.remove('absences', x.id);
+      srv.db.remove('personnel', pers.id); srv.db.remove('personnel', persLog.id);
+    }
+  });
+
   test('services publiés : charge et techniciens', async () => {
     const s = srv.ctx.services.planning;
     assert.ok(s && typeof s.charge === 'function' && typeof s.techniciens === 'function' && typeof s.periode === 'function');

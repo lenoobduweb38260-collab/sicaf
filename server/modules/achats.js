@@ -210,29 +210,97 @@ function register(ctx) {
     if (creation && f.actif === false) throw new HttpError(400, `Le fournisseur « ${f.nom} » est désactivé`);
     return f;
   }
-  /** Contrôle d'un secteur cible en écriture : existence, portée de l'utilisateur, site en lecture seule. */
+  const MSG_LECTURE_SEULE = 'Ce site est accessible en lecture seule pour vous : création ou modification impossible';
+  const MSG_HORS_PERIMETRE = 'Ce site / service est hors de votre périmètre';
+  /**
+   * Un secteur est-il interdit en écriture pour l'utilisateur ? 'lecture' (site accessible en lecture seule),
+   * 'hors' (hors des secteurs modifiables) ou null. En portée « perso », l'appartenance d'un enregistrement ne
+   * suffit pas : un site en lecture seule n'est jamais modifiable et les secteurs de rattachement s'appliquent
+   * (comme dans les modules équipements et demandes).
+   */
+  function secteurHorsEcriture(req, secteurId) {
+    const p = req.perms || {};
+    if (p.portee === 'tous' || secteurId == null || secteurId === '') return null;
+    const sid = Number(secteurId);
+    if (Array.isArray(p.secteurIdsLecture) && p.secteurIdsLecture.includes(sid)) return 'lecture';
+    const modifiables = (p.secteurIds || []).map(Number);
+    if (p.portee === 'perso' && !modifiables.length) return null;
+    return modifiables.includes(sid) ? null : 'hors';
+  }
+  /** Contrôle d'un secteur cible en écriture : existence, portée de l'utilisateur, site en lecture seule, site affiché. */
   function secteurEcriture(req, secteurId) {
     const id = idRef(secteurId, 'Le site / service');
     if (id == null) throw new HttpError(400, 'Le site / service de rattachement est obligatoire');
     if (!db.get('secteurs', id)) throw new HttpError(400, 'Site / service introuvable');
+    const refus = secteurHorsEcriture(req, id);
+    if (refus === 'lecture') throw new HttpError(403, MSG_LECTURE_SEULE);
+    if (refus === 'hors') throw new HttpError(403, MSG_HORS_PERIMETRE);
     const candidat = { secteurId: id, createdBy: req.user.id };
     if (!perms.canSeeRecord(req.perms, req.user, candidat, { ecriture: true })) {
-      if (perms.canSeeRecord(req.perms, req.user, candidat)) throw new HttpError(403, 'Ce site est accessible en lecture seule pour vous : création ou modification impossible');
-      throw new HttpError(403, 'Ce site / service est hors de votre périmètre');
+      if (perms.canSeeRecord(req.perms, req.user, candidat)) throw new HttpError(403, MSG_LECTURE_SEULE);
+      throw new HttpError(403, MSG_HORS_PERIMETRE);
     }
     return id;
   }
-  function otLisible(req, id, label) {
+  /** L'utilisateur peut-il modifier cet enregistrement (portée en écriture, site en lecture seule exclu) ? */
+  function ecritureSite(req, r) { return perms.canSeeRecord(req.perms, req.user, r, { ecriture: true }) && secteurHorsEcriture(req, r.secteurId) == null; }
+  /** Enregistrement visible, et modifiable pendant une requête de modification (403 lecture seule / hors périmètre). */
+  function getEcriture(req, col, id) {
+    const r = ctx.getVisible(req, col, id);
+    if (!req.ecriture) return r;
+    const refus = secteurHorsEcriture(req, r.secteurId);
+    if (refus === 'lecture') throw new HttpError(403, 'Ce site est accessible en lecture seule pour vous : modification impossible');
+    if (refus === 'hors') throw new HttpError(403, MSG_HORS_PERIMETRE);
+    return r;
+  }
+  /** Une référence (OT, article, fiche du personnel, commande) est-elle utilisable en écriture par l'utilisateur ? */
+  const referenceEcriture = (req, r) => !!r && perms.canSeeRecord(req.perms, req.user, r, { ecriture: true });
+  /** Deux secteurs appartiennent-ils au même site (une référence sans secteur convient à tout site) ? */
+  function memeSite(secteurRef, secteurCible) {
+    if (secteurRef == null || secteurRef === '' || secteurCible == null) return true;
+    return ctx.siteDuSecteur(secteurRef) === ctx.siteDuSecteur(secteurCible);
+  }
+  function otLisible(req, id, label, secteurCible) {
     if (id == null) return null;
     const o = db.get('ot', id);
-    if (!o || !perms.canSeeRecord(req.perms, req.user, o)) throw new HttpError(400, `${label || 'Ordre de travail'} introuvable`);
+    if (!referenceEcriture(req, o)) throw new HttpError(400, `${label || 'Ordre de travail'} introuvable`);
+    if (secteurCible !== undefined && !memeSite(o.secteurId, secteurCible)) throw new HttpError(400, `${label || 'Ordre de travail'} : ${o.numero || '#' + o.id} appartient à un autre site`);
     return o;
   }
-  function personnelLisible(req, id) {
+  function personnelLisible(req, id, secteurCible) {
     if (id == null) return null;
+    if (!perms.can(req.perms, 'rh', 'voir')) throw new HttpError(403, 'Le rattachement à une fiche du personnel nécessite le droit Ressources humaines › Voir');
     const p = db.get('personnel', id);
-    if (!p || !perms.canSeeRecord(req.perms, req.user, p)) throw new HttpError(400, 'Fiche du personnel introuvable (module Ressources humaines)');
+    if (!referenceEcriture(req, p)) throw new HttpError(400, 'Fiche du personnel introuvable (module Ressources humaines)');
+    if (secteurCible !== undefined && !memeSite(p.secteurId, secteurCible)) throw new HttpError(400, `La fiche du personnel ${nomPersonnel(p)} appartient à un autre site`);
     return p;
+  }
+  /** Demandeur d'une commande : compte actif, droit Achats › Voir et accès au site / service de la commande. */
+  function demandeurValide(req, id, secteurId) {
+    const u = db.get('users', id);
+    if (!u) throw new HttpError(400, 'Demandeur introuvable');
+    if (id === req.user.id) return u;
+    if (u.actif === false) throw new HttpError(400, `Demandeur invalide : le compte « ${ctx.nomUser(id)} » est désactivé`);
+    const p = perms.effectivePermissions(db, u, null, db.getConfig());
+    if (!perms.can(p, MODULE, 'voir') || !perms.canSeeRecord(p, u, { secteurId })) throw new HttpError(400, `Demandeur invalide : « ${ctx.nomUser(id)} » n'a pas accès aux achats de ce site / service`);
+    return u;
+  }
+  /** Destinataires d'une notification : comptes actifs, distincts, hors émetteur, ayant Achats › Voir et accès à l'élément. */
+  function destinataires(req, record, ids) {
+    const config = db.getConfig();
+    const vus = new Set();
+    const out = [];
+    for (const x of ids || []) {
+      if (x == null) continue;
+      const id = Number(x);
+      if (vus.has(id) || (req && id === req.user.id)) continue;
+      vus.add(id);
+      const u = db.get('users', id);
+      if (!u || u.actif === false) continue;
+      const p = perms.effectivePermissions(db, u, null, config);
+      if (perms.can(p, MODULE, 'voir') && perms.canSeeRecord(p, u, record)) out.push(id);
+    }
+    return out;
   }
   const nomPersonnel = (p) => (p ? `${p.prenom || ''} ${p.nom || ''}`.trim() || p.matricule || `#${p.id}` : '');
   /** Index de références pour enrichir les listes en une passe. */
@@ -283,11 +351,18 @@ function register(ctx) {
   // =================================================================================================
   // COMMANDES
   // =================================================================================================
-  function normaliserLignesCommande(req, lignes) {
+  /**
+   * Lignes d'une commande rattachée à `secteurId`. Un article ou un OT doit être dans le périmètre modifiable de
+   * l'utilisateur et sur le site de la commande (la réception entre en stock dans le magasin de l'article) ;
+   * les références déjà présentes dans `existantes` ne sont pas recontrôlées (modification par un autre utilisateur).
+   */
+  function normaliserLignesCommande(req, lignes, secteurId, existantes) {
     if (!Array.isArray(lignes)) throw new HttpError(400, 'Lignes de commande invalides (liste attendue)');
     if (!lignes.length) throw new HttpError(400, 'La commande doit comporter au moins une ligne');
     if (lignes.length > MAX_LIGNES) throw new HttpError(400, `Une commande comporte au maximum ${MAX_LIGNES} lignes`);
     const tvaDefaut = num(cfgAchats().tauxTVA);
+    const deja = (cle) => new Set((existantes || []).map((l) => (l[cle] == null ? null : Number(l[cle]))).filter((x) => x != null));
+    const articlesDeja = deja('articleId'); const otsDeja = deja('otId');
     return lignes.map((l, i) => {
       const n = `Ligne ${i + 1}`;
       if (!l || typeof l !== 'object' || Array.isArray(l)) throw new HttpError(400, `${n} : ligne invalide`);
@@ -295,8 +370,9 @@ function register(ctx) {
       let article = null;
       if (articleId != null) {
         article = db.get('articles', articleId);
-        if (!article) throw new HttpError(400, `${n} : article introuvable`);
+        if (!article || (!articlesDeja.has(articleId) && !referenceEcriture(req, article))) throw new HttpError(400, `${n} : article introuvable`);
         if (article.actif === false) throw new HttpError(400, `${n} : l'article « ${article.designation} » est désactivé`);
+        if (!memeSite(article.secteurId, secteurId)) throw new HttpError(400, `${n} : l'article « ${article.designation} » appartient au magasin d'un autre site`);
       }
       const designation = texte(l.designation, `${n} : désignation`, { max: 300 }) || (article ? String(article.designation || '') : '');
       if (!designation) throw new HttpError(400, `${n} : la désignation est obligatoire`);
@@ -307,7 +383,7 @@ function register(ctx) {
       if (prix == null) throw new HttpError(400, `${n} : le prix unitaire HT est obligatoire`);
       const tauxTVA = nombre(l.tauxTVA, `${n} : taux de TVA`, { min: 0, max: 100, defaut: tvaDefaut });
       const otId = idRef(l.otId, `${n} : ordre de travail`);
-      if (otId != null) otLisible(req, otId, `${n} : ordre de travail`);
+      if (otId != null && !otsDeja.has(otId)) otLisible(req, otId, `${n} : ordre de travail`, secteurId);
       const uniteCode = article ? String(article.uniteCode || '') : texte(l.uniteCode, `${n} : unité`, { max: 20 });
       const q = arrondi(quantite, 3);
       if (!(q > 0)) throw new HttpError(400, `${n} : quantité : la valeur doit être supérieure à 0`);
@@ -330,7 +406,7 @@ function register(ctx) {
     const verrouillee = existant && [SC.validee, SC.envoyee, SC.partielle].includes(existant.statut);
     if (verrouillee) {
       const change = (k) => b[k] !== undefined && String(b[k] == null ? '' : b[k]) !== String(existant[k] == null ? '' : existant[k]);
-      if (change('fournisseurId') || change('secteurId') || change('dateCommande') || (b.lignes !== undefined && !lignesIdentiques(normaliserLignesCommande(req, b.lignes), existant.lignes))) {
+      if (change('fournisseurId') || change('secteurId') || change('dateCommande') || (b.lignes !== undefined && !lignesIdentiques(normaliserLignesCommande(req, b.lignes, Number(existant.secteurId), existant.lignes), existant.lignes))) {
         throw new HttpError(400, `La commande ${existant.numero} est validée : les lignes, le fournisseur, le site et la date ne sont plus modifiables (annulez-la et créez-en une nouvelle si nécessaire)`);
       }
     }
@@ -343,7 +419,7 @@ function register(ctx) {
     out.commentaire = texte(val('commentaire'), 'Commentaire', { max: 5000 });
     out.adresseLivraison = texte(val('adresseLivraison'), 'Lieu de livraison', { max: 500 });
     out.conditions = texte(val('conditions'), 'Conditions particulières', { max: 2000 });
-    if (!verrouillee && (b.lignes !== undefined || !existant)) out.lignes = normaliserLignesCommande(req, b.lignes === undefined ? [] : b.lignes);
+    if (!verrouillee && (b.lignes !== undefined || !existant)) out.lignes = normaliserLignesCommande(req, b.lignes === undefined ? [] : b.lignes, out.secteurId, existant ? existant.lignes : null);
     else out.lignes = existant.lignes;
     out.totaux = calculerTotaux(out.lignes);
     out.dateCommande = dateJour(val('dateCommande'), 'Date de commande', { defaut: jourLocal() });
@@ -353,8 +429,8 @@ function register(ctx) {
     out.dateLivraisonPrevue = livraison;
     const demandeur = idRef(val('demandeurUserId'), 'Demandeur');
     if (demandeur != null) {
-      const u = db.get('users', demandeur);
-      if (!u) throw new HttpError(400, 'Demandeur introuvable');
+      // Contrôlé à la désignation et au changement de site / service (pas pour un demandeur inchangé)
+      if (!existant || demandeur !== idRef(existant.demandeurUserId) || Number(existant.secteurId) !== out.secteurId) demandeurValide(req, demandeur, out.secteurId);
       out.demandeurUserId = demandeur;
     } else out.demandeurUserId = existant ? existant.demandeurUserId : req.user.id;
     if (b.champs !== undefined || !existant) out.champs = ctx.champsPerso(CMD, b.champs || (existant && existant.champs) || {});
@@ -368,7 +444,8 @@ function register(ctx) {
   }
 
   function estProprio(req, r) { return Number(r.createdBy) === req.user.id || Number(r.demandeurUserId) === req.user.id; }
-  function ecritureSite(req, r) { return perms.canSeeRecord(req.perms, req.user, r, { ecriture: true }); }
+  /** Factures non annulées rattachées à une commande. */
+  const nbFacturesActives = (commandeId) => db.count(FAC, (f) => Number(f.commandeId) === Number(commandeId) && f.statut !== SF.annulee);
   function livraisonEnRetard(c, jour) { return [SC.validee, SC.envoyee, SC.partielle].includes(c.statut) && !!c.dateLivraisonPrevue && c.dateLivraisonPrevue < (jour || jourLocal()); }
 
   /** Actions possibles sur une commande pour l'utilisateur courant. */
@@ -381,6 +458,7 @@ function register(ctx) {
     const proprio = estProprio(req, c);
     const auDela = num((c.totaux || {}).ht) >= num(cfgAchats().seuilValidationHT);
     const aReceptions = (c.receptions || []).length > 0;
+    const facturee = nbFacturesActives(c.id) > 0;
     return {
       modifier: ecr && !final && (mod || (cre && proprio && st === SC.brouillon)),
       soumettre: ecr && st === SC.brouillon && (mod || (cre && proprio)),
@@ -389,7 +467,7 @@ function register(ctx) {
       envoyer: ecr && st === SC.validee && mod,
       receptionner: ecr && [SC.validee, SC.envoyee, SC.partielle].includes(st) && mod,
       solder: ecr && st === SC.partielle && mod,
-      annuler: ecr && !final && !aReceptions && (mod || (cre && proprio && [SC.brouillon, SC.aValider].includes(st))),
+      annuler: ecr && !final && !aReceptions && !facturee && (mod || (cre && proprio && [SC.brouillon, SC.aValider].includes(st))),
       supprimer: ecr && st === SC.brouillon && !aReceptions && (can(req, 'supprimer') || (cre && proprio)),
       facturer: ecr && cre && [SC.validee, SC.envoyee, SC.partielle, SC.recue].includes(st),
       documents: ecr && !final ? (mod || (cre && proprio)) : (ecr && mod),
@@ -410,13 +488,15 @@ function register(ctx) {
     const recu = (c.lignes || []).reduce((s, l) => s + Math.min(num(l.quantiteRecue), num(l.quantite)), 0);
     const totaux = c.totaux || calculerTotaux(c.lignes);
     const recuHT = montantRecuHT(c);
+    // Taux de réception en valeur (les lignes ont des unités différentes) ; en quantité pour une commande sans montant
+    const tauxReception = num(totaux.ht) > 0 ? Math.min(100, Math.round((recuHT / num(totaux.ht)) * 100)) : (qte > 0 ? Math.round((recu / qte) * 100) : 0);
     return Object.assign(reste, {
       totaux,
       fournisseurNom: f ? f.nom || '' : '',
       secteurNom: nomSecteur(refs, c.secteurId), secteurChemin: cheminSecteur(refs, c.secteurId),
       siteId, siteNom: siteId != null ? nomSecteur(refs, siteId) : '',
       nbLignes: (c.lignes || []).length,
-      tauxReception: qte > 0 ? Math.round((recu / qte) * 100) : 0,
+      tauxReception,
       montantRecuHT: recuHT,
       resteARecevoirHT: [SC.recue, SC.annulee].includes(c.statut) ? 0 : arrondi(Math.max(0, num(totaux.ht) - recuHT)),
       montantFactureHT: arrondi(factures.reduce((s, x) => s + num(x.montantHT), 0)),
@@ -440,12 +520,13 @@ function register(ctx) {
     const seuil = num(cfgAchats().seuilValidationHT);
     r.lignes = (c.lignes || []).map((l, index) => {
       const a = l.articleId != null ? refs.articles.get(Number(l.articleId)) : null;
+      const aVisible = !!a && perms.canSeeRecord(req.perms, req.user, a);
       const o = l.otId != null ? refs.ot.get(Number(l.otId)) : null;
       return Object.assign({}, l, {
         index, montantHT: arrondi(num(l.quantite) * num(l.prixUnitaireHT)),
         resteARecevoir: arrondi(Math.max(0, num(l.quantite) - num(l.quantiteRecue)), 3),
         montantRecuHT: arrondi(num(l.quantiteRecue) * num(l.prixUnitaireHT)),
-        articleCode: a ? a.code || '' : '', articleStock: a ? num(a.quantite) : null, articleSeuil: a ? num(a.seuilMin) : null, articleActif: a ? a.actif !== false : null,
+        articleCode: a ? a.code || '' : '', articleStock: aVisible ? num(a.quantite) : null, articleSeuil: aVisible ? num(a.seuilMin) : null, articleActif: a ? a.actif !== false : null,
         otNumero: o ? o.numero || `#${o.id}` : '', otTitre: o ? o.titre || '' : '',
       });
     });
@@ -453,7 +534,7 @@ function register(ctx) {
       index: i, userNom: refs.users.get(Number(x.userId)) || '',
       lignes: (x.lignes || []).map((lr) => Object.assign({}, lr, { designation: ((c.lignes || [])[lr.index] || {}).designation || '', uniteCode: ((c.lignes || [])[lr.index] || {}).uniteCode || '' })),
     })).reverse();
-    r.factures = db.list(FAC, (x) => Number(x.commandeId) === c.id).sort((a, b) => String(b.dateFacture).localeCompare(String(a.dateFacture)))
+    r.factures = db.list(FAC, (x) => Number(x.commandeId) === c.id && perms.canSeeRecord(req.perms, req.user, x)).sort((a, b) => String(b.dateFacture).localeCompare(String(a.dateFacture)))
       .map((x) => ({ id: x.id, numero: x.numero, numeroFournisseur: x.numeroFournisseur, dateFacture: x.dateFacture, dateEcheance: x.dateEcheance, montantHT: x.montantHT, montantTVA: x.montantTVA, montantTTC: x.montantTTC, statut: x.statut, secteurId: x.secteurId }));
     r.historique = (c.historique || []).slice().reverse().map((h) => Object.assign({}, h, { userNom: refs.users.get(Number(h.userId)) || (h.userId == null ? 'Système' : '') }));
     r.documents = (c.documents || []).map(resumeDoc);
@@ -463,6 +544,7 @@ function register(ctx) {
     r.createdByNom = refs.users.get(Number(c.createdBy)) || '';
     r.actions = actionsCommande(req, c);
     r.lectureSeule = !ecritureSite(req, c);
+    r.nbFacturesActives = nbFacturesActives(c.id);
     r.entreeStockAReception = !!cfgAchats().entreeStockAReception;
     return r;
   }
@@ -499,7 +581,7 @@ function register(ctx) {
   function montantTxt(n) { return `${arrondi(n).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`; }
   function nomFournisseur(id) { const f = id == null ? null : db.get('fournisseurs', id); return f ? f.nom || '' : ''; }
 
-  function getCommande(req, id) { return ctx.getVisible(req, CMD, id); }
+  function getCommande(req, id) { return getEcriture(req, CMD, id); }
 
   // ----- Routes : commandes (routes spécifiques d'abord) -----------------------------------------
   router.get('/api/commandes', async (req) => {
@@ -513,6 +595,7 @@ function register(ctx) {
     if (!s || typeof s.alertes !== 'function') throw new HttpError(503, 'Module stock indisponible');
     const enCommande = quantitesEnCommande();
     const fours = new Map(db.list('fournisseurs').map((f) => [f.id, f]));
+    const commandes = new Map(db.list(CMD).map((c) => [c.id, c]));
     return s.alertes(req).map((a) => {
       const f = a.fournisseurId != null ? fours.get(Number(a.fournisseurId)) : null;
       const deja = enCommande.get(Number(a.id)) || { quantite: 0, commandes: [] };
@@ -522,7 +605,8 @@ function register(ctx) {
         fournisseurId: a.fournisseurId == null ? null : Number(a.fournisseurId), fournisseurNom: f ? f.nom || '' : '', fournisseurActif: f ? f.actif !== false : null,
         delaiLivraisonJours: f && f.delaiLivraisonJours != null ? f.delaiLivraisonJours : null,
         secteurId: a.secteurId == null || a.secteurId === '' ? null : Number(a.secteurId), emplacement: a.emplacement || '',
-        dejaEnCommande: arrondi(deja.quantite, 3), commandesEnCours: deja.commandes,
+        // La quantité déjà en commande est globale (stock commun) ; seules les commandes du périmètre sont identifiées
+        dejaEnCommande: arrondi(deja.quantite, 3), commandesEnCours: deja.commandes.filter((x) => perms.canSeeRecord(req.perms, req.user, commandes.get(x.id))),
         resteACommander: arrondi(Math.max(0, num(a.quantiteACommander) - deja.quantite), 3),
       };
     });
@@ -588,7 +672,7 @@ function register(ctx) {
       if (!groupes.has(cle)) groupes.set(cle, { fournisseur: f, secteurId, lignes: [] });
       groupes.get(cle).lignes.push({ articleId: a.id, designation: a.designation || a.code || `Article #${a.id}`, referenceFournisseur: a.referenceFournisseur || '', quantite, quantiteRecue: 0, prixUnitaireHT: arrondi(num(a.prixUnitaire), 4), tauxTVA: arrondi(num(config.tauxTVA), 2), otId: null, uniteCode: a.uniteCode || '', montantHT: arrondi(quantite * num(a.prixUnitaire)) });
     }
-    if (choix) for (const id of choix.keys()) if (!alertes.some((a) => Number(a.id) === id)) ignores.push({ articleId: id, code: '', designation: (db.get('articles', id) || {}).designation || `Article #${id}`, raison: 'Article hors alerte ou hors de votre périmètre' });
+    if (choix) for (const id of choix.keys()) if (!alertes.some((a) => Number(a.id) === id)) { const art = db.get('articles', id); ignores.push({ articleId: id, code: '', designation: art && perms.canSeeRecord(req.perms, req.user, art) ? art.designation || `Article #${id}` : `Article #${id}`, raison: 'Article hors alerte ou hors de votre périmètre' }); }
     if (!groupes.size) {
       if (secteurDefaut == null && ignores.some((x) => /rattachement/.test(x.raison))) throw new HttpError(400, 'Indiquez le site / service de rattachement des commandes (secteurId)');
       return { commandes: [], ignores };
@@ -693,7 +777,7 @@ function register(ctx) {
     patch.historique = trace(Object.assign({}, c, patch), req, 'validation', commentaire);
     const maj = db.update(CMD, c.id, patch);
     ctx.audit(req, 'validation', CMD, maj.id, `Commande ${maj.numero} validée (${montantTxt(maj.totaux.ht)} HT)${commentaire ? ' — ' + commentaire : ''}`);
-    const cibles = [maj.demandeurUserId, maj.createdBy].filter((x) => x != null && Number(x) !== req.user.id);
+    const cibles = destinataires(req, maj, [maj.demandeurUserId, maj.createdBy]);
     if (cibles.length) ctx.notify(cibles, { titre: `Commande validée : ${maj.numero}`, message: `${nomFournisseur(maj.fournisseurId)} — ${montantTxt(maj.totaux.ht)} HT, validée par ${ctx.nomUser(req.user.id)}${commentaire ? ' : ' + commentaire : ''}`, lien: '#/achats/commande/' + maj.id, type: 'succes' });
     ctx.emit('achats:commandeValidee', { commande: maj, automatique: false });
     return detailCommande(req, maj);
@@ -707,7 +791,7 @@ function register(ctx) {
     patch.historique = trace(Object.assign({}, c, patch), req, 'refus', motif);
     const maj = db.update(CMD, c.id, patch);
     ctx.audit(req, 'refus', CMD, maj.id, `Commande ${maj.numero} refusée (retour en brouillon) — ${motif}`);
-    const cibles = [maj.demandeurUserId, maj.createdBy].filter((x) => x != null && Number(x) !== req.user.id);
+    const cibles = destinataires(req, maj, [maj.demandeurUserId, maj.createdBy]);
     if (cibles.length) ctx.notify(cibles, { titre: `Commande refusée : ${maj.numero}`, message: `${ctx.nomUser(req.user.id)} a refusé la commande (${montantTxt(maj.totaux.ht)} HT) : ${motif}. Elle est repassée en brouillon.`, lien: '#/achats/commande/' + maj.id, type: 'alerte' });
     return detailCommande(req, maj);
   }, { perm: [MODULE, 'valider'] });
@@ -717,6 +801,8 @@ function register(ctx) {
     if (c.statut !== SC.validee) throw new HttpError(400, `Seule une commande validée peut être envoyée au fournisseur (statut actuel : ${libelle('statutsCommande', c.statut)})`);
     const b = objet(req.body);
     const dateEnvoi = dateJour(b.dateEnvoi, 'Date d\'envoi', { defaut: jourLocal() });
+    if (dateEnvoi > jourLocal()) throw new HttpError(400, 'La date d\'envoi ne peut pas être dans le futur');
+    if (c.dateCommande && dateEnvoi < c.dateCommande) throw new HttpError(400, `La date d'envoi ne peut pas précéder la date de commande (${csvDate(c.dateCommande)})`);
     const commentaire = texte(b.commentaire, 'Commentaire', { max: 1000 });
     const patch = { statut: SC.envoyee, dateEnvoi, envoyeParUserId: req.user.id };
     patch.historique = trace(Object.assign({}, c, patch), req, 'envoi', commentaire || `Envoyée le ${csvDate(dateEnvoi)}`);
@@ -732,6 +818,7 @@ function register(ctx) {
     if (!Array.isArray(b.lignes) || !b.lignes.length) throw new HttpError(400, 'Indiquez au moins une ligne reçue (lignes : [{ index, quantite }])');
     const date = dateJour(b.date, 'Date de réception', { defaut: jourLocal() });
     if (date > jourLocal()) throw new HttpError(400, 'La date de réception ne peut pas être dans le futur');
+    if (c.dateCommande && date < c.dateCommande) throw new HttpError(400, `La date de réception ne peut pas précéder la date de commande (${csvDate(c.dateCommande)})`);
     const bonLivraison = texte(b.bonLivraison, 'N° de bon de livraison', { max: 100 });
     const commentaire = texte(b.commentaire, 'Commentaire', { max: 1000 });
     const lignes = (c.lignes || []).map((l) => Object.assign({}, l));
@@ -759,6 +846,8 @@ function register(ctx) {
       for (const r of aEntrer) {
         const a = db.get('articles', lignes[r.index].articleId);
         if (a && a.actif === false) throw new HttpError(400, `Ligne ${r.index + 1} : l'article « ${a.designation} » est désactivé — réactivez-le dans le stock avant de réceptionner`);
+        // L'entrée en stock modifie le magasin de l'article : il doit être modifiable par l'utilisateur et sur le site de la commande
+        if (a && (!referenceEcriture(req, a) || !memeSite(a.secteurId, c.secteurId))) throw new HttpError(400, `Ligne ${r.index + 1} : l'article « ${a.designation} » appartient au magasin d'un autre site ou est hors de votre périmètre — aucune entrée en stock possible`);
       }
     }
     const mouvements = new Map();
@@ -782,7 +871,7 @@ function register(ctx) {
     const maj = db.update(CMD, c.id, patch);
     ctx.audit(req, 'statut', CMD, maj.id, `Commande ${maj.numero} : ${complete ? 'réception complète' : 'réception partielle'}${bonLivraison ? ' (BL ' + bonLivraison + ')' : ''} — ${recues.length} ligne(s), ${mouvements.size} entrée(s) en stock`);
     recalculerRapprochements(maj.id);
-    const cibles = [maj.demandeurUserId, maj.createdBy].filter((x) => x != null && Number(x) !== req.user.id);
+    const cibles = destinataires(req, maj, [maj.demandeurUserId, maj.createdBy]);
     if (cibles.length) ctx.notify(cibles, { titre: `Commande ${complete ? 'reçue' : 'reçue partiellement'} : ${maj.numero}`, message: `${nomFournisseur(maj.fournisseurId)} — ${recues.length} ligne(s) réceptionnée(s) par ${ctx.nomUser(req.user.id)}${bonLivraison ? ' (BL ' + bonLivraison + ')' : ''}${complete ? '' : ' ; reliquat en attente'}.`, lien: '#/achats/commande/' + maj.id, type: 'info' });
     ctx.emit('achats:commandeRecue', { commande: maj, reception, complete });
     const d = detailCommande(req, maj);
@@ -806,13 +895,15 @@ function register(ctx) {
     const c = getCommande(req, req.params.id);
     if (finauxCmd().has(c.statut)) throw new HttpError(400, `La commande ${c.numero} est déjà ${libelle('statutsCommande', c.statut).toLowerCase()}`);
     if ((c.receptions || []).length) throw new HttpError(400, 'Cette commande a déjà fait l\'objet d\'une réception : soldez-la au lieu de l\'annuler');
+    const nbFac = nbFacturesActives(c.id);
+    if (nbFac) throw new HttpError(400, `${nbFac > 1 ? nbFac + ' factures sont rattachées' : 'Une facture est rattachée'} à la commande ${c.numero} : annulez-les d'abord (ou soldez la commande)`);
     if (!actionsCommande(req, c).annuler) throw new HttpError(403, 'Droit insuffisant : Achats & factures › Modifier');
     const motif = texte(objet(req.body).motif, 'Motif de l\'annulation', { requis: true, max: 1000 });
     const patch = { statut: SC.annulee, motifAnnulation: motif, dateAnnulation: new Date().toISOString(), annuleParUserId: req.user.id };
     patch.historique = trace(Object.assign({}, c, patch), req, 'annulation', motif);
     const maj = db.update(CMD, c.id, patch);
     ctx.audit(req, 'statut', CMD, maj.id, `Commande ${maj.numero} annulée — ${motif}`);
-    const cibles = [maj.demandeurUserId, maj.createdBy].filter((x) => x != null && Number(x) !== req.user.id);
+    const cibles = destinataires(req, maj, [maj.demandeurUserId, maj.createdBy]);
     if (cibles.length) ctx.notify(cibles, { titre: `Commande annulée : ${maj.numero}`, message: `${ctx.nomUser(req.user.id)} a annulé la commande : ${motif}`, lien: '#/achats/commande/' + maj.id, type: 'alerte' });
     return detailCommande(req, maj);
   }, { perm: [MODULE, 'voir'] });
@@ -872,13 +963,16 @@ function register(ctx) {
       if (change.length) throw new HttpError(400, `La facture ${existant.numero} est validée (bon à payer) : ses montants et références ne sont plus modifiables — mettez-la en litige pour la corriger`);
     }
     const out = {};
+    // Les références (commande, OT, fiche du personnel) sont contrôlées — périmètre en écriture, même site que la
+    // facture — lorsqu'elles sont désignées ou changent, pas à chaque modification d'un autre champ : une référence
+    // devenue invisible pour l'utilisateur ou supprimée depuis ne bloque pas la mise à jour de la facture.
+    const change = (k) => !existant || idRef(val(k), k) !== idRef(existant[k], k);
     // Commande liée
     const commandeId = idRef(val('commandeId'), 'Commande');
-    let commande = null;
-    if (commandeId != null) {
-      commande = db.get(CMD, commandeId);
-      if (!commande || !perms.canSeeRecord(req.perms, req.user, commande)) throw new HttpError(400, 'Commande introuvable');
-      if ([SC.brouillon, SC.aValider, SC.annulee].includes(commande.statut) && (!existant || Number(existant.commandeId) !== commandeId)) {
+    const commande = commandeId != null ? db.get(CMD, commandeId) : null;
+    if (commandeId != null && change('commandeId')) {
+      if (!referenceEcriture(req, commande)) throw new HttpError(400, 'Commande introuvable');
+      if ([SC.brouillon, SC.aValider, SC.annulee].includes(commande.statut)) {
         throw new HttpError(400, `La commande ${commande.numero} n'est pas validée (${libelle('statutsCommande', commande.statut)}) : elle ne peut pas être facturée`);
       }
     }
@@ -891,13 +985,17 @@ function register(ctx) {
     out.fournisseurId = fournisseurId;
     // Références OT / personnel
     out.otId = idRef(val('otId'), 'Ordre de travail');
-    const ot = out.otId != null ? otLisible(req, out.otId) : null;
     out.personnelId = idRef(val('personnelId'), 'Personnel');
-    const personnel = out.personnelId != null ? personnelLisible(req, out.personnelId) : null;
+    const otBrut = out.otId != null ? db.get('ot', out.otId) : null;
+    const personnelBrut = out.personnelId != null ? db.get('personnel', out.personnelId) : null;
     // Site / service : saisi, ou repris de la commande, de l'OT ou de la fiche du personnel
     let secteurId = val('secteurId');
-    if (secteurId == null || secteurId === '') secteurId = commande ? commande.secteurId : (ot ? ot.secteurId : (personnel ? personnel.secteurId : null));
+    if (secteurId == null || secteurId === '') secteurId = commande ? commande.secteurId : (otBrut ? otBrut.secteurId : (personnelBrut ? personnelBrut.secteurId : null));
     out.secteurId = verrouillee ? Number(existant.secteurId) : secteurEcriture(req, secteurId);
+    // Cohérence de site : une facture est rattachée aux éléments de son propre site
+    if (commande && (change('commandeId') || change('secteurId')) && !memeSite(commande.secteurId, out.secteurId)) throw new HttpError(400, `La commande ${commande.numero} appartient à un autre site que celui de la facture`);
+    const ot = out.otId != null && (change('otId') || change('secteurId')) ? otLisible(req, out.otId, 'Ordre de travail', out.secteurId) : otBrut;
+    const personnel = out.personnelId != null && (change('personnelId') || change('secteurId')) ? personnelLisible(req, out.personnelId, out.secteurId) : personnelBrut;
     // Numéros
     out.numeroFournisseur = texte(val('numeroFournisseur'), 'N° de facture du fournisseur', { requis: true, max: 60 });
     if (!numeroFournisseurLibre(fournisseurId, out.numeroFournisseur, existant)) throw new HttpError(400, `La facture n° « ${out.numeroFournisseur} » de ${fournisseur.nom} est déjà enregistrée`);
@@ -908,6 +1006,7 @@ function register(ctx) {
     out.categorieCode = codeListe('categoriesDepense', val('categorieCode'), 'Catégorie de dépense', catDefaut);
     // Dates
     out.dateFacture = dateJour(val('dateFacture'), 'Date de facture', { defaut: jourLocal() });
+    if ((!existant || b.dateFacture !== undefined) && out.dateFacture > ajouterJours(jourLocal(), 1)) throw new HttpError(400, 'La date de facture ne peut pas être dans le futur');
     const delai = Number(cfgAchats().delaiPaiementJours);
     const echeanceSaisie = b.dateEcheance !== undefined ? b.dateEcheance : (existant && b.dateFacture === undefined ? existant.dateEcheance : null);
     out.dateEcheance = dateJour(echeanceSaisie, 'Date d\'échéance', { defaut: ajouterJours(out.dateFacture, Number.isFinite(delai) ? delai : 30) });
@@ -917,14 +1016,19 @@ function register(ctx) {
     if (existant && !montantsFournis) {
       Object.assign(out, { lignes: existant.lignes || [], tauxTVA: existant.tauxTVA, montantHT: existant.montantHT, montantTVA: existant.montantTVA, montantTTC: existant.montantTTC });
     } else {
-      out.lignes = b.lignes !== undefined ? normaliserLignesFacture(b.lignes) : (existant ? existant.lignes || [] : []);
-      const tl = out.lignes.length ? calculerTotaux(out.lignes) : null;
+      const anciennes = existant ? existant.lignes || [] : [];
+      out.lignes = b.lignes !== undefined ? normaliserLignesFacture(b.lignes) : anciennes;
+      let tl = out.lignes.length ? calculerTotaux(out.lignes) : null;
       out.tauxTVA = arrondi(nombre(val('tauxTVA'), 'Taux de TVA', { min: 0, max: 100, defaut: num(cfgAchats().tauxTVA) }), 2);
       let ht = nombre(b.montantHT !== undefined ? b.montantHT : (existant && b.lignes === undefined ? existant.montantHT : undefined), 'Montant HT', { min: 0, max: 1e9 });
       if (ht == null && tl) ht = tl.ht;
       if (ht == null) throw new HttpError(400, 'Le montant HT est obligatoire');
       ht = arrondi(ht);
-      if (tl && Math.abs(ht - tl.ht) > TOLERANCE + 1e-9) throw new HttpError(400, `Le montant HT (${montantTxt(ht)}) ne correspond pas au total des lignes (${montantTxt(tl.ht)})`);
+      if (tl && Math.abs(ht - tl.ht) > TOLERANCE + 1e-9) {
+        if (b.lignes !== undefined) throw new HttpError(400, `Le montant HT (${montantTxt(ht)}) ne correspond pas au total des lignes (${montantTxt(tl.ht)})`);
+        // Montant corrigé sans nouveau détail (litige, formulaire sans éditeur de lignes) : le détail des lignes est retiré
+        out.lignes = []; tl = null; out.detailLignesRetire = anciennes.length;
+      }
       let tva = nombre(b.montantTVA, 'Montant de TVA', { min: 0, max: 1e9 });
       if (tva == null) tva = tl ? tl.tva : arrondi((ht * out.tauxTVA) / 100);
       tva = arrondi(tva);
@@ -953,10 +1057,14 @@ function register(ctx) {
     const mod = can(req, 'modifier');
     const cre = can(req, 'creer');
     const proprio = Number(f.createdBy) === req.user.id;
+    // Comme pour les commandes : au-delà du seuil de validation, l'auteur de la saisie ne donne pas lui-même le bon à payer
+    const propreInterdite = proprio && !req.perms.estAdmin && num(f.montantHT) >= num(cfgAchats().seuilValidationHT);
+    const validable = [SF.recue, SF.aValider, SF.litige].includes(st);
     return {
       modifier: ecr && (mod ? [SF.recue, SF.aValider, SF.litige, SF.validee].includes(st) : (cre && proprio && st === SF.recue)),
       soumettre: ecr && st === SF.recue && (mod || (cre && proprio)),
-      valider: ecr && can(req, 'valider') && [SF.recue, SF.aValider, SF.litige].includes(st),
+      valider: ecr && can(req, 'valider') && validable && !propreInterdite,
+      validationPropreInterdite: validable && propreInterdite,
       payer: ecr && can(req, 'valider') && st === SF.validee,
       litige: ecr && mod && [SF.recue, SF.aValider, SF.validee].includes(st),
       annuler: ecr && mod && !final,
@@ -998,7 +1106,8 @@ function register(ctx) {
     const four = refs.fournisseurs.get(Number(f.fournisseurId));
     const c = f.commandeId != null ? db.get(CMD, f.commandeId) : null;
     r.fournisseur = four ? { id: four.id, nom: four.nom || '', adresse: four.adresse || '', telephone: four.telephone || '', email: four.email || '', siret: four.siret || '' } : null;
-    r.commande = c ? { id: c.id, numero: c.numero, objet: c.objet || '', statut: c.statut, totaux: c.totaux, dateCommande: c.dateCommande, visible: perms.canSeeRecord(req.perms, req.user, c) } : null;
+    const cVisible = !!c && perms.canSeeRecord(req.perms, req.user, c);
+    r.commande = c ? { id: c.id, numero: c.numero, statut: c.statut, visible: cVisible, objet: cVisible ? c.objet || '' : '', totaux: cVisible ? c.totaux : null, dateCommande: cVisible ? c.dateCommande : null } : null;
     r.rapprochement = !finauxFac().has(f.statut) ? calculerRapprochement(f, c) : (f.rapprochement || calculerRapprochement(f, c));
     r.documents = (f.documents || []).map(resumeDoc);
     r.commentaires = (f.commentaires || []).map((x) => Object.assign({}, x, { userNom: refs.users.get(Number(x.userId)) || '' }));
@@ -1039,7 +1148,7 @@ function register(ctx) {
     return rows.sort((a, b) => String(b.dateFacture || '').localeCompare(String(a.dateFacture || '')) || String(b.numero || '').localeCompare(String(a.numero || ''), 'fr', { numeric: true }));
   }
 
-  function getFacture(req, id) { return ctx.getVisible(req, FAC, id); }
+  function getFacture(req, id) { return getEcriture(req, FAC, id); }
   function valideursFacture(f, exclure) {
     const exclus = new Set((exclure || []).filter((x) => x != null).map(Number));
     return ctx.usersAvecDroit(MODULE, 'valider', (u, p) => perms.canSeeRecord(p, u, f, { ecriture: true })).map((u) => u.id).filter((id) => !exclus.has(id));
@@ -1058,14 +1167,16 @@ function register(ctx) {
     if (f.commandeId == null) return { facture: { id: f.id, numero: f.numero, montantHT: f.montantHT }, commande: null, rapprochement: null, lignes: [], autresFactures: [], receptions: [] };
     const c = db.get(CMD, f.commandeId);
     if (!c) return { facture: { id: f.id, numero: f.numero, montantHT: f.montantHT }, commande: null, rapprochement: null, lignes: [], autresFactures: [], receptions: [] };
-    const autres = db.list(FAC, (x) => Number(x.commandeId) === c.id && x.id !== f.id).sort((a, b) => String(a.dateFacture).localeCompare(String(b.dateFacture)));
+    // Commande hors du périmètre de l'utilisateur : agrégats du rapprochement seulement (ni lignes, ni réceptions)
+    const visible = perms.canSeeRecord(req.perms, req.user, c);
+    const autres = ctx.scope(req, db.list(FAC, (x) => Number(x.commandeId) === c.id && x.id !== f.id)).sort((a, b) => String(a.dateFacture).localeCompare(String(b.dateFacture)));
     return {
       facture: { id: f.id, numero: f.numero, numeroFournisseur: f.numeroFournisseur, montantHT: f.montantHT, montantTTC: f.montantTTC, dateFacture: f.dateFacture },
-      commande: { id: c.id, numero: c.numero, objet: c.objet || '', statut: c.statut, dateCommande: c.dateCommande, totaux: c.totaux, visible: perms.canSeeRecord(req.perms, req.user, c) },
+      commande: { id: c.id, numero: c.numero, statut: c.statut, visible, objet: visible ? c.objet || '' : '', dateCommande: visible ? c.dateCommande : null, totaux: visible ? c.totaux : null },
       rapprochement: calculerRapprochement(f, c),
-      lignes: (c.lignes || []).map((l, index) => ({ index, designation: l.designation, referenceFournisseur: l.referenceFournisseur || '', uniteCode: l.uniteCode || '', quantite: l.quantite, quantiteRecue: num(l.quantiteRecue), prixUnitaireHT: l.prixUnitaireHT, montantHT: arrondi(num(l.quantite) * num(l.prixUnitaireHT)), montantRecuHT: arrondi(num(l.quantiteRecue) * num(l.prixUnitaireHT)) })),
+      lignes: visible ? (c.lignes || []).map((l, index) => ({ index, designation: l.designation, referenceFournisseur: l.referenceFournisseur || '', uniteCode: l.uniteCode || '', quantite: l.quantite, quantiteRecue: num(l.quantiteRecue), prixUnitaireHT: l.prixUnitaireHT, montantHT: arrondi(num(l.quantite) * num(l.prixUnitaireHT)), montantRecuHT: arrondi(num(l.quantiteRecue) * num(l.prixUnitaireHT)) })) : [],
       autresFactures: autres.map((x) => ({ id: x.id, numero: x.numero, numeroFournisseur: x.numeroFournisseur, dateFacture: x.dateFacture, montantHT: x.montantHT, statut: x.statut, compte: x.statut !== SF.annulee })),
-      receptions: (c.receptions || []).map((x) => ({ date: x.date, bonLivraison: x.bonLivraison || '', montantHT: x.montantHT, userNom: ctx.nomUser(x.userId) })),
+      receptions: visible ? (c.receptions || []).map((x) => ({ date: x.date, bonLivraison: x.bonLivraison || '', montantHT: x.montantHT, userNom: ctx.nomUser(x.userId) })) : [],
       tolerance: TOLERANCE,
     };
   }, { perm: [MODULE, 'voir'] });
@@ -1080,10 +1191,12 @@ function register(ctx) {
       documents: [], commentaires: commentaire ? [{ userId: req.user.id, date: new Date().toISOString(), texte: commentaire }] : [], createdBy: req.user.id,
     });
     data.historique = trace(data, req, 'creation', data.rapprochement ? `Rapprochement avec ${data.rapprochement.commandeNumero} : ${data.rapprochement.conforme ? 'conforme' : 'écart de ' + montantTxt(data.rapprochement.ecartHT) + ' HT'}` : '');
+    delete data.detailLignesRetire;
     let f = db.insert(FAC, data);
     ctx.audit(req, 'creation', FAC, f.id, `Facture ${f.numero} (n° ${f.numeroFournisseur}, ${nomFournisseur(f.fournisseurId)}) — ${montantTxt(f.montantTTC)} TTC`);
+    if (f.commandeId != null) recalculerRapprochements(f.commandeId);
     if (b.soumettre === true) f = soumettreFacture(req, f);
-    return detailFacture(req, f);
+    return detailFacture(req, db.get(FAC, f.id) || f);
   }, { perm: [MODULE, 'creer'] });
 
   router.put('/api/factures/:id', async (req) => {
@@ -1091,11 +1204,16 @@ function register(ctx) {
     if (finauxFac().has(f.statut)) throw new HttpError(400, `La facture ${f.numero} est ${libelle('statutsFacture', f.statut).toLowerCase()} : elle n'est plus modifiable`);
     if (!actionsFacture(req, f).modifier) throw new HttpError(403, 'Droit insuffisant : Achats & factures › Modifier');
     const data = validerFacture(req, req.body, f);
+    const lignesRetirees = data.detailLignesRetire; delete data.detailLignesRetire;
     if (data.dateEcheance && data.dateEcheance !== f.dateEcheance) data.retardNotifie = false;
-    data.historique = trace(Object.assign({}, f, data), req, 'modification', data.montantTTC != null && data.montantTTC !== f.montantTTC ? `Montant TTC ${montantTxt(f.montantTTC)} → ${montantTxt(data.montantTTC)}` : '');
+    data.historique = trace(Object.assign({}, f, data), req, 'modification', [
+      data.montantTTC != null && data.montantTTC !== f.montantTTC ? `Montant TTC ${montantTxt(f.montantTTC)} → ${montantTxt(data.montantTTC)}` : '',
+      lignesRetirees ? `montant corrigé : le détail des ${lignesRetirees} ligne(s) a été retiré` : '',
+    ].filter(Boolean).join(' — '));
     const maj = db.update(FAC, f.id, data);
-    ctx.audit(req, 'modification', FAC, maj.id, `Facture ${maj.numero} (n° ${maj.numeroFournisseur}) — ${montantTxt(maj.montantTTC)} TTC`);
-    return detailFacture(req, maj);
+    ctx.audit(req, 'modification', FAC, maj.id, `Facture ${maj.numero} (n° ${maj.numeroFournisseur}) — ${montantTxt(maj.montantTTC)} TTC${lignesRetirees ? ' — détail des lignes retiré' : ''}`);
+    for (const id of new Set([f.commandeId, maj.commandeId].filter((x) => x != null).map(Number))) recalculerRapprochements(id);
+    return detailFacture(req, db.get(FAC, maj.id) || maj);
   }, { perm: [MODULE, 'voir'] });
 
   router.delete('/api/factures/:id', async (req) => {
@@ -1104,6 +1222,7 @@ function register(ctx) {
     if (![SF.recue, SF.aValider, SF.annulee].includes(f.statut)) throw new HttpError(400, `La facture ${f.numero} est ${libelle('statutsFacture', f.statut).toLowerCase()} : annulez-la au lieu de la supprimer`);
     db.remove(FAC, f.id);
     ctx.audit(req, 'suppression', FAC, f.id, `Facture ${f.numero} (n° ${f.numeroFournisseur}, ${nomFournisseur(f.fournisseurId)}) — ${montantTxt(f.montantTTC)} TTC`);
+    if (f.commandeId != null) recalculerRapprochements(f.commandeId);
     return { ok: true };
   }, { perm: [MODULE, 'supprimer'] });
 
@@ -1127,6 +1246,10 @@ function register(ctx) {
   router.post('/api/factures/:id/valider', async (req) => {
     const f = getFacture(req, req.params.id);
     if (![SF.recue, SF.aValider, SF.litige].includes(f.statut)) throw new HttpError(400, `La facture ${f.numero} ne peut pas être validée (statut : ${libelle('statutsFacture', f.statut)})`);
+    const seuil = num(cfgAchats().seuilValidationHT);
+    if (num(f.montantHT) >= seuil && Number(f.createdBy) === req.user.id && !req.perms.estAdmin) {
+      throw new HttpError(403, `Vous ne pouvez pas donner le bon à payer d'une facture que vous avez saisie au-delà du seuil de ${montantTxt(seuil)} HT : un autre valideur doit l'approuver`);
+    }
     const b = objet(req.body);
     const commentaire = texte(b.commentaire, 'Commentaire', { max: 1000 });
     const c = f.commandeId != null ? db.get(CMD, f.commandeId) : null;
@@ -1173,7 +1296,7 @@ function register(ctx) {
     const maj = db.update(FAC, f.id, patch);
     ctx.audit(req, 'statut', FAC, maj.id, `Facture ${maj.numero} en litige — ${motif}`);
     const c = maj.commandeId != null ? db.get(CMD, maj.commandeId) : null;
-    const cibles = [maj.createdBy, c ? c.demandeurUserId : null].filter((x) => x != null && Number(x) !== req.user.id);
+    const cibles = destinataires(req, maj, [maj.createdBy, c ? c.demandeurUserId : null]);
     if (cibles.length) ctx.notify(cibles, { titre: `Facture en litige : ${maj.numero}`, message: `${nomFournisseur(maj.fournisseurId)} — n° ${maj.numeroFournisseur} (${montantTxt(maj.montantTTC)} TTC) : ${motif}`, lien: '#/achats/facture/' + maj.id, type: 'alerte' });
     return detailFacture(req, maj);
   }, { perm: [MODULE, 'modifier'] });
@@ -1294,13 +1417,17 @@ function register(ctx) {
   const STATUTS_A_PAYER = [SF.recue, SF.aValider, SF.validee];
   const STATUTS_IMPAYES = [SF.recue, SF.aValider, SF.validee, SF.litige];
 
+  const MAX_MOIS_SERIE = 36;
+  /** Mois AAAA-MM d'une période ; au-delà de 36 mois, les plus récents sont conservés. */
   function listeMois(du, au) {
     const out = [];
     let [y, m] = du.slice(0, 7).split('-').map(Number);
     const [y2, m2] = au.slice(0, 7).split('-').map(Number);
-    while ((y < y2 || (y === y2 && m <= m2)) && out.length < 36) { out.push(`${y}-${pad(m)}`); m++; if (m > 12) { m = 1; y++; } }
-    return out;
+    while (y < y2 || (y === y2 && m <= m2)) { out.push(`${y}-${pad(m)}`); m++; if (m > 12) { m = 1; y++; } if (out.length > 2400) break; }
+    return out.slice(-MAX_MOIS_SERIE);
   }
+  /** Montant engagé d'une commande : le montant reçu pour une commande soldée (reliquat abandonné), sinon le total commandé. */
+  function montantEngageHT(c) { return c.solde ? montantRecuHT(c) : num((c.totaux || {}).ht); }
 
   router.get('/api/achats/tableau', async (req) => {
     controleQuotidien();
@@ -1330,7 +1457,7 @@ function register(ctx) {
     const ouvertes = commandes.filter((c) => [SC.validee, SC.envoyee, SC.partielle].includes(c.statut));
     const livraisonsRetard = commandes.filter((c) => livraisonEnRetard(c, jour));
     const somme = (rows, k) => arrondi(rows.reduce((s, x) => s + num(typeof k === 'function' ? k(x) : x[k]), 0));
-    const ht = (c) => (c.totaux || {}).ht;
+    const ht = montantEngageHT;
 
     const kpis = {
       engageHT: somme(engagees, ht), nbCommandes: engagees.length,
@@ -1347,6 +1474,7 @@ function register(ctx) {
       nbLivraisonsEnRetard: livraisonsRetard.length,
     };
     const mois = listeMois(du, au);
+    const nbMoisPeriode = (Number(au.slice(0, 4)) - Number(du.slice(0, 4))) * 12 + Number(au.slice(5, 7)) - Number(du.slice(5, 7)) + 1;
     const parMoisMap = new Map(mois.map((m) => [m, { mois: m, engageHT: 0, factureHT: 0, payeTTC: 0 }]));
     for (const c of engagees) { const x = parMoisMap.get(moisDe(c.dateCommande)); if (x) x.engageHT += num(ht(c)); }
     for (const f of factPeriode) { const x = parMoisMap.get(moisDe(f.dateFacture)); if (x) x.factureHT += num(f.montantHT); }
@@ -1373,7 +1501,7 @@ function register(ctx) {
     return {
       periode: { du, au }, aujourdhui: jour,
       config: { seuilValidationHT: num(config.seuilValidationHT), alerteEcheanceJours: num(config.alerteEcheanceJours), delaiPaiementJours: num(config.delaiPaiementJours), tauxTVA: num(config.tauxTVA) },
-      kpis, parMois, parCategorie, parFournisseur, parSite,
+      kpis, parMois, serieMoisLimitee: nbMoisPeriode > MAX_MOIS_SERIE, parCategorie, parFournisseur, parSite,
       aPayer: aPayer.filter((f) => !factureEnRetard(f, jour)).sort(parEcheance).slice(0, 12).map(ligneF),
       enRetard: enRetard.sort(parEcheance).map(ligneF),
       echeancesProches: proches.sort(parEcheance).map(ligneF),
@@ -1409,6 +1537,17 @@ function register(ctx) {
   }
   router.get('/api/achats/echeancier', async (req) => echeancier(req), { perm: [MODULE, 'voir'] });
 
+  /** Compteurs de la pastille du menu : à valider (droit valider) et factures en retard, dans le périmètre. */
+  router.get('/api/achats/compteurs', async (req) => {
+    const jour = jourLocal();
+    const peutValider = can(req, 'valider');
+    const commandesAValider = peutValider ? ctx.scope(req, db.list(CMD, (c) => c.statut === SC.aValider)).length : 0;
+    const factures = ctx.scope(req, db.list(FAC, (f) => f.statut === SF.aValider || factureEnRetard(f, jour)));
+    const facturesAValider = peutValider ? factures.filter((f) => f.statut === SF.aValider).length : 0;
+    const facturesEnRetard = factures.filter((f) => factureEnRetard(f, jour)).length;
+    return { commandesAValider, facturesAValider, facturesEnRetard, total: commandesAValider + facturesAValider + facturesEnRetard };
+  }, { perm: [MODULE, 'voir'] });
+
   router.get('/api/achats/couts-ot/:otId', async (req) => {
     const ot = ctx.getVisible(req, 'ot', req.params.otId);
     const refs = references(); const jour = jourLocal();
@@ -1438,8 +1577,10 @@ function register(ctx) {
     const ot = ctx.scope(req, db.list('ot')).map((o) => ({ id: o.id, numero: o.numero || `#${o.id}`, titre: o.titre || '', statut: o.statut, final: finauxOt.has(o.statut), secteurId: o.secteurId == null ? null : Number(o.secteurId), createdAt: o.createdAt }))
       .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))).slice(0, 500);
     const rhDisponible = !!ctx.services.rh || db.count('personnel') > 0;
-    const personnel = rhDisponible ? ctx.scope(req, db.list('personnel', (p) => p.actif !== false)).map((p) => ({ id: p.id, nom: nomPersonnel(p), matricule: p.matricule || '', fonction: p.fonction || '', secteurId: p.secteurId == null ? null : Number(p.secteurId), typeContratCode: p.typeContratCode || '' })).sort((a, b) => a.nom.localeCompare(b.nom, 'fr')) : [];
-    const commandesFacturables = ctx.scope(req, db.list(CMD, (c) => [SC.validee, SC.envoyee, SC.partielle, SC.recue].includes(c.statut)));
+    // Fiches du personnel : seulement avec le droit Ressources humaines › Voir, sans donnée RH (matricule, contrat)
+    const personnel = rhDisponible && perms.can(req.perms, 'rh', 'voir') ? ctx.scope(req, db.list('personnel', (p) => p.actif !== false)).map((p) => ({ id: p.id, nom: nomPersonnel(p), fonction: p.fonction || '', secteurId: p.secteurId == null ? null : Number(p.secteurId) })).sort((a, b) => a.nom.localeCompare(b.nom, 'fr')) : [];
+    // Commandes facturables : celles que l'utilisateur peut modifier (un site en lecture seule n'est pas proposé)
+    const commandesFacturables = db.list(CMD, (c) => [SC.validee, SC.envoyee, SC.partielle, SC.recue].includes(c.statut) && ecritureSite(req, c));
     const refs = references();
     return {
       fournisseurs, articles, ot, personnel,

@@ -730,4 +730,299 @@ describe('Achats & factures', () => {
       } finally { await autre.stop(); }
     });
   });
+
+  // ------------------------------------------------------------------------------------------------
+  describe('Portée, cohérence de site et règles métier (non-régression)', () => {
+    let S2; let S2M; let artS2; let artPartage; let artProd; let fourR;
+    let modifMaint; // portée secteurs (Maintenance), droit modifier
+    const cmdValidee = async (c, extra) => { const x = await c.ok('POST', '/api/commandes', corpsCommande(Object.assign({ fournisseurId: fourR.id, lignes: [{ designation: 'Pièce', quantite: 1, prixUnitaireHT: 100 }] }, extra))); return c.ok('POST', `/api/commandes/${x.id}/soumettre`); };
+    before(async () => {
+      S2 = await admin.ok('POST', '/api/secteurs', { nom: 'Usine 2', code: 'US2', type: 'site' });
+      S2M = await admin.ok('POST', '/api/secteurs', { nom: 'Maintenance usine 2', code: 'US2-MAINT', type: 'service', parentId: S2.id });
+      fourR = srv.db.insert('fournisseurs', { nom: 'Fournisseur revue', actif: true });
+      artS2 = srv.db.insert('articles', { code: 'US2-001', designation: 'Article du magasin de l\'usine 2', quantite: 7, seuilMin: 1, prixUnitaire: 10, uniteCode: 'u', actif: true, secteurId: S2M.id, fournisseurId: fourR.id });
+      artPartage = srv.db.insert('articles', { code: 'PART-001', designation: 'Article partagé', quantite: 0, seuilMin: 5, quantiteCommande: 10, prixUnitaire: 3, uniteCode: 'u', actif: true, secteurId: null, fournisseurId: fourR.id });
+      artProd = srv.db.insert('articles', { code: 'PROD-001', designation: 'Article du magasin de production', quantite: 12, seuilMin: 1, prixUnitaire: 4, uniteCode: 'u', actif: true, secteurId: PROD.id, fournisseurId: fourR.id });
+      await creerUtilisateur('a1', 'Acheteur / comptabilité', { secteurIds: [SITE.id] });
+      await creerUtilisateur('a1lect', 'Acheteur / comptabilité', { secteurIds: [SITE.id], siteAcces: [{ siteId: S2.id, mode: 'lecture' }] });
+      await creerUtilisateur('a2', 'Acheteur / comptabilité', { secteurIds: [S2.id] });
+      await creerUtilisateur('perso', 'Demandeur', { secteurIds: [PROD.id], overrides: { achats: { voir: true, creer: true } }, siteAcces: [{ siteId: S2.id, mode: 'lecture' }] });
+      await creerUtilisateur('perso2', 'Demandeur', { secteurIds: [PROD.id], overrides: { achats: { voir: true, creer: true } } });
+      modifMaint = await creerUtilisateur('modifmaint', 'Chef de secteur', { secteurIds: [MAINT.id], overrides: { achats: { voir: true, creer: true, modifier: true } } });
+      await creerUtilisateur('inactif', 'Acheteur / comptabilité', { secteurIds: [S2.id] });
+      await admin.ok('PUT', '/api/utilisateurs/' + users.inactif.id, { actif: false });
+    });
+
+    test('ligne de commande : article d\'un autre site ou hors périmètre refusé, stock masqué, réception sans entrée hors site', async () => {
+      assert.equal((await clients.a1.get('/api/articles/' + artS2.id)).status, 404);
+      const r = await clients.a1.post('/api/commandes', corpsCommande({ fournisseurId: fourR.id, lignes: [{ articleId: artS2.id, quantite: 3 }] }));
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /article introuvable/);
+      const r2 = await admin.post('/api/commandes', corpsCommande({ fournisseurId: fourR.id, secteurId: MAINT.id, lignes: [{ articleId: artS2.id, quantite: 3 }] }));
+      assert.equal(r2.status, 400); assert.match(r2.body.erreur, /magasin d'un autre site/);
+      assert.equal(srv.db.get('articles', artS2.id).quantite, 7, 'stock du site 2 intact');
+      // Article du même site mais hors du périmètre du lecteur : quantité en stock masquée dans la fiche
+      const c = await admin.ok('POST', '/api/commandes', corpsCommande({ fournisseurId: fourR.id, secteurId: MAINT.id, lignes: [{ articleId: artProd.id, quantite: 2 }] }));
+      assert.equal(c.lignes[0].articleStock, 12);
+      const vu = await clients.modifmaint.ok('GET', '/api/commandes/' + c.id);
+      assert.equal(vu.lignes[0].articleStock, null, 'stock d\'un article hors périmètre non renvoyé');
+      assert.equal(vu.lignes[0].designation, 'Article du magasin de production');
+      // Modification des autres champs par cet utilisateur : la ligne existante n'est pas recontrôlée
+      assert.equal((await clients.modifmaint.put('/api/commandes/' + c.id, { objet: 'Objet modifié' })).status, 200);
+      // Article déplacé vers un autre site après la commande : aucune entrée en stock possible
+      await admin.ok('POST', `/api/commandes/${c.id}/soumettre`);
+      srv.db.update('articles', artProd.id, { secteurId: S2M.id });
+      const rec = await admin.post(`/api/commandes/${c.id}/receptionner`, { lignes: [{ index: 0, quantite: 2 }] });
+      assert.equal(rec.status, 400); assert.match(rec.body.erreur, /magasin d'un autre site/);
+      assert.equal(srv.db.get('articles', artProd.id).quantite, 12);
+      srv.db.update('articles', artProd.id, { secteurId: PROD.id });
+      // Brouillons depuis les alertes : la désignation d'un article hors périmètre n'est pas renvoyée
+      srv.db.update('articles', artS2.id, { quantite: 0 });
+      const al = await clients.a1.ok('POST', '/api/commandes/depuis-alertes', { secteurId: MAINT.id, articleIds: [artS2.id] });
+      assert.equal(al.commandes.length, 0);
+      assert.equal(al.ignores[0].designation, `Article #${artS2.id}`);
+      srv.db.update('articles', artS2.id, { quantite: 7 });
+    });
+
+    test('portée « perso » : ni création ni modification sur un site en lecture seule ou hors de ses secteurs', async () => {
+      const corps = (secteurId) => ({ fournisseurId: fourR.id, secteurId, lignes: [{ designation: 'x', quantite: 1, prixUnitaireHT: 5 }] });
+      let r = await clients.perso.post('/api/commandes', corps(S2M.id));
+      assert.equal(r.status, 403); assert.match(r.body.erreur, /lecture seule/);
+      r = await clients.perso.post('/api/commandes', corps(MAINT.id));
+      assert.equal(r.status, 403); assert.match(r.body.erreur, /hors de votre périmètre/);
+      const ok = await clients.perso.ok('POST', '/api/commandes', corps(PROD.id));
+      assert.equal(ok.lectureSeule, false);
+      r = await clients.perso2.post('/api/commandes', Object.assign(corps(S2M.id), { soumettre: true }));
+      assert.equal(r.status, 403);
+      assert.ok(!srv.db.findOne('notifications', (n) => n.userId === users.a2.id && /Commande à valider/.test(n.titre) && n.createdAt > new Date(Date.now() - 2000).toISOString() && /x/.test(n.message)), 'aucun valideur du site 2 notifié');
+      r = await clients.perso2.post('/api/factures', { fournisseurId: fourR.id, secteurId: S2M.id, numeroFournisseur: 'P2-1', montantHT: 10 });
+      assert.equal(r.status, 403);
+      // Élément déjà existant sur un site en lecture seule, créé par l'utilisateur : consultation seule
+      const legacy = srv.db.insert('commandes', { numero: 'CMD-LEGACY-1', fournisseurId: fourR.id, secteurId: S2M.id, statut: 'brouillon', lignes: [{ designation: 'x', quantite: 1, quantiteRecue: 0, prixUnitaireHT: 5, tauxTVA: 20, montantHT: 5 }], totaux: { ht: 5, tva: 1, ttc: 6 }, dateCommande: jour(0), demandeurUserId: users.perso.id, createdBy: users.perso.id, receptions: [], documents: [], historique: [] });
+      const d = await clients.perso.ok('GET', '/api/commandes/' + legacy.id);
+      assert.equal(d.lectureSeule, true);
+      assert.equal(d.actions.modifier, false);
+      r = await clients.perso.put('/api/commandes/' + legacy.id, { objet: 'x' });
+      assert.equal(r.status, 403); assert.match(r.body.erreur, /lecture seule/);
+      assert.equal((await clients.perso.post(`/api/commandes/${legacy.id}/soumettre`)).status, 403);
+      srv.db.remove('commandes', legacy.id);
+    });
+
+    test('facture : références en écriture et sur le même site ; factures d\'un autre site absentes de la fiche de commande', async () => {
+      const cmdS2 = await cmdValidee(admin, { secteurId: S2M.id });
+      const otS2 = srv.db.insert('ot', { numero: 'OT-US2-1', titre: 'OT usine 2', secteurId: S2M.id, statut: 'en_cours' });
+      let r = await clients.a1lect.post('/api/factures', { commandeId: cmdS2.id, fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'LECT-1', montantHT: 100 });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /Commande introuvable/);
+      r = await clients.a1lect.post('/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'LECT-2', montantHT: 100, otId: otS2.id });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /Ordre de travail introuvable/);
+      // Même pour un utilisateur qui voit tout : la facture est rattachée aux éléments de son site
+      r = await admin.post('/api/factures', { commandeId: cmdS2.id, fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'ADM-1', montantHT: 100 });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /appartient à un autre site/);
+      r = await admin.post('/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'ADM-2', montantHT: 100, otId: otS2.id });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /appartient à un autre site/);
+      const okS2 = await admin.ok('POST', '/api/factures', { commandeId: cmdS2.id, fournisseurId: fourR.id, numeroFournisseur: 'ADM-3', montantHT: 100, otId: otS2.id });
+      assert.equal(okS2.secteurId, S2M.id, 'site repris de la commande');
+      // Ligne de commande imputée à un OT d\'un autre site : refusée
+      r = await admin.post('/api/commandes', corpsCommande({ fournisseurId: fourR.id, secteurId: MAINT.id, lignes: [{ designation: 'x', quantite: 1, prixUnitaireHT: 1, otId: otS2.id }] }));
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /appartient à un autre site/);
+      // Facture d\'un autre site rattachée (données anciennes) : absente de la fiche vue depuis le site 2, montant agrégé conservé
+      const legacy = srv.db.insert('factures', { numero: 'FAC-LEGACY-1', numeroFournisseur: 'LEG-1', fournisseurId: fourR.id, secteurId: MAINT.id, commandeId: cmdS2.id, statut: 'recue', dateFacture: jour(0), dateEcheance: jour(30), montantHT: 50, montantTVA: 10, montantTTC: 60, tauxTVA: 20, lignes: [], documents: [], commentaires: [], historique: [], createdBy: 1 });
+      const d = await clients.a2.ok('GET', '/api/commandes/' + cmdS2.id);
+      assert.ok(!d.factures.some((x) => x.id === legacy.id), 'facture hors périmètre non listée');
+      assert.ok(d.factures.some((x) => x.id === okS2.id));
+      assert.equal(d.montantFactureHT, 150);
+      assert.equal(d.nbFacturesActives, 2);
+      srv.db.remove('factures', legacy.id);
+    });
+
+    test('rapprochement et fiche d\'une facture dont la commande est hors périmètre : agrégats seulement', async () => {
+      const cmd1 = await cmdValidee(admin, { secteurId: MAINT.id, lignes: [{ designation: 'Pièce confidentielle site 1', quantite: 2, prixUnitaireHT: 321 }] });
+      await admin.ok('POST', `/api/commandes/${cmd1.id}/receptionner`, { lignes: [{ index: 0, quantite: 1 }], bonLivraison: 'BL-CONF' });
+      const fA = await admin.ok('POST', '/api/factures', { commandeId: cmd1.id, fournisseurId: fourR.id, numeroFournisseur: 'S1-A', montantHT: 321 });
+      // Facture du site 2 rattachée à cette commande (données anciennes, antérieures au contrôle de site)
+      const fB = srv.db.insert('factures', { numero: 'FAC-LEGACY-2', numeroFournisseur: 'S2-B', fournisseurId: fourR.id, secteurId: S2M.id, commandeId: cmd1.id, statut: 'recue', dateFacture: jour(0), dateEcheance: jour(30), montantHT: 10, montantTVA: 2, montantTTC: 12, tauxTVA: 20, lignes: [], documents: [], commentaires: [], historique: [], createdBy: 1 });
+      assert.equal((await clients.a2.get('/api/commandes/' + cmd1.id)).status, 404);
+      const rap = await clients.a2.ok('GET', `/api/factures/${fB.id}/rapprochement`);
+      assert.equal(rap.commande.visible, false);
+      assert.deepEqual(rap.lignes, []); assert.deepEqual(rap.receptions, []); assert.deepEqual(rap.autresFactures, []);
+      assert.equal(rap.commande.totaux, null); assert.equal(rap.commande.objet, '');
+      assert.equal(rap.rapprochement.commandeHT, 642, 'agrégats du rapprochement conservés');
+      const fiche = await clients.a2.ok('GET', '/api/factures/' + fB.id);
+      assert.equal(fiche.commande.visible, false); assert.equal(fiche.commande.totaux, null);
+      const rapAdmin = await admin.ok('GET', `/api/factures/${fA.id}/rapprochement`);
+      assert.equal(rapAdmin.lignes.length, 1); assert.equal(rapAdmin.receptions.length, 1); assert.equal(rapAdmin.autresFactures.length, 1);
+      srv.db.remove('factures', fB.id);
+    });
+
+    test('références des formulaires : personnel réservé au droit RH et sans données RH ; commandes facturables modifiables', async () => {
+      const pers = srv.db.insert('personnel', { nom: 'Revue', prenom: 'Paul', matricule: 'M-REV', secteurId: MAINT.id, typeContratCode: 'cdd', fonction: 'Technicien', actif: true });
+      assert.equal((await clients.a1.get('/api/rh/personnel')).status, 403);
+      const r1 = await clients.a1.ok('GET', '/api/achats/references');
+      assert.deepEqual(r1.personnel, [], 'aucune fiche sans Ressources humaines › Voir');
+      const r = await clients.a1.post('/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'RH-1', montantHT: 10, personnelId: pers.id });
+      assert.equal(r.status, 403); assert.match(r.body.erreur, /Ressources humaines › Voir/);
+      const r2 = await admin.ok('GET', '/api/achats/references');
+      const p = r2.personnel.find((x) => x.id === pers.id);
+      assert.ok(p && p.nom === 'Paul Revue' && p.fonction === 'Technicien');
+      assert.equal(p.matricule, undefined); assert.equal(p.typeContratCode, undefined);
+      // Commandes facturables : pas celles d\'un site en lecture seule
+      const cmdS2 = await cmdValidee(admin, { secteurId: S2M.id });
+      const r3 = await clients.a1lect.ok('GET', '/api/achats/references');
+      assert.ok(!r3.commandes.some((c) => c.id === cmdS2.id), 'commande du site en lecture seule non proposée');
+      assert.ok((await clients.a2.ok('GET', '/api/achats/references')).commandes.some((c) => c.id === cmdS2.id));
+      srv.db.remove('personnel', pers.id);
+    });
+
+    test('une commande facturée ne peut pas être annulée', async () => {
+      const c = await cmdValidee(admin, { secteurId: MAINT.id });
+      const f = await admin.ok('POST', '/api/factures', { commandeId: c.id, fournisseurId: fourR.id, numeroFournisseur: 'ANN-1', montantHT: 100 });
+      assert.equal((await admin.ok('GET', '/api/commandes/' + c.id)).actions.annuler, false);
+      const r = await admin.post(`/api/commandes/${c.id}/annuler`, { motif: 'test' });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /facture est rattachée/);
+      await admin.ok('POST', `/api/factures/${f.id}/annuler`, { motif: 'doublon' });
+      assert.equal((await admin.ok('POST', `/api/commandes/${c.id}/annuler`, { motif: 'plus nécessaire' })).statut, 'annulee');
+    });
+
+    test('facture avec lignes : le montant peut être corrigé sans nouveau détail (lignes retirées, trace), pas avec des lignes incohérentes', async () => {
+      const f = await admin.ok('POST', '/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'LIG-1', lignes: [{ designation: 'Câble (au mètre)', quantite: 150, prixUnitaireHT: 2.35 }] });
+      assert.equal(f.montantHT, 352.5);
+      await admin.ok('POST', `/api/factures/${f.id}/litige`, { motif: '150 m facturés pour 100 m livrés' });
+      // Corps exact envoyé par le formulaire de modification (sans éditeur de lignes)
+      const m = await admin.ok('PUT', '/api/factures/' + f.id, { fournisseurId: fourR.id, numeroFournisseur: 'LIG-1', secteurId: MAINT.id, objet: '', categorieCode: 'pieces', otId: null, personnelId: null, dateFacture: f.dateFacture, dateEcheance: f.dateEcheance, montantHT: 235, tauxTVA: 20, montantTVA: 47, montantTTC: 282, champs: {} });
+      assert.equal(m.montantHT, 235); assert.equal(m.montantTTC, 282);
+      assert.deepEqual(m.lignes, []);
+      assert.ok(m.historique[0].details.includes('détail des 1 ligne(s) a été retiré'));
+      // Montant inchangé : le détail est conservé
+      const g = await admin.ok('POST', '/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'LIG-2', lignes: [{ designation: 'A', quantite: 2, prixUnitaireHT: 10 }] });
+      assert.equal((await admin.ok('PUT', '/api/factures/' + g.id, { montantHT: 20, tauxTVA: 20, montantTVA: 4, montantTTC: 24, objet: 'Objet' })).lignes.length, 1);
+      const r = await admin.put('/api/factures/' + g.id, { montantHT: 99, lignes: [{ designation: 'A', quantite: 2, prixUnitaireHT: 10 }] });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /ne correspond pas au total des lignes/);
+    });
+
+    test('référence inchangée non recontrôlée : OT hors du périmètre de l\'éditeur, fiche du personnel effacée', async () => {
+      const otProd = srv.db.insert('ot', { numero: 'OT-PROD-9', titre: 'OT production', secteurId: PROD.id, statut: 'en_cours' });
+      const f = await admin.ok('POST', '/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'REF-1', montantHT: 40, otId: otProd.id });
+      assert.equal((await clients.modifmaint.get('/api/ot/' + otProd.id)).status, 404, 'OT hors du périmètre de l\'éditeur');
+      const m = await clients.modifmaint.ok('PUT', '/api/factures/' + f.id, { objet: 'nouvel objet' });
+      assert.equal(m.objet, 'nouvel objet'); assert.equal(m.otId, otProd.id);
+      const r = await clients.modifmaint.put('/api/factures/' + f.id, { otId: otProd.id === ot1.id ? 9999 : srv.db.insert('ot', { numero: 'OT-PROD-10', titre: 'Autre', secteurId: PROD.id, statut: 'nouveau' }).id });
+      assert.equal(r.status, 400, 'changer la référence vers un OT invisible reste refusé');
+      const pers = srv.db.insert('personnel', { nom: 'Effacé', prenom: 'Jean', matricule: 'M-EFF', secteurId: MAINT.id, actif: true });
+      const g = await admin.ok('POST', '/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'REF-2', montantHT: 40, personnelId: pers.id });
+      srv.db.remove('personnel', pers.id);
+      assert.equal((await admin.ok('PUT', '/api/factures/' + g.id, { objet: 'formation' })).objet, 'formation');
+      assert.equal((await admin.put('/api/factures/' + g.id, { personnelId: 9999 })).status, 400);
+    });
+
+    test('tableau de bord : engagé d\'une commande soldée = montant reçu ; série limitée aux 36 derniers mois', async () => {
+      const fourS = srv.db.insert('fournisseurs', { nom: 'Fournisseur solde', actif: true });
+      const c = await cmdValidee(admin, { fournisseurId: fourS.id, secteurId: MAINT.id, lignes: [{ designation: 'A', quantite: 1, prixUnitaireHT: 300 }, { designation: 'B', quantite: 1, prixUnitaireHT: 600 }] });
+      await admin.ok('POST', `/api/commandes/${c.id}/receptionner`, { lignes: [{ index: 0, quantite: 1 }] });
+      const s = await admin.ok('POST', `/api/commandes/${c.id}/solder`, { motif: 'Reliquat abandonné' });
+      assert.equal(s.montantRecuHT, 300);
+      const t = await admin.ok('GET', '/api/achats/tableau?fournisseurId=' + fourS.id);
+      assert.equal(t.kpis.engageHT, 300);
+      assert.equal(t.parFournisseur[0].engageHT, 300);
+      assert.equal(t.parMois.reduce((x, m) => x + m.engageHT, 0), 300);
+      assert.equal(t.serieMoisLimitee, false);
+      await admin.ok('POST', '/api/factures', { fournisseurId: fourS.id, secteurId: MAINT.id, numeroFournisseur: 'TAB-1', montantHT: 1000 });
+      const long = await admin.ok('GET', `/api/achats/tableau?du=2020-01-01&fournisseurId=${fourS.id}`);
+      assert.equal(long.parMois.length, 36);
+      assert.equal(long.parMois[long.parMois.length - 1].mois, jour(0).slice(0, 7), 'les mois les plus récents sont conservés');
+      assert.equal(long.serieMoisLimitee, true);
+      assert.equal(long.parMois.reduce((x, m) => x + m.factureHT, 0), 1000);
+    });
+
+    test('facture : l\'auteur de la saisie ne donne pas le bon à payer au-delà du seuil (sauf administrateur)', async () => {
+      const f = await clients.a1.ok('POST', '/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'SOD-1', montantHT: 25000 });
+      assert.equal(f.actions.valider, false); assert.equal(f.actions.validationPropreInterdite, true);
+      const r = await clients.a1.post(`/api/factures/${f.id}/valider`, {});
+      assert.equal(r.status, 403); assert.match(r.body.erreur, /autre valideur/);
+      assert.equal((await clients.respmaint.ok('POST', `/api/factures/${f.id}/valider`, {})).statut, 'validee');
+      const g = await clients.a1.ok('POST', '/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'SOD-2', montantHT: 500 });
+      assert.equal(g.actions.valider, true);
+      assert.equal((await clients.a1.ok('POST', `/api/factures/${g.id}/valider`, {})).statut, 'validee', 'sous le seuil : autorisé');
+    });
+
+    test('rapprochement mémorisé recalculé à la création, à la modification et à la suppression d\'une autre facture', async () => {
+      const c = await cmdValidee(admin, { secteurId: MAINT.id });
+      const f1 = await admin.ok('POST', '/api/factures', { commandeId: c.id, fournisseurId: fourR.id, numeroFournisseur: 'R-1', montantHT: 100 });
+      assert.equal(f1.rapprochement.ecartHT, 0);
+      const f2 = await admin.ok('POST', '/api/factures', { commandeId: c.id, fournisseurId: fourR.id, numeroFournisseur: 'R-2', montantHT: 100 });
+      const liste = () => admin.ok('GET', '/api/factures?commandeId=' + c.id);
+      assert.equal((await liste()).find((x) => x.id === f1.id).rapprochement.ecartHT, 100, 'liste alignée sur la fiche');
+      assert.equal((await admin.ok('GET', '/api/factures/' + f1.id)).rapprochement.ecartHT, 100);
+      const c2 = await cmdValidee(admin, { secteurId: MAINT.id });
+      await admin.ok('PUT', '/api/factures/' + f2.id, { commandeId: c2.id });
+      assert.equal((await liste()).find((x) => x.id === f1.id).rapprochement.ecartHT, 0, 'recalcul après changement de commande');
+      await admin.ok('PUT', '/api/factures/' + f2.id, { commandeId: c.id });
+      assert.equal((await liste()).find((x) => x.id === f1.id).rapprochement.ecartHT, 100);
+      await admin.ok('DELETE', '/api/factures/' + f2.id);
+      assert.equal((await liste()).find((x) => x.id === f1.id).rapprochement.ecartHT, 0, 'recalcul après suppression');
+      const csv = await admin.get('/api/achats/export/factures?commandeId=' + c.id);
+      assert.ok(String(csv.body).split('\r\n').some((l) => l.startsWith(f1.numero) && /;0;?$|;0;/.test(l)), 'export aligné');
+    });
+
+    test('alertes de stock : les commandes d\'un autre site ne sont pas identifiées (quantité globale conservée)', async () => {
+      const c = await clients.a2.ok('POST', '/api/commandes', { fournisseurId: fourR.id, secteurId: S2M.id, lignes: [{ articleId: artPartage.id, quantite: 4 }] });
+      await clients.a2.ok('POST', `/api/commandes/${c.id}/soumettre`);
+      const a = (await clients.a1.ok('GET', '/api/achats/alertes-stock')).find((x) => x.id === artPartage.id);
+      assert.ok(a, 'article partagé en alerte');
+      assert.equal(a.dejaEnCommande, 4);
+      assert.ok(!a.commandesEnCours.some((x) => x.id === c.id), 'commande du site 2 non identifiée');
+      assert.ok((await clients.a2.ok('GET', '/api/achats/alertes-stock')).find((x) => x.id === artPartage.id).commandesEnCours.some((x) => x.id === c.id));
+    });
+
+    test('demandeur : compte actif ayant accès aux achats du site ; notifications réservées aux comptes qui voient la commande', async () => {
+      const corps = (demandeurUserId) => ({ fournisseurId: fourR.id, secteurId: S2M.id, demandeurUserId, lignes: [{ designation: 'x', quantite: 1, prixUnitaireHT: 5 }] });
+      let r = await clients.a2.post('/api/commandes', corps(users.a1.id));
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /Demandeur invalide/);
+      r = await clients.a2.post('/api/commandes', corps(users.inactif.id));
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /désactivé/);
+      r = await clients.a2.post('/api/commandes', corps(users.tech.id));
+      assert.equal(r.status, 400, 'sans droit Achats › Voir');
+      const ok = await admin.ok('POST', '/api/commandes', corps(users.a2.id));
+      assert.equal(ok.demandeurUserId, users.a2.id);
+      assert.equal((await admin.ok('PUT', '/api/commandes/' + ok.id, { objet: 'inchangé' })).demandeurUserId, users.a2.id);
+      // Commande existante désignant un demandeur sans accès (données anciennes) : aucune notification ne lui parvient
+      const legacy = srv.db.insert('commandes', { numero: 'CMD-LEGACY-2', fournisseurId: fourR.id, secteurId: S2M.id, statut: 'brouillon', lignes: [{ designation: 'x', quantite: 1, quantiteRecue: 0, prixUnitaireHT: 5, tauxTVA: 20, montantHT: 5 }], totaux: { ht: 5, tva: 1, ttc: 6 }, dateCommande: jour(0), demandeurUserId: users.a1.id, createdBy: users.a2.id, receptions: [], documents: [], historique: [] });
+      const avant = srv.db.count('notifications', (n) => n.userId === users.a1.id);
+      await admin.ok('POST', `/api/commandes/${legacy.id}/annuler`, { motif: 'test' });
+      assert.equal(srv.db.count('notifications', (n) => n.userId === users.a1.id), avant, 'utilisateur sans accès non notifié');
+      assert.ok(srv.db.findOne('notifications', (n) => n.userId === users.a2.id && n.lien === '#/achats/commande/' + legacy.id));
+    });
+
+    test('dates bornées : envoi et réception après la commande, facture non datée dans le futur', async () => {
+      const c = await cmdValidee(admin, { secteurId: MAINT.id, dateCommande: jour(-10) });
+      let r = await admin.post(`/api/commandes/${c.id}/envoyer`, { dateEnvoi: jour(-20) });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /précéder la date de commande/);
+      r = await admin.post(`/api/commandes/${c.id}/envoyer`, { dateEnvoi: jour(2) });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /futur/);
+      assert.equal((await admin.ok('POST', `/api/commandes/${c.id}/envoyer`, { dateEnvoi: jour(-5) })).dateEnvoi, jour(-5));
+      r = await admin.post(`/api/commandes/${c.id}/receptionner`, { lignes: [{ index: 0, quantite: 1 }], date: jour(-15) });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /précéder la date de commande/);
+      r = await admin.post('/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'FUT-1', montantHT: 10, dateFacture: '2030-06-01' });
+      assert.equal(r.status, 400); assert.match(r.body.erreur, /futur/);
+      assert.equal((await admin.post('/api/factures', { fournisseurId: fourR.id, secteurId: MAINT.id, numeroFournisseur: 'FUT-2', montantHT: 10, dateFacture: jour(1) })).status, 200, 'tolérance d\'un jour');
+      // Facture ancienne datée dans le futur : les autres champs restent modifiables
+      const legacy = srv.db.insert('factures', { numero: 'FAC-LEGACY-3', numeroFournisseur: 'LEG-3', fournisseurId: fourR.id, secteurId: MAINT.id, commandeId: null, statut: 'recue', dateFacture: '2031-01-01', dateEcheance: '2031-01-31', montantHT: 10, montantTVA: 2, montantTTC: 12, tauxTVA: 20, lignes: [], documents: [], commentaires: [], historique: [], createdBy: 1 });
+      assert.equal((await admin.put('/api/factures/' + legacy.id, { objet: 'x' })).status, 200);
+      assert.equal((await admin.put('/api/factures/' + legacy.id, { dateFacture: '2031-01-02' })).status, 400);
+    });
+
+    test('taux de réception en valeur ; compteurs de la pastille du menu', async () => {
+      const c = await cmdValidee(admin, { secteurId: MAINT.id, lignes: [{ designation: 'Câble (m)', quantite: 100, prixUnitaireHT: 0.9 }, { designation: 'Variateur', quantite: 1, prixUnitaireHT: 810 }] });
+      const r = await admin.ok('POST', `/api/commandes/${c.id}/receptionner`, { lignes: [{ index: 0, quantite: 100 }] });
+      assert.equal(r.tauxReception, 10, 'en valeur (90 € sur 900 €), pas en quantités (99 %)');
+      assert.equal((await admin.ok('POST', `/api/commandes/${c.id}/receptionner`, { lignes: [{ index: 1, quantite: 1 }] })).tauxReception, 100);
+      const k = await admin.ok('GET', '/api/achats/compteurs');
+      const t = await admin.ok('GET', '/api/achats/tableau');
+      assert.equal(k.commandesAValider, t.kpis.nbCommandesAValider);
+      assert.equal(k.facturesAValider, t.kpis.nbFacturesAValider);
+      assert.equal(k.facturesEnRetard, t.kpis.nbEnRetard);
+      assert.equal(k.total, k.commandesAValider + k.facturesAValider + k.facturesEnRetard);
+      const kc = await clients.chefprod.ok('GET', '/api/achats/compteurs');
+      assert.equal(kc.commandesAValider + kc.facturesAValider, 0, 'sans droit valider');
+      assert.equal((await clients.tech.get('/api/achats/compteurs')).status, 403);
+    });
+  });
 });

@@ -556,6 +556,132 @@ describe('Module Stock & pièces détachées', () => {
     assert.ok(srv.db.list('audit', (x) => x.action === 'reactivation' && x.entiteId === huile.id).length, 'réactivation auditée');
   });
 
+  test('retour en stock : le coût moyen pondéré est recalculé au prix de la sortie', async () => {
+    const a = await admin.ok('POST', '/api/articles', { designation: 'Joint SPI 40 × 62 × 7', uniteCode: 'u', quantite: 10, prixUnitaire: 10 });
+    const sortie = await admin.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 5, motif: 'Dépannage' });
+    assert.equal(sortie.mouvement.prixUnitaire, 10);
+    const entree = await admin.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'entree', quantite: 5, prixUnitaire: 20 });
+    assert.equal(entree.article.prixUnitaire, 15, 'CUMP après l\'entrée');
+    const retour = await admin.ok('POST', `/api/mouvements/${sortie.mouvement.id}/annuler`, {});
+    assert.equal(retour.mouvement.prixUnitaire, 10, 'retour valorisé au prix de la sortie');
+    assert.equal(retour.article.quantite, 15);
+    assert.equal(retour.article.prixUnitaire, 13.3333, 'CUMP = (10 × 15 + 5 × 10) / 15');
+    assert.equal(retour.article.valeur, 200, 'valeur du stock = 5 × 10 + 5 × 20 + 5 × 10');
+    assert.equal((await admin.ok('GET', '/api/articles/' + a.id)).valeur, 200);
+    // Même règle par le service (retour d'une sortie imputée à un OT)
+    const s = srv.ctx.services.stock;
+    const b = await admin.ok('POST', '/api/articles', { designation: 'Joint plat 60 × 80', uniteCode: 'u', quantite: 20, prixUnitaire: 8 });
+    const s2 = s.sortir({ articleId: b.id, quantite: 10, userId: 1, motif: 'Essai' });
+    assert.equal(s.entrer({ articleId: b.id, quantite: 10, userId: 1, prixUnitaire: 12 }).article.prixUnitaire, 10);
+    const r2 = s.annulerSortie(s2.mouvement.id, 1);
+    assert.equal(r2.article.quantite, 30);
+    assert.equal(r2.article.prixUnitaire, 9.3333, 'CUMP = (20 × 10 + 10 × 8) / 30');
+    await admin.ok('DELETE', '/api/articles/' + a.id);
+    await admin.ok('DELETE', '/api/articles/' + b.id);
+  });
+
+  test('article sans seuil (0) : jamais « sous le seuil », ni alerte, ni notification', async () => {
+    const alertesAvant = (await admin.ok('GET', '/api/stock-alertes')).length;
+    const valoAvant = await admin.ok('GET', '/api/stock-valorisation');
+    const a = await admin.ok('POST', '/api/articles', { designation: 'Joint torique 20 × 2 (non stocké)' });
+    assert.equal(a.seuilMin, 0);
+    assert.equal(a.quantite, 0);
+    assert.equal(a.sousSeuil, false, 'un article sans seuil n\'est pas en alerte');
+    assert.equal(a.quantiteACommander, 0);
+    assert.equal((await admin.ok('GET', '/api/stock-alertes')).length, alertesAvant, 'aucune alerte ajoutée');
+    assert.equal((await admin.ok('GET', '/api/stock-valorisation')).nbSousSeuil, valoAvant.nbSousSeuil);
+    assert.ok(!(await admin.ok('GET', '/api/articles?sousSeuil=1')).some((x) => x.id === a.id));
+    assert.ok(!srv.ctx.services.stock.alertes().some((x) => x.id === a.id), 'service alertes (tableau de bord)');
+    // Un article sans seuil qui s'épuise n'émet pas d'alerte de seuil
+    evenements.length = 0;
+    await admin.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'entree', quantite: 2, prixUnitaire: 1 });
+    const fin = await admin.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 2 });
+    assert.equal(fin.article.sousSeuil, false);
+    assert.equal(fin.article.rupture, true, 'la rupture (stock nul) reste signalée');
+    assert.equal(evenements.length, 0, 'pas d\'événement stock:sousSeuil sans seuil');
+    // Dès qu'un seuil est défini, la règle habituelle s'applique
+    const maj = await admin.ok('PUT', '/api/articles/' + a.id, { seuilMin: 1 });
+    assert.equal(maj.sousSeuil, true);
+    assert.ok((await admin.ok('GET', '/api/stock-alertes')).some((x) => x.id === a.id));
+    await admin.ok('DELETE', '/api/articles/' + a.id);
+  });
+
+  test('journal des mouvements : un OT hors de la portée du lecteur n\'est ni nommé ni cherchable', async () => {
+    const a = await admin.ok('POST', '/api/articles', { designation: 'Joint de presse (magasin central)', quantite: 10 });
+    const ot = srv.db.insert('ot', { numero: 'OT-CONF-0001', titre: 'Remplacement joint presse — incident sécurité', statut: 'en_cours', equipementId: autreSecteurEq.id, secteurId: maint.id, pieces: [], createdBy: 1 });
+    await admin.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 2, otId: ot.id });
+    assert.equal((await technicienProd.get('/api/ot/' + ot.id)).status, 404, 'OT invisible pour le technicien PROD');
+    const fiche = await technicienProd.ok('GET', '/api/articles/' + a.id);
+    const m = fiche.mouvements.find((x) => x.otId === ot.id);
+    assert.ok(m, 'le mouvement reste visible');
+    assert.equal(m.otMasque, true);
+    assert.equal(m.otNumero, '');
+    assert.equal(m.otTitre, 'Ordre de travail hors de votre périmètre');
+    assert.equal(m.motif, 'Ordre de travail hors de votre périmètre', 'motif par défaut « OT n° — titre » masqué');
+    assert.ok(!/incident sécurité|OT-CONF-0001/.test(JSON.stringify(fiche)), 'ni le titre ni le numéro ne fuient dans la fiche');
+    const liste = await technicienProd.ok('GET', '/api/mouvements?articleId=' + a.id);
+    assert.ok(liste.some((x) => x.otId === ot.id) && !/incident sécurité|OT-CONF-0001/.test(JSON.stringify(liste)));
+    assert.equal((await technicienProd.ok('GET', '/api/mouvements?recherche=OT-CONF-0001')).length, 0, 'la recherche ne permet pas de sonder un numéro d\'OT');
+    await admin.ok('PUT', '/api/utilisateurs/' + userId('tech.prod'), { overrides: { stock: { exporter: true } } });
+    const techExport = srv.client(); await techExport.login('tech.prod', 'motdepasse1');
+    const csv = await techExport.get('/api/mouvements-export?articleId=' + a.id);
+    assert.equal(csv.status, 200);
+    assert.ok(String(csv.body).includes('Hors périmètre') && !/incident sécurité|OT-CONF-0001/.test(String(csv.body)), 'export CSV masqué aussi');
+    // L'administrateur et l'intervenant affecté voient l'OT
+    assert.equal((await admin.ok('GET', '/api/articles/' + a.id)).mouvements.find((x) => x.otId === ot.id).otNumero, 'OT-CONF-0001');
+    srv.db.update('ot', ot.id, { technicienId: userId('tech.prod') });
+    const affecte = (await technicienProd.ok('GET', '/api/articles/' + a.id)).mouvements.find((x) => x.otId === ot.id);
+    assert.equal(affecte.otNumero, 'OT-CONF-0001', 'intervenant affecté : OT visible');
+    assert.equal(affecte.otMasque, false);
+    srv.db.remove('ot', ot.id);
+  });
+
+  test('numérotation : une création refusée ne consomme pas de code d\'article', async () => {
+    const compteur = () => srv.db.data.meta.numeros.art || 0;
+    const premier = await admin.ok('POST', '/api/articles', { designation: 'Article numéroté' });
+    const n = compteur();
+    assert.equal((await admin.post('/api/articles', { designation: '' })).status, 400);
+    assert.equal((await admin.post('/api/articles', { designation: 'X', seuilMin: -1 })).status, 400);
+    assert.equal((await admin.post('/api/articles', { designation: 'X', fournisseurId: 99999 })).status, 400);
+    assert.equal((await admin.post('/api/articles', { designation: 'X', quantite: -3 })).status, 400, 'quantité initiale invalide');
+    assert.equal(compteur(), n, 'aucun code consommé');
+    const suivant = await admin.ok('POST', '/api/articles', { designation: 'Article numéroté suivant' });
+    assert.equal(compteur(), n + 1);
+    assert.equal(Number(suivant.code.replace(/\D/g, '')), Number(premier.code.replace(/\D/g, '')) + 1, 'codes consécutifs');
+    await admin.ok('DELETE', '/api/articles/' + suivant.id);
+    await admin.ok('DELETE', '/api/articles/' + premier.id);
+  });
+
+  test('services : option silencieux pour les traitements en masse (mouvement enregistré, sans entrée de journal unitaire)', async () => {
+    const s = srv.ctx.services.stock;
+    const a = await admin.ok('POST', '/api/articles', { designation: 'Vis CHC M8 × 30 (boîte de 100)', quantite: 5 });
+    const nbAudit = () => srv.db.count('audit', (x) => x.action === 'mouvement' && x.entite === 'articles' && x.entiteId === a.id);
+    const avant = nbAudit();
+    const inv = s.inventorier({ articleId: a.id, quantite: 7, userId: 1, motif: 'Inventaire INV-0001', silencieux: true });
+    assert.equal(inv.mouvement.type, 'inventaire');
+    assert.equal(inv.article.quantite, 7);
+    assert.equal(s.entrer({ articleId: a.id, quantite: 3, userId: 1, motif: 'Réception', prixUnitaire: 2, silencieux: true }).article.quantite, 10);
+    assert.equal(s.sortir({ articleId: a.id, quantite: 1, userId: 1, motif: 'Lot', silencieux: true }).article.quantite, 9);
+    assert.equal(nbAudit(), avant, 'aucune entrée de journal pour les mouvements silencieux');
+    assert.equal(srv.db.count('mouvementsStock', (m) => m.articleId === a.id), 4, 'les mouvements sont bien enregistrés (stock initial + 3)');
+    s.inventorier({ articleId: a.id, quantite: 9, userId: 1, motif: 'Contrôle' });
+    assert.equal(nbAudit(), avant + 1, 'sans l\'option, le journal est alimenté');
+  });
+
+  test('nombres : seule l\'écriture décimale est acceptée pour une chaîne (ni hexadécimal, ni exposant)', async () => {
+    const a = await admin.ok('POST', '/api/articles', { designation: 'Rondelle M8', quantite: '12,5', seuilMin: ' 2 ', prixUnitaire: '0.4' });
+    assert.equal(a.quantite, 12.5, 'virgule décimale acceptée');
+    assert.equal(a.seuilMin, 2);
+    assert.equal(a.prixUnitaire, 0.4);
+    for (const [body, msg] of [[{ designation: 'X', seuilMin: '0x10' }, 'seuil hexadécimal'], [{ designation: 'X', quantite: '1e3' }, 'quantité en notation scientifique'], [{ designation: 'X', prixUnitaire: 'Infinity' }, 'prix infini']]) {
+      assert.equal((await admin.post('/api/articles', body)).status, 400, msg);
+    }
+    assert.equal((await admin.post(`/api/articles/${a.id}/mouvements`, { type: 'entree', quantite: '0x10' })).status, 400, 'quantité de mouvement hexadécimale');
+    assert.equal((await admin.post(`/api/articles/${a.id}/mouvements`, { type: 'entree', quantite: 1, prixUnitaire: '1e2' })).status, 400, 'prix de mouvement en notation scientifique');
+    assert.equal(srv.db.get('articles', a.id).quantite, 12.5, 'aucun mouvement enregistré après les refus');
+    await admin.ok('DELETE', '/api/articles/' + a.id);
+  });
+
   test('données de démonstration : idempotentes, 15 articles, 3 sous le seuil, journal cohérent', async () => {
     const s2 = await demarrer();
     try {

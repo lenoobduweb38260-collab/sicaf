@@ -57,6 +57,11 @@
     const f = l.filter((s) => s.final).map((s) => s.code);
     return (f.length ? f : ['termine', 'annule']).includes(code);
   }
+  /** Un statut d'OT est-il une annulation (statut final de la liste `statutsOT`) ? */
+  function otAnnule(code) {
+    const s = GMAO.liste('statutsOT').find((x) => x.code === code);
+    return !!(s && s.final && (s.code === 'annule' || /annul/i.test(s.label || '')));
+  }
   function codeParDefaut(liste, voulu) {
     const l = GMAO.liste(liste);
     if (!l.length) return voulu;
@@ -209,6 +214,16 @@
     selEq.addEventListener('change', majInfo);
     const priorites = GMAO.liste('priorites');
     const aidePriorite = priorites.filter((p) => p.delaiHeures).map((p) => `${p.label} : ${p.delaiHeures} h`).join(' · ');
+    // Encadrant (droit « modifier ») : choix du demandeur parmi les comptes actifs de son périmètre (même règle que le
+    // serveur : subordonné direct, secteur modifiable partagé ou compte sans secteur) ; avec la validation réservée au
+    // supérieur hiérarchique, le demandeur d'une demande soumise n'est changé que par son N+1 ou un administrateur
+    const verrouDemandeur = !creation && existant.statut === ST().soumise && !!wf().validerParSuperieurUniquement && !GMAO.estAdmin() && !existant.peutValider;
+    const designable = (u) => {
+      const p = GMAO.perms || {};
+      if (u.id === GMAO.user.id || (existant && u.id === existant.demandeurId) || p.estAdmin || p.portee === 'tous' || Number(u.managerId) === GMAO.user.id) return true;
+      const ids = (u.secteurIds || []).map(Number);
+      return !ids.length || ids.some((sid) => (p.secteurIds || []).includes(sid));
+    };
     const champs = [
       { nom: 'titre', label: 'Titre de la demande', type: 'texte', requis: true, pleineLargeur: true, placeholder: 'ex. Fuite d\'huile sur la presse hydraulique', maxLength: 200 },
       { type: 'html', label: 'Équipement concerné', rendu: (f) => { formRef = f; setTimeout(majInfo, 0); return frag(el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, rechercheEq, selEq), infoEq, doublons); } },
@@ -217,7 +232,7 @@
       { nom: 'prioriteCode', label: 'Priorité', type: 'select', requis: true, options: ui.optionsListe('priorites', { vide: false }), aide: aidePriorite ? 'Délais de traitement — ' + aidePriorite : '' },
       { nom: 'description', label: 'Description du problème', type: 'texte_long', lignes: 5, placeholder: 'Symptômes constatés, circonstances, conséquences pour la production…' },
       { nom: 'arretProduction', label: 'Arrêt de production (équipement immobilisé)', type: 'interrupteur', sansDecalage: true },
-      can('modifier') ? { nom: 'demandeurId', label: 'Demandeur', type: 'select', options: ui.optionsUsers({ vide: false }), aide: 'Par défaut : vous-même' } : null,
+      can('modifier') ? { nom: 'demandeurId', label: 'Demandeur', type: 'select', options: ui.optionsUsers({ vide: false, filtre: designable }), disabled: verrouDemandeur, aide: verrouDemandeur ? 'Validation réservée au supérieur hiérarchique : seul le supérieur du demandeur (ou un administrateur) peut changer le demandeur d\'une demande soumise' : 'Par défaut : vous-même' } : null,
       creation ? { nom: 'pieceJointe', label: 'Pièce jointe (photo, document — 5 Mo max.)', type: 'fichier', tailleMax: TAILLE_MAX_PJ } : null,
       ...ui.champsPersoDefs(ENTITE),
     ];
@@ -236,7 +251,7 @@
           champs: ui.champsPersoValeurs(v),
         };
         if (!creation && selEq.disabled) delete body.equipementId;
-        if (v.demandeurId !== undefined && v.demandeurId !== '' && v.demandeurId != null) body.demandeurId = v.demandeurId;
+        if (!verrouDemandeur && v.demandeurId !== undefined && v.demandeurId !== '' && v.demandeurId != null) body.demandeurId = v.demandeurId;
         if (creation && v.pieceJointe && v.pieceJointe.contenu) body.pieceJointes = [v.pieceJointe];
         const res = creation ? await api.post('/api/demandes', body) : await api.put('/api/demandes/' + existant.id, body);
         if (res.avertissement) toast(res.avertissement, 'alerte', 8000);
@@ -296,9 +311,16 @@
     });
   }
   async function reouvrirDemande(d, apres) {
+    // Un ordre de travail terminé ne redevient pas l'intervention en cours : il est réouvert d'abord (le serveur refuse sinon)
+    const statutOt = d.otStatut || (d.ot && d.ot.statut) || null;
+    const otTermine = !!(d.otId && statutOt && otFinal(statutOt) && !otAnnule(statutOt));
+    const numeroOt = d.otNumero || (d.ot && d.ot.numero) || '';
+    const message = d.statut === ST().refusee ? `La demande repassera au statut « ${ui.libelle('statutsDemande', ST().soumise)} » et sera de nouveau proposée aux valideurs.`
+      : otTermine ? `L'ordre de travail ${numeroOt} lié à cette demande est terminé : réouvrez d'abord l'ordre de travail depuis sa fiche, puis la demande ; sinon créez une nouvelle demande.`
+        : `La demande reprendra son statut précédent (« ${ui.libelle('statutsDemande', ST().validee)} », ou « ${ui.libelle('statutsDemande', ST().convertie)} » si un ordre de travail encore ouvert lui est lié).`;
     ui.formModal({
       titre: `Réouvrir la demande ${d.numero}`, taille: 'petite', colonnes: 1, submitLabel: 'Réouvrir',
-      avant: ui.alerte(d.statut === ST().refusee ? `La demande repassera au statut « ${ui.libelle('statutsDemande', ST().soumise)} » et sera de nouveau proposée aux valideurs.` : `La demande reprendra son statut précédent (« ${ui.libelle('statutsDemande', ST().validee)} » ou « ${ui.libelle('statutsDemande', ST().convertie)} » si un ordre de travail est lié).`, 'info'),
+      avant: ui.alerte(message, otTermine ? 'alerte' : 'info'),
       champs: [{ nom: 'commentaire', label: 'Motif de la réouverture (facultatif)', type: 'texte_long', lignes: 3 }],
       onSubmit: async (v) => {
         const r = await api.post(`/api/demandes/${d.id}/reouvrir`, { commentaire: v.commentaire });
@@ -392,11 +414,13 @@
     const tailleLisible = (t) => (t > 1024 * 1024 ? (t / 1024 / 1024).toFixed(1) + ' Mo' : Math.max(1, Math.round(t / 1024)) + ' Ko');
     for (const p of pjs) {
       const url = `/api/demandes/${d.id}/documents/${p.index}`;
+      // Suppression réservée à l'auteur de la pièce jointe, aux valideurs et aux administrateurs (indicateur calculé par le serveur)
+      const supprimable = p.supprimable !== undefined ? !!p.supprimable : !!(d.actions && d.actions.joindre);
       cont.appendChild(el('div', { class: 'inline', style: { gap: '10px', padding: '6px 0', borderBottom: '1px solid var(--bordure)', width: '100%' } },
         /^image\//.test(p.type || '') ? el('img', { src: url, alt: p.nom, style: { width: '48px', height: '48px', objectFit: 'cover', borderRadius: '6px', border: '1px solid var(--bordure)' } }) : el('span', { class: 'inline', style: { color: 'var(--primaire)', width: '48px', height: '48px', justifyContent: 'center', background: 'var(--primaire-clair)', borderRadius: '6px' } }, ico('piece_jointe', 22)),
         el('div', { style: { flex: 1, minWidth: 0 } }, el('a', { href: url, target: '_blank', class: 'texte-gras' }, p.nom), el('div', { class: 'texte-2 texte-petit' }, [p.description, tailleLisible(p.taille), `${p.userNom || ''} · ${ui.formatDateHeure(p.date)}`].filter(Boolean).join(' · '))),
         el('a', { href: url + '?telecharger=1', class: 'btn btn-icone btn-sm', title: 'Télécharger' }, icone('export')),
-        d.actions && d.actions.joindre ? el('button', { type: 'button', class: 'btn btn-icone btn-sm texte-danger', title: 'Supprimer', onclick: async () => {
+        supprimable ? el('button', { type: 'button', class: 'btn btn-icone btn-sm texte-danger', title: 'Supprimer', onclick: async () => {
           if (!(await ui.confirm({ titre: 'Supprimer la pièce jointe', message: `Supprimer « ${p.nom} » ?`, okLabel: 'Supprimer', danger: true }))) return;
           try { await api.del(`/api/demandes/${d.id}/documents/${p.index}`); toast('Pièce jointe supprimée', 'succes'); recharger(); } catch (e) { erreur(e); }
         } }, icone('supprimer')) : null));

@@ -133,7 +133,8 @@
     const actions = [];
     if (voir('demandes') && GMAO.can('demandes', 'creer')) actions.push(ui.bouton('Nouvelle demande', { icone: 'plus', classe: 'btn-primaire', onClic: aller('#/demandes?nouveau=1') }));
     if (voir('ot') && GMAO.can('ot', 'creer')) actions.push(ui.bouton('Nouvel OT', { icone: 'ot', classe: actions.length ? '' : 'btn-primaire', onClic: aller('#/ot?nouveau=1') }));
-    if (voir('stock') && (GMAO.can('stock', 'modifier') || GMAO.can('stock', 'creer'))) actions.push(ui.bouton('Entrée de stock', { icone: 'stock', onClic: aller('#/stock') }));
+    // Raccourci vers le stock : la vue Stock ne propose pas d'ouverture directe du formulaire d'entrée, le libellé ne la promet donc pas
+    if (voir('stock') && (GMAO.can('stock', 'modifier') || GMAO.can('stock', 'creer'))) actions.push(ui.bouton(GMAO.moduleLabel('stock') || 'Stock & pièces', { icone: 'stock', onClic: aller('#/stock') }));
     if (voir('planning')) actions.push(ui.bouton('Planning', { icone: 'planning', onClic: aller('#/planning') }));
 
     return el('div', { class: 'carte', style: { display: 'flex', gap: '16px', alignItems: 'flex-start', flexWrap: 'wrap', background: 'linear-gradient(120deg, var(--primaire-clair) 0%, var(--surface) 62%)' } },

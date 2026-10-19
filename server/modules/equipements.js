@@ -6,7 +6,12 @@
  *
  * Services publiés : ctx.services.equipements.releverCompteur(equipementId, valeur, req)
  * Événements émis  : 'equipement:etat' ({ equipement, ancien, nouveau }),
- *                    'equipement:compteur' ({ equipement, ancien, nouveau })
+ *                    'equipement:compteur' ({ equipement, ancien, nouveau }),
+ *                    'equipement:modifie' ({ equipement, ancien, secteur }) — `secteur` décrit un changement de
+ *                    secteur ({ ancien, nouveau, equipementIds, ot, plans, demandes }) ou vaut null.
+ * Changement de secteur : les OT non clôturés, les plans préventifs et les demandes non closes de l'équipement
+ * (et de ses sous-équipements déplacés) reprennent le nouveau secteur, puisque la portée des autres modules
+ * repose sur le secteurId copié de l'équipement.
  */
 const nom = 'Équipements';
 const ENTITE = 'equipements';
@@ -17,6 +22,26 @@ const UNITES_COMPTEUR = ['heures', 'cycles', 'km', 'pièces', 'tonnes', 'm³', '
 function csvEscape(v) {
   const s = v == null ? '' : String(v).replace(/\r?\n/g, ' ');
   return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+const pad = (n) => String(n).padStart(2, '0');
+/** Jour local « AAAA-MM-JJ » : les dates du calendrier (garantie) se comparent au jour local, jamais au jour UTC. */
+function jourLocal(d) { d = d || new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+/**
+ * Nombre strict : un nombre fini, ou une chaîne décimale (virgule acceptée) ; NaN pour tout le reste
+ * (booléens, tableaux, notation hexadécimale ou scientifique…), que Number() convertirait en silence.
+ */
+function nombreStrict(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : NaN;
+  if (typeof v === 'string' && /^\s*-?\d+(?:[.,]\d+)?\s*$/.test(v)) return Number(v.trim().replace(',', '.'));
+  return NaN;
+}
+const RE_HORODATAGE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+/** Date d'un relevé : chaîne « AAAA-MM-JJ » (minuit local) ou horodatage ISO 8601 ; null si invalide. */
+function dateReleve(v) {
+  if (typeof v !== 'string' || !RE_HORODATAGE.test(v.trim())) return null;
+  const s = v.trim();
+  const d = s.length === 10 ? new Date(Number(s.slice(0, 4)), Number(s.slice(5, 7)) - 1, Number(s.slice(8, 10))) : new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 function register(ctx) {
@@ -48,6 +73,14 @@ function register(ctx) {
   }
 
   // ----- Utilitaires ------------------------------------------------------
+  /** Texte libre : seule une chaîne est acceptée (booléens, tableaux et objets refusés ; nombre toléré sur demande). */
+  function chaine(v, libelle, { max = 0, nombreAccepte = false } = {}) {
+    if (v == null) return '';
+    if (typeof v !== 'string' && !(nombreAccepte && typeof v === 'number' && Number.isFinite(v))) throw new HttpError(400, `${libelle} : valeur invalide (texte attendu)`);
+    const s = String(v).trim();
+    if (max && s.length > max) throw new HttpError(400, `${libelle} : ${max} caractères maximum`);
+    return s;
+  }
   function statutsOtFinaux() {
     const l = ctx.liste('statutsOT');
     return new Set(l.length ? l.filter((s) => s.final).map((s) => s.code) : ['termine', 'annule']);
@@ -131,7 +164,7 @@ function register(ctx) {
     const base = resume(e, new Map([[e.id, ot.filter((o) => !finauxOt.has(o.statut)).length]]));
     const parent = e.parentId != null ? db.get(ENTITE, e.parentId) : null;
     const fournisseur = e.fournisseurId != null ? db.get('fournisseurs', e.fournisseurId) : null;
-    const garantie = e.garantieFin ? (e.garantieFin < new Date().toISOString().slice(0, 10) ? 'expiree' : 'valide') : null;
+    const garantie = e.garantieFin ? (e.garantieFin < jourLocal() ? 'expiree' : 'valide') : null;
     return Object.assign(base, {
       parent: parent ? { id: parent.id, numero: parent.numero, nom: parent.nom } : null,
       chemin: ancetres(e).map((a) => ({ id: a.id, numero: a.numero, nom: a.nom })),
@@ -180,23 +213,19 @@ function register(ctx) {
   function valider(req, body, existant) {
     body = body && typeof body === 'object' ? body : {};
     const out = {};
-    const texte = (cle, max, libelle) => {
-      const v = body[cle] === undefined ? (existant ? existant[cle] : '') : body[cle];
-      if (v != null && typeof v === 'object') throw new HttpError(400, `${libelle || cle} invalide`);
-      const s = String(v == null ? '' : v).trim();
-      if (s.length > max) throw new HttpError(400, `${libelle || cle} : ${max} caractères maximum`);
-      return s;
-    };
+    // Un numéro de série est souvent numérique : c'est le seul texte où un nombre est toléré
+    const texte = (cle, max, libelle) => chaine(body[cle] === undefined ? (existant ? existant[cle] : '') : body[cle], libelle || cle, { max, nombreAccepte: cle === 'numeroSerie' });
     out.nom = texte('nom', 150, 'La désignation');
     if (!out.nom) throw new HttpError(400, 'La désignation de l\'équipement est obligatoire');
 
-    // Numéro : saisi (unique) ou généré
-    if (body.numero !== undefined && String(body.numero || '').trim() !== '') {
-      const n = String(body.numero).trim();
-      if (n.length > 30) throw new HttpError(400, 'Le numéro ne doit pas dépasser 30 caractères');
-      if (!numeroUnique(n, existant)) throw new HttpError(400, `Le numéro « ${n} » est déjà utilisé par un autre équipement`);
-      out.numero = n;
-    } else if (!existant) out.numero = genererNumero();
+    // Numéro : saisi (unique) ou généré — la génération attend la fin des contrôles, pour qu'une création refusée
+    // ne consomme pas de numéro (le compteur de numérotation n'est jamais remis en arrière)
+    let numeroAGenerer = false;
+    const numero = body.numero === undefined ? '' : chaine(body.numero, 'Le numéro', { max: 30, nombreAccepte: true });
+    if (numero) {
+      if (!numeroUnique(numero, existant)) throw new HttpError(400, `Le numéro « ${numero} » est déjà utilisé par un autre équipement`);
+      out.numero = numero;
+    } else if (!existant) numeroAGenerer = true;
 
     out.description = texte('description', 5000, 'La description');
     out.localisation = texte('localisation', 200, 'La localisation');
@@ -243,22 +272,52 @@ function register(ctx) {
     }
     const va = body.valeurAchat === undefined ? (existant ? existant.valeurAchat : null) : body.valeurAchat;
     if (va == null || va === '') out.valeurAchat = null;
-    else { const n = Number(va); if (!Number.isFinite(n) || n < 0) throw new HttpError(400, 'La valeur d\'achat doit être un nombre positif'); out.valeurAchat = n; }
+    else { const n = nombreStrict(va); if (!Number.isFinite(n) || n < 0) throw new HttpError(400, 'La valeur d\'achat doit être un nombre positif'); out.valeurAchat = n; }
 
     // Compteur { valeur, unite }
     const cpt = body.compteur === undefined ? (existant ? existant.compteur : null) : body.compteur;
     if (cpt == null || cpt === '') out.compteur = existant && existant.compteur ? existant.compteur : { valeur: 0, unite: 'heures' };
     else {
-      if (typeof cpt !== 'object') throw new HttpError(400, 'Compteur invalide');
-      const val = cpt.valeur == null || cpt.valeur === '' ? 0 : Number(cpt.valeur);
+      if (typeof cpt !== 'object' || Array.isArray(cpt)) throw new HttpError(400, 'Compteur invalide');
+      const val = cpt.valeur == null || cpt.valeur === '' ? 0 : nombreStrict(cpt.valeur);
       if (!Number.isFinite(val) || val < 0) throw new HttpError(400, 'La valeur du compteur doit être un nombre positif');
-      const unite = String(cpt.unite == null ? '' : cpt.unite).trim().slice(0, 20) || 'heures';
+      const unite = chaine(cpt.unite, 'L\'unité du compteur').slice(0, 20) || 'heures';
       out.compteur = { valeur: val, unite };
     }
 
     out.actif = body.actif === undefined ? (existant ? existant.actif !== false : true) : !!body.actif;
     if (body.champs !== undefined || !existant) out.champs = ctx.champsPerso(ENTITE, body.champs || (existant && existant.champs) || {});
+    if (numeroAGenerer) out.numero = genererNumero();
     return out;
+  }
+
+  /**
+   * Changement de secteur d'un équipement : les OT non clôturés, les plans préventifs et les demandes non closes
+   * des équipements déplacés reprennent le nouveau secteur. La portée des autres modules repose sur le secteurId
+   * de chaque enregistrement (copié de l'équipement) : sans cette reprise, les techniciens du nouveau secteur ne
+   * verraient ni les OT en cours ni les plans. Les éléments clôturés gardent le secteur de l'époque.
+   * @returns {{ ot: number, plans: number, demandes: number }} nombre d'éléments rattachés au nouveau secteur
+   */
+  function propagerSecteur(req, equipement, equipementIds, nouveau) {
+    const ids = new Set(equipementIds.map(Number));
+    const finauxOt = statutsOtFinaux();
+    const finauxDi = statutsDemandeFinaux();
+    const lib = (s) => cheminSecteur(s) || '—';
+    const cibles = [
+      ['ot', 'ot', (o) => !finauxOt.has(o.statut), (o) => `OT ${o.numero || o.id}`],
+      ['plansPreventifs', 'plans', () => true, (p) => `Plan ${p.numero || p.id}${p.nom ? ' : ' + p.nom : ''}`],
+      ['demandes', 'demandes', (d) => !finauxDi.has(d.statut), (d) => `Demande ${d.numero || d.id}`],
+    ];
+    const bilan = { ot: 0, plans: 0, demandes: 0 };
+    for (const [collection, cle, retenu, libelle] of cibles) {
+      for (const x of db.list(collection, (x) => x.equipementId != null && ids.has(Number(x.equipementId)) && retenu(x))) {
+        if (x.secteurId != null && Number(x.secteurId) === Number(nouveau)) continue;
+        db.update(collection, x.id, { secteurId: nouveau });
+        bilan[cle]++;
+        ctx.audit(req, 'modification', collection, x.id, `${libelle(x)} : secteur ${lib(x.secteurId)} → ${lib(nouveau)} (déplacement de l'équipement ${equipement.numero})`, { notifier: false });
+      }
+    }
+    return bilan;
   }
 
   // ----- Filtres de liste -------------------------------------------------
@@ -346,7 +405,7 @@ function register(ctx) {
       ].concat(champs.map((c) => { const v = (r.champs || {})[c.cle]; return v == null ? '' : (typeof v === 'boolean' ? (v ? 'Oui' : 'Non') : v); })).map(csvEscape).join(';'));
     }
     ctx.audit(req, 'export', ENTITE, null, `${lignes.length - 1} équipement(s)`);
-    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="equipements-${new Date().toISOString().slice(0, 10)}.csv"` });
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="equipements-${jourLocal()}.csv"` });
     res.end(lignes.join('\r\n'));
   }, { perm: [ENTITE, 'exporter'] });
 
@@ -368,13 +427,22 @@ function register(ctx) {
     verifierPorteeEcriture(req, existant.secteurId);
     const data = valider(req, req.body, existant);
     const e = db.update(ENTITE, existant.id, data);
-    // Changement de secteur : les sous-équipements qui suivaient le parent sont déplacés avec lui
-    if (existant.secteurId !== e.secteurId) {
-      for (const id of descendants(e.id)) { const c = db.get(ENTITE, id); if (c && Number(c.secteurId) === Number(existant.secteurId)) db.update(ENTITE, id, { secteurId: e.secteurId }); }
+    let detailsAudit = `Équipement ${e.numero} ${e.nom}`;
+    let secteur = null;
+    if (Number(existant.secteurId) !== Number(e.secteurId)) {
+      // Changement de secteur : les sous-équipements qui suivaient le parent sont déplacés avec lui,
+      // puis les OT, plans et demandes des équipements déplacés reprennent le nouveau secteur
+      const deplaces = [e.id];
+      for (const id of descendants(e.id)) { const c = db.get(ENTITE, id); if (c && Number(c.secteurId) === Number(existant.secteurId)) { db.update(ENTITE, id, { secteurId: e.secteurId }); deplaces.push(id); } }
+      secteur = Object.assign({ ancien: existant.secteurId, nouveau: e.secteurId, equipementIds: deplaces }, propagerSecteur(req, e, deplaces, e.secteurId));
+      const rattaches = [secteur.ot ? `${secteur.ot} OT` : '', secteur.plans ? `${secteur.plans} plan(s) préventif(s)` : '', secteur.demandes ? `${secteur.demandes} demande(s)` : ''].filter(Boolean);
+      detailsAudit += ` : secteur ${cheminSecteur(existant.secteurId) || '—'} → ${cheminSecteur(e.secteurId) || '—'}${deplaces.length > 1 ? ` avec ${deplaces.length - 1} sous-équipement(s)` : ''}${rattaches.length ? ` (${rattaches.join(', ')} rattachés au nouveau secteur)` : ''}`;
     }
-    ctx.audit(req, 'modification', ENTITE, e.id, `Équipement ${e.numero} ${e.nom}`);
+    ctx.audit(req, 'modification', ENTITE, e.id, detailsAudit);
     if (existant.etatCode !== e.etatCode) changerEtat(req, existant, e.etatCode, '', true);
-    return detail(req, db.get(ENTITE, e.id));
+    const maj = db.get(ENTITE, e.id);
+    ctx.emit('equipement:modifie', { equipement: maj, ancien: existant, secteur, userId: req.user.id });
+    return detail(req, maj);
   }, { perm: [ENTITE, 'modifier'] });
 
   router.delete('/api/equipements/:id', async (req) => {
@@ -402,10 +470,10 @@ function register(ctx) {
     const source = getVisible(req, req.params.id);
     verifierPorteeEcriture(req, source.secteurId);
     const b = req.body && typeof req.body === 'object' ? req.body : {};
-    const { id, createdAt, updatedAt, documents, compteurReleves, historiqueEtats, ...reste } = source;
+    // Le numéro de la copie est généré par valider(), après les contrôles : une duplication refusée n'en consomme pas
+    const { id, createdAt, updatedAt, documents, compteurReleves, historiqueEtats, numero, ...reste } = source;
     const copie = Object.assign(reste, {
-      numero: genererNumero(),
-      nom: String(b.nom || '').trim() || `${source.nom} (copie)`,
+      nom: chaine(b.nom, 'La désignation', { max: 150 }) || `${source.nom} (copie)`,
       numeroSerie: '',
       compteur: { valeur: 0, unite: (source.compteur || {}).unite || 'heures' },
       compteurReleves: [], historiqueEtats: [], documents: [],
@@ -445,7 +513,7 @@ function register(ctx) {
     const b = req.body || {};
     if (b.etatCode == null || b.etatCode === '') throw new HttpError(400, 'Le nouvel état est obligatoire');
     const etatCode = codeListe('etatsEquipement', b.etatCode, 'État');
-    const commentaire = String(b.commentaire == null ? '' : b.commentaire).trim().slice(0, 1000);
+    const commentaire = chaine(b.commentaire, 'Le commentaire').slice(0, 1000);
     if (etatCode === existant.etatCode) throw new HttpError(400, 'L\'équipement est déjà dans cet état');
     const e = changerEtat(req, existant, etatCode, commentaire, false);
     return detail(req, e);
@@ -456,13 +524,19 @@ function register(ctx) {
     const e = db.get(ENTITE, equipementId);
     if (!e) throw new HttpError(404, 'Équipement introuvable');
     if (req && req.perms && !peutVoir(req, e)) throw new HttpError(404, 'Équipement introuvable');
-    const v = Number(valeur);
+    // Valeur et date strictement typées : Number(true), Number([4321]) ou new Date(true) donneraient un relevé absurde
+    const v = nombreStrict(valeur);
     if (!Number.isFinite(v) || v < 0) throw new HttpError(400, 'La valeur du compteur doit être un nombre positif');
     let date = new Date().toISOString();
-    if (options.date) { const d = new Date(options.date); if (Number.isNaN(d.getTime())) throw new HttpError(400, 'Date de relevé invalide'); if (d.getTime() > Date.now() + 60000) throw new HttpError(400, 'La date du relevé ne peut pas être dans le futur'); date = d.toISOString(); }
+    if (options.date != null && options.date !== '') {
+      const d = dateReleve(options.date);
+      if (!d) throw new HttpError(400, 'Date de relevé invalide (format attendu AAAA-MM-JJ ou AAAA-MM-JJTHH:MM)');
+      if (d.getTime() > Date.now() + 60000) throw new HttpError(400, 'La date du relevé ne peut pas être dans le futur');
+      date = d.toISOString();
+    }
     const ancien = (e.compteur || {}).valeur || 0;
     const userId = req && req.user ? req.user.id : null;
-    const releve = { date, valeur: v, userId, commentaire: String(options.commentaire || '').trim().slice(0, 500), otId: options.otId == null ? null : Number(options.otId) };
+    const releve = { date, valeur: v, userId, commentaire: chaine(options.commentaire, 'Le commentaire').slice(0, 500), otId: options.otId == null ? null : Number(options.otId) };
     const releves = (e.compteurReleves || []).concat([releve]).sort((a, b) => String(a.date).localeCompare(String(b.date))).slice(-1000);
     const dernier = releves[releves.length - 1];
     const maj = db.update(ENTITE, e.id, { compteur: { valeur: dernier.valeur, unite: (e.compteur || {}).unite || 'heures' }, compteurReleves: releves });
@@ -485,8 +559,9 @@ function register(ctx) {
     const existant = getVisible(req, req.params.id);
     verifierPorteeEcriture(req, existant.secteurId);
     const b = req.body && typeof req.body === 'object' ? req.body : {};
-    const nomDoc = String(b.nom || '').trim().replace(/[\\/:*?"<>|]/g, '_').slice(0, 150);
+    const nomDoc = chaine(b.nom, 'Le nom du document').replace(/[\\/:*?"<>|]/g, '_').slice(0, 150);
     if (!nomDoc) throw new HttpError(400, 'Le nom du document est obligatoire');
+    const description = chaine(b.description, 'La description').slice(0, 500);
     const contenu = typeof b.contenu === 'string' ? b.contenu : '';
     const m = /^data:([\w.+-]+\/[\w.+-]+)?(?:;[\w-]+=[\w-]+)*;base64,([A-Za-z0-9+/=\s]*)$/.exec(contenu);
     if (!m) throw new HttpError(400, 'Contenu du document invalide (données base64 attendues)');
@@ -496,8 +571,8 @@ function register(ctx) {
     if (taille > TAILLE_MAX_DOC) throw new HttpError(400, `Document trop volumineux (${(taille / 1024 / 1024).toFixed(1)} Mo, maximum 5 Mo)`);
     const docs = existant.documents || [];
     if (docs.length >= MAX_DOCS) throw new HttpError(400, `Nombre maximal de documents atteint (${MAX_DOCS})`);
-    const type = String(b.type || m[1] || 'application/octet-stream').slice(0, 100);
-    const doc = { nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, date: new Date().toISOString(), userId: req.user.id, description: String(b.description || '').trim().slice(0, 500) };
+    const type = (typeof b.type === 'string' && b.type.trim() ? b.type.trim() : (m[1] || 'application/octet-stream')).slice(0, 100);
+    const doc = { nom: nomDoc, type, taille, contenu: `data:${m[1] || type};base64,${base64}`, date: new Date().toISOString(), userId: req.user.id, description };
     const e = db.update(ENTITE, existant.id, { documents: docs.concat([doc]) });
     ctx.audit(req, 'document', ENTITE, e.id, `Document ajouté à ${e.numero} : ${nomDoc} (${Math.round(taille / 1024)} Ko)`);
     return { ok: true, document: resumeDoc(doc, e.documents.length - 1), documents: e.documents.map(resumeDoc) };

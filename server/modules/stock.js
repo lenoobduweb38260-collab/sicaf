@@ -13,8 +13,11 @@
  * Routes : /api/articles (CRUD + mouvements), /api/mouvements, /api/mouvements/:id/annuler,
  *          /api/stock-alertes, /api/stock-valorisation, /api/stock-references,
  *          /api/articles-export, /api/mouvements-export.
- * Services publiés : ctx.services.stock = { sortir, entrer, annulerSortie, inventorier, … }.
- * Événement émis : 'stock:sousSeuil' (article) lors du passage sous le seuil minimum.
+ * Services publiés : ctx.services.stock = { sortir, entrer, annulerSortie, inventorier, … }. Un traitement en
+ *          masse (validation d'inventaire, réception de commande) passe { silencieux: true } : le mouvement est
+ *          enregistré sans entrée de journal unitaire, l'appelant écrivant sa propre entrée récapitulative.
+ * Événement émis : 'stock:sousSeuil' (article) lors du passage sous le seuil minimum ; un article sans seuil
+ *          (0) n'est pas suivi. Dans le journal des mouvements, un OT hors de la portée du lecteur est masqué.
  */
 const nom = 'Stock & pièces détachées';
 const ENTITE = 'articles';
@@ -39,8 +42,8 @@ function csvEscape(v) {
 }
 const csvNombre = (n) => (n == null || n === '' ? '' : String(arrondi(n, 4)).replace('.', ','));
 
-/** Quantité en dessous (ou au niveau) du seuil minimum. */
-function estSousSeuil(a) { return num(a.quantite) <= num(a.seuilMin); }
+/** Quantité en dessous (ou au niveau) du seuil minimum. Un article sans seuil (0) n'est pas suivi : jamais en alerte. */
+function estSousSeuil(a) { return num(a.seuilMin) > 0 && num(a.quantite) <= num(a.seuilMin); }
 /** Quantité à commander = max(quantiteCommande, seuilMin × 2 − quantite). */
 function quantiteACommander(a) { return arrondi(Math.max(num(a.quantiteCommande), num(a.seuilMin) * 2 - num(a.quantite), 0)); }
 /** Valeur du stock (une quantité négative n'est pas valorisée). */
@@ -72,7 +75,9 @@ function register(ctx) {
       return defaut;
     }
     if (typeof v !== 'number' && typeof v !== 'string') throw new HttpError(400, `${label} : nombre attendu`);
-    const n = typeof v === 'number' ? v : Number(String(v).replace(',', '.').trim());
+    // Chaîne : écriture décimale seulement (virgule acceptée) ; Number() accepterait l'hexadécimal ou l'exposant
+    if (typeof v === 'string' && !/^\s*-?\d+(?:[.,]\d+)?\s*$/.test(v)) throw new HttpError(400, `${label} : nombre attendu`);
+    const n = typeof v === 'number' ? v : Number(v.replace(',', '.').trim());
     if (!Number.isFinite(n)) throw new HttpError(400, `${label} : nombre attendu`);
     if (strictPositif && !(n > 0)) throw new HttpError(400, `${label} : la valeur doit être supérieure à 0`);
     if (min != null && n < min) throw new HttpError(400, `${label} : la valeur ne peut pas être négative`);
@@ -137,14 +142,36 @@ function register(ctx) {
     });
   }
 
-  function enrichirMouvement(m, refs) {
+  /** Même règle que le module OT : droit de consultation, portée, ou OT dont le lecteur est créateur ou intervenant. */
+  function otVisible(req, o) {
+    if (!req || !req.perms) return true; // appel interne (service)
+    if (!perms.can(req.perms, 'ot', 'voir')) return false;
+    if (ctx.canSee(req, o)) return true;
+    const uid = Number(req.user.id);
+    return Number(o.createdBy) === uid || Number(o.technicienId) === uid || (Array.isArray(o.techniciens) && o.techniciens.map(Number).includes(uid));
+  }
+  const OT_HORS_PORTEE = 'Ordre de travail hors de votre périmètre';
+  /** Retire d'un motif le numéro et le titre d'un OT que le lecteur ne peut pas consulter (motif « OT n° — titre » des sorties). */
+  function masquerMotif(motif, o) {
+    let s = String(motif == null ? '' : motif);
+    const re = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const numero = String(o.numero == null ? '' : o.numero).trim();
+    const titre = String(o.titre == null ? '' : o.titre).trim();
+    if (numero) s = s.replace(new RegExp(`(?:OT\\s+)?${re(numero)}(?:\\s+—\\s+${titre ? re(titre) : ''})?`, 'gi'), OT_HORS_PORTEE);
+    if (titre.length >= 2) s = s.replace(new RegExp(re(titre), 'gi'), '…');
+    return s;
+  }
+
+  function enrichirMouvement(m, refs, req) {
     const a = refs.articles.get(Number(m.articleId));
     const o = m.otId != null ? refs.ot.get(Number(m.otId)) : null;
+    const otMasque = !!(o && !otVisible(req, o));
     const f = m.fournisseurId != null ? refs.fournisseurs.get(Number(m.fournisseurId)) : null;
     return Object.assign({}, m, {
       articleCode: a ? a.code || '' : '', articleDesignation: a ? a.designation || '' : '(article supprimé)', uniteCode: a ? uniteCode(a) : '',
       userNom: m.userId != null ? refs.users.get(Number(m.userId)) || '' : '',
-      otNumero: o ? o.numero || '' : '', otTitre: o ? o.titre || '' : '',
+      otNumero: o && !otMasque ? o.numero || '' : '', otTitre: otMasque ? OT_HORS_PORTEE : (o ? o.titre || '' : ''), otMasque,
+      motif: otMasque ? masquerMotif(m.motif, o) : m.motif,
       fournisseurNom: f ? f.nom || '' : '',
       ecart: m.ecart != null ? m.ecart : arrondi(num(m.quantiteApres) - num(m.quantiteAvant)),
       valeur: arrondi(num(m.quantite) * num(m.prixUnitaire), 2),
@@ -210,7 +237,7 @@ function register(ctx) {
     if (au) rows = rows.filter((m) => String(m.date) <= au);
     const refs = references();
     const termes = normaliser(q.recherche).split(/\s+/).filter(Boolean);
-    let out = rows.sort(parDateDesc).map((m) => enrichirMouvement(m, refs));
+    let out = rows.sort(parDateDesc).map((m) => enrichirMouvement(m, refs, req));
     if (termes.length) out = out.filter((m) => { const t = normaliser([m.articleCode, m.articleDesignation, m.motif, m.otNumero, m.userNom, m.fournisseurNom].join(' ')); return termes.every((x) => t.includes(x)); });
     return out;
   }
@@ -241,16 +268,18 @@ function register(ctx) {
     const pris = (k) => (b[k] === undefined && existant ? existant[k] : b[k]);
     const out = {};
 
-    // Code (automatique si vide à la création)
+    // Code saisi, ou généré à la fin des contrôles (une création refusée ne consomme pas de numéro)
+    let codeAGenerer = false;
     if (b.code !== undefined || !existant) {
-      let code = texte(b.code, 'Code', { max: 50 });
+      const code = texte(b.code, 'Code', { max: 50 });
       if (!code) {
         if (existant) throw new HttpError(400, 'Code : champ obligatoire');
-        code = nouveauCode();
+        codeAGenerer = true;
+      } else {
+        if (/[\u0000-\u001f]/.test(code)) throw new HttpError(400, 'Code : caractères invalides');
+        if (codeExiste(code, existant ? existant.id : null)) throw new HttpError(400, `Le code « ${code} » est déjà utilisé par un autre article`);
+        out.code = code;
       }
-      if (/[\u0000-\u001f]/.test(code)) throw new HttpError(400, 'Code : caractères invalides');
-      if (codeExiste(code, existant ? existant.id : null)) throw new HttpError(400, `Le code « ${code} » est déjà utilisé par un autre article`);
-      out.code = code;
     }
     out.designation = texte(pris('designation'), 'Désignation', { requis: true, max: 200 });
     out.description = texte(pris('description'), 'Description', { max: 5000 });
@@ -314,6 +343,7 @@ function register(ctx) {
       if (b.champs != null && (typeof b.champs !== 'object' || Array.isArray(b.champs))) throw new HttpError(400, 'Champs personnalisés invalides');
       out.champs = ctx.champsPerso(ENTITE, b.champs || (existant && existant.champs) || {});
     }
+    if (codeAGenerer) out.code = nouveauCode();
     return out;
   }
 
@@ -343,7 +373,7 @@ function register(ctx) {
    * Enregistre un mouvement et met à jour la quantité de l'article.
    * @returns {{ mouvement, article }}
    */
-  function enregistrer({ articleId, type, quantite, motif, prixUnitaire, prixMouvement, fournisseurId, otId, userId, req, origineId, refuserInactif }) {
+  function enregistrer({ articleId, type, quantite, motif, prixUnitaire, prixMouvement, fournisseurId, otId, userId, req, origineId, refuserInactif, silencieux }) {
     if (!TYPES_MOUVEMENT[type]) throw new HttpError(400, 'Type de mouvement invalide');
     const article = db.get(ENTITE, articleId);
     if (!article) throw new HttpError(404, 'Article introuvable');
@@ -353,6 +383,8 @@ function register(ctx) {
     // Toutes les validations AVANT la moindre écriture
     const motifTexte = texte(motif, 'Motif', { max: 500 });
     const prixEntree = type === 'entree' && prixUnitaire != null && prixUnitaire !== '' ? nombre(prixUnitaire, 'Prix unitaire', { max: 1e8 }) : null;
+    // Un retour en stock revient à la valeur de sa sortie : il pèse dans le coût moyen comme une entrée à ce prix
+    const prixValorise = prixEntree != null ? prixEntree : (type === 'retour' && prixMouvement != null ? num(prixMouvement) : null);
     const avant = arrondi(num(article.quantite));
     const unite = uniteCode(article);
     let apres;
@@ -367,11 +399,11 @@ function register(ctx) {
     const maintenant = new Date().toISOString();
     const patch = { quantite: apres };
     let pu = prixMouvement != null ? num(prixMouvement) : num(article.prixUnitaire);
-    if (prixEntree != null) {
+    if (prixValorise != null) {
       // Coût unitaire moyen pondéré (CUMP)
       const base = Math.max(0, avant);
-      patch.prixUnitaire = base + q > 0 ? arrondi((base * num(article.prixUnitaire) + q * prixEntree) / (base + q), 4) : prixEntree;
-      pu = prixEntree;
+      patch.prixUnitaire = base + q > 0 ? arrondi((base * num(article.prixUnitaire) + q * prixValorise) / (base + q), 4) : prixValorise;
+      pu = prixValorise;
     }
     if (type === 'inventaire') patch.dateDernierInventaire = maintenant;
     const maj = db.update(ENTITE, article.id, patch);
@@ -388,11 +420,11 @@ function register(ctx) {
       entree: `entrée de ${frNombre(q)} ${unite}`, sortie: `sortie de ${frNombre(q)} ${unite}`, retour: `retour en stock de ${frNombre(q)} ${unite}`,
       inventaire: `inventaire, quantité constatée ${frNombre(q)} ${unite} (écart ${ecartTxt})`,
     }[type].replace(/\s+/g, ' ').trim();
-    ctx.audit(req || pseudoReq(userId), 'mouvement', ENTITE, article.id, `${article.code || '#' + article.id} ${article.designation} : ${quoi} — stock ${frNombre(avant)} → ${frNombre(apres)}${motifTexte ? ' — ' + motifTexte : ''}`);
+    if (!silencieux) ctx.audit(req || pseudoReq(userId), 'mouvement', ENTITE, article.id, `${article.code || '#' + article.id} ${article.designation} : ${quoi} — stock ${frNombre(avant)} → ${frNombre(apres)}${motifTexte ? ' — ' + motifTexte : ''}`);
 
-    // Passage sous le seuil : quantiteAvant > seuil ≥ quantiteApres
+    // Passage sous le seuil (article suivi, seuil > 0) : quantiteAvant > seuil ≥ quantiteApres
     const seuil = num(maj.seuilMin);
-    if (maj.actif !== false && avant > seuil && seuil >= apres) notifierSousSeuil(maj);
+    if (maj.actif !== false && seuil > 0 && avant > seuil && seuil >= apres) notifierSousSeuil(maj);
     return { mouvement, article: maj };
   }
 
@@ -463,7 +495,7 @@ function register(ctx) {
     const tous = db.list(MVT, (m) => Number(m.articleId) === a.id).sort(parDateDesc);
     const r = resume(a, refs, new Map([[a.id, tous.length ? tous[0].date : null]]));
     r.nbMouvements = tous.length;
-    r.mouvements = tous.slice(0, 50).map((m) => enrichirMouvement(m, refs));
+    r.mouvements = tous.slice(0, 50).map((m) => enrichirMouvement(m, refs, req));
     const f = a.fournisseurId != null ? db.get('fournisseurs', a.fournisseurId) : null;
     r.fournisseur = f ? { id: f.id, nom: f.nom || '', contact: f.contact || '', telephone: f.telephone || '', email: f.email || '', siteWeb: f.siteWeb || '', delaiLivraisonJours: f.delaiLivraisonJours == null ? null : f.delaiLivraisonJours, actif: f.actif !== false } : null;
 
@@ -531,8 +563,8 @@ function register(ctx) {
 
   router.post('/api/articles', async (req) => {
     const b = objet(req.body);
-    const data = validerArticle(req, b, null);
     const quantiteInitiale = arrondi(nombre(b.quantite, 'Quantité initiale', { defaut: 0 }));
+    const data = validerArticle(req, b, null);
     data.quantite = 0;
     data.createdBy = req.user.id;
     let a = db.insert(ENTITE, data);
@@ -597,7 +629,7 @@ function register(ctx) {
     const r = enregistrer({ articleId: a.id, type, quantite: b.quantite, motif: b.motif || (ot ? `${/^OT/i.test(String(ot.numero || '')) ? '' : 'OT '}${ot.numero || '#' + ot.id} — ${ot.titre || ''}` : ''), prixUnitaire, fournisseurId, otId, userId: req.user.id, req, refuserInactif: type !== 'inventaire' });
     if (ot) imputerOt(ot, r.mouvement, r.article, req);
     const refs = references();
-    return { mouvement: enrichirMouvement(r.mouvement, refs), article: resume(r.article, refs) };
+    return { mouvement: enrichirMouvement(r.mouvement, refs, req), article: resume(r.article, refs) };
   }, { perm: [MODULE, 'modifier'] });
 
   router.get('/api/mouvements', async (req) => {
@@ -613,7 +645,7 @@ function register(ctx) {
     for (const m of rows) {
       const d = new Date(m.date);
       const date = Number.isNaN(d.getTime()) ? '' : `${d.toLocaleDateString('fr-FR')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-      lignes.push([date, TYPES_MOUVEMENT[m.type] || m.type, m.articleCode, m.articleDesignation, csvNombre(m.quantite), m.uniteCode, csvNombre(m.ecart), csvNombre(m.quantiteAvant), csvNombre(m.quantiteApres), csvNombre(m.prixUnitaire), csvNombre(m.valeur), m.otNumero, m.fournisseurNom, m.motif, m.userNom].map(csvEscape).join(';'));
+      lignes.push([date, TYPES_MOUVEMENT[m.type] || m.type, m.articleCode, m.articleDesignation, csvNombre(m.quantite), m.uniteCode, csvNombre(m.ecart), csvNombre(m.quantiteAvant), csvNombre(m.quantiteApres), csvNombre(m.prixUnitaire), csvNombre(m.valeur), m.otMasque ? 'Hors périmètre' : m.otNumero, m.fournisseurNom, m.motif, m.userNom].map(csvEscape).join(';'));
     }
     ctx.audit(req, 'export', MVT, null, `${rows.length} mouvement(s) de stock`);
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="mouvements-stock-${new Date().toISOString().slice(0, 10)}.csv"`, 'Cache-Control': 'no-store' });
@@ -633,7 +665,7 @@ function register(ctx) {
     }
     const r = annulerSortie(m.id, req.user.id, req);
     const refs = references();
-    return { mouvement: enrichirMouvement(r.mouvement, refs), article: resume(r.article, refs) };
+    return { mouvement: enrichirMouvement(r.mouvement, refs, req), article: resume(r.article, refs) };
   }, { perm: [MODULE, 'modifier'] });
 
   // ----- Routes : alertes, valorisation, références ---------------------------------------
@@ -697,21 +729,23 @@ function register(ctx) {
   }, { perm: [MODULE, 'voir'] });
 
   // ----- Services publiés -----------------------------------------------------------------
+  // `silencieux: true` (traitement en masse) : mouvement enregistré sans entrée de journal unitaire ; l'appelant
+  // écrit une entrée récapitulative, le détail restant dans mouvementsStock.
   ctx.services.stock = {
     /** Sortie de stock (ex. pièce consommée sur un OT). Lève HttpError 400 « Stock insuffisant… » si nécessaire. */
-    sortir({ articleId, quantite, otId, userId, motif } = {}) {
-      return enregistrer({ articleId: idRef(articleId, 'Article'), type: 'sortie', quantite, otId: otId == null || otId === '' ? null : idRef(otId, 'Ordre de travail'), userId, motif, refuserInactif: true });
+    sortir({ articleId, quantite, otId, userId, motif, silencieux } = {}) {
+      return enregistrer({ articleId: idRef(articleId, 'Article'), type: 'sortie', quantite, otId: otId == null || otId === '' ? null : idRef(otId, 'Ordre de travail'), userId, motif, refuserInactif: true, silencieux: !!silencieux });
     },
     /** Entrée en stock (réception) ; le prix unitaire éventuel met à jour le CUMP de l'article. */
-    entrer({ articleId, quantite, userId, motif, prixUnitaire, fournisseurId } = {}) {
+    entrer({ articleId, quantite, userId, motif, prixUnitaire, fournisseurId, silencieux } = {}) {
       const f = fournisseurId == null || fournisseurId === '' ? null : idRef(fournisseurId, 'Fournisseur');
       if (f != null && !db.get('fournisseurs', f)) throw new HttpError(400, 'Fournisseur introuvable');
-      return enregistrer({ articleId: idRef(articleId, 'Article'), type: 'entree', quantite, userId, motif, prixUnitaire, fournisseurId: f, refuserInactif: true });
+      return enregistrer({ articleId: idRef(articleId, 'Article'), type: 'entree', quantite, userId, motif, prixUnitaire, fournisseurId: f, refuserInactif: true, silencieux: !!silencieux });
     },
-    /** Annule une sortie : mouvement « retour » qui ré-incrémente le stock. */
+    /** Annule une sortie : mouvement « retour » qui ré-incrémente le stock (et recalcule le coût moyen pondéré). */
     annulerSortie(mouvementId, userId) { return annulerSortie(idRef(mouvementId, 'Mouvement'), userId); },
     /** Inventaire : quantité constatée (l'écart est calculé). */
-    inventorier({ articleId, quantite, userId, motif } = {}) { return enregistrer({ articleId: idRef(articleId, 'Article'), type: 'inventaire', quantite, userId, motif }); },
+    inventorier({ articleId, quantite, userId, motif, silencieux } = {}) { return enregistrer({ articleId: idRef(articleId, 'Article'), type: 'inventaire', quantite, userId, motif, silencieux: !!silencieux }); },
     /** Articles actifs sous le seuil (portée appliquée si req fourni). */
     alertes: (req) => (req ? alertes(req) : db.list(ENTITE, (a) => a.actif !== false && estSousSeuil(a)).map((a) => Object.assign({}, a, { quantiteACommander: quantiteACommander(a) }))),
     estSousSeuil, quantiteACommander, valeur: valeurArticle,
