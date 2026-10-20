@@ -476,7 +476,8 @@
         const items = idx.get(jour) || { ot: [], ech: [] };
         const estAuj = jour === donnees.aujourdhui;
         const total = heuresDe(items.ot);
-        cal.appendChild(el('div', { class: 'cal-entete', style: { textAlign: 'left', padding: '8px 10px', background: estAuj ? 'var(--primaire-clair)' : '' } },
+        // Jour courant : teinte translucide posée sur la surface (et non sur la couleur des séparateurs de la grille)
+        cal.appendChild(el('div', { class: 'cal-entete', style: { textAlign: 'left', padding: '8px 10px', background: estAuj ? 'linear-gradient(var(--primaire-clair), var(--primaire-clair)), var(--surface)' : '' } },
           el('div', { style: FLEX({ justifyContent: 'space-between' }) },
             el('span', { style: { color: estAuj ? 'var(--lien)' : 'var(--texte)', fontSize: '13px', cursor: 'pointer' }, title: `Détail du ${libelleJour(jour)}`, onclick: () => ouvrirJour(jour) }, `${JOURS_COURTS[i]} ${jourCourt(jour)}`),
             peutCreerOt() ? el('button', { type: 'button', class: 'btn btn-icone btn-sm', style: { padding: '1px' }, title: 'Nouvel OT ce jour', onclick: () => nouvelOt(jour) }, icone('plus')) : null),

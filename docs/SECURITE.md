@@ -78,7 +78,8 @@ destinées au pôle informatique.
   secours à usage unique affichés une seule fois ; clé chiffrée au repos (AES-256-GCM) avec une clé conservée hors de la base
   (`cle-double-authentification.key`, à copier avec les données lors d'un changement de serveur) ; désactivation et nouveaux
   codes de secours avec mot de passe **et** code ; réinitialisation par le pôle informatique depuis la fiche de l'utilisateur
-  (journalisée, notifiée), jamais contournée par un code de réinitialisation ni par la récupération d'urgence.
+  (journalisée, notifiée), jamais contournée par un code de réinitialisation ni par la récupération d'urgence. En dernier
+  recours, sur un serveur autonome arrêté : `node server/index.js --reinitialiser-double-auth <identifiant>` (journalisé).
 - **Prise en main d'un compte** (mot de passe défini ou réinitialisé, code, double authentification) : réservée à un gestionnaire
   de niveau hiérarchique supérieur qui possède lui-même tous les droits du compte (surcharges, portée, secteurs, sites) ; sinon
   seul un administrateur peut agir. Changer son mot de passe exige le mot de passe actuel, y compris quand il expire pendant une
@@ -115,11 +116,12 @@ destinées au pôle informatique.
   informatique de retrouver l'erreur dans le journal du serveur.
 - **Accès par navigateur web** : refusé par défaut, l'application GMAO SICAF est seule autorisée
   (Système & informatique › Réseau & postes).
-- **Chiffrement du réseau (HTTPS)** : quand le poste serveur partage la GMAO, il sert l'application en HTTPS avec un
-  certificat généré sur ce poste (TLS 1.2 minimum, HSTS, cookie `Secure`) ; le HTTP en clair est redirigé. Sur chaque poste
-  client, le pôle informatique **confirme l'empreinte** du certificat (affichée sur le poste serveur : icône de la zone de
-  notification › « Empreinte du certificat… », et dans Système & informatique › Réseau & postes) ; le poste n'accepte ensuite
-  que ce certificat (épinglage, reconnu aussi par l'empreinte de sa clé lors d'un renouvellement). Une empreinte différente
+- **Chiffrement du réseau (HTTPS)** : sans partage réseau, le serveur intégré n'écoute que sur le poste lui-même
+  (127.0.0.1). Quand le poste serveur partage la GMAO, il sert l'application en HTTPS avec un certificat généré sur ce
+  poste (dossier `tls` des données, renouvelé automatiquement ; TLS 1.2 minimum, HSTS, cookie `Secure`) ; le HTTP en
+  clair est redirigé. Sur chaque poste client, le pôle informatique **confirme l'empreinte** du certificat (affichée sur le
+  poste serveur : icône de la zone de notification › « Empreinte du certificat… », et dans Système & informatique › Réseau &
+  postes) ; le poste n'accepte ensuite que ce certificat (épinglage, reconnu aussi par l'empreinte de sa clé lors d'un renouvellement). Une empreinte différente
   signifie une usurpation possible ou un poste serveur réinstallé : ne pas confirmer sans vérification.
 - **Fichiers reçus** : les secrets de sauvegarde (clés, mot de passe de chiffrement, destinations) et les codes de
   réinitialisation en cours ne figurent dans aucun export, aucune sauvegarde, aucune copie téléchargeable ou restaurable
@@ -130,6 +132,11 @@ destinées au pôle informatique.
   de ce serveur, ne reprend aucun code de réinitialisation, ramène les réglages de sécurité dans leurs bornes, et n'est
   possible qu'avec l'accès à tous les sites. Les routes brutes publiques (réception d'une sauvegarde) peuvent vérifier la clé
   avant de lire le corps (`avantCorps`).
+- **Données personnelles des visiteurs** (Audits & visites) : téléphone, e-mail, pièce d'identité et véhicule des visiteurs,
+  e-mail et téléphone du contact de l'organisme ne sont transmis qu'aux gestionnaires de la visite (droit Modifier), la
+  pièce d'identité en clair uniquement sur la fiche du visiteur ; ils sont anonymisés au-delà de la durée de conservation
+  (365 jours par défaut, 1 à 3 650 : Configuration › Options des modules), chaque jour et à la demande (droit Valider),
+  opération journalisée.
 
 ## 5. Traçabilité
 
@@ -142,11 +149,16 @@ destinées au pôle informatique.
 
 ## 6. Sauvegardes
 
-- Sauvegarde locale quotidienne, sauvegardes manuelles, sauvegarde avant chaque import ou restauration.
+- Copie locale quotidienne de la base (au démarrage, puis à la première modification de chaque jour ; 30 conservées),
+  sauvegardes manuelles, sauvegarde avant chaque import ou restauration.
+- **Sauvegardes planifiées** (Système & informatique › Base de données & sauvegardes) : par défaut toutes les 24 heures à
+  22 h, 30 copies locales conservées, puis envoi vers chaque destination.
 - **Destinations multiples** : dossier local, clé USB, NAS ou partage réseau, serveur GMAO d'un autre site.
   Compression, chiffrement AES-256-GCM optionnel (clé dérivée par scrypt), empreinte SHA-256 vérifiée.
-- **Réception** des sauvegardes d'un autre site protégée par une clé aléatoire (comparaison en temps constant,
-  limitation des essais) ; les sauvegardes reçues ne sont jamais importées automatiquement.
+- **Réception** des sauvegardes d'un autre site (désactivée par défaut) protégée par une clé aléatoire affichée une seule
+  fois, dont seule l'empreinte SHA-256 est conservée (comparaison en temps constant, limitation des essais, clé vérifiée
+  avant la lecture du fichier) ; les sauvegardes reçues ne sont jamais importées automatiquement. Vers le serveur d'un
+  autre site en HTTPS, rien n'est envoyé sans l'empreinte de son certificat confirmée par le pôle informatique.
 - Les secrets (clés, mots de passe de chiffrement, destinations) ne sont jamais envoyés à l'interface ni écrits dans
   les sauvegardes et les copies téléchargeables ; les sauvegardes ne contiennent jamais de code de réinitialisation.
 

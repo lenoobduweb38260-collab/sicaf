@@ -81,10 +81,20 @@
         s.piecesJointes ? { label: 'Pièces jointes', valeur: `${ui.formatNombre(s.piecesJointes.taille / (1024 * 1024), 1)} Mo utilisés sur ${ui.formatNombre(s.piecesJointes.quotaMo, 0)} Mo` } : null,
         s.piecesJointes && s.piecesJointes.dossier ? { label: 'Dossier des pièces jointes', valeur: el('code', null, s.piecesJointes.dossier) } : null,
       ], { colonnes: 2 })));
-      cont.appendChild(ui.carte('Contenu de la base', el('div', { class: 'tableau-conteneur' }, el('table', { class: 'tableau tableau-compact' }, el('thead', null, el('tr', null, el('th', null, 'Collection'), el('th', { class: 'num' }, 'Éléments'))), el('tbody', null, s.collections.map((c) => el('tr', null, el('td', null, c.nom), el('td', { class: 'num' }, String(c.nombre)))))))));
+      cont.appendChild(ui.carte('Contenu de la base', el('div', { class: 'tableau-conteneur' }, el('table', { class: 'tableau tableau-compact' }, el('thead', null, el('tr', null, el('th', null, 'Collection'), el('th', { class: 'num' }, 'Éléments'))), el('tbody', null, s.collections.map((c) => el('tr', null, el('td', { title: `Nom dans le fichier de données : ${c.nom}` }, LIBELLES_COLLECTIONS[c.nom] || c.nom), el('td', { class: 'num' }, String(c.nombre)))))))));
     }).catch((e) => { ui.vider(cont); cont.appendChild(ui.alerte(e.message, 'danger')); });
   }
 
+
+  /** Libellés des collections de la base (nom technique en infobulle). */
+  const LIBELLES_COLLECTIONS = {
+    users: 'Utilisateurs', profils: 'Profils', secteurs: 'Sites et secteurs', equipements: 'Équipements', demandes: 'Demandes d\'intervention',
+    ot: 'Ordres de travail', plansPreventifs: 'Plans préventifs', articles: 'Articles du stock', mouvementsStock: 'Mouvements de stock',
+    fournisseurs: 'Fournisseurs', documents: 'Documents', audit: 'Journal d\'activité', notifications: 'Notifications',
+    demandesMdp: 'Demandes de réinitialisation du mot de passe', plans: 'Plans 3D', inventaires: 'Inventaires', commandes: 'Commandes',
+    factures: 'Factures', visites: 'Audits et visites', personnel: 'Personnel', habilitations: 'Habilitations', formations: 'Formations',
+    visitesMedicales: 'Visites médicales', absences: 'Absences', sauvegardesHistorique: 'Historique des sauvegardes',
+  };
 
   // ----- Onglet Réseau & postes ---------------------------------------------
   function ongletReseau(cont) {

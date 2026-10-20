@@ -136,7 +136,7 @@ table.tableau tr.inv-selectionnee td{background:var(--primaire-clair)}
 .inv-historique li{display:flex;gap:10px;align-items:flex-start;padding:7px 2px;border-bottom:1px solid var(--bordure);font-size:13px}
 .inv-historique li:last-child{border-bottom:0}
 .inv-historique .h-icone{width:22px;height:22px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;color:#fff;margin-top:1px}
-.inv-historique li.ok .h-icone{background:var(--ok)}.inv-historique li.erreur .h-icone{background:var(--danger)}.inv-historique li.info .h-icone{background:var(--info)}
+.inv-historique li.ok .h-icone{background:var(--ok)}.inv-historique li.erreur .h-icone{background:var(--danger-fond)}.inv-historique li.info .h-icone{background:var(--info)}
 .inv-historique .h-icone svg{width:13px;height:13px}
 .inv-historique .h-heure{color:var(--texte-2);font-size:11.5px;margin-left:auto;white-space:nowrap;padding-left:6px}
 .inv-historique .h-texte{min-width:0}

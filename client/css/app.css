@@ -18,7 +18,8 @@
   --bordure-2: #d1d5db;
   --ok: #16a34a;
   --alerte: #f59e0b;
-  --danger: #dc2626;
+  /* Rouge des textes d'erreur : contraste d'au moins 4,5:1 sur les surfaces, le fond de page et les lignes sélectionnées */
+  --danger: #c81e1e;
   /* Couleurs d'état employées comme texte : contraste d'au moins 4,5:1 sur les surfaces (--ok et --alerte, trop clairs,
      restent pour les pastilles, jauges et bordures) ; --…-fond : fond plein sous un texte blanc (boutons, compteurs) */
   --ok-texte: #15803d;
@@ -46,11 +47,12 @@
   --surface: #1e293b;
   --surface-2: #273449;
   --texte: #e5e7eb;
-  --texte-2: #9ca3af;
+  --texte-2: #a3aab5;
   --bordure: #334155;
   --bordure-2: #475569;
-  /* Rouge éclairci : messages d'erreur, astérisques des champs obligatoires, robustesse « faible » lisibles sur --surface */
-  --danger: #f87171;
+  /* Rouge éclairci : messages d'erreur, astérisques des champs obligatoires, robustesse « faible » lisibles sur --surface
+     et sur les lignes sélectionnées (--primaire-clair) */
+  --danger: #fa9191;
   --ok-texte: #4ade80;
   --alerte-texte: #fbbf24;
   --sidebar-fond: #0b1220;

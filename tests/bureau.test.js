@@ -204,7 +204,7 @@ describe('electron/main.js avec un Electron simulé', () => {
   /** Construit un faux module « electron » qui enregistre les appels. */
   function fauxElectron(userData) {
     const ev = {};
-    const journal = { fenetres: [], urls: [], fichiers: [], requetes: [], trays: 0, menus: 0, loginItems: [], quit: 0, verification: null, presse: [] };
+    const journal = { fenetres: [], urls: [], fichiers: [], requetes: [], trays: 0, menus: 0, loginItems: [], quit: 0, verification: null, presse: [], options: [] };
     let pret;
     const whenReady = new Promise((r) => { pret = r; });
     class BrowserWindow {
@@ -229,6 +229,7 @@ describe('electron/main.js avec un Electron simulé', () => {
       on: (n, fn) => { ev[n] = fn; }, setAppUserModelId() {}, getPath: (n) => (n === 'userData' ? userData : os.tmpdir()), getVersion: () => '1.0.7',
       whenReady: () => whenReady, quit: () => { journal.quit += 1; }, exit() {}, relaunch() {},
       setLoginItemSettings: (o) => journal.loginItems.push(o),
+      commandLine: { appendSwitch: (nom, valeur) => journal.options.push([nom, valeur]) },
     };
     const handlers = {};
     const electron = {
@@ -286,6 +287,8 @@ describe('electron/main.js avec un Electron simulé', () => {
     assert.equal((await faux.handlers['bureau:parametres'](appelAssistant)).mode, 'serveur');
     // Marqueur « application de bureau » et blocage des navigateurs web
     assert.match(faux.electron.app.userAgentFallback, /GMAO-SICAF-Bureau\/1\.0\.7/);
+    // Interface de Chromium (champs de date, messages de validation) en français quelle que soit la langue de Windows
+    assert.deepEqual(faux.journal.options.find((o) => o[0] === 'lang'), ['lang', 'fr-FR']);
     assert.equal((await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 Chrome' } })).status, 403, 'navigateur web refusé');
     assert.equal((await fetch(url + 'api/auth/infos', { headers: { 'user-agent': faux.electron.app.userAgentFallback } })).status, 200, 'application acceptée');
     // Un appel IPC depuis une origine étrangère est refusé

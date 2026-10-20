@@ -74,7 +74,7 @@
 .ach-etape.faite .ach-puce { background: var(--ok); border-color: var(--ok); color: #fff; }
 .ach-etape.courante .ach-puce { border-color: var(--primaire); color: var(--lien); box-shadow: 0 0 0 3px var(--primaire-clair); }
 .ach-etape.courante { color: var(--texte); font-weight: 600; }
-.ach-etape.echec .ach-puce { background: var(--danger); border-color: var(--danger); color: #fff; }
+.ach-etape.echec .ach-puce { background: var(--danger-fond); border-color: var(--danger-fond); color: #fff; }
 .ach-etape.echec { color: var(--danger); font-weight: 600; }
 .ach-trait { width: 36px; height: 2px; background: var(--bordure-2); margin: 0 8px; flex-shrink: 0; }
 .ach-trait.fait { background: var(--ok); }

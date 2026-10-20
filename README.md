@@ -172,8 +172,10 @@ plusieurs sites, mises à jour signées. Détails et recommandations de déploie
 - Base : un fichier JSON (`data/gmao.json`), écrit de manière atomique ; les photos et documents joints sont rangés
   à part dans `data/pieces/` (espace réservé réglable, 400 Mo par défaut : *Configuration › Général*), le journal
   d'activité ancien dans `data/journal/`.
-- Une sauvegarde quotidienne est créée automatiquement au démarrage dans `data/backups/` (30 conservées), plus
-  des sauvegardes manuelles et une avant chaque import / restauration.
+- Une copie quotidienne de la base est créée automatiquement dans `data/backups/` (au démarrage, puis à la première
+  modification de chaque jour ; 30 conservées), plus des sauvegardes manuelles et une avant chaque import / restauration.
+- Sauvegardes planifiées (*Système & informatique › Base de données & sauvegardes*) : par défaut chaque jour à 22 h,
+  compressées et chiffrables, vers des dossiers (disque, clé USB, NAS) ou le serveur GMAO d'un autre site.
 - Export / import complet au format JSON (pièces jointes comprises, sans les secrets de sauvegarde) depuis
   *Système & informatique › Base de données & sauvegardes*, réservé aux comptes ayant accès à tous les sites.
 - Pour déplacer la GMAO sur un autre PC : copiez le dossier `data` en entier (base, pièces jointes, journal,

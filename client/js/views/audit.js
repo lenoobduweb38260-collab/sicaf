@@ -52,7 +52,7 @@
       }
 
       container.appendChild(ui.pageEntete({
-        titre: GMAO.moduleLabel('audit'), icone: 'audit', sousTitre: 'Journal de toutes les actions (logs). Les rôles responsables sont notifiés des événements importants (Configuration › Journal & notifications).',
+        titre: GMAO.moduleLabel('audit'), icone: 'audit', sousTitre: 'Journal de toutes les actions. Les rôles responsables sont notifiés des événements importants (Configuration › Journal & notifications).',
         actions: [
           ui.bouton('Actualiser', { icone: 'rafraichir', onClic: charger }),
           GMAO.can('audit', 'exporter') ? ui.bouton('Exporter CSV', { icone: 'export', onClic: () => { const qs = new URLSearchParams(Object.entries(filtres).filter(([, v]) => v)).toString(); api.telecharger('/api/audit/export' + (qs ? '?' + qs : ''), 'journal-audit.csv').catch(erreur); } }) : null,

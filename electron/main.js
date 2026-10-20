@@ -77,6 +77,9 @@ const VERROU = app.requestSingleInstanceLock();
 if (!VERROU) app.quit();
 else app.on('second-instance', () => afficher());
 app.setAppUserModelId('fr.sicaf.gmao');
+// Chromium en français quelle que soit la langue de Windows : calendriers et format des champs de date, messages de
+// validation des formulaires, menus contextuels (avant « ready »)
+app.commandLine.appendSwitch('lang', 'fr-FR');
 // Marqueur « application de bureau » : le serveur GMAO refuse les navigateurs web (sauf autorisation du pôle informatique)
 app.userAgentFallback = `${app.userAgentFallback || 'Mozilla/5.0'} GMAO-SICAF-Bureau/${app.getVersion()}`;
 
