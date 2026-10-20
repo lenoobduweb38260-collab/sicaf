@@ -741,3 +741,462 @@ describe('Module Stock & pièces détachées', () => {
     } finally { await s2.stop(); }
   });
 });
+
+describe('Stock : pièces dédiées à une ou plusieurs machines', () => {
+  let srv, admin, techProd, profils, prod, maint;
+  let ligne, machineA, sousA, machineB, pontMaint, isolee;
+  const s = () => srv.ctx.services.stock;
+  const userId = (login) => srv.db.findOne('users', (u) => u.login === login).id;
+  const eq = (numero, nom, secteurId, parentId = null, extra = {}) => srv.db.insert('equipements', Object.assign({ numero, nom, secteurId, parentId, actif: true, typeCode: 'machine', etatCode: 'en_service' }, extra));
+
+  before(async () => {
+    srv = await demarrer();
+    admin = srv.client();
+    await admin.login('admin', 'admin');
+    const secteurs = await admin.ok('GET', '/api/secteurs');
+    prod = secteurs.find((x) => x.code === 'PROD');
+    maint = secteurs.find((x) => x.code === 'MAINT');
+    profils = await admin.ok('GET', '/api/profils');
+    ligne = eq('EQ-D01', 'Ligne de conditionnement', prod.id);
+    machineA = eq('EQ-D02', 'Remplisseuse', prod.id, ligne.id);
+    sousA = eq('EQ-D03', 'Moteur de la remplisseuse', prod.id, machineA.id);
+    machineB = eq('EQ-D04', 'Presse hydraulique', prod.id);
+    pontMaint = eq('EQ-D05', 'Pont roulant atelier', maint.id);
+    isolee = eq('EQ-D06', 'Banc d\'essai provisoire', prod.id);
+    await admin.ok('POST', '/api/utilisateurs', { login: 'tech.dedie', nom: 'Technicien', prenom: 'Tom', profilId: profils.find((p) => p.nom === 'Technicien').id, secteurIds: [prod.id], password: 'motdepasse1', doitChangerMdp: false, overrides: { stock: { exporter: true } } });
+    techProd = srv.client();
+    await techProd.login('tech.dedie', 'motdepasse1');
+  });
+  after(async () => { await srv.stop(); });
+
+  test('article : champ reservee (défaut faux), inclureSousEquipements (défaut vrai), au moins un équipement exigé', async () => {
+    const libre = await admin.ok('POST', '/api/articles', { designation: 'Graisse universelle', quantite: 10 });
+    assert.equal(libre.reservee, false, 'pièce libre par défaut');
+    assert.equal(libre.inclureSousEquipements, true);
+    const ancien = srv.db.insert('articles', { code: 'ART-ANCIEN', designation: 'Article existant sans le champ', quantite: 4, equipementIds: [machineB.id], actif: true });
+    assert.equal((await admin.ok('GET', '/api/articles/' + ancien.id)).reservee, false, 'article existant : non dédié (aucune migration de comportement)');
+    assert.equal(s().utilisablePour(srv.db.get('articles', ancien.id), machineA.id).ok, true, 'liste indicative : utilisable partout');
+
+    const refus = await admin.post('/api/articles', { designation: 'Roulement dédié', reservee: true });
+    assert.equal(refus.status, 400);
+    assert.match(refus.body.erreur, /au moins un équipement/);
+    assert.equal((await admin.post('/api/articles', { designation: 'Roulement dédié', reservee: true, equipementIds: [] })).status, 400);
+    assert.equal((await admin.post('/api/articles', { designation: 'Roulement dédié', reservee: 'oui', equipementIds: [machineA.id] })).status, 400, 'booléen strict');
+    assert.equal((await admin.post('/api/articles', { designation: 'Roulement dédié', reservee: true, inclureSousEquipements: 1, equipementIds: [machineA.id] })).status, 400, 'booléen strict');
+
+    const dedie = await admin.ok('POST', '/api/articles', { designation: 'Roulement dédié 6312', reservee: true, equipementIds: [machineA.id], quantite: 5 });
+    assert.equal(dedie.reservee, true);
+    assert.equal(dedie.inclureSousEquipements, true);
+    assert.deepEqual(dedie.reserveeA, ['Remplisseuse']);
+    assert.deepEqual(dedie.equipementsAutorisesIds.slice().sort((x, y) => x - y), [machineA.id, sousA.id].sort((x, y) => x - y));
+    // Retirer tous les équipements d'une pièce dédiée est refusé ; une modification sans rapport reste possible
+    assert.equal((await admin.put('/api/articles/' + dedie.id, { equipementIds: [] })).status, 400);
+    assert.equal((await admin.ok('PUT', '/api/articles/' + dedie.id, { emplacement: 'A4' })).reservee, true, 'caractère dédié conservé');
+    const libere = await admin.ok('PUT', '/api/articles/' + dedie.id, { reservee: false });
+    assert.equal(libere.reservee, false);
+    assert.deepEqual(libere.equipementIds, [machineA.id], 'les équipements deviennent la liste indicative');
+    await admin.ok('PUT', '/api/articles/' + dedie.id, { reservee: true });
+  });
+
+  test('règle unique : sous-équipements inclus ou non, équipements autorisés, raison explicite', async () => {
+    const a = await admin.ok('POST', '/api/articles', { code: 'DED-LIGNE', designation: 'Capteur de la ligne', reservee: true, equipementIds: [ligne.id], quantite: 3 });
+    const brut = () => srv.db.get('articles', a.id);
+    assert.deepEqual(s().equipementsAutorises(brut()).sort((x, y) => x - y), [ligne.id, machineA.id, sousA.id].sort((x, y) => x - y), 'descendants par parentId, tous niveaux');
+    assert.equal(s().equipementsAutorises(srv.db.findOne('articles', (x) => x.designation === 'Graisse universelle')), null, 'pièce libre : null');
+    assert.equal(s().utilisablePour(brut(), sousA.id).ok, true, 'petit-enfant autorisé');
+    const non = s().utilisablePour(brut(), machineB.id);
+    assert.equal(non.ok, false);
+    assert.match(non.raison, /DED-LIGNE — Capteur de la ligne/);
+    assert.match(non.raison, /Ligne de conditionnement \(EQ-D01\), sous-équipements compris/);
+    assert.match(non.raison, /Presse hydraulique \(EQ-D04\)/);
+    assert.match(s().utilisablePour(brut(), null).raison, /précisez l'équipement/);
+
+    await admin.ok('PUT', '/api/articles/' + a.id, { inclureSousEquipements: false });
+    assert.deepEqual(s().equipementsAutorises(brut()), [ligne.id], 'sans les sous-équipements');
+    assert.equal(s().utilisablePour(brut(), machineA.id).ok, false);
+    assert.doesNotMatch(s().utilisablePour(brut(), machineA.id).raison, /sous-équipements compris/);
+    await admin.ok('PUT', '/api/articles/' + a.id, { inclureSousEquipements: true });
+    // Rattachement d'un équipement à la ligne : autorisé aussitôt (règle évaluée à chaque utilisation)
+    srv.db.update('equipements', isolee.id, { parentId: machineA.id });
+    assert.equal(s().utilisablePour(brut(), isolee.id).ok, true);
+    srv.db.update('equipements', isolee.id, { parentId: null });
+    assert.equal(s().utilisablePour(brut(), isolee.id).ok, false);
+  });
+
+  test('service sortir : équipement de l\'OT ou explicite, refus clair sinon ; entrées et inventaires non restreints', async () => {
+    const a = await admin.ok('POST', '/api/articles', { code: 'DED-SVC', designation: 'Joint de vérin dédié', reservee: true, equipementIds: [machineA.id], quantite: 20 });
+    const otB = srv.db.insert('ot', { numero: 'OT-DED-0001', titre: 'Intervention presse', statut: 'en_cours', equipementId: machineB.id, secteurId: prod.id, pieces: [], createdBy: 1 });
+    const otA = srv.db.insert('ot', { numero: 'OT-DED-0002', titre: 'Intervention remplisseuse', statut: 'en_cours', equipementId: sousA.id, secteurId: prod.id, pieces: [], createdBy: 1 });
+    const otSans = srv.db.insert('ot', { numero: 'OT-DED-0003', titre: 'Intervention de secteur', statut: 'en_cours', equipementId: null, secteurId: prod.id, pieces: [], createdBy: 1 });
+    assert.throws(() => s().sortir({ articleId: a.id, quantite: 1, userId: 1 }), (e) => e.status === 400 && /précisez l'équipement/.test(e.message));
+    assert.throws(() => s().sortir({ articleId: a.id, quantite: 1, otId: otB.id, userId: 1 }), (e) => e.status === 400 && /DED-SVC/.test(e.message) && /Remplisseuse \(EQ-D02\)/.test(e.message) && /Presse hydraulique/.test(e.message));
+    assert.throws(() => s().sortir({ articleId: a.id, quantite: 1, otId: otA.id, equipementId: machineB.id, userId: 1 }), (e) => e.status === 400 && /ne correspond pas/.test(e.message), 'équipement explicite différent de celui de l\'OT');
+    assert.throws(() => s().sortir({ articleId: a.id, quantite: 1, otId: otSans.id, userId: 1 }), (e) => e.status === 400, 'OT sans équipement : équipement à préciser');
+    assert.equal(srv.db.get('articles', a.id).quantite, 20, 'aucune sortie après les refus');
+    const r = s().sortir({ articleId: a.id, quantite: 2, otId: otA.id, userId: 1 });
+    assert.equal(r.mouvement.equipementId, sousA.id, 'équipement de l\'OT enregistré sur le mouvement');
+    assert.equal(s().sortir({ articleId: a.id, quantite: 1, otId: otSans.id, equipementId: machineA.id, userId: 1 }).mouvement.equipementId, machineA.id);
+    assert.equal(s().sortir({ articleId: a.id, quantite: 1, equipementId: machineA.id, userId: 1 }).mouvement.equipementId, machineA.id);
+    assert.equal(s().entrer({ articleId: a.id, quantite: 5, userId: 1, motif: 'Réception' }).article.quantite, 21, 'entrée non restreinte');
+    assert.equal(s().inventorier({ articleId: a.id, quantite: 30, userId: 1 }).article.quantite, 30, 'inventaire non restreint');
+    const retour = s().annulerSortie(r.mouvement.id, 1);
+    assert.equal(retour.mouvement.type, 'retour');
+    assert.equal(retour.mouvement.equipementId, sousA.id, 'retour : équipement de la sortie conservé (traçabilité), sans restriction');
+    // Pièce libre : jamais restreinte, équipement de l'OT tout de même tracé
+    const libre = srv.db.findOne('articles', (x) => x.designation === 'Graisse universelle');
+    assert.equal(s().sortir({ articleId: libre.id, quantite: 1, otId: otB.id, userId: 1 }).mouvement.equipementId, machineB.id);
+    assert.equal(s().sortir({ articleId: libre.id, quantite: 1, userId: 1 }).mouvement.equipementId, null);
+  });
+
+  test('sortie manuelle : equipementId obligatoire pour une pièce dédiée sans OT, enregistré, affiché et exporté', async () => {
+    const a = await admin.ok('POST', '/api/articles', { code: 'DED-MAN', designation: 'Courroie dédiée', reservee: true, equipementIds: [machineA.id, machineB.id], quantite: 10 });
+    const sans = await techProd.post(`/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1 });
+    assert.equal(sans.status, 400);
+    assert.match(sans.body.erreur, /DED-MAN — Courroie dédiée/);
+    assert.match(sans.body.erreur, /Presse hydraulique \(EQ-D04\) et Remplisseuse \(EQ-D02\)/);
+    const mauvais = await techProd.post(`/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: isolee.id });
+    assert.equal(mauvais.status, 400);
+    assert.match(mauvais.body.erreur, /ne peut pas être utilisée sur Banc d'essai provisoire/);
+    assert.equal((await techProd.post(`/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: 999999 })).status, 400, 'équipement inexistant');
+    assert.equal((await techProd.post(`/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: pontMaint.id })).status, 400, 'équipement hors périmètre');
+    const ok = await techProd.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 2, equipementId: machineB.id, motif: 'Remplacement' });
+    assert.equal(ok.mouvement.equipementId, machineB.id);
+    assert.equal(ok.mouvement.equipementNom, 'Presse hydraulique');
+    assert.equal(ok.article.quantite, 8);
+    assert.equal((await techProd.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'entree', quantite: 1 })).article.quantite, 9, 'entrée sans équipement');
+    assert.equal((await techProd.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'inventaire', quantite: 12 })).article.quantite, 12, 'inventaire sans équipement');
+    // Pièce libre : l'équipement destinataire est facultatif mais enregistré
+    const libre = srv.db.findOne('articles', (x) => x.designation === 'Graisse universelle');
+    assert.equal((await techProd.ok('POST', `/api/articles/${libre.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: isolee.id })).mouvement.equipementNumero, 'EQ-D06');
+    // Historique, journal et export
+    const fiche = await techProd.ok('GET', '/api/articles/' + a.id);
+    const m = fiche.mouvements.find((x) => x.id === ok.mouvement.id);
+    assert.equal(m.equipementNom, 'Presse hydraulique');
+    assert.equal(m.equipementNumero, 'EQ-D04');
+    assert.ok((await techProd.ok('GET', `/api/mouvements?equipementId=${machineB.id}`)).some((x) => x.id === ok.mouvement.id), 'filtre du journal par équipement');
+    assert.ok((await techProd.ok('GET', '/api/mouvements?recherche=EQ-D04')).some((x) => x.id === ok.mouvement.id), 'recherche par équipement');
+    const csv = (await techProd.get('/api/mouvements-export?articleId=' + a.id)).body.split('\r\n');
+    assert.ok(csv[0].includes(';OT;Équipement;Fournisseur;'), 'colonne Équipement : ' + csv[0]);
+    assert.ok(csv.some((l) => l.includes(';EQ-D04 Presse hydraulique;')), 'équipement exporté');
+    assert.ok(srv.db.list('audit', (x) => x.action === 'mouvement' && x.entiteId === a.id).some((x) => /pour EQ-D04 Presse hydraulique/.test(x.details)), 'journal : équipement destinataire');
+    // Retour d'une sortie manuelle : équipement conservé
+    const retour = await techProd.ok('POST', `/api/mouvements/${ok.mouvement.id}/annuler`, {});
+    assert.equal(retour.mouvement.equipementNom, 'Presse hydraulique');
+  });
+
+  test('suppression du dernier équipement : pièce dédiée inutilisable, signalée « à réaffecter », Stock › Modifier notifiés ; équipement réformé conservé', async () => {
+    const provisoire = eq('EQ-D07', 'Machine provisoire', prod.id);
+    const a = await admin.ok('POST', '/api/articles', { code: 'DED-ORPH', designation: 'Filtre spécifique', reservee: true, equipementIds: [provisoire.id], quantite: 4 });
+    const multi = await admin.ok('POST', '/api/articles', { code: 'DED-MULTI', designation: 'Filtre partagé', reservee: true, equipementIds: [provisoire.id, machineB.id], quantite: 4 });
+    const notifsAvant = srv.db.count('notifications', (n) => n.userId === userId('tech.dedie'));
+    const r = await admin.ok('DELETE', '/api/equipements/' + provisoire.id);
+    assert.equal(r.desactive, false);
+    assert.equal(r.piecesAReaffecter, 1);
+    const apres = await admin.ok('GET', '/api/articles/' + a.id);
+    assert.equal(apres.reservee, true, 'reste dédiée');
+    assert.deepEqual(apres.equipementIds, []);
+    assert.equal(apres.sansEquipement, true);
+    assert.match(apres.reserveeTexte, /à réaffecter/);
+    assert.deepEqual(apres.equipementsAutorisesIds, []);
+    const refus = await admin.post(`/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: machineB.id });
+    assert.equal(refus.status, 400);
+    assert.match(refus.body.erreur, /n'est plus affectée à aucun équipement/);
+    assert.equal((await admin.ok('GET', '/api/articles/' + multi.id)).sansEquipement, false, 'pièce encore affectée à un autre équipement');
+    assert.deepEqual(srv.db.get('articles', multi.id).equipementIds, [machineB.id]);
+    const notifs = srv.db.list('notifications', (n) => n.userId === userId('tech.dedie')).slice(notifsAvant);
+    assert.equal(notifs.filter((n) => /Pièce dédiée sans équipement/.test(n.titre)).length, 1, 'technicien (Stock › Modifier, article visible) notifié une fois');
+    assert.ok(notifs.some((n) => n.lien === `#/stock/${a.id}` && /Filtre spécifique/.test(n.message)));
+    assert.ok(srv.db.list('notifications', (n) => n.userId === 1).some((n) => /Pièce dédiée sans équipement/.test(n.titre)), 'administrateur notifié');
+    assert.ok(srv.db.list('audit', (x) => x.entite === 'articles' && x.entiteId === a.id).some((x) => /suppression de l'équipement EQ-D07 Machine provisoire/.test(x.details) && /à réaffecter/.test(x.details)));
+    // Réaffectation
+    const reaffecte = await admin.ok('PUT', '/api/articles/' + a.id, { equipementIds: [machineB.id] });
+    assert.equal(reaffecte.sansEquipement, false);
+    // Équipement réformé ou désactivé : conservé dans la liste, signalé « réformé »
+    srv.db.update('equipements', machineB.id, { etatCode: 'reforme' });
+    const reforme = await admin.ok('GET', '/api/articles/' + a.id);
+    assert.deepEqual(reforme.equipementIds, [machineB.id]);
+    assert.equal(reforme.reserveeEquipements[0].reforme, true);
+    assert.match(reforme.reserveeTexte, /Presse hydraulique \(EQ-D04, réformé\)/);
+    srv.db.update('equipements', machineB.id, { etatCode: 'en_service' });
+  });
+
+  test('liste, filtre « pièces dédiées / pièces libres » et export CSV (colonnes Dédiée et Équipements)', async () => {
+    const dediees = await admin.ok('GET', '/api/articles?reservee=1');
+    const libres = await admin.ok('GET', '/api/articles?reservee=0');
+    const tous = await admin.ok('GET', '/api/articles');
+    assert.ok(dediees.length >= 4 && dediees.every((a) => a.reservee === true));
+    assert.ok(libres.length >= 2 && libres.every((a) => a.reservee === false));
+    assert.equal(dediees.length + libres.length, tous.length);
+    assert.equal((await admin.get('/api/articles?reservee=peut-etre')).status, 400);
+    const csv = (await admin.get('/api/articles-export')).body.split('\r\n');
+    const entetes = csv[0].replace(/^﻿/, '').split(';');
+    const iD = entetes.indexOf('Dédiée'); const iE = entetes.indexOf('Équipements');
+    assert.ok(iD > 0 && iE === iD + 1, 'colonnes Dédiée puis Équipements : ' + csv[0]);
+    const ligneDe = (code) => csv.find((l) => l.startsWith(code + ';')).split(';');
+    assert.equal(ligneDe('DED-LIGNE')[iD], 'Oui');
+    assert.equal(ligneDe('DED-LIGNE')[iE], 'Ligne de conditionnement (EQ-D01), sous-équipements compris');
+    assert.equal(ligneDe('ART-ANCIEN')[iD], 'Non');
+    assert.equal(ligneDe('ART-ANCIEN')[iE], 'Presse hydraulique (EQ-D04)', 'pièce libre : équipements compatibles');
+    const filtre = (await admin.get('/api/articles-export?reservee=1')).body.split('\r\n').slice(1).filter(Boolean);
+    assert.equal(filtre.length, dediees.length, 'filtre appliqué à l\'export');
+  });
+
+  test('visibilité : équipements hors périmètre comptés mais jamais nommés (liste, refus, export, journal des mouvements)', async () => {
+    const a = await admin.ok('POST', '/api/articles', { code: 'DED-VIS', designation: 'Câble de levage', reservee: true, equipementIds: [machineB.id, pontMaint.id], quantite: 6 });
+    const vu = (await techProd.ok('GET', '/api/articles')).find((x) => x.id === a.id);
+    assert.deepEqual(vu.reserveeA, ['Presse hydraulique']);
+    assert.equal(vu.reserveeHorsPerimetre, 1);
+    assert.equal(vu.reserveeTexte, 'Presse hydraulique (EQ-D04) et 1 équipement(s) hors de votre périmètre');
+    assert.deepEqual(vu.equipementsAutorisesIds, [machineB.id], 'identifiants hors périmètre non transmis');
+    const refus = await techProd.post(`/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: machineA.id });
+    assert.equal(refus.status, 400);
+    assert.match(refus.body.erreur, /Presse hydraulique \(EQ-D04\) et 1 équipement\(s\) hors de votre périmètre/);
+    assert.doesNotMatch(refus.body.erreur, /Pont roulant/);
+    const pourAdmin = await admin.post(`/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: machineA.id });
+    assert.match(pourAdmin.body.erreur, /Pont roulant atelier \(EQ-D05\)/, 'l\'administrateur voit tous les équipements autorisés');
+    const ligneCsv = (await techProd.get('/api/articles-export')).body.split('\r\n').find((l) => l.startsWith('DED-VIS;'));
+    assert.ok(ligneCsv.includes(';Presse hydraulique (EQ-D04) et 1 équipement(s) hors de votre périmètre;') && !ligneCsv.includes('Pont roulant'), ligneCsv);
+    // Sortie sur l'équipement hors périmètre (administrateur) : masquée pour le technicien
+    const m = await admin.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: pontMaint.id });
+    const vus = await techProd.ok('GET', '/api/mouvements?articleId=' + a.id);
+    const x = vus.find((y) => y.id === m.mouvement.id);
+    assert.equal(x.equipementMasque, true);
+    assert.equal(x.equipementNom, 'Équipement hors de votre périmètre');
+    assert.equal(x.equipementId, null);
+    assert.ok(!/Pont roulant|EQ-D05/.test(JSON.stringify(vus)), 'ni le nom ni le numéro ne fuient');
+    assert.equal((await techProd.ok('GET', `/api/mouvements?equipementId=${pontMaint.id}`)).length, 0, 'pas de sondage par identifiant');
+    const csv = (await techProd.get('/api/mouvements-export?articleId=' + a.id)).body;
+    assert.ok(csv.includes(';Hors périmètre;') && !/Pont roulant|EQ-D05/.test(csv));
+    // Fiche : sous-équipements autorisés par héritage
+    const capteur = srv.db.findOne('articles', (y) => y.code === 'DED-LIGNE');
+    const fiche = await techProd.ok('GET', '/api/articles/' + capteur.id);
+    assert.deepEqual(fiche.sousEquipementsAutorises.map((e) => e.nom).sort(), ['Moteur de la remplisseuse', 'Remplisseuse']);
+    assert.ok(fiche.sousEquipementsAutorises.every((e) => e.viaNom === 'Ligne de conditionnement'));
+  });
+
+  test('journal : création et modification du caractère dédié ou des équipements en clair', async () => {
+    const a = await admin.ok('POST', '/api/articles', { code: 'DED-JRN', designation: 'Bague d\'usure', reservee: true, equipementIds: [machineA.id] });
+    const lignes = () => srv.db.list('audit', (x) => x.entite === 'articles' && x.entiteId === a.id).map((x) => x.details);
+    assert.ok(lignes().some((d) => /pièce dédiée à EQ-D02 Remplisseuse, sous-équipements compris/.test(d)), lignes().join('\n'));
+    await admin.ok('PUT', '/api/articles/' + a.id, { equipementIds: [machineA.id, machineB.id], inclureSousEquipements: false });
+    const d1 = lignes().pop();
+    assert.match(d1, /équipements autorisés ajoutés : EQ-D04 Presse hydraulique/);
+    assert.match(d1, /sous-équipements désormais exclus/);
+    assert.match(d1, /\(équipements, sous-équipements\)/, 'champs modifiés en français');
+    await admin.ok('PUT', '/api/articles/' + a.id, { reservee: false });
+    assert.match(lignes().pop(), /n'est plus une pièce dédiée/);
+    await admin.ok('PUT', '/api/articles/' + a.id, { reservee: true, equipementIds: [machineB.id] });
+    const d3 = lignes().pop();
+    assert.match(d3, /devient une pièce dédiée/);
+    assert.match(d3, /équipements autorisés retirés : EQ-D02 Remplisseuse/);
+  });
+
+  test('références du stock et résolution d\'un code scanné : restriction indiquée', async () => {
+    const refs = await techProd.ok('GET', '/api/stock-references');
+    const e = refs.equipements.find((x) => x.id === sousA.id);
+    assert.equal(e.parentId, machineA.id, 'arborescence transmise pour le choix du destinataire');
+    const code = await techProd.ok('GET', '/api/codes?code=DED-LIGNE');
+    assert.equal(code.type, 'article');
+    assert.equal(code.details.reservee, true);
+    assert.deepEqual(code.details.reserveeA, ['Ligne de conditionnement']);
+    assert.match(code.details.reserveeTexte, /sous-équipements compris/);
+    assert.equal((await techProd.ok('GET', '/api/codes?code=ART-ANCIEN')).details.reservee, false);
+  });
+
+  test('données de démonstration : pièces dédiées à des machines de la démonstration, idempotentes', async () => {
+    const s2 = await demarrer();
+    try {
+      const { seedDemo } = require('../server/modules');
+      seedDemo(s2.ctx);
+      const dediees = s2.db.list('articles', (a) => a.reservee === true);
+      assert.ok(dediees.length >= 2 && dediees.length <= 3, `${dediees.length} pièces dédiées`);
+      for (const a of dediees) {
+        assert.ok(a.equipementIds.length && a.equipementIds.every((id) => s2.db.get('equipements', id)), `${a.designation} : machines existantes`);
+      }
+      seedDemo(s2.ctx);
+      assert.equal(s2.db.count('articles', (a) => a.reservee === true), dediees.length, 'idempotent');
+      // Les sorties de démonstration respectent la règle (équipement autorisé enregistré)
+      for (const a of dediees) {
+        const autorises = s2.ctx.services.stock.equipementsAutorises(a);
+        const sorties = s2.db.list('mouvementsStock', (m) => m.articleId === a.id && m.type === 'sortie');
+        assert.ok(sorties.every((m) => m.equipementId != null && autorises.includes(m.equipementId)), `${a.designation} : sorties sur un équipement autorisé`);
+      }
+    } finally { await s2.stop(); }
+  });
+});
+
+describe('Stock : pièces dédiées — visibilité, sites, droits et journal', () => {
+  let srv, admin, prod, maint, site2, prod2, profils;
+  let ligne, remplisseuse, moteur, presse, secret, valreas;
+  const eq = (numero, nom, secteurId, parentId = null) => srv.db.insert('equipements', { numero, nom, secteurId, parentId, actif: true, typeCode: 'machine', etatCode: 'en_service' });
+  const technicien = async (login, extra = {}) => {
+    await admin.ok('POST', '/api/utilisateurs', Object.assign({ login, nom: 'Contrôle', prenom: login, profilId: profils.find((p) => p.nom === 'Technicien').id, secteurIds: [prod.id], password: 'motdepasse1', doitChangerMdp: false }, extra));
+    const c = srv.client();
+    await c.login(login, 'motdepasse1');
+    return c;
+  };
+  const userId = (login) => srv.db.findOne('users', (u) => u.login === login).id;
+  const derniereLigne = (articleId) => srv.db.list('audit', (x) => x.entite === 'articles' && x.entiteId === articleId).map((x) => x.details).pop();
+
+  before(async () => {
+    srv = await demarrer();
+    admin = srv.client();
+    await admin.login('admin', 'admin');
+    const secteurs = await admin.ok('GET', '/api/secteurs');
+    prod = secteurs.find((x) => x.code === 'PROD');
+    maint = secteurs.find((x) => x.code === 'MAINT');
+    site2 = await admin.ok('POST', '/api/secteurs', { nom: 'Usine de Valréas', code: 'VAL', type: 'site' });
+    prod2 = await admin.ok('POST', '/api/secteurs', { nom: 'Production Valréas', code: 'VAL-PROD', type: 'service', parentId: site2.id });
+    profils = await admin.ok('GET', '/api/profils');
+    ligne = eq('EQ-V01', 'Ligne de conditionnement', prod.id);
+    remplisseuse = eq('EQ-V02', 'Remplisseuse', prod.id, ligne.id);
+    moteur = eq('EQ-V03', 'Moteur de la remplisseuse', prod.id, remplisseuse.id);
+    presse = eq('EQ-V04', 'Presse hydraulique', prod.id);
+    secret = eq('EQ-V05', 'Machine confidentielle maintenance', maint.id);
+    valreas = eq('EQ-V06', 'Presse de Valréas', prod2.id);
+  });
+  after(async () => { await srv.stop(); });
+
+  test('mouvement vers un équipement hors périmètre supprimé : nom, numéro et identifiant restent masqués (journal, fiche, export, filtre)', async () => {
+    const tech = await technicien('tech.vis', { overrides: { stock: { exporter: true } } });
+    const techMaint = await technicien('tech.maint', { secteurIds: [maint.id] });
+    const a = await admin.ok('POST', '/api/articles', { code: 'VIS-1', designation: 'Câble partagé', quantite: 20, reservee: true, equipementIds: [presse.id, secret.id] });
+    const mv = (await admin.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: secret.id })).mouvement;
+    assert.equal(srv.db.get('mouvementsStock', mv.id).equipementSecteurId, maint.id, 'secteur de l\'équipement conservé sur le mouvement');
+    assert.equal(mv.equipementSecteurId, undefined, 'information interne non renvoyée');
+    // Équipement destinataire de sorties : désactivé (traçabilité), jamais supprimé par l'API
+    const d = await admin.ok('DELETE', '/api/equipements/' + secret.id);
+    assert.equal(d.desactive, true);
+    assert.equal(d.references.mouvements, 1);
+    assert.ok(srv.db.get('equipements', secret.id), 'équipement conservé');
+    // Équipement supprimé malgré tout (base antérieure, suppression directe) : la visibilité reste évaluée sur son secteur
+    srv.db.remove('equipements', secret.id);
+    const fuite = (t) => /confidentielle|EQ-V05/.test(t);
+    const ligneTech = (await tech.ok('GET', '/api/mouvements?articleId=' + a.id)).find((m) => m.id === mv.id);
+    assert.equal(ligneTech.equipementMasque, true);
+    assert.equal(ligneTech.equipementId, null);
+    assert.equal(ligneTech.equipementNom, 'Équipement hors de votre périmètre');
+    assert.ok(!fuite(JSON.stringify(ligneTech)), JSON.stringify(ligneTech));
+    const fiche = await tech.ok('GET', '/api/articles/' + a.id);
+    assert.ok(!fuite(JSON.stringify(fiche.mouvements)), 'fiche de l\'article');
+    const csv = String((await tech.get('/api/mouvements-export?articleId=' + a.id)).body);
+    assert.ok(!fuite(csv), 'export');
+    assert.match(csv, /Hors périmètre/);
+    assert.deepEqual(await tech.ok('GET', '/api/mouvements?equipementId=' + secret.id), [], 'pas de sondage par identifiant');
+    assert.deepEqual(await tech.ok('GET', '/api/mouvements?recherche=confidentielle'), [], 'pas de sondage par la recherche');
+    // Lecteur du secteur de l'équipement, et portée « tous » : libellé conservé, mention « supprimé »
+    const vuMaint = (await techMaint.ok('GET', '/api/mouvements?equipementId=' + secret.id)).find((m) => m.id === mv.id);
+    assert.equal(vuMaint && vuMaint.equipementNom, 'EQ-V05 — Machine confidentielle maintenance (supprimé)');
+    const vuAdmin = (await admin.ok('GET', '/api/mouvements?articleId=' + a.id)).find((m) => m.id === mv.id);
+    assert.equal(vuAdmin.equipementMasque, false);
+    assert.equal(vuAdmin.equipementId, secret.id);
+    // Mouvement antérieur (secteur de l'équipement inconnu) : masqué sauf en portée « tous »
+    const ancien = srv.db.insert('mouvementsStock', { articleId: a.id, type: 'sortie', quantite: 1, quantiteAvant: 19, quantiteApres: 18, date: new Date().toISOString(), userId: 1, otId: null, motif: '', prixUnitaire: 0, equipementId: 99999, equipementLibelle: 'EQ-ANC — Ancienne machine secrète' });
+    const ancTech = (await tech.ok('GET', '/api/mouvements?articleId=' + a.id)).find((m) => m.id === ancien.id);
+    assert.equal(ancTech.equipementMasque, true);
+    assert.ok(!/Ancienne machine/.test(JSON.stringify(ancTech)));
+    assert.match((await admin.ok('GET', '/api/mouvements?articleId=' + a.id)).find((m) => m.id === ancien.id).equipementNom, /Ancienne machine secrète \(supprimé\)/);
+    // Retour en stock de la sortie : secteur repris
+    const retour = await admin.ok('POST', `/api/mouvements/${mv.id}/annuler`, {});
+    assert.equal(srv.db.get('mouvementsStock', retour.mouvement.id).equipementSecteurId, maint.id);
+    assert.ok(!fuite(JSON.stringify((await tech.ok('GET', '/api/mouvements?articleId=' + a.id)).find((m) => m.id === retour.mouvement.id))));
+  });
+
+  test('site en lecture seule : la liste affichée se renvoie telle quelle, un ajout ou un retrait de ses équipements est refusé explicitement', async () => {
+    const lect = await technicien('tech.lect', { siteAcces: [{ siteId: site2.id, mode: 'lecture' }], overrides: { stock: { creer: true } } });
+    const a = await admin.ok('POST', '/api/articles', { code: 'SITE-1', designation: 'Pièce multi-site', quantite: 5, reservee: true, equipementIds: [presse.id, valreas.id] });
+    const vu = await lect.ok('GET', '/api/articles/' + a.id);
+    assert.deepEqual(vu.reserveeA.slice().sort(), ['Presse de Valréas', 'Presse hydraulique']);
+    // Formulaire renvoyé tel quel (seul l'emplacement change) : accepté, réponse calculée comme un GET
+    const r = await lect.ok('PUT', '/api/articles/' + a.id, { equipementIds: vu.equipementIds, reservee: true, inclureSousEquipements: true, emplacement: 'B2' });
+    assert.equal(r.emplacement, 'B2');
+    assert.deepEqual(r.reserveeA.slice().sort(), ['Presse de Valréas', 'Presse hydraulique'], 'réponse du PUT identique à la lecture');
+    // Retrait de l'équipement en lecture seule : refus explicite, rien n'est modifié
+    const retrait = await lect.put('/api/articles/' + a.id, { equipementIds: [presse.id] });
+    assert.equal(retrait.status, 403);
+    assert.match(retrait.body.erreur, /Presse de Valréas.*lecture seule.*ne peut pas être retiré/);
+    assert.deepEqual(srv.db.get('articles', a.id).equipementIds.slice().sort(), [presse.id, valreas.id].sort());
+    // Ajout d'un équipement en lecture seule : refus explicite
+    const libre = await admin.ok('POST', '/api/articles', { code: 'SITE-2', designation: 'Pièce libre', quantite: 1 });
+    const ajout = await lect.put('/api/articles/' + libre.id, { equipementIds: [valreas.id] });
+    assert.equal(ajout.status, 403);
+    assert.match(ajout.body.erreur, /lecture seule.*ne peut pas être ajouté/);
+    // Libellés : « autorisé » pour une pièce dédiée, « compatible » pour une pièce libre
+    assert.match((await admin.put('/api/articles/' + a.id, { equipementIds: [presse.id, 99999] })).body.erreur, /Équipement autorisé introuvable \(#99999\)/);
+    assert.match((await admin.put('/api/articles/' + libre.id, { equipementIds: [99999] })).body.erreur, /Équipement compatible introuvable \(#99999\)/);
+  });
+
+  test('réservation : droit Stock › Créer, refus tant que des équipements autorisés sont hors du périmètre, gestionnaires prévenus quand la pièce devient libre', async () => {
+    const tech = await technicien('tech.resa');
+    const magasinier = await technicien('mag.resa', { overrides: { stock: { creer: true } } });
+    const secret2 = eq('EQ-V07', 'Compresseur de la maintenance', maint.id);
+    const cachee = await admin.ok('POST', '/api/articles', { code: 'RESA-1', designation: 'Cartouche réservée maintenance', quantite: 5, reservee: true, equipementIds: [secret2.id] });
+    const visible = await admin.ok('POST', '/api/articles', { code: 'RESA-2', designation: 'Joint de la presse', quantite: 5, reservee: true, equipementIds: [presse.id] });
+    const libre = await admin.ok('POST', '/api/articles', { code: 'RESA-3', designation: 'Graisse', quantite: 5 });
+    // Technicien (Stock › Modifier seulement) : ni levée de la réservation, ni changement de liste ou des sous-équipements
+    for (const corps of [{ reservee: false }, { equipementIds: [presse.id, remplisseuse.id] }, { inclureSousEquipements: false }]) {
+      const r = await tech.put('/api/articles/' + visible.id, corps);
+      assert.equal(r.status, 403, JSON.stringify(corps));
+      assert.match(r.body.erreur, /Stock › Créer/);
+    }
+    assert.equal((await tech.put('/api/articles/' + cachee.id, { reservee: false })).status, 403);
+    assert.equal(srv.db.get('articles', cachee.id).reservee, true, 'réservation conservée');
+    // … mais le formulaire renvoyé sans changement de réservation, et les équipements compatibles d'une pièce libre, restent modifiables
+    assert.equal((await tech.ok('PUT', '/api/articles/' + visible.id, { emplacement: 'C1', reservee: true, inclureSousEquipements: true, equipementIds: [presse.id] })).emplacement, 'C1');
+    assert.deepEqual((await tech.ok('PUT', '/api/articles/' + libre.id, { equipementIds: [presse.id] })).equipementIds, [presse.id]);
+    assert.equal((await tech.post(`/api/articles/${cachee.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: presse.id })).status, 400, 'pièce toujours refusée sur une autre machine');
+    // Stock › Créer, mais équipement autorisé hors de son périmètre : refus
+    const hors = await magasinier.put('/api/articles/' + cachee.id, { reservee: false });
+    assert.equal(hors.status, 403);
+    assert.match(hors.body.erreur, /1 équipement\(s\) hors de votre périmètre/);
+    assert.equal((await magasinier.put('/api/articles/' + cachee.id, { equipementIds: [secret2.id, presse.id] })).status, 403, 'ajout de son propre équipement refusé');
+    // Stock › Créer, tous les équipements visibles : réservation levée, gestionnaires du stock prévenus (pas l'auteur)
+    const n0 = srv.db.list('notifications').length;
+    assert.equal((await magasinier.ok('PUT', '/api/articles/' + visible.id, { reservee: false })).reservee, false);
+    const notes = srv.db.list('notifications').slice(n0).filter((n) => n.titre === 'Pièce dédiée devenue libre');
+    assert.ok(notes.some((n) => n.userId === userId('admin') && /RESA-2/.test(n.message)), 'administrateur prévenu');
+    assert.ok(!notes.some((n) => n.userId === userId('mag.resa')), 'auteur non prévenu');
+    assert.ok(!notes.some((n) => n.userId === userId('tech.resa')), 'technicien sans Stock › Créer non prévenu');
+  });
+
+  test('journal : un article antérieur aux pièces dédiées ne cite que les champs réellement modifiés', async () => {
+    const ancien = srv.db.insert('articles', { code: 'ANC-1', designation: 'Article ancien', quantite: 3, uniteCode: 'u', equipementIds: [], emplacement: 'A1', actif: true });
+    // Corps envoyé par le formulaire : reservee et inclureSousEquipements toujours présents, textes vides
+    await admin.ok('PUT', '/api/articles/' + ancien.id, { designation: 'Article ancien', description: '', emplacement: 'A2', referenceFournisseur: '', reservee: false, inclureSousEquipements: true, equipementIds: [], champs: {} });
+    const d = derniereLigne(ancien.id);
+    assert.match(d, /\(emplacement\)$/, d);
+    assert.doesNotMatch(d, /pièce dédiée|sous-équipements|description|référence/);
+  });
+
+  test('identifiants : écriture décimale seulement (booléen, tableau, hexadécimal, exposant refusés)', async () => {
+    const a = await admin.ok('POST', '/api/articles', { code: 'ID-1', designation: 'Pièce de ligne', quantite: 50, reservee: true, equipementIds: [ligne.id, presse.id], inclureSousEquipements: false });
+    for (const v of [true, [presse.id], `0x${presse.id.toString(16)}`, `${presse.id}e0`, presse.id + 0.5, -presse.id, { id: presse.id }]) {
+      const r = await admin.post(`/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: v });
+      assert.equal(r.status, 400, JSON.stringify(v));
+      assert.match(r.body.erreur, /identifiant invalide/);
+    }
+    assert.equal((await admin.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: ` ${presse.id} ` })).mouvement.equipementId, presse.id, 'chaîne décimale acceptée');
+    assert.equal((await admin.post('/api/articles', { designation: 'Liste invalide', equipementIds: [true] })).status, 400);
+    assert.equal((await admin.post(`/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, otId: '0x1' })).status, 400);
+    assert.throws(() => srv.ctx.services.stock.sortir({ articleId: a.id, quantite: 1, equipementId: true, userId: 1 }), /identifiant invalide/);
+  });
+
+  test('liste filtrée sur un équipement : pièces libres compatibles et pièces dédiées utilisables, sous-équipements compris', async () => {
+    const tech = await technicien('tech.filtre');
+    const deLigne = await admin.ok('POST', '/api/articles', { code: 'FIL-1', designation: 'Capteur de la ligne', reservee: true, equipementIds: [ligne.id] });
+    const deRemp = await admin.ok('POST', '/api/articles', { code: 'FIL-2', designation: 'Roulement de la remplisseuse', reservee: true, equipementIds: [remplisseuse.id] });
+    const compat = await admin.ok('POST', '/api/articles', { code: 'FIL-3', designation: 'Graisse compatible', equipementIds: [remplisseuse.id] });
+    const dePresse = await admin.ok('POST', '/api/articles', { code: 'FIL-4', designation: 'Joint de presse', reservee: true, equipementIds: [presse.id] });
+    const sansSous = await admin.ok('POST', '/api/articles', { code: 'FIL-5', designation: 'Carter de ligne', reservee: true, equipementIds: [ligne.id], inclureSousEquipements: false });
+    const ids = (await admin.ok('GET', '/api/articles?equipementId=' + remplisseuse.id)).map((x) => x.id);
+    for (const x of [deLigne, deRemp, compat]) assert.ok(ids.includes(x.id), x.code);
+    for (const x of [dePresse, sansSous]) assert.ok(!ids.includes(x.id), x.code);
+    assert.ok((await admin.ok('GET', '/api/articles?equipementId=' + moteur.id)).some((x) => x.id === deRemp.id), 'sous-équipement');
+    const csv = String((await admin.get('/api/articles-export?equipementId=' + remplisseuse.id)).body);
+    assert.match(csv, /FIL-1/);
+    assert.doesNotMatch(csv, /FIL-4/);
+    // Équipement hors de la portée du lecteur : aucun résultat (pas de sondage par identifiant)
+    await admin.ok('POST', '/api/articles', { code: 'FIL-6', designation: 'Pièce maintenance', equipementIds: [valreas.id] });
+    assert.deepEqual(await tech.ok('GET', '/api/articles?equipementId=' + valreas.id), []);
+  });
+});

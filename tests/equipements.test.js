@@ -434,7 +434,7 @@ describe('Module Équipements', () => {
     assert.equal(fiche.nbDemandesOuvertes, 1);
     assert.equal(fiche.articlesCompatibles.length, 1);
     assert.equal(fiche.articlesCompatibles[0].designation, 'Filtre à huile');
-    assert.deepEqual(fiche.references, { ot: 0, demandes: 1, plans: 1, articles: 1 });
+    assert.deepEqual(fiche.references, { ot: 0, demandes: 1, plans: 1, articles: 1, mouvements: 0 });
     // Référencé par une demande et un plan → désactivation plutôt que suppression
     const r = await admin.ok('DELETE', '/api/equipements/' + compresseur.id);
     assert.equal(r.desactive, true);
@@ -617,5 +617,97 @@ describe('Module Équipements', () => {
     const fiche = await admin.ok('GET', '/api/equipements/' + compDemo.id);
     assert.ok(fiche.photoIndex >= 0 && fiche.documents.length === 2, 'photo et consigne jointes');
     assert.ok(fiche.compteurReleves.length >= 3, 'historique de compteur');
+  });
+});
+
+describe('Équipements : pièces dédiées dans la fiche', () => {
+  let srv, admin, demandeur, prod;
+  let ligne, remplisseuse, etiqueteuse, presse;
+
+  before(async () => {
+    srv = await demarrer();
+    admin = srv.client(); await admin.login('admin', 'admin');
+    prod = (await admin.ok('GET', '/api/secteurs')).find((s) => s.code === 'PROD');
+    const profils = await admin.ok('GET', '/api/profils');
+    await admin.ok('POST', '/api/utilisateurs', { login: 'dem.ded', nom: 'Demandeur', profilId: profils.find((p) => p.nom === 'Demandeur').id, secteurIds: [prod.id], password: 'motdepasse1', doitChangerMdp: false });
+    demandeur = srv.client(); await demandeur.login('dem.ded', 'motdepasse1');
+    ligne = await admin.ok('POST', '/api/equipements', { nom: 'Ligne de conditionnement', secteurId: prod.id });
+    remplisseuse = await admin.ok('POST', '/api/equipements', { nom: 'Remplisseuse', parentId: ligne.id });
+    etiqueteuse = await admin.ok('POST', '/api/equipements', { nom: 'Étiqueteuse', parentId: ligne.id });
+    presse = await admin.ok('POST', '/api/equipements', { nom: 'Presse', secteurId: prod.id });
+  });
+  after(async () => { await srv.stop(); });
+
+  test('onglet des pièces : pièces dédiées (directes ou héritées du parent) distinguées des pièces compatibles', async () => {
+    const directe = await admin.ok('POST', '/api/articles', { code: 'ART-E1', designation: 'Roulement de la remplisseuse', reservee: true, equipementIds: [remplisseuse.id] });
+    const heritee = await admin.ok('POST', '/api/articles', { code: 'ART-E2', designation: 'Capteur de la ligne', reservee: true, equipementIds: [ligne.id] });
+    const sansSous = await admin.ok('POST', '/api/articles', { code: 'ART-E3', designation: 'Armoire de la ligne', reservee: true, inclureSousEquipements: false, equipementIds: [ligne.id] });
+    const compatible = await admin.ok('POST', '/api/articles', { code: 'ART-E4', designation: 'Graisse', equipementIds: [remplisseuse.id, presse.id] });
+    await admin.ok('POST', '/api/articles', { code: 'ART-E5', designation: 'Joint de la presse', reservee: true, equipementIds: [presse.id] });
+
+    const fiche = await admin.ok('GET', '/api/equipements/' + remplisseuse.id);
+    assert.deepEqual(fiche.articlesDedies.map((a) => a.code).sort(), ['ART-E1', 'ART-E2']);
+    const d1 = fiche.articlesDedies.find((a) => a.id === directe.id);
+    assert.equal(d1.direct, true);
+    const d2 = fiche.articlesDedies.find((a) => a.id === heritee.id);
+    assert.equal(d2.direct, false);
+    assert.equal(d2.viaId, ligne.id);
+    assert.equal(d2.viaNom, 'Ligne de conditionnement');
+    assert.ok(!fiche.articlesDedies.some((a) => a.id === sansSous.id), 'sous-équipements exclus : pièce non proposée');
+    assert.deepEqual(fiche.articlesCompatibles.map((a) => a.id), [compatible.id], 'pièces compatibles : pièces libres seulement');
+    assert.equal(fiche.articlesCompatibles[0].reservee, false);
+
+    const ficheLigne = await admin.ok('GET', '/api/equipements/' + ligne.id);
+    assert.deepEqual(ficheLigne.articlesDedies.map((a) => a.code).sort(), ['ART-E2', 'ART-E3']);
+    assert.ok(ficheLigne.articlesDedies.every((a) => a.direct));
+    const fichePresse = await admin.ok('GET', '/api/equipements/' + presse.id);
+    assert.deepEqual(fichePresse.articlesDedies.map((a) => a.code), ['ART-E5']);
+    assert.deepEqual(fichePresse.articlesCompatibles.map((a) => a.code), ['ART-E4']);
+
+    // Sans le droit Stock › Voir : aucune pièce
+    const pourDemandeur = await demandeur.ok('GET', '/api/equipements/' + remplisseuse.id);
+    assert.deepEqual(pourDemandeur.articlesDedies, []);
+    assert.deepEqual(pourDemandeur.articlesCompatibles, []);
+  });
+
+  test('suppression d\'un équipement : retiré des pièces, nombre de pièces dédiées à réaffecter renvoyé', async () => {
+    const provisoire = await admin.ok('POST', '/api/equipements', { nom: 'Banc provisoire', secteurId: prod.id });
+    const a = await admin.ok('POST', '/api/articles', { code: 'ART-E6', designation: 'Pièce du banc', reservee: true, equipementIds: [provisoire.id] });
+    const libre = await admin.ok('POST', '/api/articles', { code: 'ART-E7', designation: 'Visserie', equipementIds: [provisoire.id, presse.id] });
+    const r = await admin.ok('DELETE', '/api/equipements/' + provisoire.id);
+    assert.equal(r.piecesAReaffecter, 1);
+    assert.deepEqual(srv.db.get('articles', a.id).equipementIds, []);
+    assert.equal(srv.db.get('articles', a.id).reservee, true);
+    assert.deepEqual(srv.db.get('articles', libre.id).equipementIds, [presse.id], 'compatibilité retirée');
+    assert.ok(srv.db.list('audit', (x) => x.entite === 'equipements' && x.action === 'suppression').some((x) => /1 pièce\(s\) dédiée\(s\) désormais sans équipement/.test(x.details)));
+  });
+});
+
+describe('Équipements : suppression d\'un équipement destinataire de sorties de stock', () => {
+  let srv, admin, PROD;
+  before(async () => {
+    srv = await demarrer();
+    admin = srv.client(); await admin.login('admin', 'admin');
+    PROD = (await admin.ok('GET', '/api/secteurs')).find((s) => s.code === 'PROD').id;
+  });
+  after(async () => { await srv.stop(); });
+
+  test('équipement référencé par des mouvements de stock : désactivé (traçabilité) au lieu d\'être supprimé', async () => {
+    const e = await admin.ok('POST', '/api/equipements', { nom: 'Banc de test', typeCode: 'machine', secteurId: PROD });
+    const a = await admin.ok('POST', '/api/articles', { code: 'MVT-EQ', designation: 'Pièce dédiée au banc', quantite: 5, reservee: true, equipementIds: [e.id] });
+    await admin.ok('POST', `/api/articles/${a.id}/mouvements`, { type: 'sortie', quantite: 1, equipementId: e.id });
+    assert.equal((await admin.ok('GET', '/api/equipements/' + e.id)).references.mouvements, 1);
+    const r = await admin.ok('DELETE', '/api/equipements/' + e.id);
+    assert.equal(r.desactive, true);
+    assert.equal(r.references.mouvements, 1);
+    assert.equal(srv.db.get('equipements', e.id).actif, false, 'conservé, désactivé');
+    assert.match(srv.db.list('audit', (x) => x.entite === 'equipements' && x.entiteId === e.id).pop().details, /1 mouvement\(s\) de stock/);
+    assert.deepEqual(srv.db.get('articles', a.id).equipementIds, [e.id], 'pièce dédiée toujours affectée (équipement réformé conservé)');
+    // Sans mouvement : suppression effective, pièce dédiée signalée à réaffecter
+    const e2 = await admin.ok('POST', '/api/equipements', { nom: 'Banc provisoire', typeCode: 'machine', secteurId: PROD });
+    await admin.ok('POST', '/api/articles', { code: 'MVT-EQ2', designation: 'Pièce du banc provisoire', quantite: 1, reservee: true, equipementIds: [e2.id] });
+    const r2 = await admin.ok('DELETE', '/api/equipements/' + e2.id);
+    assert.equal(r2.desactive, false);
+    assert.equal(r2.piecesAReaffecter, 1);
   });
 });

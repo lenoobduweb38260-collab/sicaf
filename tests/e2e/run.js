@@ -111,6 +111,68 @@ async function main() {
     await page.click('text=Nouveau site / secteur'); await page.fill('#f_nom', 'Secteur E2E'); await page.click('.modal-pied .btn-primaire'); await page.waitForSelector('.toast.succes');
     etape('Secteur créé', true);
 
+    // Pièce dédiée : création depuis l'interface, puis choix des pièces sur l'OT d'une autre machine et de la bonne machine
+    await page.goto(base + '/#/stock'); await page.waitForSelector('.vue[data-module="stock"] table.tableau');
+    await page.click('text=Nouvel article'); await page.waitForSelector('.modal #f_designation');
+    await page.fill('#f_designation', 'Vérin de serrage E2E'); await page.fill('#f_quantite', '4');
+    await page.check('#f_reservee');
+    etape('Formulaire article : « Équipements autorisés » quand la case « Pièce dédiée » est cochée', (await page.$eval('.modal label[for="f_equipementIds"]', (l) => l.firstChild.textContent)) === 'Équipements autorisés');
+    // Sans équipement : erreur propre aux pièces dédiées, effacée quand la case est décochée
+    const erreurEq = () => page.$eval('.modal label[for="f_equipementIds"]', (l) => l.closest('.champ').querySelector('.erreur-champ').textContent);
+    await page.click('.modal-pied .btn-primaire'); await page.waitForTimeout(200);
+    const erreurDediee = await erreurEq();
+    await page.uncheck('#f_reservee'); await page.waitForTimeout(100);
+    etape('Formulaire article : erreur « au moins un équipement autorisé » effacée au décochage', /au moins un équipement autorisé/.test(erreurDediee) && (await erreurEq()) === '');
+    await page.check('#f_reservee');
+    await page.click('.modal .cases-liste label:has-text("Presse hydraulique 250 t") input');
+    await page.click('.modal-pied .btn-primaire'); await page.waitForSelector('.toast.succes');
+    await page.waitForSelector('.page-entete .badge:text-is("Dédiée")');
+    const idDediee = Number((await page.evaluate(() => location.hash)).match(/stock\/(\d+)/)[1]);
+    etape('Pièce dédiée créée depuis l\'interface (badge « Dédiée »)', idDediee > 0);
+    await capture('stock-piece-dediee');
+    const ots = await page.evaluate(() => api.get('/api/ot'));
+    const otAutre = ots.find((o) => /groupe froid/i.test(o.titre) && !/termine|annule/.test(o.statut));
+    const otBonne = ots.find((o) => /joint de tige/i.test(o.titre) && !/termine|annule/.test(o.statut));
+    const optionPiece = async (otId) => {
+      await page.goto(base + '/#/ot/' + otId); await page.waitForSelector('.vue[data-module="ot"] .onglets');
+      await page.click('.onglets button:has-text("Réalisation")');
+      await page.waitForFunction(() => Array.from(document.querySelectorAll('.vue select')).some((s) => /Choisir un article/.test(s.textContent) && !s.disabled));
+      return page.evaluate((id) => {
+        const s = Array.from(document.querySelectorAll('.vue select')).find((x) => /Choisir un article/.test(x.textContent));
+        const o = s.querySelector(`option[value="${id}"]`);
+        return o ? { desactivee: o.disabled, groupe: o.parentElement.label, raison: o.title } : null;
+      }, idDediee);
+    };
+    const surAutre = await optionPiece(otAutre.id);
+    etape('OT d\'une autre machine : pièce dédiée désactivée avec la raison', !!surAutre && surAutre.desactivee && /ne peut pas être utilisée sur Groupe froid/.test(surAutre.raison), surAutre && surAutre.raison);
+    // Aide sur les pièces grisées conservée quand l'article choisi change
+    const aidePieces = () => page.evaluate(() => { const s = Array.from(document.querySelectorAll('.vue select')).find((x) => /Choisir un article/.test(x.textContent)); return Array.from(s.closest('.carte').querySelectorAll('.aide')).map((a) => a.textContent).join(' '); });
+    await page.evaluate(() => { const s = Array.from(document.querySelectorAll('.vue select')).find((x) => /Choisir un article/.test(x.textContent)); const o = Array.from(s.options).find((x) => x.value && !x.disabled); s.value = o.value; s.dispatchEvent(new Event('change')); s.value = ''; s.dispatchEvent(new Event('change')); });
+    etape('OT : aide sur les pièces dédiées grisées conservée après le choix d\'un article', /grisée/.test(await aidePieces()));
+    // OT sans équipement : groupe et raison invitant à renseigner l'équipement de l'OT
+    const prod = await page.evaluate(() => GMAO.refs.secteurs.find((x) => x.code === 'PROD').id);
+    const otSansEq = await page.evaluate((sid) => api.post('/api/ot', { titre: 'Contrôle sans équipement', typeCode: 'correctif', prioriteCode: 'normale', secteurId: sid }), prod);
+    const surSansEq = await optionPiece(otSansEq.id);
+    etape('OT sans équipement : pièce dédiée grisée « renseignez d\'abord l\'équipement de l\'OT »', !!surSansEq && surSansEq.desactivee && /renseignez d'abord l'équipement/.test(surSansEq.groupe) && /renseignez d'abord l'équipement de l'ordre de travail/.test(surSansEq.raison), surSansEq && surSansEq.groupe);
+    // Nouveau mouvement : un OT choisi avant une pièce dédiée qu'il n'autorise pas est désélectionné
+    await page.goto(base + '/#/stock'); await page.waitForSelector('.vue[data-module="stock"] table.tableau');
+    await page.click('.page-entete button:has-text("Nouveau mouvement")'); await page.waitForSelector('.modal #f_articleId');
+    await page.check('.modal input[type=radio][value="sortie"]');
+    await page.selectOption('.modal #f_otId', String(otAutre.id));
+    await page.selectOption('.modal #f_articleId', String(idDediee));
+    await page.waitForTimeout(200);
+    const mvt = await page.evaluate(() => ({ ot: document.querySelector('#f_otId').value, erreur: document.querySelector('#f_otId').closest('.champ').querySelector('.erreur-champ').textContent }));
+    etape('Nouveau mouvement : OT non autorisé désélectionné et signalé', mvt.ot === '' && /OT non autorisé/.test(mvt.erreur), mvt.erreur);
+    await page.keyboard.press('Escape'); await page.waitForTimeout(200);
+    { const abandon = await page.$('.modal .btn-danger'); if (abandon) await abandon.click(); }
+    await page.waitForFunction(() => !document.querySelector('.modal #f_articleId'));
+    const surBonne = await optionPiece(otBonne.id);
+    etape('OT de la bonne machine : pièce dédiée en tête et utilisable', !!surBonne && !surBonne.desactivee && surBonne.groupe === 'Pièces dédiées à cet équipement');
+    await page.evaluate((id) => { const s = Array.from(document.querySelectorAll('.vue select')).find((x) => /Choisir un article/.test(x.textContent)); s.value = String(id); s.dispatchEvent(new Event('change')); }, idDediee);
+    await page.click('.vue button:has-text("Sortir du stock")'); await page.waitForSelector('.toast.succes >> text=Sortie de stock enregistrée');
+    etape('Pièce dédiée sortie du stock sur l\'OT de la bonne machine', (await page.textContent('.vue')).includes('Vérin de serrage E2E'));
+    await capture('ot-piece-dediee');
+
     // Thème sombre + déconnexion
     await page.click('.entete-utilisateur'); await page.click('text=Thème sombre'); await page.waitForTimeout(200);
     etape('Thème sombre appliqué', (await page.getAttribute('html', 'data-theme')) === 'sombre');

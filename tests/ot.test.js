@@ -939,3 +939,182 @@ describe('Ordres de travail', () => {
     } finally { await autre.stop(); }
   });
 });
+
+describe('Ordres de travail : pièces dédiées (règle du module Stock)', () => {
+  let srv, admin, tech, PROD;
+  let ligne, remplisseuse, presse, dediee, libre;
+  const eq = (numero, nom, parentId = null) => srv.db.insert('equipements', { numero, nom, parentId, secteurId: PROD, actif: true, typeCode: 'machine', etatCode: 'en_service', criticiteCode: 'B', documents: [], champs: {}, createdBy: 1 });
+
+  before(async () => {
+    srv = await demarrer();
+    admin = srv.client(); await admin.login('admin', 'admin');
+    PROD = (await admin.ok('GET', '/api/secteurs')).find((s) => s.code === 'PROD').id;
+    const profils = await admin.ok('GET', '/api/profils');
+    await admin.ok('POST', '/api/utilisateurs', { login: 'tech.ded', nom: 'Technicien', prenom: 'Tess', profilId: profils.find((p) => p.nom === 'Technicien').id, secteurIds: [PROD], password: 'tech1234', doitChangerMdp: false });
+    tech = srv.client(); await tech.login('tech.ded', 'tech1234');
+    ligne = eq('EQ-L01', 'Ligne 1');
+    remplisseuse = eq('EQ-L02', 'Remplisseuse', ligne.id);
+    presse = eq('EQ-L03', 'Presse 250 t');
+    dediee = await admin.ok('POST', '/api/articles', { code: 'ART-DED', designation: 'Roulement appairé', reservee: true, equipementIds: [ligne.id], quantite: 10, prixUnitaire: 40 });
+    libre = await admin.ok('POST', '/api/articles', { code: 'ART-LIB', designation: 'Graisse EP2', quantite: 10, prixUnitaire: 6, equipementIds: [presse.id] });
+  });
+  after(async () => { await srv.stop(); });
+
+  test('POST /api/ot/:id/pieces passe par la règle : refus sur une autre machine, sortie sur un équipement autorisé (sous-équipement compris)', async () => {
+    const otPresse = await admin.ok('POST', '/api/ot', { titre: 'Remplacement joint presse', equipementId: presse.id, technicienId: srv.db.findOne('users', (u) => u.login === 'tech.ded').id });
+    const refus = await tech.post(`/api/ot/${otPresse.id}/pieces`, { articleId: dediee.id, quantite: 1 });
+    assert.equal(refus.status, 400);
+    assert.match(refus.body.erreur, /ART-DED — Roulement appairé/);
+    assert.match(refus.body.erreur, /Ligne 1 \(EQ-L01\), sous-équipements compris/);
+    assert.match(refus.body.erreur, /Presse 250 t \(EQ-L03\)/);
+    assert.equal(srv.db.get('articles', dediee.id).quantite, 10, 'aucune sortie');
+    assert.equal((await admin.ok('GET', '/api/ot/' + otPresse.id)).pieces.length, 0);
+    assert.equal((await admin.ok('POST', `/api/ot/${otPresse.id}/pieces`, { articleId: libre.id, quantite: 1 })).pieces.length, 1, 'pièce libre : sortie possible');
+    const otRemp = await admin.ok('POST', '/api/ot', { titre: 'Remplacement roulement remplisseuse', equipementId: remplisseuse.id });
+    const ok = await admin.ok('POST', `/api/ot/${otRemp.id}/pieces`, { articleId: dediee.id, quantite: 2 });
+    assert.equal(ok.pieces.length, 1);
+    assert.equal(ok.coutPieces, 80);
+    const m = srv.db.get('mouvementsStock', ok.pieces[0].mouvementId);
+    assert.equal(m.equipementId, remplisseuse.id, 'équipement de l\'OT enregistré sur le mouvement');
+  });
+
+  test('changement d\'équipement d\'un OT ayant consommé une pièce dédiée : refusé si elle n\'est pas autorisée pour le nouvel équipement', async () => {
+    const o = await admin.ok('POST', '/api/ot', { titre: 'Révision de la remplisseuse', equipementId: remplisseuse.id });
+    const avecPiece = await admin.ok('POST', `/api/ot/${o.id}/pieces`, { articleId: dediee.id, quantite: 1 });
+    await admin.ok('POST', `/api/ot/${o.id}/pieces`, { articleId: libre.id, quantite: 1 });
+    const refus = await admin.put('/api/ot/' + o.id, { equipementId: presse.id });
+    assert.equal(refus.status, 400);
+    assert.match(refus.body.erreur, /Changement d'équipement impossible/);
+    assert.match(refus.body.erreur, /ART-DED — Roulement appairé/);
+    assert.doesNotMatch(refus.body.erreur, /Graisse/, 'seules les pièces dédiées non autorisées sont citées');
+    assert.equal(srv.db.get('ot', o.id).equipementId, remplisseuse.id);
+    assert.equal((await admin.put('/api/ot/' + o.id, { equipementId: null, secteurId: PROD })).status, 400, 'OT sans équipement : pièce dédiée non autorisée');
+    assert.equal((await admin.ok('PUT', '/api/ot/' + o.id, { equipementId: ligne.id })).equipementId, ligne.id, 'équipement parent autorisé : changement accepté');
+    // Après retour en stock de la pièce dédiée, le changement est possible
+    const ligneDed = avecPiece.pieces.find((p) => p.articleId === dediee.id);
+    await admin.ok('DELETE', `/api/ot/${o.id}/pieces/${ligneDed.uid}`);
+    assert.equal((await admin.ok('PUT', '/api/ot/' + o.id, { equipementId: presse.id })).equipementId, presse.id);
+  });
+
+  test('GET /api/ot-articles : reservee, utilisable, reserveeA ; dédiées utilisables en tête, non utilisables en fin de liste', async () => {
+    const otRemp = await admin.ok('POST', '/api/ot', { titre: 'Contrôle remplisseuse', equipementId: remplisseuse.id });
+    const r = await tech.ok('GET', `/api/ot-articles?otId=${otRemp.id}`);
+    assert.equal(r.equipementId, remplisseuse.id);
+    const d = r.articles.find((a) => a.id === dediee.id);
+    assert.equal(d.reservee, true);
+    assert.equal(d.utilisable, true);
+    assert.deepEqual(d.reserveeA, ['Ligne 1']);
+    assert.equal(r.articles[0].id, dediee.id, 'pièce dédiée utilisable en tête');
+    const l = r.articles.find((a) => a.id === libre.id);
+    assert.equal(l.reservee, false);
+    assert.equal(l.utilisable, true);
+    const otPresse = await admin.ok('POST', '/api/ot', { titre: 'Contrôle presse', equipementId: presse.id });
+    const r2 = await tech.ok('GET', `/api/ot-articles?otId=${otPresse.id}`);
+    const d2 = r2.articles.find((a) => a.id === dediee.id);
+    assert.equal(d2.utilisable, false);
+    assert.match(d2.raison, /ne peut pas être utilisée sur Presse 250 t/);
+    assert.equal(r2.articles[r2.articles.length - 1].id, dediee.id, 'pièce dédiée à une autre machine en fin de liste');
+    assert.equal(r2.articles[0].id, libre.id, 'pièce compatible ensuite en tête');
+    const sansOt = await tech.ok('GET', '/api/ot-articles');
+    assert.equal(sansOt.articles.find((a) => a.id === dediee.id).utilisable, false, 'sans OT : pas d\'équipement');
+  });
+
+  test('pièces prévues d\'un OT de plan préventif : indicateurs de la règle dans la fiche', async () => {
+    const o = srv.db.insert('ot', { numero: 'OT-DED-PREV', titre: 'OT généré', statut: 'nouveau', equipementId: presse.id, secteurId: PROD, pieces: [], piecesPrevues: [{ articleId: dediee.id, code: 'ART-DED', designation: 'Roulement appairé', quantite: 1 }, { articleId: libre.id, quantite: 2 }], tempsPasse: [], taches: [], commentaires: [], documents: [], historique: [], createdBy: 1 });
+    const fiche = await admin.ok('GET', '/api/ot/' + o.id);
+    assert.equal(fiche.piecesPrevues[0].reservee, true);
+    assert.equal(fiche.piecesPrevues[0].utilisable, false);
+    assert.match(fiche.piecesPrevues[0].raison, /dédiée à Ligne 1/);
+    assert.equal(fiche.piecesPrevues[1].utilisable, true);
+    assert.equal(fiche.piecesPrevues[1].designation, 'Graisse EP2');
+  });
+});
+
+describe('Ordres de travail : pièces dédiées — réouverture, pièces prévues, plans, identifiants', () => {
+  let srv, admin, PROD, uTech;
+  let remplisseuse, presse, dediee, dediee2, libre;
+  const eq = (numero, nom, parentId = null) => srv.db.insert('equipements', { numero, nom, parentId, secteurId: PROD, actif: true, typeCode: 'machine', etatCode: 'en_service', criticiteCode: 'B', documents: [], champs: {}, createdBy: 1 });
+  const plan = (nom, equipementId, pieces, extra = {}) => admin.ok('POST', '/api/preventif', Object.assign({ nom, equipementId, periodicite: { type: 'mois', valeur: 1 }, gamme: [{ libelle: 'Contrôle', duree: 1 }], pieces }, extra));
+
+  before(async () => {
+    srv = await demarrer();
+    const cfg = srv.db.getConfig(); cfg.preventif = Object.assign({}, cfg.preventif, { genererAuto: false }); srv.db.setConfig(cfg);
+    admin = srv.client(); await admin.login('admin', 'admin');
+    PROD = (await admin.ok('GET', '/api/secteurs')).find((s) => s.code === 'PROD').id;
+    const profils = await admin.ok('GET', '/api/profils');
+    uTech = await admin.ok('POST', '/api/utilisateurs', { login: 'tech.reo', nom: 'Technicien', prenom: 'Rémi', profilId: profils.find((p) => p.nom === 'Technicien').id, secteurIds: [PROD], password: 'tech1234', doitChangerMdp: false });
+    remplisseuse = eq('EQ-R01', 'Remplisseuse');
+    presse = eq('EQ-R02', 'Presse hydraulique');
+    dediee = await admin.ok('POST', '/api/articles', { code: 'ART-R1', designation: 'Roulement dédié', reservee: true, equipementIds: [remplisseuse.id], quantite: 20, prixUnitaire: 30 });
+    dediee2 = await admin.ok('POST', '/api/articles', { code: 'ART-R2', designation: 'Joint dédié', reservee: true, equipementIds: [remplisseuse.id], quantite: 20, prixUnitaire: 5 });
+    libre = await admin.ok('POST', '/api/articles', { code: 'ART-R3', designation: 'Graisse', quantite: 20, prixUnitaire: 2 });
+  });
+  after(async () => { await srv.stop(); });
+
+  test('PUT { reouvrir, equipementId } refusé par la règle des pièces dédiées : aucune écriture (OT clôturé, réalisation du plan conservée)', async () => {
+    const pl = await plan('Plan remplisseuse', remplisseuse.id, [{ articleId: dediee.id, quantite: 1 }]);
+    const otId = (await admin.ok('POST', `/api/preventif/${pl.id}/generer`, {})).ot.id;
+    await admin.ok('POST', `/api/ot/${otId}/statut`, { statut: 'en_cours' });
+    await admin.ok('POST', `/api/ot/${otId}/pieces`, { articleId: dediee.id, quantite: 1 });
+    await admin.ok('POST', `/api/ot/${otId}/cloturer`, { rapport: 'Roulement remplacé' });
+    const avant = { ot: srv.db.get('ot', otId), plan: srv.db.get('plansPreventifs', pl.id) };
+    assert.equal(avant.plan.dernierOtId, otId);
+    const nAudit = srv.db.count('audit', (x) => x.entite === 'ot' && x.entiteId === otId);
+    const r = await admin.put('/api/ot/' + otId, { reouvrir: true, motifReouverture: 'Changement de machine', equipementId: presse.id });
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /Changement d'équipement impossible/);
+    const o = srv.db.get('ot', otId); const p = srv.db.get('plansPreventifs', pl.id);
+    assert.equal(o.statut, avant.ot.statut, 'OT toujours clôturé');
+    assert.equal((o.historique || []).length, (avant.ot.historique || []).length, 'historique inchangé');
+    assert.equal(srv.db.count('audit', (x) => x.entite === 'ot' && x.entiteId === otId), nAudit, 'aucune réouverture au journal');
+    assert.deepEqual({ dernierOtId: p.dernierOtId, derniereExecution: p.derniereExecution }, { dernierOtId: avant.plan.dernierOtId, derniereExecution: avant.plan.derniereExecution }, 'réalisation du plan conservée');
+    // Requête valide : réouverture et modification appliquées
+    const ok = await admin.ok('PUT', '/api/ot/' + otId, { reouvrir: true, motifReouverture: 'Compléter le compte rendu', rapport: 'Roulement remplacé, alignement contrôlé' });
+    assert.notEqual(ok.statut, 'termine');
+    assert.equal(ok.rapport, 'Roulement remplacé, alignement contrôlé');
+  });
+
+  test('changement d\'équipement : pièces prévues dédiées non autorisées retirées (historique, avertissement) ; pièces consommées refusées, message accordé', async () => {
+    const pl = await plan('Plan remplisseuse bis', remplisseuse.id, [{ articleId: dediee.id, quantite: 1 }, { articleId: libre.id, quantite: 2 }]);
+    const otId = (await admin.ok('POST', `/api/preventif/${pl.id}/generer`, {})).ot.id;
+    const r = await admin.ok('PUT', '/api/ot/' + otId, { equipementId: presse.id });
+    assert.deepEqual(r.piecesPrevues.map((x) => x.articleId), [libre.id], 'pièce dédiée retirée des pièces prévues');
+    assert.ok(r.piecesPrevues.every((x) => x.utilisable), 'aucune pièce prévue non autorisée');
+    assert.match(r.avertissements[0], /Pièces prévues retirées.*ART-R1 — Roulement dédié/);
+    assert.ok(r.historique.some((h) => h.action === 'piecesPrevues' && /ART-R1/.test(h.commentaire)));
+    // Pièce consommée : refus, au singulier puis au pluriel
+    const o2 = await admin.ok('POST', '/api/ot', { titre: 'Dépannage remplisseuse', equipementId: remplisseuse.id });
+    await admin.ok('POST', `/api/ot/${o2.id}/pieces`, { articleId: dediee.id, quantite: 1 });
+    const un = await admin.put('/api/ot/' + o2.id, { equipementId: presse.id });
+    assert.equal(un.status, 400);
+    assert.match(un.body.erreur, /une pièce dédiée déjà consommée .* n'est pas autorisée .*Remettez-la en stock/);
+    await admin.ok('POST', `/api/ot/${o2.id}/pieces`, { articleId: dediee2.id, quantite: 1 });
+    const deux = await admin.put('/api/ot/' + o2.id, { equipementId: presse.id });
+    assert.match(deux.body.erreur, /des pièces dédiées déjà consommées .*Remettez-les en stock/);
+  });
+
+  test('OT créé depuis un plan devenu non conforme (POST /api/ot { planPreventifId }) : pièce non reprise, signalée au responsable du plan', async () => {
+    const piece = await admin.ok('POST', '/api/articles', { code: 'ART-R4', designation: 'Filtre libre', quantite: 10 });
+    const pl = await plan('Plan presse', presse.id, [{ articleId: piece.id, quantite: 1 }, { articleId: libre.id, quantite: 1 }], { technicienId: uTech.id });
+    // La pièce devient dédiée à la remplisseuse : le plan de la presse est signalé
+    const maj = await admin.ok('PUT', '/api/articles/' + piece.id, { reservee: true, equipementIds: [remplisseuse.id] });
+    assert.deepEqual(maj.plansNonConformes.map((p) => p.id), [pl.id]);
+    assert.match(srv.db.list('audit', (x) => x.entite === 'articles' && x.entiteId === piece.id).pop().details, /1 plan\(s\) préventif\(s\) actif\(s\) prévoient désormais cette pièce sur un équipement non autorisé/);
+    const n0 = srv.db.list('notifications').length;
+    const o = await admin.ok('POST', '/api/ot', { planPreventifId: pl.id, titre: 'Depuis le plan' });
+    assert.deepEqual(o.piecesPrevues.map((x) => x.articleId), [libre.id], 'pièce dédiée non autorisée non reprise');
+    assert.match(o.avertissements[0], /Pièce prévue du plan non reprise.*ART-R4 — Filtre libre/);
+    assert.ok(srv.db.get('ot', o.id).historique.some((h) => h.action === 'piecesPrevues' && /ART-R4/.test(h.commentaire)));
+    const notes = srv.db.list('notifications').slice(n0).filter((n) => /pièces prévues non reprises/.test(n.titre));
+    assert.ok(notes.some((n) => n.userId === uTech.id && /ART-R4/.test(n.message)), 'responsable du plan prévenu');
+  });
+
+  test('identifiants d\'équipement et de plan : écriture décimale seulement', async () => {
+    for (const v of [true, [presse.id], `0x${presse.id.toString(16)}`, `${presse.id}e0`]) {
+      const r = await admin.post('/api/ot', { titre: 'Identifiant invalide', equipementId: v });
+      assert.equal(r.status, 400, JSON.stringify(v));
+      assert.match(r.body.erreur, /identifiant invalide/);
+    }
+    assert.equal((await admin.ok('POST', '/api/ot', { titre: 'Identifiant en chaîne', equipementId: String(presse.id) })).equipementId, presse.id);
+  });
+});

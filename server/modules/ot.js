@@ -29,7 +29,10 @@
  * Événements émis    : 'ot:cree', 'ot:modifie', 'ot:statut' ({ ot, ancien, nouveau }), 'ot:termine', 'ot:annule',
  *                      'ot:supprime'. Charge utile : copie de l'OT complétée de { ot, ancien?, nouveau? }
  *                      (lisible indifféremment comme `data.ot` ou comme l'OT lui-même).
- * Services consommés : ctx.services.stock.{ sortir, annulerSortie }, ctx.services.equipements.{ releverCompteur, visible, chemin }.
+ * Services consommés : ctx.services.stock.{ sortir, annulerSortie, utilisablePour, indicateurs }, ctx.services.equipements.{ releverCompteur, visible, chemin }.
+ * Pièces dédiées : la règle d'utilisation est celle du module Stock (utilisablePour) ; une sortie de pièce sur un OT
+ *   la subit (équipement de l'OT), et l'équipement d'un OT ne change pas s'il a déjà consommé une pièce dédiée
+ *   non autorisée pour le nouvel équipement.
  */
 const crypto = require('crypto');
 const nom = 'Ordres de travail';
@@ -55,6 +58,7 @@ const STATUTS_DEFAUT = [
 const LIBELLES_ETAPES = {
   creation: 'Ordre de travail créé', duplication: 'Créé par duplication', affectation: 'Affectation', statut: 'Changement de statut',
   cloture: 'Ordre de travail clôturé', annulation: 'Ordre de travail annulé', reouverture: 'Ordre de travail réouvert', modification: 'Modification',
+  piecesPrevues: 'Pièces prévues',
 };
 
 /** Champs que le technicien affecté peut modifier sans le droit « modifier ». */
@@ -202,10 +206,11 @@ function register(ctx) {
     if (max != null && n > max) throw new HttpError(400, `${label} ne doit pas dépasser ${max}`);
     return n;
   }
+  /** Identifiant : entier positif, ou chaîne en écriture décimale (booléens, tableaux, hexadécimal et exposant refusés). */
   function idRef(v, label) {
     if (v === undefined || v === null || v === '') return null;
-    const n = Number(v);
-    if (!Number.isInteger(n) || n <= 0) throw new HttpError(400, `${label} : identifiant invalide`);
+    const n = typeof v === 'number' ? v : (typeof v === 'string' && /^\s*\d+\s*$/.test(v) ? Number(v.trim()) : NaN);
+    if (!Number.isSafeInteger(n) || n <= 0) throw new HttpError(400, `${label} : identifiant invalide`);
     return n;
   }
   function lireDate(v, label) {
@@ -532,6 +537,54 @@ function register(ctx) {
     };
   }
 
+  /** Pièces dédiées : indicateurs du module Stock (reservee, utilisable, raison…) pour l'équipement donné. */
+  function indicateursPieces(req, articles, equipementId) {
+    const stock = ctx.services.stock;
+    if (stock && typeof stock.indicateurs === 'function') return stock.indicateurs(articles, equipementId, req);
+    return articles.map(() => ({ reservee: false, reserveeA: [], reserveeTexte: '', reserveeHorsPerimetre: 0, sansEquipement: false, utilisable: true, raison: '' }));
+  }
+  const champsIndicateurs = (x) => ({ reservee: !!x.reservee, utilisable: x.utilisable !== false, raison: x.raison || '', reserveeA: x.reserveeA || [], reserveeTexte: x.reserveeTexte || '', reserveeHorsPerimetre: x.reserveeHorsPerimetre || 0, sansEquipement: !!x.sansEquipement });
+  /** Pièces prévues (gamme du plan préventif) avec disponibilité et indicateurs des pièces dédiées. */
+  function piecesPrevuesDetail(req, o, articles) {
+    const lignes = o.piecesPrevues || [];
+    const arts = lignes.map((pc) => articles.get(Number(pc.articleId)) || null);
+    const ind = indicateursPieces(req, arts.filter(Boolean), o.equipementId);
+    let k = 0;
+    return lignes.map((pc, i) => {
+      const a = arts[i];
+      const x = a ? champsIndicateurs(ind[k++]) : {};
+      return Object.assign({}, pc, { designation: pc.designation || (a ? a.designation : ''), code: pc.code || (a ? a.code || '' : ''), disponible: a ? Number(a.quantite) || 0 : null }, x);
+    });
+  }
+  /**
+   * Changement d'équipement d'un OT (règle du module Stock) : refusé si des pièces dédiées déjà consommées ne sont pas
+   * autorisées pour le nouvel équipement. Les pièces prévues (plan préventif) non autorisées sont retirées des pièces
+   * prévues : la fonction renvoie { piecesPrevues, retirees } (retirees vide si rien ne change).
+   */
+  function verifierPiecesDediees(req, o, nouvelEquipementId) {
+    const stock = ctx.services.stock;
+    const sansChangement = { piecesPrevues: o.piecesPrevues || [], retirees: [] };
+    if (!stock || typeof stock.utilisablePour !== 'function') return sansChangement;
+    const vus = new Set(); const refusees = [];
+    for (const p of o.pieces || []) {
+      const id = Number(p.articleId);
+      if (vus.has(id)) continue;
+      vus.add(id);
+      const a = db.get('articles', id);
+      if (!a || stock.utilisablePour(a, nouvelEquipementId, req).ok) continue;
+      refusees.push(`${a.code ? a.code + ' — ' : ''}${a.designation || ''}`);
+    }
+    if (refusees.length) {
+      const plusieurs = refusees.length > 1;
+      throw new HttpError(400, `Changement d'équipement impossible : ${plusieurs ? 'des pièces dédiées déjà consommées sur cet ordre de travail ne sont pas autorisées' : 'une pièce dédiée déjà consommée sur cet ordre de travail n\'est pas autorisée'} pour le nouvel équipement (${refusees.join(', ')}). ${plusieurs ? 'Remettez-les' : 'Remettez-la'} en stock depuis l'OT avant de changer d'équipement.`);
+    }
+    if (!(o.piecesPrevues || []).length || typeof stock.piecesPrevuesPour !== 'function') return sansChangement;
+    const f = stock.piecesPrevuesPour(o.piecesPrevues, nouvelEquipementId, req);
+    return { piecesPrevues: f.retenues, retirees: f.ecartees };
+  }
+  /** « ART-0002 — Roulement…, ART-0013 — Capteur… » */
+  const listePieces = (lignes) => lignes.map((x) => `${x.code ? x.code + ' — ' : ''}${x.designation || '#' + x.articleId}`).join(', ');
+
   /** Fiche complète (enrichie). */
   function detail(req, o) {
     const refs = references();
@@ -546,7 +599,7 @@ function register(ctx) {
     const articles = new Map(db.list('articles').map((a) => [a.id, a]));
     const mouvements = db.list('mouvementsStock', (m) => Number(m.otId) === o.id)
       .sort((a, b) => String(a.date || a.createdAt || '').localeCompare(String(b.date || b.createdAt || '')))
-      .map((m) => { const a = articles.get(Number(m.articleId)); return Object.assign({}, m, { articleCode: a ? a.code || '' : '', articleDesignation: a ? a.designation || '' : '', userNom: nomDe(refs, m.userId) }); });
+      .map((m) => { const a = articles.get(Number(m.articleId)); return Object.assign({}, m, { equipementSecteurId: undefined, articleCode: a ? a.code || '' : '', articleDesignation: a ? a.designation || '' : '', userNom: nomDe(refs, m.userId) }); });
     const couts = calculerCouts(o, refs.taux);
     const stock = ctx.services.stock;
     return Object.assign(base, {
@@ -564,7 +617,7 @@ function register(ctx) {
       commentaires: (o.commentaires || []).map((c, i) => Object.assign({}, c, { index: i, userNom: nomDe(refs, c.userId) })),
       tempsPasse: (o.tempsPasse || []).map((t, i) => Object.assign({}, t, { index: i, userNom: nomDe(refs, t.userId) })),
       pieces: (o.pieces || []).map((pc, i) => Object.assign({}, pc, { index: i, montant: arrondi((Number(pc.quantite) || 0) * (Number(pc.prixUnitaire) || 0)) })),
-      piecesPrevues: (o.piecesPrevues || []).map((pc) => { const a = articles.get(Number(pc.articleId)); return Object.assign({}, pc, { designation: pc.designation || (a ? a.designation : ''), code: pc.code || (a ? a.code || '' : ''), disponible: a ? Number(a.quantite) || 0 : null }); }),
+      piecesPrevues: piecesPrevuesDetail(req, o, articles),
       taches: (o.taches || []).map((t, i) => Object.assign({}, t, { index: i, faitParNom: nomDe(refs, t.faitPar) })),
       historique: (o.historique || []).map((h) => Object.assign({}, h, { userNom: h.userId == null ? 'Système' : nomDe(refs, h.userId) })),
       clotureParNom: nomDe(refs, o.cloturePar),
@@ -658,9 +711,19 @@ function register(ctx) {
     }
     let taches = plan ? tachesDepuis((plan.gamme || []).slice().sort((a, b) => (a.ordre || 0) - (b.ordre || 0)).map((g) => ({ libelle: g.libelle, duree: g.duree }))) : [];
     if (!plan && body.taches !== undefined) taches = tachesDepuis(body.taches);
-    const piecesPrevues = plan ? (plan.pieces || []).filter((x) => x && x.articleId != null).map((x) => { const a = db.get('articles', x.articleId); return { articleId: Number(x.articleId), code: a ? a.code || '' : '', designation: a ? a.designation || '' : '', quantite: Number(x.quantite) || 0 }; }) : [];
+    // Pièces prévues du plan : seules celles qui sont utilisables sur l'équipement de l'OT sont reprises (règle des
+    // pièces dédiées du module Stock) ; les autres sont signalées (historique, journal, responsable du plan)
+    let lignesPlan = plan ? (plan.pieces || []).filter((x) => x && x.articleId != null) : [];
+    let piecesEcartees = [];
+    const sStock = ctx.services.stock;
+    if (lignesPlan.length && sStock && typeof sStock.piecesPrevuesPour === 'function') {
+      const f = sStock.piecesPrevuesPour(lignesPlan, data.equipementId, req && req.perms ? req : null);
+      lignesPlan = f.retenues; piecesEcartees = f.ecartees;
+    }
+    const piecesPrevues = lignesPlan.map((x) => { const a = db.get('articles', x.articleId); return { articleId: Number(x.articleId), code: a ? a.code || '' : '', designation: a ? a.designation || '' : '', quantite: Number(x.quantite) || 0 }; });
     const createdBy = options.createdBy !== undefined ? options.createdBy : (req && req.user ? req.user.id : null);
     const statut = st.initial;
+    const noteEcartees = piecesEcartees.length ? `Pièces prévues du plan non reprises (pièces dédiées non autorisées pour l'équipement de l'OT) : ${listePieces(piecesEcartees)}` : '';
     const record = Object.assign({
       numero: numeroUnique(), statut,
       demandeId: demande ? demande.id : null, planPreventifId: plan ? plan.id : null,
@@ -668,18 +731,31 @@ function register(ctx) {
       dateDebut: null, dateFin: null, tempsPasse: [], pieces: [], piecesPrevues, causeCode: null, rapport: '',
       commentaires: [], documents: [], coutPieces: 0, coutMainOeuvre: 0, coutTotal: 0, compteurReleve: null, taches,
       cloturePar: null, dateCloture: null, createdBy,
-      historique: [entree(req, options.source === 'duplication' ? 'duplication' : 'creation', statut, options.commentaire || (demande ? `Depuis la demande ${demande.numero || demande.id}` : plan ? `Depuis le plan préventif ${plan.numero || plan.nom}` : ''))],
+      historique: [entree(req, options.source === 'duplication' ? 'duplication' : 'creation', statut, options.commentaire || (demande ? `Depuis la demande ${demande.numero || demande.id}` : plan ? `Depuis le plan préventif ${plan.numero || plan.nom}` : ''))]
+        .concat(noteEcartees ? [entree(req, 'piecesPrevues', statut, noteEcartees)] : []),
     }, data);
     record.coutTotal = arrondi((record.coutExterne || 0));
     const o = db.insert(ENTITE, record);
-    ctx.audit(req, options.source === 'duplication' ? 'duplication' : 'creation', ENTITE, o.id, `${refOt(o.numero)} : ${o.titre}${demande ? ` (demande ${demande.numero || demande.id})` : ''}${plan ? ` (plan ${plan.numero || plan.nom})` : ''}${options.commentaire ? ' — ' + options.commentaire : ''}`);
+    ctx.audit(req, options.source === 'duplication' ? 'duplication' : 'creation', ENTITE, o.id, `${refOt(o.numero)} : ${o.titre}${demande ? ` (demande ${demande.numero || demande.id})` : ''}${plan ? ` (plan ${plan.numero || plan.nom})` : ''}${options.commentaire ? ' — ' + options.commentaire : ''}${noteEcartees ? ' — ' + noteEcartees : ''}`);
     const acteur = req && req.user ? req.user.id : null;
+    if (piecesEcartees.length) {
+      // Responsable du plan, à défaut les utilisateurs Préventif › Modifier qui voient le plan
+      const responsables = plan.technicienId != null ? [Number(plan.technicienId)] : ctx.usersAvecDroit('preventif', 'modifier', (u, p) => perms.canSeeRecord(p, u, plan)).map((u) => u.id);
+      notifier(responsables, acteur, {
+        titre: `Plan ${plan.numero || plan.nom} : pièces prévues non reprises`,
+        message: `${refOt(o.numero)} : ${piecesEcartees.length > 1 ? `${piecesEcartees.length} pièces dédiées prévues par le plan ne sont pas autorisées` : 'une pièce dédiée prévue par le plan n\'est pas autorisée'} pour l'équipement de l'OT (${listePieces(piecesEcartees)}). Corrigez les pièces du plan.`.slice(0, 600),
+        lien: `#/preventif/${plan.id}`, type: 'alerte',
+      });
+    }
     if (o.techniciens.length) {
       notifier(o.techniciens, acteur, { titre: `Nouvel ordre de travail : ${o.numero}`, message: `${o.titre}${o.datePrevue ? ' — prévu le ' + jourDe(o.datePrevue).split('-').reverse().join('/') : ''}`, lien: `#/ot/${o.id}`, type: o.prioriteCode && o.prioriteCode === (ctx.liste('priorites').slice(-1)[0] || {}).code ? 'alerte' : 'info' });
     } else {
       notifier(planificateurs(o), acteur, { titre: `OT à affecter : ${o.numero}`, message: o.titre, lien: `#/ot/${o.id}`, type: 'info' });
     }
     ctx.emit('ot:cree', charge(o, { source: options.source || (demande ? 'demande' : plan ? 'plan' : 'manuel') }));
+    // Pièces écartées : propriété de la copie renvoyée à l'appelant (non enregistrée, non sérialisée), lue par le rapport
+    // de génération du module Préventif et par la réponse de POST /api/ot
+    Object.defineProperty(o, 'piecesEcartees', { value: piecesEcartees, enumerable: false });
     return o;
   }
 
@@ -894,18 +970,26 @@ function register(ctx) {
     }).filter(Boolean).sort((a, b) => a.nomComplet.localeCompare(b.nomComplet, 'fr'));
   }, { perm: [ENTITE, 'voir'] });
 
-  /** Articles consommables sur un OT (lecture directe du stock, selon la portée). */
+  /**
+   * Articles consommables sur un OT (lecture directe du stock, selon la portée). Pour chaque article : compatible
+   * (liste indicative de l'article) et, pour une pièce dédiée, reservee, utilisable (pour l'équipement de l'OT),
+   * reserveeA (noms des équipements autorisés visibles) et raison. Ordre : pièces dédiées utilisables, compatibles,
+   * autres, puis pièces dédiées non utilisables (jamais sélectionnables).
+   */
   router.get('/api/ot-articles', async (req) => {
     const stock = ctx.services.stock;
     const disponible = !!(stock && typeof stock.sortir === 'function');
     let equipementId = null;
     if (req.query.otId) { const o = getVisible(req, req.query.otId); equipementId = o.equipementId == null ? null : Number(o.equipementId); }
-    const articles = ctx.scope(req, db.list('articles', (a) => a.actif !== false)).map((a) => ({
+    const bruts = ctx.scope(req, db.list('articles', (a) => a.actif !== false));
+    const ind = indicateursPieces(req, bruts, equipementId);
+    const rang = (a) => (a.reservee ? (a.utilisable ? 0 : 3) : (a.compatible ? 1 : 2));
+    const articles = bruts.map((a, i) => Object.assign({
       id: a.id, code: a.code || '', designation: a.designation || '', quantite: Number(a.quantite) || 0, uniteCode: a.uniteCode || null,
       prixUnitaire: Number(a.prixUnitaire) || 0, emplacement: a.emplacement || '', categorieCode: a.categorieCode || null, seuilMin: a.seuilMin == null ? null : Number(a.seuilMin),
       compatible: equipementId != null && (a.equipementIds || []).map(Number).includes(equipementId),
-    })).sort((a, b) => (Number(b.compatible) - Number(a.compatible)) || a.designation.localeCompare(b.designation, 'fr'));
-    return { disponible, stockNegatif: !!wf().stockNegatif, articles };
+    }, champsIndicateurs(ind[i]))).sort((a, b) => (rang(a) - rang(b)) || a.designation.localeCompare(b.designation, 'fr'));
+    return { disponible, stockNegatif: !!wf().stockNegatif, equipementId, articles };
   }, { perm: [ENTITE, 'voir'] });
 
   router.get('/api/ot/:id', async (req) => detail(req, getVisible(req, req.params.id)), { perm: [ENTITE, 'voir'] });
@@ -913,7 +997,9 @@ function register(ctx) {
   // ----- Routes : création / modification / suppression ---------------------------
   router.post('/api/ot', async (req) => {
     const o = creer(req, req.body, {});
-    return detail(req, o);
+    const r = detail(req, o);
+    if (o.piecesEcartees.length) r.avertissements = o.piecesEcartees.map((x) => `Pièce prévue du plan non reprise : ${x.raison}`);
+    return r;
   }, { perm: [ENTITE, 'creer'] });
 
   function egal(a, b) {
@@ -931,41 +1017,68 @@ function register(ctx) {
     const modif = can(req, 'modifier');
     if (!modif && !estAffecte(req.user.id, o)) throw new HttpError(403, 'Droit insuffisant : Ordres de travail › Modifier (ou être technicien affecté à cet ordre de travail)');
     if (body.statut !== undefined && !egal(body.statut, o.statut)) throw new HttpError(400, 'Le statut se modifie par les actions de workflow (démarrer, mettre en attente, clôturer, annuler…)');
+    /**
+     * Patch de la modification, calculé sur l'état `base` de l'OT : toutes les validations (champs, pièces dédiées,
+     * affectation, dates) ont lieu ici, avant la moindre écriture.
+     */
+    const preparer = (base) => {
+      if (!modif) {
+        const interdits = CHAMPS_PLANIFICATION.concat(['technicienId', 'techniciens']).filter((k) => body[k] !== undefined && !egal(body[k], base[k]));
+        if (interdits.length) throw new HttpError(403, 'En tant que technicien affecté, vous ne pouvez modifier que les informations de réalisation (compte rendu, cause, relevé, coût externe, dates de réalisation)');
+      }
+      const patch = modif ? lireCorps(req, body, base) : {};
+      const ajouts = [];
+      let retirees = [];
+      if (patch.equipementId !== undefined && !egal(patch.equipementId, base.equipementId)) {
+        // Pièces dédiées : consommées non autorisées → refus ; prévues non autorisées → retirées des pièces prévues
+        const v = verifierPiecesDediees(req, base, patch.equipementId);
+        if (v.retirees.length) {
+          retirees = v.retirees;
+          patch.piecesPrevues = v.piecesPrevues;
+          ajouts.push(entree(req, 'piecesPrevues', base.statut, `Pièces prévues retirées (pièces dédiées non autorisées pour le nouvel équipement) : ${listePieces(retirees)}`));
+        }
+      }
+      Object.assign(patch, lireRealisation(body, base));
+      // Affectation (comparée après normalisation : le responsable fait toujours partie des intervenants)
+      let affChangee = false;
+      let nouveauxIntervenants = [];
+      if (body.technicienId !== undefined || body.techniciens !== undefined) {
+        const aff = lireAffectation(req, body, base);
+        affChangee = !egal(aff.technicienId, base.technicienId) || !egal(aff.techniciens.slice().sort(), (base.techniciens || []).map(Number).sort());
+        if (affChangee) {
+          if (!can(req, 'affecter')) throw new HttpError(403, 'Droit insuffisant : Ordres de travail › Affecter');
+          const anciens = new Set((base.techniciens || []).map(Number).concat(base.technicienId != null ? [Number(base.technicienId)] : []));
+          nouveauxIntervenants = aff.techniciens.filter((id) => !anciens.has(id));
+          Object.assign(patch, aff);
+          ajouts.unshift(entree(req, 'affectation', base.statut, `Responsable : ${ctx.nomUser(aff.technicienId) || '—'} ; intervenants : ${aff.techniciens.map((id) => ctx.nomUser(id)).join(', ') || '—'}`));
+        }
+      }
+      if (patch.dateDebut !== undefined || patch.dateFin !== undefined) verifierDebutFin(patch.dateDebut !== undefined ? patch.dateDebut : base.dateDebut, patch.dateFin !== undefined ? patch.dateFin : base.dateFin);
+      if (ajouts.length) patch.historique = (base.historique || []).concat(ajouts);
+      return { patch, affChangee, nouveauxIntervenants, retirees };
+    };
     if (st.estFinal(o.statut)) {
       if (!(modif && body.reouvrir === true)) throw new HttpError(400, `L'ordre de travail ${o.numero} est clôturé (${st.libelle(o.statut)}) : réouvrez-le avant de le modifier`);
-      o = reouvrir(req, o, texte(body.motifReouverture, 'Le motif de réouverture', { max: 1000 }), null);
+      const motif = texte(body.motifReouverture, 'Le motif de réouverture', { max: 1000 });
+      // Requête validée sur l'état réouvert AVANT la réouverture : un refus ne laisse ni OT réouvert, ni réalisation du
+      // plan préventif remise en cause (réaction du module Préventif à ot:statut)
+      preparer(Object.assign({}, o, { statut: statutReouverture(o, st), dateFin: null, cloturePar: null, dateCloture: null }));
+      o = reouvrir(req, o, motif, null);
     }
-    if (!modif) {
-      const interdits = CHAMPS_PLANIFICATION.concat(['technicienId', 'techniciens']).filter((k) => body[k] !== undefined && !egal(body[k], o[k]));
-      if (interdits.length) throw new HttpError(403, 'En tant que technicien affecté, vous ne pouvez modifier que les informations de réalisation (compte rendu, cause, relevé, coût externe, dates de réalisation)');
-    }
-    const patch = modif ? lireCorps(req, body, o) : {};
-    Object.assign(patch, lireRealisation(body, o));
-    // Affectation (comparée après normalisation : le responsable fait toujours partie des intervenants)
-    let affChangee = false;
-    let nouveauxIntervenants = [];
-    if (body.technicienId !== undefined || body.techniciens !== undefined) {
-      const aff = lireAffectation(req, body, o);
-      affChangee = !egal(aff.technicienId, o.technicienId) || !egal(aff.techniciens.slice().sort(), (o.techniciens || []).map(Number).sort());
-      if (affChangee) {
-        if (!can(req, 'affecter')) throw new HttpError(403, 'Droit insuffisant : Ordres de travail › Affecter');
-        const anciens = new Set((o.techniciens || []).map(Number).concat(o.technicienId != null ? [Number(o.technicienId)] : []));
-        nouveauxIntervenants = aff.techniciens.filter((id) => !anciens.has(id));
-        Object.assign(patch, aff);
-        patch.historique = (o.historique || []).concat([entree(req, 'affectation', o.statut, `Responsable : ${ctx.nomUser(aff.technicienId) || '—'} ; intervenants : ${aff.techniciens.map((id) => ctx.nomUser(id)).join(', ') || '—'}`)]);
-      }
-    }
-    if (patch.dateDebut !== undefined || patch.dateFin !== undefined) verifierDebutFin(patch.dateDebut !== undefined ? patch.dateDebut : o.dateDebut, patch.dateFin !== undefined ? patch.dateFin : o.dateFin);
+    const { patch, affChangee, nouveauxIntervenants, retirees } = preparer(o);
+    const avertissements = retirees.length ? [`Pièces prévues retirées (pièces dédiées non autorisées pour le nouvel équipement) : ${listePieces(retirees)}`] : [];
     const changes = Object.keys(patch).filter((k) => k !== 'historique' && !egal(patch[k], o[k]));
     if (!changes.length) return detail(req, o);
     avecCouts(o, patch);
     const maj = db.update(ENTITE, o.id, patch);
-    const LIBELLES = { titre: 'titre', description: 'description', typeCode: 'type', prioriteCode: 'priorité', equipementId: 'équipement', secteurId: 'secteur', datePrevue: 'date prévue', dureeEstimee: 'durée estimée', fournisseurId: 'prestataire', coutExterne: 'coût externe', champs: 'champs personnalisés', rapport: 'compte rendu', causeCode: 'cause', compteurReleve: 'relevé de compteur', dateDebut: 'date de début', dateFin: 'date de fin', technicienId: 'responsable', techniciens: 'intervenants' };
-    ctx.audit(req, affChangee && changes.every((k) => k === 'technicienId' || k === 'techniciens') ? 'affectation' : 'modification', ENTITE, o.id, `${refOt(maj.numero)} : ${changes.map((k) => LIBELLES[k] || k).join(', ')}`);
+    const LIBELLES = { titre: 'titre', description: 'description', typeCode: 'type', prioriteCode: 'priorité', equipementId: 'équipement', secteurId: 'secteur', datePrevue: 'date prévue', dureeEstimee: 'durée estimée', fournisseurId: 'prestataire', coutExterne: 'coût externe', champs: 'champs personnalisés', rapport: 'compte rendu', causeCode: 'cause', compteurReleve: 'relevé de compteur', dateDebut: 'date de début', dateFin: 'date de fin', technicienId: 'responsable', techniciens: 'intervenants', piecesPrevues: 'pièces prévues' };
+    ctx.audit(req, affChangee && changes.every((k) => k === 'technicienId' || k === 'techniciens') ? 'affectation' : 'modification', ENTITE, o.id, `${refOt(maj.numero)} : ${changes.map((k) => LIBELLES[k] || k).join(', ')}${avertissements.length ? ' — ' + avertissements.join(' ; ') : ''}`);
     if (nouveauxIntervenants.length) notifier(nouveauxIntervenants, req.user.id, { titre: `Affectation : ${refOt(maj.numero)}`, message: `${maj.titre}${maj.datePrevue ? ' — prévu le ' + jourDe(maj.datePrevue).split('-').reverse().join('/') : ''}`, lien: `#/ot/${maj.id}`, type: 'info' });
     if (patch.datePrevue !== undefined && !egal(patch.datePrevue, o.datePrevue)) notifier((maj.techniciens || []).filter((id) => !nouveauxIntervenants.includes(id)), req.user.id, { titre: `${refOt(maj.numero)} replanifié`, message: `${maj.titre} — nouvelle date prévue : ${maj.datePrevue ? jourDe(maj.datePrevue).split('-').reverse().join('/') : 'non planifiée'}`, lien: `#/ot/${maj.id}`, type: 'info' });
     ctx.emit('ot:modifie', charge(maj, { champsModifies: changes }));
-    return detail(req, maj);
+    const r = detail(req, maj);
+    if (avertissements.length) r.avertissements = avertissements;
+    return r;
   }, { perm: [ENTITE, 'voir'] });
 
   router.delete('/api/ot/:id', async (req) => {
@@ -1217,7 +1330,8 @@ function register(ctx) {
     if ((o.pieces || []).length >= MAX_PIECES) throw new HttpError(400, 'Nombre maximal de lignes de pièces atteint');
     let r;
     try {
-      r = await stock.sortir({ articleId, quantite, otId: o.id, userId: req.user.id, motif: `${refOt(o.numero)} — ${o.titre}` });
+      // Pièce dédiée : la règle du module Stock s'applique à l'équipement de l'OT
+      r = await stock.sortir({ articleId, quantite, otId: o.id, userId: req.user.id, req, motif: `${refOt(o.numero)} — ${o.titre}` });
     } catch (e) {
       if (e && e.status) throw e;
       throw new HttpError(400, (e && e.message) || 'Sortie de stock refusée');

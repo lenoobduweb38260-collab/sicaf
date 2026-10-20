@@ -5,15 +5,19 @@
  *  - Articles (pièces de rechange, consommables, lubrifiants…) : code automatique, catégorie, unité,
  *    seuil minimum, quantité de réapprovisionnement, emplacement, prix (coût unitaire moyen pondéré),
  *    fournisseur, équipements compatibles, magasin (secteur), champs personnalisés.
- *  - Mouvements de stock : entrée, sortie (éventuellement imputée à un OT), inventaire (quantité
- *    constatée → écart), retour (annulation d'une sortie). Chaque mouvement enregistre
- *    quantiteAvant / quantiteApres. La quantité d'un article ne se modifie QUE par un mouvement.
+ *  - Pièces dédiées (reservee) : utilisables uniquement sur les équipements choisis (equipementIds) et, si
+ *    inclureSousEquipements (défaut), sur leurs sous-équipements. La règle est celle de ce module seul
+ *    (utilisablePour, equipementsAutorises) : sorties, OT et plans préventifs la reprennent par les services.
+ *  - Mouvements de stock : entrée, sortie (éventuellement imputée à un OT, équipement destinataire
+ *    enregistré), inventaire (quantité constatée → écart), retour (annulation d'une sortie). Chaque
+ *    mouvement enregistre quantiteAvant / quantiteApres. La quantité d'un article ne se modifie QUE par un mouvement.
  *  - Alertes de réapprovisionnement, valorisation, exports CSV.
  *
  * Routes : /api/articles (CRUD + mouvements), /api/mouvements, /api/mouvements/:id/annuler,
  *          /api/stock-alertes, /api/stock-valorisation, /api/stock-references,
  *          /api/articles-export, /api/mouvements-export.
- * Services publiés : ctx.services.stock = { sortir, entrer, annulerSortie, inventorier, … }. Un traitement en
+ * Services publiés : ctx.services.stock = { sortir, entrer, annulerSortie, inventorier, utilisablePour,
+ *          equipementsAutorises, infosDediee, dediesA, retirerEquipement, … }. Un traitement en
  *          masse (validation d'inventaire, réception de commande) passe { silencieux: true } : le mouvement est
  *          enregistré sans entrée de journal unitaire, l'appelant écrivant sa propre entrée récapitulative.
  * Événement émis : 'stock:sousSeuil' (article) lors du passage sous le seuil minimum ; un article sans seuil
@@ -81,10 +85,11 @@ function register(ctx) {
     if (n > max) throw new HttpError(400, `${label} : valeur trop grande`);
     return n;
   }
+  /** Identifiant : entier positif, ou chaîne en écriture décimale (booléens, tableaux, hexadécimal et exposant refusés). */
   function idRef(v, label) {
     if (v === undefined || v === null || v === '') return null;
-    const n = Number(v);
-    if (!Number.isInteger(n) || n <= 0) throw new HttpError(400, `${label} : identifiant invalide`);
+    const n = typeof v === 'number' ? v : (typeof v === 'string' && /^\s*\d+\s*$/.test(v) ? Number(v.trim()) : NaN);
+    if (!Number.isSafeInteger(n) || n <= 0) throw new HttpError(400, `${label} : identifiant invalide`);
     return n;
   }
   function dateFiltre(v, label, finDeJour) {
@@ -125,12 +130,140 @@ function register(ctx) {
     if (s && typeof s.visible === 'function') { try { return !!s.visible(req, e); } catch (err) { /* repli */ } }
     return ctx.canSee(req, e);
   }
-  function references() {
+  /** Visibilité d'un équipement pour un lecteur ; sans lecteur (appel interne), tout est visible. */
+  const voitEquipement = (req, e) => !!e && (!req || !req.perms || equipementVisible(req, e));
+  /**
+   * Lecteur en consultation : pendant une requête d'écriture, les sites accessibles en lecture seule sont exclus de la
+   * portée ; la réponse d'un POST / PUT est pourtant calculée comme celle d'un GET (mêmes équipements affichés).
+   */
+  const enLecture = (req) => (req && req.perms && req.ecriture ? { user: req.user, perms: req.perms, profil: req.profil, query: req.query || {}, params: req.params || {}, ecriture: false } : req);
+  /** Droit de gérer la réservation d'une pièce (caractère dédié, équipements autorisés) : Stock › Créer. */
+  const peutGererReservation = (req) => !req || !req.perms || !!req.perms.estAdmin || perms.can(req.perms, MODULE, 'creer');
+
+  // ----- Pièces dédiées ---------------------------------------------------------------------
+  // Une pièce dédiée (reservee: true) n'est utilisable que sur les équipements choisis (equipementIds) et, si
+  // inclureSousEquipements n'est pas faux, sur leurs sous-équipements (descendants par parentId). Cette règle
+  // n'existe qu'ici : les autres modules passent par ctx.services.stock.{ utilisablePour, equipementsAutorises }.
+  const estDediee = (a) => !!(a && a.reservee === true);
+  const avecSousEquipements = (a) => !a || a.inclureSousEquipements !== false;
+  /** Équipements lus une seule fois pour un traitement : fiches par identifiant et enfants par parent. */
+  function contexteEquipements() {
+    const parId = new Map();
+    const enfants = new Map();
+    for (const e of db.list('equipements')) {
+      parId.set(e.id, e);
+      if (e.parentId != null && e.parentId !== '') {
+        const p = Number(e.parentId);
+        if (!enfants.has(p)) enfants.set(p, []);
+        enfants.get(p).push(e.id);
+      }
+    }
+    return { parId, enfants };
+  }
+  function descendantsDe(id, c) {
+    const out = []; const vus = new Set([id]); const pile = [id];
+    while (pile.length) {
+      for (const x of c.enfants.get(pile.pop()) || []) if (!vus.has(x)) { vus.add(x); out.push(x); pile.push(x); }
+    }
+    return out;
+  }
+  /** Équipements choisis sur l'article et toujours présents en base. */
+  const equipementsChoisis = (a, c) => Array.from(new Set((a.equipementIds || []).map(Number))).filter((id) => c.parId.has(id));
+  /**
+   * Identifiants des équipements sur lesquels une pièce dédiée est utilisable : équipements choisis, plus leurs
+   * sous-équipements si inclureSousEquipements ; null pour une pièce libre (utilisable sur tout équipement).
+   */
+  function equipementsAutorises(a, c) {
+    if (!estDediee(a)) return null;
+    c = c || contexteEquipements();
+    const ids = new Set(equipementsChoisis(a, c));
+    if (avecSousEquipements(a)) for (const id of Array.from(ids)) for (const d of descendantsDe(id, c)) ids.add(d);
+    return Array.from(ids);
+  }
+  /** Un équipement réformé ou désactivé reste autorisé : il est seulement signalé « réformé ». */
+  const estReforme = (e) => e.actif === false || /r[ée]form/i.test(`${e.etatCode || ''} ${e.etatCode ? libelleListe('etatsEquipement', e.etatCode) : ''}`);
+  const resumeEquipement = (e) => ({ id: e.id, numero: e.numero || '', nom: e.nom || `#${e.id}`, actif: e.actif !== false, etatCode: e.etatCode || null, reforme: estReforme(e) });
+  const libelleEquipement = (e) => `${e.nom}${e.numero || e.reforme ? ` (${[e.numero, e.reforme ? 'réformé' : ''].filter(Boolean).join(', ')})` : ''}`;
+  const enumeration = (parts) => (parts.length > 1 ? `${parts.slice(0, -1).join(', ')} et ${parts[parts.length - 1]}` : (parts[0] || ''));
+  /** « Presse 250 t (EQ-0010), Robot (EQ-0011) et 2 équipement(s) hors de votre périmètre, sous-équipements compris » */
+  function texteAutorises(d, sousEquipements) {
+    const parts = d.reserveeEquipements.map(libelleEquipement);
+    if (d.reserveeHorsPerimetre) parts.push(`${d.reserveeHorsPerimetre} équipement(s) hors de votre périmètre`);
+    return `${enumeration(parts) || 'aucun équipement'}${sousEquipements && parts.length ? ', sous-équipements compris' : ''}`;
+  }
+  /**
+   * Caractère dédié d'un article pour un lecteur : équipements choisis visibles (reserveeA : noms ; reserveeEquipements :
+   * fiches résumées), nombre d'équipements choisis hors de son périmètre, pièce sans équipement (à réaffecter) et
+   * identifiants des équipements visibles sur lesquels elle est utilisable (null pour une pièce libre).
+   */
+  function infosDediee(a, req, c) {
+    if (!estDediee(a)) {
+      return { reservee: false, inclureSousEquipements: avecSousEquipements(a), reserveeA: [], reserveeEquipements: [], reserveeHorsPerimetre: 0, reserveeTexte: '', sansEquipement: false, equipementsAutorisesIds: null };
+    }
+    c = c || contexteEquipements();
+    const choisis = equipementsChoisis(a, c);
+    const visibles = choisis.map((id) => c.parId.get(id)).filter((e) => voitEquipement(req, e)).map(resumeEquipement)
+      .sort((x, y) => x.nom.localeCompare(y.nom, 'fr'));
+    const autorises = equipementsAutorises(a, c);
+    const d = {
+      reservee: true, inclureSousEquipements: avecSousEquipements(a),
+      reserveeA: visibles.map((e) => e.nom), reserveeEquipements: visibles, reserveeHorsPerimetre: choisis.length - visibles.length,
+      sansEquipement: !choisis.length,
+      equipementsAutorisesIds: autorises.filter((id) => voitEquipement(req, c.parId.get(id))),
+    };
+    // « sous-équipements compris » n'est mentionné que si des sous-équipements existent réellement
+    d.reserveeTexte = d.sansEquipement ? 'aucun équipement : à réaffecter' : texteAutorises(d, autorises.length > choisis.length);
+    return d;
+  }
+  const nomPiece = (a) => `« ${a.code ? a.code + ' — ' : ''}${a.designation || ''} »`;
+  /**
+   * Règle d'utilisation : { ok, raison }. Une pièce libre est utilisable partout ; une pièce dédiée seulement sur un
+   * équipement autorisé (raison citant la pièce et les équipements autorisés visibles par le lecteur `req`).
+   */
+  function utilisablePour(a, equipementId, req, c) {
+    if (!a) return { ok: false, raison: 'Article introuvable' };
+    if (!estDediee(a)) return { ok: true, raison: '' };
+    c = c || contexteEquipements();
+    const d = infosDediee(a, req, c);
+    if (d.sansEquipement) return { ok: false, raison: `La pièce ${nomPiece(a)} est dédiée mais n'est plus affectée à aucun équipement : réaffectez-la (fiche de l'article) avant de l'utiliser` };
+    const id = equipementId == null || equipementId === '' ? null : Number(equipementId);
+    if (id == null) return { ok: false, raison: `La pièce ${nomPiece(a)} est dédiée à ${d.reserveeTexte} : précisez l'équipement sur lequel elle est utilisée` };
+    if (equipementsAutorises(a, c).includes(id)) return { ok: true, raison: '' };
+    const e = c.parId.get(id);
+    const cible = e && voitEquipement(req, e) ? libelleEquipement(resumeEquipement(e)) : 'cet équipement';
+    return { ok: false, raison: `La pièce ${nomPiece(a)} est dédiée à ${d.reserveeTexte} : elle ne peut pas être utilisée sur ${cible}` };
+  }
+  /** Lecteur reconstitué (droits et portée) pour un appel de service qui ne transmet que l'identifiant de l'utilisateur. */
+  function lecteurDe(userId) {
+    const u = userId != null ? db.get('users', userId) : null;
+    if (!u) return null;
+    try { return { user: u, perms: perms.effectivePermissions(db, u, null, ctx.config()) }; } catch (e) { return null; }
+  }
+  /**
+   * Équipement destinataire d'une sortie : celui de l'OT s'il en a un, sinon l'équipement indiqué (existant et visible).
+   * Un équipement indiqué différent de celui de l'OT est refusé.
+   */
+  function equipementSortie(ot, equipementId, req) {
+    const explicite = idRef(equipementId, 'Équipement destinataire');
+    if (explicite != null) {
+      const e = db.get('equipements', explicite);
+      if (!e || !voitEquipement(req, e)) throw new HttpError(400, 'Équipement destinataire introuvable ou hors de votre périmètre');
+    }
+    const deLOt = ot && ot.equipementId != null && ot.equipementId !== '' ? Number(ot.equipementId) : null;
+    if (deLOt != null && explicite != null && explicite !== deLOt) {
+      throw new HttpError(400, `L'équipement indiqué ne correspond pas à celui de l'ordre de travail ${ot.numero || ot.id} : une pièce imputée à un OT est sortie pour l'équipement de l'OT`);
+    }
+    return deLOt != null ? deLOt : explicite;
+  }
+
+  function references(req) {
     return {
       fournisseurs: new Map(db.list('fournisseurs').map((f) => [f.id, f])),
       users: new Map(db.list('users').map((u) => [u.id, `${u.prenom || ''} ${u.nom || ''}`.trim() || u.login])),
       ot: new Map(db.list('ot').map((o) => [o.id, o])),
       articles: new Map(db.list(ENTITE).map((a) => [a.id, a])),
+      eq: contexteEquipements(),
+      req: req || null,
     };
   }
   function derniersMouvements() {
@@ -143,7 +276,7 @@ function register(ctx) {
   function resume(a, refs, derniers) {
     const f = a.fournisseurId != null ? refs.fournisseurs.get(Number(a.fournisseurId)) : null;
     const sousSeuil = estSousSeuil(a);
-    return Object.assign({}, a, {
+    return Object.assign({}, a, infosDediee(a, refs.req, refs.eq), {
       quantite: arrondi(num(a.quantite)), seuilMin: num(a.seuilMin), quantiteCommande: num(a.quantiteCommande), prixUnitaire: num(a.prixUnitaire),
       equipementIds: (a.equipementIds || []).map(Number), secteurId: a.secteurId == null || a.secteurId === '' ? null : Number(a.secteurId),
       actif: a.actif !== false, champs: a.champs || {},
@@ -174,12 +307,33 @@ function register(ctx) {
     return s;
   }
 
+  const EQUIPEMENT_HORS_PORTEE = 'Équipement hors de votre périmètre';
+  /**
+   * Visibilité de l'équipement destinataire d'un mouvement. Équipement existant : règle du module Équipements.
+   * Équipement supprimé : même règle appliquée au secteur qu'il avait à la date du mouvement (equipementSecteurId) ;
+   * sans cette information (mouvement antérieur), il n'est montré qu'en portée « tous ».
+   */
+  function voitEquipementMouvement(req, m, e) {
+    if (e) return voitEquipement(req, e);
+    if (!req || !req.perms) return true;
+    if (m.equipementSecteurId === undefined) return req.perms.portee === 'tous' && !Array.isArray(req.perms.siteFiltre);
+    return equipementVisible(req, { id: Number(m.equipementId), secteurId: m.equipementSecteurId });
+  }
   function enrichirMouvement(m, refs, req) {
     const a = refs.articles.get(Number(m.articleId));
     const o = m.otId != null ? refs.ot.get(Number(m.otId)) : null;
     const otMasque = !!(o && !otVisible(req, o));
     const f = m.fournisseurId != null ? refs.fournisseurs.get(Number(m.fournisseurId)) : null;
+    // Équipement destinataire (traçabilité) : fiche actuelle, libellé conservé si l'équipement a été supprimé
+    const e = m.equipementId != null ? refs.eq.parId.get(Number(m.equipementId)) || null : null;
+    const eqMasque = m.equipementId != null && !voitEquipementMouvement(req, m, e);
+    let equipementNom = '';
+    if (m.equipementId != null) equipementNom = eqMasque ? EQUIPEMENT_HORS_PORTEE : (e ? e.nom || '' : `${m.equipementLibelle || 'Équipement'} (supprimé)`);
     return Object.assign({}, m, {
+      equipementSecteurId: undefined,
+      equipementId: m.equipementId == null || eqMasque ? null : Number(m.equipementId), equipementExiste: !!(e && !eqMasque),
+      equipementNumero: e && !eqMasque ? e.numero || '' : '', equipementNom, equipementMasque: eqMasque,
+      equipementLibelle: eqMasque ? '' : m.equipementLibelle || '',
       articleCode: a ? a.code || '' : '', articleDesignation: a ? a.designation || '' : '(article supprimé)', uniteCode: a ? uniteCode(a) : '',
       userNom: m.userId != null ? refs.users.get(Number(m.userId)) || '' : '',
       otNumero: o && !otMasque ? o.numero || '' : '', otTitre: otMasque ? OT_HORS_PORTEE : (o ? o.titre || '' : ''), otMasque,
@@ -224,10 +378,23 @@ function register(ctx) {
       if (q.fournisseurId === 'aucun') rows = rows.filter((a) => a.fournisseurId == null || a.fournisseurId === '');
       else { const f = idRef(q.fournisseurId, 'Fournisseur'); rows = rows.filter((a) => Number(a.fournisseurId) === f); }
     }
-    if (q.equipementId) { const e = idRef(q.equipementId, 'Équipement'); rows = rows.filter((a) => (a.equipementIds || []).map(Number).includes(e)); }
+    // Pièces d'un équipement : pièces libres compatibles et pièces dédiées utilisables sur lui (sous-équipements compris) ;
+    // un équipement hors de la portée du lecteur ne permet pas de filtrer (pas de sondage par identifiant)
+    if (q.equipementId) {
+      const e = idRef(q.equipementId, 'Équipement');
+      const c = contexteEquipements();
+      if (!voitEquipement(req, c.parId.get(e))) rows = [];
+      else rows = rows.filter((a) => (estDediee(a) ? equipementsAutorises(a, c).includes(e) : (a.equipementIds || []).map(Number).includes(e)));
+    }
     if (q.secteurId) {
       if (q.secteurId === 'aucun') rows = rows.filter((a) => a.secteurId == null || a.secteurId === '');
       else { const ids = perms.secteursDescendants(db, [idRef(q.secteurId, 'Secteur')]); rows = rows.filter((a) => a.secteurId != null && ids.includes(Number(a.secteurId))); }
+    }
+    // Pièces dédiées (reservee=1) ou libres (reservee=0)
+    if (q.reservee !== undefined && q.reservee !== '' && q.reservee !== 'tous') {
+      if (vrai(q.reservee)) rows = rows.filter(estDediee);
+      else if (faux(q.reservee)) rows = rows.filter((a) => !estDediee(a));
+      else throw new HttpError(400, 'Filtre « pièces dédiées » invalide : 1 (dédiées) ou 0 (libres) attendu');
     }
     if (vrai(q.sousSeuil)) rows = rows.filter((a) => a.actif !== false && estSousSeuil(a));
     if (q.actif !== undefined && q.actif !== '' && q.actif !== 'tous') {
@@ -255,6 +422,7 @@ function register(ctx) {
       rows = rows.filter((m) => types.includes(m.type));
     }
     if (q.userId) { const id = idRef(q.userId, 'Utilisateur'); rows = rows.filter((m) => Number(m.userId) === id); }
+    if (q.equipementId) { const id = idRef(q.equipementId, 'Équipement'); rows = rows.filter((m) => Number(m.equipementId) === id); }
     if (q.otId) {
       if (q.otId === 'aucun') rows = rows.filter((m) => m.otId == null);
       else if (q.otId === 'tous') rows = rows.filter((m) => m.otId != null);
@@ -265,10 +433,12 @@ function register(ctx) {
     if (du && au && du > au) throw new HttpError(400, 'La date de début doit précéder la date de fin');
     if (du) rows = rows.filter((m) => String(m.date) >= du);
     if (au) rows = rows.filter((m) => String(m.date) <= au);
-    const refs = references();
+    const refs = references(req);
     const termes = normaliser(q.recherche).split(/\s+/).filter(Boolean);
     let out = rows.sort(parDateDesc).map((m) => enrichirMouvement(m, refs, req));
-    if (termes.length) out = out.filter((m) => { const t = normaliser([m.articleCode, m.articleDesignation, m.motif, m.otNumero, m.userNom, m.fournisseurNom].join(' ')); return termes.every((x) => t.includes(x)); });
+    // Un équipement hors de la portée du lecteur ne permet pas de filtrer (pas de sondage par identifiant)
+    if (q.equipementId) out = out.filter((m) => !m.equipementMasque);
+    if (termes.length) out = out.filter((m) => { const t = normaliser([m.articleCode, m.articleDesignation, m.motif, m.otNumero, m.userNom, m.fournisseurNom, m.equipementMasque ? '' : m.equipementNom, m.equipementNumero].join(' ')); return termes.every((x) => t.includes(x)); });
     return out;
   }
 
@@ -330,26 +500,74 @@ function register(ctx) {
     }
     out.fournisseurId = fournisseurId;
 
-    // Équipements compatibles (les compatibilités hors de la portée de l'utilisateur sont conservées)
+    // Pièce dédiée : utilisable uniquement sur les équipements choisis (et leurs sous-équipements si demandé)
+    const booleen = (v, label) => {
+      if (typeof v !== 'boolean') throw new HttpError(400, `${label} : valeur invalide (vrai ou faux attendu)`);
+      return v;
+    };
+    let reserveeLue; let sousLu;
+    if (b.reservee !== undefined && b.reservee !== null) reserveeLue = booleen(b.reservee, 'Pièce dédiée');
+    else if (!existant) reserveeLue = false;
+    if (b.inclureSousEquipements !== undefined && b.inclureSousEquipements !== null) sousLu = booleen(b.inclureSousEquipements, 'Inclure les sous-équipements');
+    else if (!existant) sousLu = true;
+    const reservee = reserveeLue !== undefined ? reserveeLue : !!(existant && existant.reservee === true);
+
+    // Équipements compatibles, ou autorisés pour une pièce dédiée. Seuls les ajouts sont contrôlés (équipement existant
+    // et modifiable par l'utilisateur) ; un équipement hors de sa portée est conservé ; un équipement d'un site accessible
+    // en lecture seule, affiché mais non modifiable, ne peut être ni ajouté ni retiré (refus explicite).
     if (b.equipementIds !== undefined || !existant) {
+      const quoi = reservee ? 'Équipements autorisés' : 'Équipements compatibles';
+      const unEq = reservee ? 'Équipement autorisé' : 'Équipement compatible';
       const src = b.equipementIds == null ? [] : b.equipementIds;
-      if (!Array.isArray(src)) throw new HttpError(400, 'Équipements compatibles : liste attendue');
-      if (src.length > 500) throw new HttpError(400, 'Équipements compatibles : 500 au maximum');
+      if (!Array.isArray(src)) throw new HttpError(400, `${quoi} : liste attendue`);
+      if (src.length > 500) throw new HttpError(400, `${quoi} : 500 au maximum`);
+      const anciens = existant ? (existant.equipementIds || []).map(Number) : [];
+      const lecteur = enLecture(req);
+      const nomEq = (e) => `« ${e.nom || '#' + e.id} »${e.numero ? ` (${e.numero})` : ''}`;
       const ids = [];
       for (const v of src) {
-        const id = idRef(v, 'Équipement compatible');
-        if (id == null) continue;
+        const id = idRef(v, unEq);
+        if (id == null || ids.includes(id)) continue;
         const e = db.get('equipements', id);
-        if (!e || !equipementVisible(req, e)) throw new HttpError(400, `Équipement compatible introuvable (#${id})`);
-        if (!ids.includes(id)) ids.push(id);
-      }
-      if (existant) {
-        for (const id of (existant.equipementIds || []).map(Number)) {
-          const e = db.get('equipements', id);
-          if (e && !equipementVisible(req, e) && !ids.includes(id)) ids.push(id);
+        if (anciens.includes(id)) { if (e) ids.push(id); continue; } // déjà dans la liste : pas un ajout
+        if (!e || !equipementVisible(req, e)) {
+          if (e && equipementVisible(lecteur, e)) throw new HttpError(403, `L'équipement ${nomEq(e)} est sur un site accessible en lecture seule pour vous : il ne peut pas être ajouté`);
+          throw new HttpError(400, `${unEq} introuvable (#${id})`);
         }
+        ids.push(id);
+      }
+      for (const id of anciens) {
+        if (ids.includes(id)) continue;
+        const e = db.get('equipements', id);
+        if (!e || equipementVisible(req, e)) continue; // supprimé entre-temps, ou retrait demandé par l'utilisateur
+        if (equipementVisible(lecteur, e)) throw new HttpError(403, `L'équipement ${nomEq(e)} est sur un site accessible en lecture seule pour vous : il ne peut pas être retiré`);
+        ids.push(id); // hors de la portée de l'utilisateur : conservé
       }
       out.equipementIds = ids;
+    }
+    if (reserveeLue !== undefined) out.reservee = reserveeLue;
+    if (sousLu !== undefined) out.inclureSousEquipements = sousLu;
+    if (reservee && (!existant || b.reservee !== undefined || b.equipementIds !== undefined)) {
+      const liste = out.equipementIds !== undefined ? out.equipementIds : ((existant && existant.equipementIds) || []).map(Number);
+      if (!liste.some((id) => db.get('equipements', id))) throw new HttpError(400, 'Pièce dédiée : choisissez au moins un équipement autorisé');
+    }
+    // Réservation d'une pièce (caractère dédié, équipements autorisés, sous-équipements) : droit Stock › Créer, le droit
+    // Stock › Modifier servant aussi aux sorties ; refusée tant que des équipements autorisés échappent à l'utilisateur,
+    // qui ne peut pas juger de l'effet du changement sur des machines qu'il ne voit pas
+    if (existant && req && req.perms) {
+      const avant = estDediee(existant);
+      // Équipements encore présents en base (un identifiant d'équipement supprimé n'est pas un changement de réservation)
+      const presents = (l) => l.filter((id) => db.get('equipements', id));
+      const listeAvant = presents((existant.equipementIds || []).map(Number));
+      const listeApres = out.equipementIds !== undefined ? presents(out.equipementIds) : listeAvant;
+      const sousApres = out.inclureSousEquipements !== undefined ? out.inclureSousEquipements : avecSousEquipements(existant);
+      const memeListe = listeAvant.length === listeApres.length && listeAvant.every((id) => listeApres.includes(id));
+      const change = avant !== reservee || ((avant || reservee) && (!memeListe || sousApres !== avecSousEquipements(existant)));
+      if (change) {
+        if (!peutGererReservation(req)) throw new HttpError(403, 'Droit insuffisant : le caractère dédié d\'une pièce et ses équipements autorisés se modifient avec le droit Stock › Créer');
+        const hors = avant ? infosDediee(existant, enLecture(req)).reserveeHorsPerimetre : 0;
+        if (hors) throw new HttpError(403, `Cette pièce est aussi dédiée à ${hors} équipement(s) hors de votre périmètre (ou du site affiché) : sa réservation ne peut être modifiée que par un utilisateur qui voit tous ses équipements autorisés`);
+      }
     }
 
     // Magasin / secteur
@@ -401,11 +619,20 @@ function register(ctx) {
    * Enregistre un mouvement et met à jour la quantité de l'article.
    * @returns {{ mouvement, article }}
    */
-  function enregistrer({ articleId, type, quantite, motif, prixUnitaire, prixMouvement, fournisseurId, otId, userId, req, origineId, refuserInactif, silencieux }) {
+  function enregistrer({ articleId, type, quantite, motif, prixUnitaire, prixMouvement, fournisseurId, otId, userId, req, origineId, refuserInactif, silencieux, equipementId, controleDedie, libelleEquipementOrigine, secteurEquipementOrigine }) {
     if (!TYPES_MOUVEMENT[type]) throw new HttpError(400, 'Type de mouvement invalide');
     const article = db.get(ENTITE, articleId);
     if (!article) throw new HttpError(404, 'Article introuvable');
     if (refuserInactif && article.actif === false) throw new HttpError(400, `L'article « ${article.designation} » est désactivé : réactivez-le avant d'enregistrer une ${type === 'entree' ? 'entrée' : 'sortie'}`);
+    // Équipement destinataire (sortie, et retour d'une sortie) ; une sortie d'une pièce dédiée suit la règle d'utilisation.
+    // Les entrées, inventaires et retours ne sont jamais restreints.
+    const eqMvt = (type === 'sortie' || type === 'retour') && equipementId != null && equipementId !== '' ? Number(equipementId) : null;
+    let eqFiche = null;
+    if (eqMvt != null) eqFiche = db.get('equipements', eqMvt);
+    if (type === 'sortie' && controleDedie && estDediee(article)) {
+      const u = utilisablePour(article, eqMvt, req && req.perms ? req : lecteurDe(userId));
+      if (!u.ok) throw new HttpError(400, u.raison);
+    }
     const q = arrondi(nombre(quantite, type === 'inventaire' ? 'Quantité constatée' : 'Quantité', { requis: true, strictPositif: type !== 'inventaire' }));
     if (type !== 'inventaire' && !(q > 0)) throw new HttpError(400, 'Quantité : la valeur doit être supérieure à 0 (après arrondi à 0,001)');
     // Toutes les validations AVANT la moindre écriture
@@ -439,6 +666,9 @@ function register(ctx) {
       articleId: article.id, type, quantite: q, quantiteAvant: avant, quantiteApres: apres, ecart: arrondi(apres - avant),
       date: maintenant, userId: userId == null ? null : Number(userId), otId: otId == null ? null : Number(otId),
       motif: motifTexte, prixUnitaire: arrondi(pu, 4), fournisseurId: fournisseurId == null ? null : Number(fournisseurId),
+      equipementId: eqMvt, equipementLibelle: eqFiche ? `${eqFiche.numero ? eqFiche.numero + ' — ' : ''}${eqFiche.nom || ''}` : (eqMvt != null ? libelleEquipementOrigine || '' : ''),
+      // Secteur de l'équipement à la date du mouvement : sa visibilité reste évaluable s'il est supprimé ensuite
+      ...(eqMvt != null ? { equipementSecteurId: eqFiche ? (eqFiche.secteurId == null || eqFiche.secteurId === '' ? null : Number(eqFiche.secteurId)) : (secteurEquipementOrigine === undefined ? undefined : secteurEquipementOrigine) } : {}),
       mouvementOrigineId: origineId == null ? null : origineId, annuleParId: null,
       createdBy: userId == null ? null : Number(userId),
     });
@@ -448,7 +678,8 @@ function register(ctx) {
       entree: `entrée de ${frNombre(q)} ${unite}`, sortie: `sortie de ${frNombre(q)} ${unite}`, retour: `retour en stock de ${frNombre(q)} ${unite}`,
       inventaire: `inventaire, quantité constatée ${frNombre(q)} ${unite} (écart ${ecartTxt})`,
     }[type].replace(/\s+/g, ' ').trim();
-    if (!silencieux) ctx.audit(req || pseudoReq(userId), 'mouvement', ENTITE, article.id, `${article.code || '#' + article.id} ${article.designation} : ${quoi} — stock ${frNombre(avant)} → ${frNombre(apres)}${motifTexte ? ' — ' + motifTexte : ''}`);
+    const pour = type === 'sortie' && eqFiche ? ` pour ${eqFiche.numero ? eqFiche.numero + ' ' : ''}${eqFiche.nom || ''}` : '';
+    if (!silencieux) ctx.audit(req || pseudoReq(userId), 'mouvement', ENTITE, article.id, `${article.code || '#' + article.id} ${article.designation} : ${quoi}${pour} — stock ${frNombre(avant)} → ${frNombre(apres)}${motifTexte ? ' — ' + motifTexte : ''}`);
 
     // Passage sous le seuil (article suivi, seuil > 0) : quantiteAvant > seuil ≥ quantiteApres
     const seuil = num(maj.seuilMin);
@@ -465,7 +696,7 @@ function register(ctx) {
     const dateSortie = new Date(m.date);
     // Le retour se fait au prix de la sortie
     const r = enregistrer({
-      articleId: Number(m.articleId), type: 'retour', quantite: m.quantite, userId, req, otId: m.otId, origineId: m.id, prixMouvement: num(m.prixUnitaire),
+      articleId: Number(m.articleId), type: 'retour', quantite: m.quantite, userId, req, otId: m.otId, origineId: m.id, prixMouvement: num(m.prixUnitaire), equipementId: m.equipementId, libelleEquipementOrigine: m.equipementLibelle, secteurEquipementOrigine: m.equipementSecteurId,
       motif: `Annulation de la sortie du ${Number.isNaN(dateSortie.getTime()) ? '?' : dateSortie.toLocaleDateString('fr-FR')}${m.motif ? ' (' + String(m.motif).slice(0, 300) + ')' : ''}`,
     });
     db.update(MVT, m.id, { annuleParId: r.mouvement.id });
@@ -519,7 +750,7 @@ function register(ctx) {
   }
 
   function detail(req, a) {
-    const refs = references();
+    const refs = references(req);
     const tous = db.list(MVT, (m) => Number(m.articleId) === a.id).sort(parDateDesc);
     const r = resume(a, refs, new Map([[a.id, tous.length ? tous[0].date : null]]));
     r.nbMouvements = tous.length;
@@ -539,7 +770,7 @@ function register(ctx) {
       x.nbMouvements++; x.derniereDate = m.date;
       parOt.set(k, x);
     }
-    const equipements = new Map(db.list('equipements').map((e) => [e.id, e]));
+    const equipements = refs.eq.parId;
     r.ots = Array.from(parOt.values()).map((x) => {
       const o = refs.ot.get(x.otId);
       if (o && !ctx.canSee(req, o)) return null;
@@ -550,27 +781,108 @@ function register(ctx) {
       });
     }).filter(Boolean).sort((p, q) => String(q.derniereDate).localeCompare(String(p.derniereDate)));
 
-    // Équipements compatibles (selon la portée)
+    // Équipements compatibles, ou autorisés pour une pièce dédiée (selon la portée)
+    const ficheEq = (e) => ({ id: e.id, numero: e.numero || '', nom: e.nom || '', secteurId: e.secteurId == null ? null : e.secteurId, typeCode: e.typeCode || null, etatCode: e.etatCode || null, criticiteCode: e.criticiteCode || null, localisation: e.localisation || '', actif: e.actif !== false, reforme: estReforme(e), parentId: e.parentId == null ? null : Number(e.parentId) });
     r.equipements = (a.equipementIds || []).map((id) => equipements.get(Number(id))).filter((e) => e && equipementVisible(req, e))
-      .map((e) => ({ id: e.id, numero: e.numero || '', nom: e.nom || '', secteurId: e.secteurId == null ? null : e.secteurId, typeCode: e.typeCode || null, etatCode: e.etatCode || null, criticiteCode: e.criticiteCode || null, localisation: e.localisation || '', actif: e.actif !== false }))
+      .map(ficheEq)
       .sort((p, q) => p.nom.localeCompare(q.nom, 'fr'));
+    // Sous-équipements autorisés par héritage (pièce dédiée, sous-équipements inclus), avec l'équipement choisi d'origine
+    r.sousEquipementsAutorises = [];
+    if (estDediee(a) && avecSousEquipements(a)) {
+      const choisis = new Set(equipementsChoisis(a, refs.eq));
+      const vus = new Set();
+      for (const id of choisis) {
+        for (const d of descendantsDe(id, refs.eq)) {
+          const e = equipements.get(d);
+          if (choisis.has(d) || vus.has(d) || !equipementVisible(req, e)) continue;
+          vus.add(d);
+          const origine = equipements.get(id);
+          const origineVisible = !!(origine && equipementVisible(req, origine));
+          r.sousEquipementsAutorises.push(Object.assign(ficheEq(e), { viaId: origineVisible ? id : null, viaNom: origineVisible ? origine.nom || '' : '' }));
+        }
+      }
+      r.sousEquipementsAutorises.sort((p, q) => p.nom.localeCompare(q.nom, 'fr'));
+    }
     r.stats = statistiques(tous, a);
     r.stockNegatifAutorise = !!wf().stockNegatif;
     return r;
   }
 
+  // ----- Journal : caractère dédié et équipements -----------------------------------------------
+  const LIBELLES_CHAMPS = {
+    code: 'code', designation: 'désignation', description: 'description', categorieCode: 'catégorie', uniteCode: 'unité', seuilMin: 'seuil minimum',
+    quantiteCommande: 'quantité de réapprovisionnement', emplacement: 'emplacement', prixUnitaire: 'prix unitaire', referenceFournisseur: 'référence fournisseur',
+    fournisseurId: 'fournisseur', equipementIds: 'équipements', reservee: 'pièce dédiée', inclureSousEquipements: 'sous-équipements', secteurId: 'magasin / secteur',
+    actif: 'statut', champs: 'champs personnalisés',
+  };
+  /** Libellé d'un équipement pour le journal d'activité (numéro et nom). */
+  const equipementJournal = (id, c) => { const e = c.parId.get(Number(id)); return e ? `${e.numero ? e.numero + ' ' : ''}${e.nom || ''}`.trim() : `équipement #${id}`; };
+  /** « pièce dédiée à EQ-0005 Remplisseuse rotative, sous-équipements compris » (vide pour une pièce libre). */
+  function journalDedie(a, c) {
+    if (!estDediee(a)) return '';
+    const ids = equipementsChoisis(a, c);
+    return `pièce dédiée à ${ids.length ? ids.map((id) => equipementJournal(id, c)).join(', ') : 'aucun équipement'}${avecSousEquipements(a) ? ', sous-équipements compris' : ', sans les sous-équipements'}`;
+  }
+  /** Changements du caractère dédié et de la liste d'équipements, en clair (vide si rien ne change). */
+  function journalChangementsDedie(avant, apres, c) {
+    const parts = [];
+    const dAvant = estDediee(avant); const dApres = estDediee(apres);
+    if (dAvant !== dApres) parts.push(dApres ? 'devient une pièce dédiée' : 'n\'est plus une pièce dédiée (pièce libre)');
+    const ancienne = (avant.equipementIds || []).map(Number); const nouvelle = (apres.equipementIds || []).map(Number);
+    const ajoutes = nouvelle.filter((id) => !ancienne.includes(id)); const retires = ancienne.filter((id) => !nouvelle.includes(id));
+    const quoi = dApres ? 'équipements autorisés' : 'équipements compatibles';
+    if (ajoutes.length) parts.push(`${quoi} ajoutés : ${ajoutes.map((id) => equipementJournal(id, c)).join(', ')}`);
+    if (retires.length) parts.push(`${quoi} retirés : ${retires.map((id) => equipementJournal(id, c)).join(', ')}`);
+    const sousChange = dApres && avecSousEquipements(avant) !== avecSousEquipements(apres);
+    if (sousChange) parts.push(avecSousEquipements(apres) ? 'sous-équipements désormais inclus' : 'sous-équipements désormais exclus');
+    if (dApres && (dAvant !== dApres || ajoutes.length || retires.length || sousChange)) parts.push(journalDedie(apres, c));
+    return parts.join(' ; ');
+  }
+
+  /**
+   * Plans préventifs actifs qui prévoient l'article alors qu'il n'est pas utilisable sur leur équipement (règle des
+   * pièces dédiées). Leurs OT ne reprennent pas la pièce ; ils sont signalés pour être corrigés.
+   */
+  function plansNonConformes(a, c) {
+    c = c || contexteEquipements();
+    return db.list('plansPreventifs', (p) => p.actif !== false && (p.pieces || []).some((x) => x && Number(x.articleId) === a.id))
+      .filter((p) => !utilisablePour(a, p.equipementId, null, c).ok)
+      .sort((x, y) => String(x.numero || '').localeCompare(String(y.numero || ''), 'fr', { numeric: true }));
+  }
+  /** Pièce qui cesse d'être dédiée : les gestionnaires du stock (Stock › Créer) qui la voient sont prévenus. */
+  function notifierReservationLevee(a, req) {
+    try {
+      const auteur = req && req.user ? req.user.id : null;
+      const destinataires = ctx.usersAvecDroit(MODULE, 'creer', (u, p) => u.id !== auteur && perms.canSeeRecord(p, u, a)).map((u) => u.id);
+      if (!destinataires.length) return;
+      ctx.notify(destinataires, {
+        titre: 'Pièce dédiée devenue libre',
+        message: `${a.code ? a.code + ' — ' : ''}${a.designation} n'est plus une pièce dédiée${auteur != null ? ` (modification par ${ctx.nomUser(auteur)})` : ''} : elle peut désormais être sortie pour tout équipement.`,
+        lien: `#/stock/${a.id}`, type: 'alerte',
+      });
+    } catch (e) { ctx.log('Stock : notification de réservation levée impossible', e.message); }
+  }
+
   // ----- Routes : articles ---------------------------------------------------------------
   router.get('/api/articles', async (req) => {
-    const refs = references();
+    const refs = references(req);
     const derniers = derniersMouvements();
     return filtrerArticles(req, req.query).map((a) => resume(a, refs, derniers));
   }, { perm: [MODULE, 'voir'] });
 
   router.get('/api/articles-export', async (req, res) => {
-    const refs = references();
+    const refs = references(req);
     const champs = ((ctx.config().champsPersonnalises || {})[ENTITE]) || [];
-    const equipements = new Map(db.list('equipements').map((e) => [e.id, e]));
-    const entetes = ['Code', 'Désignation', 'Catégorie', 'Unité', 'Quantité', 'Seuil minimum', 'Sous le seuil', 'Quantité à commander', 'Emplacement', 'Prix unitaire', 'Valeur', 'Fournisseur', 'Référence fournisseur', 'Magasin / secteur', 'Équipements compatibles', 'Actif', 'Description'].concat(champs.map((c) => c.label));
+    const entetes = ['Code', 'Désignation', 'Catégorie', 'Unité', 'Quantité', 'Seuil minimum', 'Sous le seuil', 'Quantité à commander', 'Emplacement', 'Prix unitaire', 'Valeur', 'Fournisseur', 'Référence fournisseur', 'Magasin / secteur', 'Dédiée', 'Équipements', 'Actif', 'Description'].concat(champs.map((c) => c.label));
+    // Équipements autorisés (pièce dédiée) ou compatibles, limités à ceux que le lecteur peut voir
+    const equipementsCsv = (r) => {
+      if (r.reservee) return r.sansEquipement ? 'Aucun : à réaffecter' : r.reserveeTexte;
+      const ids = equipementsChoisis(r, refs.eq);
+      const visibles = ids.map((id) => refs.eq.parId.get(id)).filter((e) => voitEquipement(req, e)).map(resumeEquipement).sort((x, y) => x.nom.localeCompare(y.nom, 'fr'));
+      const parts = visibles.map(libelleEquipement);
+      if (ids.length > visibles.length) parts.push(`${ids.length - visibles.length} équipement(s) hors de votre périmètre`);
+      return enumeration(parts);
+    };
     const lignes = ['\ufeff' + entetes.map(csvEscape).join(';')];
     const rows = filtrerArticles(req, req.query);
     for (const a of rows) {
@@ -579,7 +891,7 @@ function register(ctx) {
       lignes.push([
         r.code, r.designation, libelleListe('categoriesArticles', r.categorieCode), libelleListe('unites', r.uniteCode), csvNombre(r.quantite), csvNombre(r.seuilMin),
         r.actif && r.sousSeuil ? 'Oui' : 'Non', csvNombre(r.sousSeuil ? r.quantiteACommander : 0), r.emplacement, csvNombre(r.prixUnitaire), csvNombre(r.valeur), r.fournisseurNom, r.referenceFournisseur,
-        s ? s.nom : '', r.equipementIds.map((id) => equipements.get(id)).filter(Boolean).map((e) => `${e.numero ? e.numero + ' ' : ''}${e.nom}`).join(', '), r.actif ? 'Oui' : 'Non', r.description,
+        s ? s.nom : '', r.reservee ? 'Oui' : 'Non', equipementsCsv(r), r.actif ? 'Oui' : 'Non', r.description,
       ].concat(champs.map((c) => { const v = (r.champs || {})[c.cle]; return v == null ? '' : (typeof v === 'boolean' ? (v ? 'Oui' : 'Non') : v); })).map(csvEscape).join(';'));
     }
     ctx.audit(req, 'export', ENTITE, null, `${rows.length} article(s)`);
@@ -596,12 +908,13 @@ function register(ctx) {
     data.quantite = 0;
     data.createdBy = req.user.id;
     let a = db.insert(ENTITE, data);
-    ctx.audit(req, 'creation', ENTITE, a.id, `Article ${a.code} — ${a.designation}`);
+    const dediee = journalDedie(a, contexteEquipements());
+    ctx.audit(req, 'creation', ENTITE, a.id, `Article ${a.code} — ${a.designation}${dediee ? ' — ' + dediee : ''}`);
     if (quantiteInitiale > 0) {
       const r = enregistrer({ articleId: a.id, type: 'inventaire', quantite: quantiteInitiale, userId: req.user.id, req, motif: 'Stock initial à la création de l\'article' });
       a = r.article;
     }
-    return detail(req, a);
+    return detail(enLecture(req), a);
   }, { perm: [MODULE, 'creer'] });
 
   router.put('/api/articles/:id', async (req) => {
@@ -611,12 +924,38 @@ function register(ctx) {
       throw new HttpError(400, 'La quantité en stock ne se modifie pas directement : enregistrez un mouvement (entrée, sortie ou inventaire)');
     }
     const data = validerArticle(req, b, existant);
-    const changes = Object.keys(data).filter((k) => JSON.stringify(data[k]) !== JSON.stringify(existant[k] === undefined ? null : existant[k]));
+    // Comparaison avec les valeurs effectives : un article antérieur aux pièces dédiées n'a ni reservee (faux) ni
+    // inclureSousEquipements (vrai) ; un nombre absent vaut 0, un statut absent « actif », un champ vide un champ absent
+    const NUMERIQUES = ['seuilMin', 'quantiteCommande', 'prixUnitaire'];
+    const effectif = (k, v) => {
+      if (k === 'reservee') return v === true;
+      if (k === 'inclureSousEquipements' || k === 'actif') return v !== false;
+      if (NUMERIQUES.includes(k)) return num(v);
+      return v === undefined ? null : v;
+    };
+    const vide = (v) => v == null || v === '' || (Array.isArray(v) && !v.length) || (typeof v === 'object' && !Array.isArray(v) && !Object.keys(v).length);
+    const changes = Object.keys(data).filter((k) => {
+      const x = effectif(k, data[k]); const y = effectif(k, existant[k]);
+      return !(vide(x) && vide(y)) && JSON.stringify(x) !== JSON.stringify(y);
+    });
     const a = db.update(ENTITE, existant.id, data);
     let action = 'modification';
     if (changes.length === 1 && changes[0] === 'actif') action = a.actif === false ? 'desactivation' : 'reactivation';
-    ctx.audit(req, action, ENTITE, a.id, `Article ${a.code} — ${a.designation}${changes.length ? ' (' + changes.join(', ') + ')' : ''}`);
-    return detail(req, a);
+    const c = contexteEquipements();
+    const dediee = journalChangementsDedie(existant, a, c);
+    // Réservation modifiée : plans préventifs actifs qui prévoient désormais la pièce sur un équipement non autorisé
+    const reservationModifiee = ['reservee', 'inclureSousEquipements', 'equipementIds'].some((k) => changes.includes(k));
+    const nonConformes = reservationModifiee ? plansNonConformes(a, c) : [];
+    const plansTxt = nonConformes.length ? ` ; ${nonConformes.length} plan(s) préventif(s) actif(s) prévoient désormais cette pièce sur un équipement non autorisé (${nonConformes.map((p) => p.numero || '#' + p.id).join(', ')}) : elle ne sera pas reprise sur leurs prochains OT` : '';
+    ctx.audit(req, action, ENTITE, a.id, `Article ${a.code} — ${a.designation}${changes.length ? ' (' + changes.map((k) => LIBELLES_CHAMPS[k] || k).join(', ') + ')' : ''}${dediee ? ' — ' + dediee : ''}${plansTxt}`);
+    if (estDediee(existant) && !estDediee(a)) notifierReservationLevee(a, req);
+    const lecteur = enLecture(req);
+    const voitPlans = perms.can(req.perms, 'preventif', 'voir');
+    const plansVisibles = voitPlans ? nonConformes.filter((p) => ctx.canSee(lecteur, p)) : [];
+    return Object.assign(detail(lecteur, a), {
+      plansNonConformes: plansVisibles.map((p) => ({ id: p.id, numero: p.numero || '', nom: p.nom || '' })),
+      plansNonConformesHorsPerimetre: nonConformes.length - plansVisibles.length,
+    });
   }, { perm: [MODULE, 'modifier'] });
 
   router.delete('/api/articles/:id', async (req) => {
@@ -654,10 +993,13 @@ function register(ctx) {
       if (!ot || !ctx.canSee(req, ot)) throw new HttpError(400, 'Ordre de travail introuvable');
       if (otEstFinal(ot)) throw new HttpError(400, `L'ordre de travail ${ot.numero || ot.id} est clôturé : imputation impossible`);
     }
-    const r = enregistrer({ articleId: a.id, type, quantite: b.quantite, motif: b.motif || (ot ? `${/^OT/i.test(String(ot.numero || '')) ? '' : 'OT '}${ot.numero || '#' + ot.id} — ${ot.titre || ''}` : ''), prixUnitaire, fournisseurId, otId, userId: req.user.id, req, refuserInactif: type !== 'inventaire' });
+    // Sortie : équipement destinataire (celui de l'OT, sinon celui indiqué), obligatoire pour une pièce dédiée
+    const equipementId = type === 'sortie' ? equipementSortie(ot, b.equipementId, req) : null;
+    const r = enregistrer({ articleId: a.id, type, quantite: b.quantite, motif: b.motif || (ot ? `${/^OT/i.test(String(ot.numero || '')) ? '' : 'OT '}${ot.numero || '#' + ot.id} — ${ot.titre || ''}` : ''), prixUnitaire, fournisseurId, otId, userId: req.user.id, req, refuserInactif: type !== 'inventaire', equipementId, controleDedie: true });
     if (ot) imputerOt(ot, r.mouvement, r.article, req);
-    const refs = references();
-    return { mouvement: enrichirMouvement(r.mouvement, refs, req), article: resume(r.article, refs) };
+    const lecteur = enLecture(req);
+    const refs = references(lecteur);
+    return { mouvement: enrichirMouvement(r.mouvement, refs, lecteur), article: resume(r.article, refs) };
   }, { perm: [MODULE, 'modifier'] });
 
   router.get('/api/mouvements', async (req) => {
@@ -668,12 +1010,13 @@ function register(ctx) {
 
   router.get('/api/mouvements-export', async (req, res) => {
     const rows = filtrerMouvements(req, req.query);
-    const entetes = ['Date', 'Type', 'Code article', 'Désignation', 'Quantité', 'Unité', 'Écart', 'Stock avant', 'Stock après', 'Prix unitaire', 'Valeur', 'OT', 'Fournisseur', 'Motif', 'Utilisateur'];
+    const entetes = ['Date', 'Type', 'Code article', 'Désignation', 'Quantité', 'Unité', 'Écart', 'Stock avant', 'Stock après', 'Prix unitaire', 'Valeur', 'OT', 'Équipement', 'Fournisseur', 'Motif', 'Utilisateur'];
+    const equipementCsv = (m) => (m.equipementMasque ? 'Hors périmètre' : (m.equipementNom ? `${m.equipementNumero ? m.equipementNumero + ' ' : ''}${m.equipementNom}` : ''));
     const lignes = ['\ufeff' + entetes.map(csvEscape).join(';')];
     for (const m of rows) {
       const d = new Date(m.date);
       const date = Number.isNaN(d.getTime()) ? '' : `${d.toLocaleDateString('fr-FR')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-      lignes.push([date, TYPES_MOUVEMENT[m.type] || m.type, m.articleCode, m.articleDesignation, csvNombre(m.quantite), m.uniteCode, csvNombre(m.ecart), csvNombre(m.quantiteAvant), csvNombre(m.quantiteApres), csvNombre(m.prixUnitaire), csvNombre(m.valeur), m.otMasque ? 'Hors périmètre' : m.otNumero, m.fournisseurNom, m.motif, m.userNom].map(csvEscape).join(';'));
+      lignes.push([date, TYPES_MOUVEMENT[m.type] || m.type, m.articleCode, m.articleDesignation, csvNombre(m.quantite), m.uniteCode, csvNombre(m.ecart), csvNombre(m.quantiteAvant), csvNombre(m.quantiteApres), csvNombre(m.prixUnitaire), csvNombre(m.valeur), m.otMasque ? 'Hors périmètre' : m.otNumero, equipementCsv(m), m.fournisseurNom, m.motif, m.userNom].map(csvEscape).join(';'));
     }
     ctx.audit(req, 'export', MVT, null, `${rows.length} mouvement(s) de stock`);
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="mouvements-stock-${new Date().toISOString().slice(0, 10)}.csv"`, 'Cache-Control': 'no-store' });
@@ -692,13 +1035,14 @@ function register(ctx) {
       }
     }
     const r = annulerSortie(m.id, req.user.id, req);
-    const refs = references();
-    return { mouvement: enrichirMouvement(r.mouvement, refs, req), article: resume(r.article, refs) };
+    const lecteur = enLecture(req);
+    const refs = references(lecteur);
+    return { mouvement: enrichirMouvement(r.mouvement, refs, lecteur), article: resume(r.article, refs) };
   }, { perm: [MODULE, 'modifier'] });
 
   // ----- Routes : alertes, valorisation, références ---------------------------------------
   function alertes(req) {
-    const refs = references();
+    const refs = references(req);
     const derniers = derniersMouvements();
     return ctx.scope(req, db.list(ENTITE, (a) => a.actif !== false && estSousSeuil(a)))
       .map((a) => {
@@ -747,7 +1091,7 @@ function register(ctx) {
     const fournisseurs = db.list('fournisseurs').map((f) => ({ id: f.id, nom: f.nom || `#${f.id}`, actif: f.actif !== false, delaiLivraisonJours: f.delaiLivraisonJours == null ? null : f.delaiLivraisonJours }))
       .sort((a, b) => a.nom.localeCompare(b.nom, 'fr'));
     const equipements = db.list('equipements').filter((e) => equipementVisible(req, e))
-      .map((e) => ({ id: e.id, numero: e.numero || '', nom: e.nom || '', secteurId: e.secteurId == null ? null : e.secteurId, actif: e.actif !== false }))
+      .map((e) => ({ id: e.id, numero: e.numero || '', nom: e.nom || '', secteurId: e.secteurId == null ? null : e.secteurId, actif: e.actif !== false, parentId: e.parentId == null ? null : Number(e.parentId), etatCode: e.etatCode || null, reforme: estReforme(e) }))
       .sort((a, b) => a.nom.localeCompare(b.nom, 'fr'));
     const finaux = statutsOtFinaux();
     const otOuverts = ctx.scope(req, db.list('ot')).filter((o) => !finaux.has(o.statut))
@@ -757,14 +1101,120 @@ function register(ctx) {
     return { fournisseurs, equipements, otOuverts, emplacements, stockNegatif: !!wf().stockNegatif };
   }, { perm: [MODULE, 'voir'] });
 
+  // ----- Pièces dédiées : retrait d'un équipement supprimé ------------------------------------
+  /**
+   * Retire un équipement (supprimé) des listes d'équipements des articles. Une pièce dédiée qui n'a plus aucun
+   * équipement reste dédiée mais inutilisable : elle est signalée « à réaffecter » et les utilisateurs Stock › Modifier
+   * qui la voient sont prévenus. Retourne { articles, aReaffecter } (identifiants).
+   */
+  function retirerEquipement(equipementOuId, req) {
+    const e = equipementOuId && typeof equipementOuId === 'object' ? equipementOuId : db.get('equipements', equipementOuId);
+    const id = Number(e ? e.id : equipementOuId);
+    const libelle = e ? `${e.numero ? e.numero + ' ' : ''}${e.nom || ''}`.trim() : `équipement #${id}`;
+    const c = contexteEquipements();
+    const modifies = []; const aReaffecter = [];
+    for (const a of db.list(ENTITE, (x) => (x.equipementIds || []).map(Number).includes(id))) {
+      const restants = (a.equipementIds || []).filter((x) => Number(x) !== id);
+      const maj = db.update(ENTITE, a.id, { equipementIds: restants });
+      modifies.push(a.id);
+      if (!estDediee(a)) continue;
+      const orpheline = !restants.map(Number).some((x) => x !== id && c.parId.has(x));
+      ctx.audit(req || null, 'modification', ENTITE, a.id, `Article ${a.code} — ${a.designation} : équipement autorisé retiré (suppression de l'équipement ${libelle})${orpheline ? ' ; pièce dédiée sans équipement : à réaffecter' : ''}`, { notifier: false });
+      if (orpheline) aReaffecter.push(maj);
+    }
+    for (const a of aReaffecter) {
+      try {
+        const destinataires = [];
+        ctx.usersAvecDroit(MODULE, 'modifier', (u, p) => { if (!perms.canSeeRecord(p, u, a)) return false; destinataires.push({ u, p }); return true; });
+        for (const { u, p } of destinataires) {
+          // L'équipement supprimé n'est nommé qu'aux utilisateurs qui pouvaient le voir
+          const nomEq = e && perms.canSeeRecord(p, u, e) ? ` (${libelle})` : '';
+          ctx.notify([u.id], {
+            titre: 'Pièce dédiée sans équipement : à réaffecter',
+            message: `${a.code ? a.code + ' — ' : ''}${a.designation} : l'équipement auquel elle était dédiée${nomEq} a été supprimé. La pièce n'est plus utilisable sur aucun équipement tant qu'elle n'est pas réaffectée.`,
+            lien: `#/stock/${a.id}`, type: 'alerte',
+          });
+        }
+      } catch (err) { ctx.log('Stock : notification de pièce dédiée impossible', err.message); }
+    }
+    return { articles: modifies, aReaffecter: aReaffecter.map((a) => a.id) };
+  }
+
+  /**
+   * Pièces dédiées utilisables sur un équipement (choisi directement ou, sous-équipements inclus, par un ancêtre),
+   * avec `direct` et `viaId` (équipement choisi dont il hérite). Le lecteur `req` restreint la liste à sa portée.
+   */
+  function dediesA(equipementId, req) {
+    const id = Number(equipementId);
+    const c = contexteEquipements();
+    const ancetres = []; const vus = new Set([id]);
+    let cur = c.parId.get(id);
+    while (cur && cur.parentId != null && cur.parentId !== '' && !vus.has(Number(cur.parentId))) { const p = Number(cur.parentId); vus.add(p); ancetres.push(p); cur = c.parId.get(p); }
+    const rows = db.list(ENTITE, (a) => estDediee(a) && (a.equipementIds || []).map(Number).some((x) => x === id || ancetres.includes(x)));
+    return (req && req.perms ? ctx.scope(req, rows) : rows).map((a) => {
+      const choisis = (a.equipementIds || []).map(Number);
+      const direct = choisis.includes(id);
+      const via = direct ? null : ancetres.find((x) => choisis.includes(x));
+      if (!direct && !avecSousEquipements(a)) return null;
+      return Object.assign({}, a, { direct, viaId: via == null ? null : via });
+    }).filter(Boolean);
+  }
+
   // ----- Services publiés -----------------------------------------------------------------
   // `silencieux: true` (traitement en masse) : mouvement enregistré sans entrée de journal unitaire ; l'appelant
   // écrit une entrée récapitulative, le détail restant dans mouvementsStock.
   ctx.services.stock = {
-    /** Sortie de stock (ex. pièce consommée sur un OT). Lève HttpError 400 « Stock insuffisant… » si nécessaire. */
-    sortir({ articleId, quantite, otId, userId, motif, silencieux } = {}) {
-      return enregistrer({ articleId: idRef(articleId, 'Article'), type: 'sortie', quantite, otId: otId == null || otId === '' ? null : idRef(otId, 'Ordre de travail'), userId, motif, refuserInactif: true, silencieux: !!silencieux });
+    /**
+     * Sortie de stock (ex. pièce consommée sur un OT). Lève HttpError 400 « Stock insuffisant… » si nécessaire.
+     * Équipement destinataire : celui de l'OT (otId), sinon `equipementId` ; une pièce dédiée n'est sortie que pour un
+     * équipement autorisé (message selon la portée de `req`, ou de l'utilisateur `userId` à défaut).
+     */
+    sortir({ articleId, quantite, otId, userId, motif, silencieux, equipementId, req } = {}) {
+      const ot = otId == null || otId === '' ? null : db.get('ot', idRef(otId, 'Ordre de travail'));
+      const eq = equipementSortie(ot, equipementId, req && req.perms ? req : null);
+      return enregistrer({ articleId: idRef(articleId, 'Article'), type: 'sortie', quantite, otId: otId == null || otId === '' ? null : idRef(otId, 'Ordre de travail'), userId, motif, refuserInactif: true, silencieux: !!silencieux, equipementId: eq, controleDedie: true, req: req && req.perms ? req : null });
     },
+    /** Règle d'utilisation d'une pièce : { ok, raison } ; `req` (facultatif) limite les équipements cités à sa portée. */
+    utilisablePour: (article, equipementId, req) => utilisablePour(article, equipementId, req || null),
+    /** Identifiants des équipements autorisés d'une pièce dédiée (sous-équipements compris si demandé) ; null pour une pièce libre. */
+    equipementsAutorises: (article) => equipementsAutorises(article),
+    /** Indicateurs d'affichage d'une pièce pour un lecteur : reservee, reserveeA (noms visibles), reserveeEquipements, reserveeHorsPerimetre, reserveeTexte, sansEquipement, equipementsAutorisesIds. */
+    infosDediee: (article, req) => infosDediee(article, req || null),
+    /**
+     * Indicateurs d'une liste d'articles pour un équipement (une seule lecture des équipements) :
+     * chaque article est complété de infosDediee et de { utilisable, raison } pour cet équipement.
+     */
+    indicateurs(articles, equipementId, req) {
+      const c = contexteEquipements();
+      return (articles || []).map((a) => {
+        const d = infosDediee(a, req || null, c);
+        const u = utilisablePour(a, equipementId, req || null, c);
+        return Object.assign(d, { utilisable: u.ok, raison: u.ok ? '' : u.raison });
+      });
+    },
+    /**
+     * Pièces prévues d'un plan préventif reprises sur un OT de l'équipement : les lignes utilisables (règle des pièces
+     * dédiées) sont retenues, les autres écartées avec la raison (citant les équipements visibles par `req`).
+     * → { retenues: [lignes du plan], ecartees: [{ articleId, code, designation, quantite, raison }] }
+     */
+    piecesPrevuesPour(pieces, equipementId, req) {
+      const c = contexteEquipements();
+      const retenues = []; const ecartees = [];
+      for (const x of pieces || []) {
+        if (!x || x.articleId == null) continue;
+        const a = db.get(ENTITE, x.articleId);
+        const u = a ? utilisablePour(a, equipementId, req || null, c) : { ok: true };
+        if (u.ok) retenues.push(x);
+        else ecartees.push({ articleId: Number(x.articleId), code: a.code || '', designation: a.designation || '', quantite: Number(x.quantite) || 0, raison: u.raison });
+      }
+      return { retenues, ecartees };
+    },
+    /** Plans préventifs actifs qui prévoient l'article sur un équipement non autorisé (règle des pièces dédiées). */
+    plansNonConformes: (article) => plansNonConformes(article),
+    /** Pièces dédiées utilisables sur un équipement ({ direct, viaId }), selon la portée de `req`. */
+    dediesA: (equipementId, req) => dediesA(equipementId, req || null),
+    /** Retrait d'un équipement supprimé des articles (pièces dédiées signalées et notifiées si elles n'ont plus d'équipement). */
+    retirerEquipement: (equipementOuId, req) => retirerEquipement(equipementOuId, req || null),
     /** Entrée en stock (réception) ; le prix unitaire éventuel met à jour le CUMP de l'article. */
     entrer({ articleId, quantite, userId, motif, prixUnitaire, fournisseurId, silencieux } = {}) {
       const f = fournisseurId == null || fournisseurId === '' ? null : idRef(fournisseurId, 'Fournisseur');
@@ -829,44 +1279,44 @@ function insererDemo(ctx) {
   const defs = [
     { designation: TEMOIN, cat: 'mecanique', u: 'u', q: 12, seuil: 4, qc: 10, empl: 'Magasin central — A1 — Étagère 2', pu: 8.9, f: SKF, ref: '6205-2RSH', eqs: equipements('Convoyeur de sortie ligne 1', 'Étiqueteuse'),
       description: 'Roulement rigide à une rangée de billes, 25 × 52 × 15 mm, deux joints d\'étanchéité.',
-      hist: [[9, 'sortie', 4, 'Révision des galets de l\'étiqueteuse', 'jbernard']] },
-    { designation: 'Roulement à billes 6312-2Z/C3', cat: 'mecanique', u: 'u', q: 2, seuil: 2, qc: 4, empl: 'Magasin central — A1 — Étagère 4', pu: 64.5, f: SKF, ref: '6312-2Z/C3', eqs: equipements('Remplisseuse rotative'),
-      description: 'Roulement moteur principal de la remplisseuse, côté accouplement (60 × 130 × 31 mm, jeu C3).',
-      hist: [[33, 'sortie', 2, 'Remplacement du palier côté accouplement (analyse vibratoire)', 'kleroy']] },
+      hist: [[9, 'sortie', 4, 'Révision des galets de l\'étiqueteuse', 'jbernard', null, 'Étiqueteuse']] },
+    { designation: 'Roulement à billes 6312-2Z/C3', cat: 'mecanique', u: 'u', q: 2, seuil: 2, qc: 4, empl: 'Magasin central — A1 — Étagère 4', pu: 64.5, f: SKF, ref: '6312-2Z/C3', eqs: equipements('Remplisseuse rotative'), reservee: true,
+      description: 'Roulement moteur principal de la remplisseuse, côté accouplement (60 × 130 × 31 mm, jeu C3). Pièce appairée au moteur Krones : réservée à la remplisseuse.',
+      hist: [[33, 'sortie', 2, 'Remplacement du palier côté accouplement (analyse vibratoire)', 'kleroy', null, 'Remplisseuse rotative']] },
     { designation: 'Roulement à billes 6310-2Z/C3', cat: 'mecanique', u: 'u', q: 3, seuil: 2, qc: 4, empl: 'Magasin central — A1 — Étagère 4', pu: 48.2, f: SKF, ref: '6310-2Z/C3', eqs: equipements('Remplisseuse rotative'),
       description: 'Roulement moteur principal de la remplisseuse, côté ventilateur (50 × 110 × 27 mm, jeu C3).', hist: [] },
     { designation: 'Courroie crantée HTD 1400-8M-30', cat: 'mecanique', u: 'u', q: 4, seuil: 2, qc: 3, empl: 'Magasin central — A2 — Crochets', pu: 46.8, f: SKF, ref: 'PHG 1400-8M-30', eqs: equipements('Convoyeur de sortie ligne 1'),
       description: 'Courroie synchrone profil HTD, pas 8 mm, longueur primitive 1 400 mm, largeur 30 mm.', hist: [] },
-    { designation: 'Cartouche filtre à air compresseur GA 37', cat: 'pneumatique', u: 'u', q: 5, seuil: 2, qc: 4, empl: 'Magasin central — B1 — Étagère 1', pu: 89, f: fournisseur('Atlas Copco', /atlas/i), ref: '1613 9001 00', eqs: equipements('Compresseur d\'air GA 37'),
-      description: 'Élément filtrant d\'aspiration d\'origine constructeur (remplacement toutes les 4 000 h).',
+    { designation: 'Cartouche filtre à air compresseur GA 37', cat: 'pneumatique', u: 'u', q: 5, seuil: 2, qc: 4, empl: 'Magasin central — B1 — Étagère 1', pu: 89, f: fournisseur('Atlas Copco', /atlas/i), ref: '1613 9001 00', eqs: equipements('Compresseur d\'air GA 37'), reservee: true,
+      description: 'Élément filtrant d\'aspiration d\'origine constructeur (remplacement toutes les 4 000 h). Réservé au compresseur GA 37 (garantie constructeur).',
       hist: [[70, 'entree', 4, 'Réception de la commande CDE-2026-0142', 'mdupont', 91.5]] },
     { designation: 'Filtre plissé F7 592 × 592 × 534 mm', cat: 'consommable', u: 'u', q: 8, seuil: 4, qc: 8, empl: 'Magasin central — C3 — Palette', pu: 42.5, f: null, ref: 'F7-592-592-534-8P', eqs: equipements('CTA atelier conditionnement'),
       description: 'Filtre à poches F7 (ePM1 60 %), 8 poches, cadre galvanisé.',
-      hist: [[56, 'sortie', 8, 'Remplacement trimestriel des filtres de la CTA', 'kleroy'], [40, 'entree', 8, 'Réception de la commande CDE-2026-0171', 'mdupont', 42.5]] },
+      hist: [[56, 'sortie', 8, 'Remplacement trimestriel des filtres de la CTA', 'kleroy', null, 'CTA atelier conditionnement'], [40, 'entree', 8, 'Réception de la commande CDE-2026-0171', 'mdupont', 42.5]] },
     { designation: 'Huile hydraulique Azolla ZS 46', cat: 'lubrifiant', u: 'l', q: 120, seuil: 40, qc: 208, empl: 'Local lubrifiants — Fût n°2', pu: 3.85, f: TOTAL, ref: 'AZOLLA ZS 46 — fût 208 L', eqs: equipements('Presse hydraulique 250 t', 'Chariot élévateur thermique n°2'),
       description: 'Huile hydraulique anti-usure HM, grade ISO VG 46.',
-      hist: [[44, 'sortie', 25, 'Appoint du réservoir de la presse 250 t (fuite à surveiller)', 'jbernard'], [24, 'entree', 104, 'Réception de la commande CDE-2026-0198 (demi-fût)', 'mdupont', 3.79]] },
+      hist: [[44, 'sortie', 25, 'Appoint du réservoir de la presse 250 t (fuite à surveiller)', 'jbernard', null, 'Presse hydraulique 250 t'], [24, 'entree', 104, 'Réception de la commande CDE-2026-0198 (demi-fût)', 'mdupont', 3.79]] },
     { designation: 'Graisse lithium Multis EP 2 (cartouche 400 g)', cat: 'lubrifiant', u: 'u', q: 2, seuil: 6, qc: 12, empl: 'Local lubrifiants — Armoire 1', pu: 6.4, f: TOTAL, ref: 'MULTIS EP 2 — 400 g', eqs: equipements('Robot de palettisation', 'Convoyeur de sortie ligne 1', 'Pont roulant 5 t'),
       description: 'Graisse multi-usages au lithium, extrême pression, NLGI 2.',
-      hist: [[27, 'sortie', 6, 'Graissage des axes 1 à 4 du robot et des paliers des convoyeurs', 'jbernard']] },
+      hist: [[27, 'sortie', 6, 'Graissage des axes 1 à 4 du robot et des paliers des convoyeurs', 'jbernard', null, 'Robot de palettisation']] },
     { designation: 'Kit joints de vérin hydraulique (tige Ø 40 à 80)', cat: 'hydraulique', u: 'lot', q: 6, seuil: 2, qc: 4, empl: 'Magasin central — B2 — Tiroir 5', pu: 38, f: SKF, ref: 'SKF-KIT-VH-4080', eqs: equipements('Presse hydraulique 250 t', 'Chariot élévateur thermique n°2'),
       description: 'Jeu de joints de tige, racleurs et bagues de guidage pour vérins hydrauliques.', hist: [] },
     { designation: 'Contacteur TeSys D 18 A — bobine 24 V CC', cat: 'electrique', u: 'u', q: 1, seuil: 2, qc: 3, empl: 'Magasin central — D1 — Bac 3', pu: 72.3, f: SCHNEIDER, ref: 'LC1D18BD', eqs: equipements('Fardeleuse', 'Remplisseuse rotative'),
       description: 'Contacteur tripolaire 18 A AC-3, 1 NO + 1 NF, bobine 24 V CC.',
-      hist: [[12, 'sortie', 2, 'Remplacement des contacteurs du four de rétraction (fardeleuse)', 'kleroy']] },
+      hist: [[12, 'sortie', 2, 'Remplacement des contacteurs du four de rétraction (fardeleuse)', 'kleroy', null, 'Fardeleuse']] },
     { designation: 'Disjoncteur moteur GV2ME10 (4 à 6,3 A)', cat: 'electrique', u: 'u', q: 3, seuil: 1, qc: 2, empl: 'Magasin central — D1 — Bac 4', pu: 61, f: SCHNEIDER, ref: 'GV2ME10', eqs: equipements('Convoyeur de sortie ligne 1', 'Étiqueteuse'),
       description: 'Disjoncteur magnéto-thermique de protection moteur, réglage 4 à 6,3 A.', hist: [] },
     { designation: 'Fusibles cylindriques 10 × 38 gG 10 A (boîte de 10)', cat: 'electrique', u: 'lot', q: 8, initial: 9, seuil: 3, qc: 5, empl: 'Magasin central — D2 — Bac 1', pu: 9.8, f: REXEL, ref: 'DF2CA10', eqs: [],
       description: 'Cartouches fusibles gG 500 V, pouvoir de coupure 120 kA.',
       hist: [[7, 'inventaire', 8, 'Inventaire tournant zone D (une boîte manquante)', 'mdupont']] },
-    { designation: 'Capteur inductif M18 PNP 8 mm', cat: 'electrique', u: 'u', q: 4, seuil: 1, qc: 2, empl: 'Magasin central — D3 — Bac 2', pu: 58.9, f: SCHNEIDER, ref: 'XS618B1PAL2', eqs: equipements('Remplisseuse rotative', 'Étiqueteuse'),
-      description: 'Détecteur de proximité inductif M18, portée 8 mm, sortie PNP NO, connecteur M12.',
-      hist: [[25, 'sortie', 1, 'Remplacement du détecteur de présence bouteille (étiqueteuse)', 'jbernard'], [25, 'retour', 1, 'Pièce non utilisée : défaut de câblage, capteur d\'origine conservé', 'jbernard']] },
+    { designation: 'Capteur inductif M18 PNP 8 mm', cat: 'electrique', u: 'u', q: 4, seuil: 1, qc: 2, empl: 'Magasin central — D3 — Bac 2', pu: 58.9, f: SCHNEIDER, ref: 'XS618B1PAL2', eqs: equipements('Ligne de conditionnement L1'), reservee: true, sous: true,
+      description: 'Détecteur de proximité inductif M18, portée 8 mm, sortie PNP NO, connecteur M12. Modèle paramétré pour la ligne 1 : réservé à ses machines.',
+      hist: [[25, 'sortie', 1, 'Remplacement du détecteur de présence bouteille (étiqueteuse)', 'jbernard', null, 'Étiqueteuse'], [25, 'retour', 1, 'Pièce non utilisée : défaut de câblage, capteur d\'origine conservé', 'jbernard', null, 'Étiqueteuse']] },
     { designation: 'Électrovanne 5/2 G1/4 — 24 V CC', cat: 'pneumatique', u: 'u', q: 2, seuil: 1, qc: 2, empl: 'Magasin central — B1 — Étagère 3', pu: 112, f: null, ref: 'SY5120-5LZ-01', eqs: equipements('Robot de palettisation', 'Fardeleuse'),
       description: 'Distributeur pneumatique monostable 5/2, raccordement G1/4, bobine 24 V CC.', hist: [] },
     { designation: 'Câble souple H07RN-F 3G2,5 mm²', cat: 'electrique', u: 'm', q: 85, seuil: 25, qc: 100, empl: 'Magasin logistique — Touret n°1', pu: 2.35, f: REXEL, ref: 'H07RNF3G2,5', eqs: equipements('Transpalette électrique'), secteur: LOG,
       description: 'Câble souple caoutchouc pour alimentation d\'engins mobiles et prolongateurs.',
-      hist: [[28, 'sortie', 15, 'Remplacement du câble du chargeur de batterie du transpalette', 'kleroy']] },
+      hist: [[28, 'sortie', 15, 'Remplacement du câble du chargeur de batterie du transpalette', 'kleroy', null, 'Transpalette électrique']] },
   ];
 
   const INITIAL = 90; // inventaire de reprise : il y a 90 jours
@@ -879,7 +1329,7 @@ function insererDemo(ctx) {
     const a = db.insert(ENTITE, {
       code: codeUnique(), designation: d.designation, description: d.description || '', categorieCode: code('categoriesArticles', d.cat), uniteCode: code('unites', d.u),
       quantite: d.q, seuilMin: d.seuil, quantiteCommande: d.qc, emplacement: d.empl, prixUnitaire: d.pu, fournisseurId: d.f == null ? null : d.f, referenceFournisseur: d.ref,
-      equipementIds: d.eqs, secteurId: d.secteur == null ? null : d.secteur, actif: true, champs: {}, createdBy: admin ? admin.id : null,
+      equipementIds: d.eqs, reservee: !!d.reservee && d.eqs.length > 0, inclureSousEquipements: d.sous !== false, secteurId: d.secteur == null ? null : d.secteur, actif: true, champs: {}, createdBy: admin ? admin.id : null,
     });
     const brutA = colArticles.find((x) => x.id === a.id);
     if (brutA) brutA.createdAt = jour(INITIAL, '07:00');
@@ -887,13 +1337,16 @@ function insererDemo(ctx) {
     // Inventaire initial puis historique, dans l'ordre chronologique
     const mvts = [[INITIAL, 'inventaire', initial, 'Inventaire initial (reprise du stock à la mise en service de la GMAO)', 'mdupont', d.pu]].concat(d.hist);
     let stock = 0; let derniereSortie = null; let derniereDate = null;
-    for (const [n, type, qte, motif, login, prix] of mvts) {
+    for (const [n, type, qte, motif, login, prix, nomEq] of mvts) {
+      const eq = nomEq ? db.findOne('equipements', (e) => e.nom === nomEq) : null;
       const avant = stock;
       stock = arrondi(type === 'inventaire' ? qte : stock + (type === 'entree' || type === 'retour' ? qte : -qte));
       const date = jour(n, type === 'retour' ? '15:30' : (type === 'entree' ? '10:30' : (n === INITIAL ? '07:30' : '08:45')));
       const m = db.insert(MVT, {
         articleId: a.id, type, quantite: qte, quantiteAvant: arrondi(avant), quantiteApres: stock, ecart: arrondi(stock - avant), date,
         userId: userId(login), otId: null, motif, prixUnitaire: prix != null ? prix : d.pu, fournisseurId: type === 'entree' ? (d.f == null ? null : d.f) : null,
+        equipementId: eq && (type === 'sortie' || type === 'retour') ? eq.id : null, equipementLibelle: eq && (type === 'sortie' || type === 'retour') ? `${eq.numero ? eq.numero + ' — ' : ''}${eq.nom}` : '',
+        ...(eq && (type === 'sortie' || type === 'retour') ? { equipementSecteurId: eq.secteurId == null || eq.secteurId === '' ? null : Number(eq.secteurId) } : {}),
         mouvementOrigineId: type === 'retour' && derniereSortie ? derniereSortie.id : null, annuleParId: null, createdBy: userId(login),
       });
       const brut = colMvt.find((x) => x.id === m.id);
@@ -908,7 +1361,8 @@ function insererDemo(ctx) {
   }
   db.touch();
   const sousSeuil = db.count(ENTITE, (a) => a.actif !== false && estSousSeuil(a));
-  return `${defs.length} articles (${sousSeuil} sous le seuil), ${nbMvt} mouvements de stock (dont ${nbMvt - defs.length} sur les 60 derniers jours)`;
+  const dediees = defs.filter((d) => d.reservee && d.eqs.length).length;
+  return `${defs.length} articles (${sousSeuil} sous le seuil, ${dediees} pièces dédiées), ${nbMvt} mouvements de stock (dont ${nbMvt - defs.length} sur les 60 derniers jours)`;
 }
 
 module.exports = { nom, register, seedDemo, estSousSeuil, quantiteACommander, valeurArticle, csvEscape };

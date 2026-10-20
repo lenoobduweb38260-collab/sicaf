@@ -1545,11 +1545,19 @@ ${CSS_ETIQUETTES}
         { label: 'Emplacement', valeur: x.emplacement },
         { label: 'Référence fournisseur', valeur: [x.referenceFournisseur, x.fournisseurNom].filter(Boolean).join(' · ') },
         x.sousSeuil ? { label: 'Alerte', valeur: el('span', { class: 'texte-alerte texte-gras' }, 'Stock sous le seuil minimum') } : null,
+        // Pièce dédiée (règle du module Stock) : restriction indiquée, l'inventaire lui-même n'est pas restreint
+        x.reservee ? { label: 'Pièce dédiée', valeur: x.sansEquipement
+          ? frag(ui.badge('Dédiée — à réaffecter', '#dc2626'), ' ', el('span', { class: 'texte-danger' }, 'sans équipement : inutilisable tant qu\'elle n\'est pas réaffectée'))
+          : frag(ui.badge('Dédiée', '#7c3aed'), ` utilisable uniquement sur ${x.reserveeTexte}`,
+            sortieImpossible(x) ? el('div', { class: 'texte-alerte texte-petit' }, 'Aucun équipement autorisé accessible : sortie impossible.') : null) } : null,
         !x.actif ? { label: 'Statut', valeur: el('span', { class: 'texte-danger' }, 'Article désactivé') } : null,
         (x.inventairesEnCours || []).length ? { label: 'Inventaire en cours', valeur: frag(...x.inventairesEnCours.map((i, k) => frag(k ? ', ' : '', lienVue('#/inventaire/' + i.id, `${i.numero} — ${i.nom}`)))) } : null,
       ].filter(Boolean)));
       if (GMAO.can('stock', 'modifier') && !GMAO.siteLectureSeule(x.secteurId) && x.actif) {
-        actions.append(ui.bouton('Entrée', { icone: 'import', classe: 'btn-ok', onClic: () => mouvementRapide(r, 'entree', rafraichir) }), ui.bouton('Sortie', { icone: 'export', classe: 'btn-alerte', onClic: () => mouvementRapide(r, 'sortie', rafraichir) }));
+        // Pièce dédiée sans équipement autorisé accessible (ou à réaffecter) : la sortie est impossible, le bouton le dit
+        const impossible = sortieImpossible(x);
+        actions.append(ui.bouton('Entrée', { icone: 'import', classe: 'btn-ok', onClic: () => mouvementRapide(r, 'entree', rafraichir) }),
+          ui.bouton('Sortie', { icone: 'export', classe: 'btn-alerte', disabled: impossible, titre: impossible ? (x.sansEquipement ? 'Pièce dédiée sans équipement : à réaffecter avant toute sortie' : 'Aucun équipement autorisé accessible : sortie impossible') : undefined, onClic: () => mouvementRapide(r, 'sortie', rafraichir) }));
       }
       actions.appendChild(ui.bouton('Imprimer l\'étiquette', { icone: 'imprimer', onClic: () => imprimerUne('articles', r.id) }));
     } else if (r.type === 'equipement') {
@@ -1585,20 +1593,43 @@ ${CSS_ETIQUETTES}
     } catch (e) { erreur(e); }
   }
 
-  function mouvementRapide(r, type, apres) {
+  /** Pièce dédiée sans aucun équipement autorisé accessible (résultat du serveur) : aucune sortie possible. */
+  function sortieImpossible(x) {
+    return !!(x && x.reservee && (x.sansEquipement || !(x.equipementsAutorisesIds || []).length));
+  }
+
+  async function mouvementRapide(r, type, apres) {
     const x = r.details || {};
     const u = x.unite || '';
+    if (type === 'sortie' && sortieImpossible(x)) {
+      toast(x.sansEquipement ? 'Pièce dédiée sans équipement : à réaffecter avant toute sortie' : 'Aucun équipement autorisé accessible : sortie impossible', 'alerte');
+      return;
+    }
+    // Sortie : équipement destinataire (traçabilité), comme la sortie manuelle du stock ; pour une pièce dédiée, choisi
+    // parmi les équipements autorisés (calculés par le serveur) et obligatoire
+    let optionsEq = null;
+    if (type === 'sortie') {
+      let refs = { equipements: [] };
+      try { refs = await api.get('/api/stock-references'); } catch (e) { /* liste vide : la sortie d'une pièce dédiée sera refusée avec la raison */ }
+      const autorises = x.reservee ? new Set((x.equipementsAutorisesIds || []).map(Number)) : null;
+      const liste = (refs.equipements || []).filter((e) => (autorises ? autorises.has(Number(e.id)) : e.actif !== false));
+      const vide = autorises ? (liste.length ? '— Choisir l\'équipement autorisé —' : '— Aucun équipement autorisé accessible —') : '— Non précisé —';
+      optionsEq = [{ value: '', label: vide }].concat(liste.map((e) => ({ value: e.id, label: `${e.numero ? e.numero + ' — ' : ''}${e.nom}${e.reforme ? ' — réformé' : ''}` })));
+    }
     ui.formModal({
       titre: `${type === 'entree' ? 'Entrée en stock' : 'Sortie de stock'} — ${r.code}`, taille: 'petite', submitLabel: type === 'entree' ? 'Enregistrer l\'entrée' : 'Enregistrer la sortie',
-      avant: el('p', { class: 'texte-2' }, `${r.libelle} · stock actuel ${qte(x.quantite, u)}`),
+      avant: el('p', { class: 'texte-2' }, `${r.libelle} · stock actuel ${qte(x.quantite, u)}${type === 'sortie' && x.reservee ? ` · pièce dédiée : uniquement sur ${x.reserveeTexte}` : ''}`),
       champs: [
         { nom: 'quantite', label: `Quantité${u ? ' (' + u + ')' : ''}`, type: 'nombre', requis: true, min: 0.001, step: 'any', valeur: 1 },
         type === 'entree' ? { nom: 'prixUnitaire', label: `Prix unitaire (${((GMAO.config || {}).general || {}).devise || '€'}, facultatif)`, type: 'nombre', min: 0, step: '0.01' } : null,
+        optionsEq ? { nom: 'equipementId', label: 'Équipement destinataire', type: 'select', requis: !!x.reservee, options: optionsEq, pleineLargeur: true,
+          aide: x.reservee ? 'Pièce dédiée : seuls les équipements autorisés sont proposés' : 'Facultatif : enregistré sur le mouvement (traçabilité)' } : null,
         { nom: 'motif', label: 'Motif', type: 'texte', placeholder: type === 'entree' ? 'ex. Réception commande' : 'ex. Dépannage convoyeur', pleineLargeur: true },
       ],
       colonnes: 1,
       onSubmit: async (v) => {
         const body = { type, quantite: v.quantite, motif: v.motif || '' };
+        if (type === 'sortie' && v.equipementId !== '' && v.equipementId != null) body.equipementId = v.equipementId;
         if (type === 'entree' && v.prixUnitaire != null && v.prixUnitaire !== '') body.prixUnitaire = v.prixUnitaire;
         const res = await api.post(`/api/articles/${r.id}/mouvements`, body);
         toast(`${type === 'entree' ? 'Entrée' : 'Sortie'} enregistrée : stock ${qte(res.article.quantite, u)}`, 'succes');

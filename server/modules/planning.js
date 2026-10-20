@@ -660,21 +660,31 @@ function register(ctx) {
       let numero = null;
       for (let i = 0; i < 1000 && !numero; i++) { const n = db.nextNumber('ot', gabarit); if (!db.findOne('ot', (x) => x.numero === n)) numero = n; }
       const codeOk = (nomListe, code, voulu) => { const l = ctx.liste(nomListe); if (code && (!l.length || l.some((x) => x.code === code))) return code; return l.some((x) => x.code === voulu) ? voulu : (l[0] ? l[0].code : voulu); };
+      // Pièces prévues : seules celles qui sont utilisables sur l'équipement du plan (règle des pièces dédiées du module Stock)
+      let lignes = (plan.pieces || []).filter((x) => x && x.articleId != null);
+      let ecartees = [];
+      const stock = ctx.services.stock;
+      if (lignes.length && stock && typeof stock.piecesPrevuesPour === 'function') {
+        const f = stock.piecesPrevuesPour(lignes, plan.equipementId, req);
+        lignes = f.retenues; ecartees = f.ecartees;
+      }
+      const noteEcartees = ecartees.length ? `Pièces prévues du plan non reprises (pièces dédiées non autorisées pour l'équipement de l'OT) : ${ecartees.map((x) => `${x.code ? x.code + ' — ' : ''}${x.designation}`).join(', ')}` : '';
       const record = {
         numero: numero || 'OT-' + Date.now(), titre: plan.nom, description: plan.description || '',
         typeCode: codeOk('typesIntervention', plan.typeCode, 'preventif'), prioriteCode: codeOk('priorites', plan.prioriteCode, 'normale'), statut: st.initial,
         equipementId: plan.equipementId == null ? null : plan.equipementId, secteurId: plan.secteurId == null ? null : plan.secteurId,
         demandeId: null, planPreventifId: plan.id, technicienId, techniciens: technicienId != null ? [technicienId] : [],
         datePrevue, dateDebut: null, dateFin: null, dureeEstimee: plan.dureeEstimee == null ? null : plan.dureeEstimee,
-        tempsPasse: [], pieces: [], piecesPrevues: (plan.pieces || []).map((x) => { const a = db.get('articles', x.articleId); return { articleId: Number(x.articleId), code: a ? a.code || '' : '', designation: a ? a.designation || '' : '', quantite: Number(x.quantite) || 0 }; }),
+        tempsPasse: [], pieces: [], piecesPrevues: lignes.map((x) => { const a = db.get('articles', x.articleId); return { articleId: Number(x.articleId), code: a ? a.code || '' : '', designation: a ? a.designation || '' : '', quantite: Number(x.quantite) || 0 }; }),
         causeCode: null, rapport: '', commentaires: [], documents: [], coutPieces: 0, coutMainOeuvre: 0, coutExterne: 0, coutTotal: 0,
         fournisseurId: null, compteurReleve: null,
         taches: (plan.gamme || []).slice().sort((a, b) => (a.ordre || 0) - (b.ordre || 0)).map((g, i) => ({ ordre: i + 1, libelle: g.libelle, duree: g.duree == null ? null : g.duree, fait: false, faitPar: null, dateFait: null })),
         cloturePar: null, dateCloture: null, champs: {}, createdBy: req.user.id,
-        historique: [entreeHistorique(req, 'creation', 'Ordre de travail créé', st.initial, commentaire)],
+        historique: [entreeHistorique(req, 'creation', 'Ordre de travail créé', st.initial, commentaire)]
+          .concat(noteEcartees ? [entreeHistorique(req, 'piecesPrevues', 'Pièces prévues', st.initial, noteEcartees)] : []),
       };
       ot = db.insert('ot', record);
-      ctx.audit(req, 'creation', 'ot', ot.id, `${refOt(ot.numero)} : ${ot.titre} (plan ${plan.numero || plan.id}, depuis le planning)`);
+      ctx.audit(req, 'creation', 'ot', ot.id, `${refOt(ot.numero)} : ${ot.titre} (plan ${plan.numero || plan.id}, depuis le planning)${noteEcartees ? ' — ' + noteEcartees : ''}`);
       if (technicienId != null) notifier([technicienId], req.user.id, { titre: `Nouvel ordre de travail : ${ot.numero}`, message: `${ot.titre} — prévu le ${formatDateFr(datePrevue)}`, lien: `#/ot/${ot.id}`, type: 'info' });
       ctx.emit('ot:cree', Object.assign({}, ot, { ot, source: 'plan' }));
     }

@@ -115,16 +115,20 @@
   }
   const invalider = () => { Object.keys(cache).forEach((k) => delete cache[k]); };
   const chargerReferences = () => charger('refs', () => api.get('/api/preventif-references'));
-  /** Articles : API du module Stock si disponible, sinon liste fournie par le module préventif. */
+  /**
+   * Articles : liste des références du module préventif (avec les indicateurs des pièces dédiées calculés par le
+   * serveur), sinon API du module Stock.
+   */
   async function chargerArticles(refs) {
+    if (refs && Array.isArray(refs.articles)) return refs.articles.map((a) => Object.assign({}, a, { equipementIds: (a.equipementIds || []).map(Number) }));
     if (GMAO.can('stock', 'voir')) {
       try {
         const r = await charger('articles', () => api.get('/api/articles', { actif: '1' }));
         const liste = Array.isArray(r) ? r : (r && (r.articles || r.lignes)) || [];
-        if (liste.length) return liste.filter((a) => a.actif !== false).map((a) => ({ id: a.id, code: a.code || '', designation: a.designation || '', quantite: Number(a.quantite) || 0, uniteCode: a.uniteCode || null, equipementIds: (a.equipementIds || []).map(Number) }));
+        if (liste.length) return liste.filter((a) => a.actif !== false).map((a) => ({ id: a.id, code: a.code || '', designation: a.designation || '', quantite: Number(a.quantite) || 0, uniteCode: a.uniteCode || null, equipementIds: (a.equipementIds || []).map(Number), reservee: !!a.reservee, reserveeTexte: a.reserveeTexte || '', sansEquipement: !!a.sansEquipement, equipementsAutorisesIds: a.equipementsAutorisesIds == null ? null : a.equipementsAutorisesIds }));
       } catch (e) { /* repli ci-dessous */ }
     }
-    return (refs && refs.articles) || [];
+    return [];
   }
 
   // ----- Badge de navigation (plans en retard) ---------------------------------------------------
@@ -213,16 +217,35 @@
     const corps = el('div', { class: 'liste-editable' });
     const grille = 'minmax(0, 1fr) 110px 36px';
     const libelleArticle = (a) => `${a.code ? a.code + ' — ' : ''}${a.designation} (stock : ${nf(a.quantite)}${uniteArticle(a.uniteCode, a.quantite)})`;
-    function select(it) {
+    // Pièce dédiée : utilisable si l'équipement du plan figure parmi ses équipements autorisés (liste calculée par le serveur)
+    const autorisee = (a) => !a.reservee || (equipementId != null && (a.equipementsAutorisesIds || []).map(Number).includes(Number(equipementId)));
+    const raisonRefus = (a) => (a.sansEquipement ? 'pièce dédiée sans équipement (à réaffecter)' : `réservée à ${a.reserveeTexte || 'd\'autres équipements'}`);
+    function select(it, indication) {
       const sel = el('select', { 'aria-label': 'Article' });
       sel.appendChild(el('option', { value: '' }, '— Choisir un article —'));
-      const compatibles = articles.filter((a) => equipementId != null && a.equipementIds.includes(Number(equipementId)));
-      const autres = articles.filter((a) => !compatibles.includes(a));
+      const dediees = articles.filter((a) => a.reservee && autorisee(a));
+      const refusees = articles.filter((a) => a.reservee && !autorisee(a));
+      const compatibles = articles.filter((a) => !a.reservee && equipementId != null && a.equipementIds.includes(Number(equipementId)));
+      const autres = articles.filter((a) => !a.reservee && !compatibles.includes(a));
+      if (dediees.length) sel.appendChild(el('optgroup', { label: 'Pièces dédiées à cet équipement' }, dediees.map((a) => el('option', { value: String(a.id), title: `Pièce dédiée : ${a.reserveeTexte}` }, `Dédiée · ${libelleArticle(a)}`))));
       if (compatibles.length) sel.appendChild(el('optgroup', { label: 'Compatibles avec l\'équipement' }, compatibles.map((a) => el('option', { value: String(a.id) }, libelleArticle(a)))));
-      if (autres.length) sel.appendChild(el('optgroup', { label: compatibles.length ? 'Autres articles' : 'Articles en stock' }, autres.map((a) => el('option', { value: String(a.id) }, libelleArticle(a)))));
+      if (autres.length) sel.appendChild(el('optgroup', { label: compatibles.length || dediees.length ? 'Autres articles' : 'Articles en stock' }, autres.map((a) => el('option', { value: String(a.id) }, libelleArticle(a)))));
+      if (refusees.length) {
+        sel.appendChild(el('optgroup', { label: equipementId == null ? 'Pièces dédiées (choisissez d\'abord l\'équipement du plan)' : 'Pièces dédiées à d\'autres équipements (non utilisables)' },
+          refusees.map((a) => el('option', { value: String(a.id), disabled: true, title: raisonRefus(a) }, `${a.code ? a.code + ' — ' : ''}${a.designation} — ${raisonRefus(a)}`))));
+      }
       if (it.articleId != null && !parId.has(Number(it.articleId))) sel.appendChild(el('option', { value: String(it.articleId) }, it.designation || `Article #${it.articleId}`));
       sel.value = it.articleId == null ? '' : String(it.articleId);
-      sel.addEventListener('change', () => { it.articleId = sel.value ? Number(sel.value) : null; });
+      const majIndication = () => {
+        ui.vider(indication);
+        const a = it.articleId != null ? parId.get(Number(it.articleId)) : null;
+        if (!a || !a.reservee) return;
+        indication.appendChild(autorisee(a)
+          ? frag(ui.badge('Dédiée', '#7c3aed'), ` utilisable uniquement sur ${a.reserveeTexte}`)
+          : frag(ui.badge('Non autorisée', '#dc2626'), ` ${raisonRefus(a)} : retirez cette pièce ou choisissez un équipement autorisé`));
+      };
+      sel.addEventListener('change', () => { it.articleId = sel.value ? Number(sel.value) : null; majIndication(); });
+      majIndication();
       return sel;
     }
     function rendre() {
@@ -235,7 +258,8 @@
       items.forEach((it, i) => {
         const q = el('input', { type: 'number', value: it.quantite, min: '0', step: 'any', 'aria-label': 'Quantité' });
         q.addEventListener('input', () => { it.quantite = q.value; });
-        corps.appendChild(el('div', { class: 'ligne', style: { gridTemplateColumns: grille } }, select(it), q,
+        const indication = el('div', { class: 'texte-petit texte-2', style: { marginTop: '2px' } });
+        corps.appendChild(el('div', { class: 'ligne', style: { gridTemplateColumns: grille } }, el('div', { style: { minWidth: '0' } }, select(it, indication), indication), q,
           el('button', { type: 'button', class: 'btn btn-icone btn-sm texte-danger', title: 'Retirer la pièce', onclick: () => { items.splice(i, 1); rendre(); } }, icone('supprimer'))));
       });
       if (articles.length) corps.appendChild(el('div', { style: { marginTop: '4px' } }, ui.bouton('Ajouter une pièce', { icone: 'plus', classe: 'btn-sm', onClic: () => { items.push({ articleId: null, quantite: '1' }); rendre(); } })));
@@ -250,6 +274,8 @@
         if (i >= 0) return `Pièces : choisissez l'article de la ligne ${i + 1} (ou retirez-la)`;
         const j = items.findIndex((it) => it.articleId != null && !(Number(it.quantite) > 0));
         if (j >= 0) return `Pièces : la quantité de la ligne ${j + 1} doit être strictement positive`;
+        const k = items.findIndex((it) => { const a = it.articleId != null ? parId.get(Number(it.articleId)) : null; return a && !autorisee(a); });
+        if (k >= 0) { const a = parId.get(Number(items[k].articleId)); return `Pièces : la pièce dédiée « ${a.designation} » de la ligne ${k + 1} n'est pas utilisable sur l'équipement du plan (${raisonRefus(a)})`; }
         return '';
       },
     };
@@ -404,6 +430,8 @@
       onSubmit: async (v) => {
         const r = await api.post(`/api/preventif/${p.id}/generer`, { datePrevue: v.datePrevue });
         toast(`Ordre de travail ${r.ot.numero} généré`, 'succes');
+        // Pièces dédiées non autorisées pour l'équipement : non reprises sur l'OT
+        (r.avertissements || []).forEach((a) => toast(a, 'alerte', 9000));
         majBadge();
         if (apres) apres(r.plan, r.ot);
       },
@@ -458,7 +486,7 @@
   }
   function afficherRapport(r) {
     if (!r.nb && !r.erreurs.length) toast(r.ignores.length ? `Aucun OT généré (${r.ignores.length} plan(s) à échéance déjà couverts ou ignorés)` : 'Aucun plan n\'est arrivé à échéance', 'info');
-    else toast(`${r.nb} ordre${r.nb > 1 ? 's' : ''} de travail généré${r.nb > 1 ? 's' : ''}`, r.erreurs.length ? 'alerte' : 'succes');
+    else toast(`${r.nb} ordre${r.nb > 1 ? 's' : ''} de travail généré${r.nb > 1 ? 's' : ''}`, r.erreurs.length || (r.avertissements || []).length ? 'alerte' : 'succes');
     if (!r.nb && !r.erreurs.length && !r.ignores.length) return;
     const lienPlan = (x) => el('a', { href: '#/preventif/' + x.planId, onclick: () => ui.fermerModales() }, `${x.planNumero} — ${x.planNom}`);
     const contenu = el('div');
@@ -466,6 +494,11 @@
       el('thead', null, el('tr', null, el('th', null, 'OT'), el('th', null, 'Plan'), el('th', null, 'Date prévue'))),
       el('tbody', null, r.generes.map((g) => el('tr', null, el('td', null, GMAO.can('ot', 'voir') ? el('a', { href: '#/ot/' + g.otId, onclick: () => ui.fermerModales() }, g.otNumero) : g.otNumero), el('td', null, lienPlan(g)), el('td', null, ui.formatDate(g.datePrevue)))))))));
     if (r.ignores.length) contenu.appendChild(ui.carte(`Plans à échéance ignorés (${r.ignores.length})`, el('ul', { style: { margin: '0', paddingLeft: '18px' } }, r.ignores.map((x) => el('li', null, lienPlan(x), el('span', { class: 'texte-2' }, ' — ' + x.motif))))));
+    if ((r.avertissements || []).length) {
+      contenu.appendChild(ui.carte(`Pièces prévues non reprises (${r.avertissements.length})`, frag(
+        el('p', { class: 'texte-2 texte-petit', style: { marginTop: 0 } }, 'Pièces dédiées non autorisées pour l\'équipement du plan : elles ne figurent pas dans les pièces prévues de l\'OT. Corrigez les pièces de ces plans.'),
+        el('ul', { style: { margin: '0', paddingLeft: '18px' } }, r.avertissements.map((x) => el('li', null, lienPlan(x), el('span', { class: 'texte-2' }, ` — ${x.otNumero} : ${(x.pieces || []).map((y) => `${y.code ? y.code + ' — ' : ''}${y.designation}`).join(', ')}`)))))));
+    }
     if (r.erreurs.length) contenu.appendChild(ui.alerte(frag(el('strong', null, 'Erreurs : '), r.erreurs.map((x) => `${x.planNumero} : ${x.message}`).join(' ; ')), 'alerte'));
     ui.modal({ titre: 'Résultat de la génération', taille: 'large', contenu, boutons: [{ label: 'Fermer', classe: 'btn-primaire' }] });
   }
@@ -547,6 +580,7 @@
     } else if (p.actif !== false && p.etat === 'proche' && !p.otOuvertId) {
       container.appendChild(ui.alerte(`Échéance proche (${texteRestant(p)}) : l'ordre de travail sera généré automatiquement ${GMAO.config.preventif && GMAO.config.preventif.genererAuto === false ? 'via « Générer les OT à échéance »' : 'dans l\'heure'}.`, 'info'));
     }
+    if ((p.piecesNonAutorisees || []).length) container.appendChild(ui.alerte(texteNonAutorisees(p.piecesNonAutorisees.length), 'alerte'));
     if (p.otAnnule) container.appendChild(ui.alerte(frag(`L'OT `, GMAO.can('ot', 'voir') ? el('a', { href: '#/ot/' + p.otAnnule.id }, p.otAnnule.numero) : p.otAnnule.numero, ' généré pour cette échéance a été annulé : il ne sera pas régénéré automatiquement. Générez un nouvel OT ou reportez l\'échéance (Modifier).'), 'alerte'));
 
     // Indicateurs
@@ -623,15 +657,25 @@
   function rendrePieces(p) {
     const pieces = p.pieces || [];
     if (!pieces.length) return ui.carte('Pièces nécessaires', ui.vide('Aucune pièce prévue pour ce plan.', 'piece'));
-    return ui.carte(`Pièces nécessaires (${pieces.length})`, ui.table({
+    const nonAutorisees = (p.piecesNonAutorisees || []).length;
+    return ui.carte(`Pièces nécessaires (${pieces.length})`, frag(nonAutorisees ? ui.alerte(texteNonAutorisees(nonAutorisees), 'alerte') : null, ui.table({
       lignes: pieces, recherche: false, pagination: false, compact: true, cleId: 'articleId',
       colonnes: [
         { cle: 'code', label: 'Code', largeur: '120px', rendu: (x) => x.code || '—' },
-        { cle: 'designation', label: 'Désignation', rendu: (x) => (x.introuvable ? el('span', { class: 'texte-danger' }, x.designation) : x.designation) },
+        { cle: 'designation', label: 'Désignation', rendu: (x) => (x.introuvable ? el('span', { class: 'texte-danger' }, x.designation)
+          : el('div', null, x.designation, x.reservee ? ' ' : null, x.reservee ? (x.utilisable ? ui.badge('Dédiée', '#7c3aed', { titre: `Pièce dédiée : ${x.reserveeTexte}` }) : ui.badge('Non autorisée', '#dc2626', { titre: x.raison })) : null,
+            // Le rouge est porté par un élément enfant : la couleur de .cellule-secondaire l'emporterait sur .texte-danger
+            x.reservee && !x.utilisable ? el('div', { class: 'cellule-secondaire' }, el('span', { class: 'texte-danger' }, x.raison)) : null)) },
         { cle: 'quantite', label: 'Quantité', aligner: 'droite', rendu: (x) => `${nf(x.quantite)}${uniteArticle(x.uniteCode, x.quantite)}` },
         { cle: 'disponible', label: 'En stock', aligner: 'droite', rendu: (x) => (x.disponible == null ? '—' : el('span', { class: x.disponible < x.quantite ? 'texte-danger texte-gras' : 'texte-ok' }, nf(x.disponible), x.disponible < x.quantite ? ' (insuffisant)' : '')) },
       ],
-    }).el);
+    }).el));
+  }
+  /** Pièces prévues devenues non autorisées pour l'équipement du plan (résultat du serveur). */
+  function texteNonAutorisees(n) {
+    return n > 1
+      ? `${n} pièces prévues ne sont pas autorisées pour l'équipement du plan (pièces dédiées) : elles ne seront pas reprises sur les ordres de travail générés. Modifiez les pièces du plan.`
+      : 'Une pièce prévue n\'est pas autorisée pour l\'équipement du plan (pièce dédiée) : elle ne sera pas reprise sur les ordres de travail générés. Modifiez les pièces du plan.';
   }
 
   function rendreHistorique(p) {
@@ -746,7 +790,9 @@
       vide: 'Aucun plan de maintenance préventive',
       colonnes: [
         { cle: 'numero', label: 'Numéro', rendu: (p) => el('span', { class: 'cellule-principale', style: { whiteSpace: 'nowrap' } }, p.numero), valeurTri: (p) => p.numero },
-        { cle: 'nom', label: 'Plan', rendu: (p) => el('div', { style: { minWidth: '180px' } }, el('div', { class: 'cellule-principale' }, p.nom), el('div', { class: 'cellule-secondaire' }, [ui.libelle('typesIntervention', p.typeCode), p.nbTaches ? `${p.nbTaches} tâche${p.nbTaches > 1 ? 's' : ''}` : 'sans gamme', p.dureeEstimee != null ? ui.formatDuree(p.dureeEstimee) : '', (p.pieces || []).length ? `${p.pieces.length} pièce${p.pieces.length > 1 ? 's' : ''}` : ''].filter(Boolean).join(' · '))), valeurTri: (p) => String(p.nom || '').toLowerCase() },
+        { cle: 'nom', label: 'Plan', rendu: (p) => el('div', { style: { minWidth: '180px' } }, el('div', { class: 'cellule-principale' }, p.nom,
+          (p.piecesNonAutorisees || []).length ? frag(' ', ui.badge('Pièce non autorisée', '#dc2626', { titre: texteNonAutorisees(p.piecesNonAutorisees.length) })) : null),
+          el('div', { class: 'cellule-secondaire' }, [ui.libelle('typesIntervention', p.typeCode), p.nbTaches ? `${p.nbTaches} tâche${p.nbTaches > 1 ? 's' : ''}` : 'sans gamme', p.dureeEstimee != null ? ui.formatDuree(p.dureeEstimee) : '', (p.pieces || []).length ? `${p.pieces.length} pièce${p.pieces.length > 1 ? 's' : ''}` : ''].filter(Boolean).join(' · '))), valeurTri: (p) => String(p.nom || '').toLowerCase() },
         { cle: 'equipementNom', label: 'Équipement', rendu: lienEquipement, valeurTri: (p) => String(p.equipementNom || 'zzz').toLowerCase() },
         { cle: 'periodicite', label: 'Périodicité', rendu: (p) => el('div', { style: { whiteSpace: 'nowrap' } }, el('div', null, periodiciteLisible(p.periodicite, p.uniteCompteur)),
           el('div', { class: 'cellule-secondaire', title: 'Dernière exécution' }, p.derniereExecution == null || p.derniereExecution === '' ? 'jamais réalisé' : ((p.periodicite || {}).type === 'compteur' ? `fait à ${valeurEcheance(p.periodicite, p.derniereExecution, p.uniteCompteur)}` : `fait le ${ui.formatDate(p.derniereExecution)}`))),

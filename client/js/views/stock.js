@@ -2,8 +2,10 @@
  * Vue Stock & pièces détachées.
  *   #/stock            onglets Articles · Mouvements · Alertes · Valorisation
  *   #/stock/:id        fiche article (détails, entrée / sortie / inventaire, mouvements, consommation par OT, équipements)
- * Paramètres reconnus sur #/stock : categorieCode, fournisseurId, equipementId, secteurId, sousSeuil=1, recherche,
- * articleId / otId / type (journal des mouvements), onglet.
+ * Paramètres reconnus sur #/stock : categorieCode, fournisseurId, equipementId, secteurId, sousSeuil=1, reservee=1|0,
+ * recherche, articleId / otId / type (journal des mouvements), onglet.
+ * Pièces dédiées : la règle (équipements autorisés, sous-équipements) est calculée par le serveur ; la vue n'affiche
+ * que ses résultats (reservee, reserveeTexte, equipementsAutorisesIds, sansEquipement).
  */
 (function () {
   'use strict';
@@ -22,6 +24,7 @@
   const ROUGE = '#dc2626';
   const ORANGE = '#f59e0b';
   const VERT = '#16a34a';
+  const VIOLET = '#7c3aed';
 
   // ----- Utilitaires d'affichage ----------------------------------------------------------
   function lienVue(href, label) { return el('a', { href, onclick: (ev) => ev.stopPropagation(), style: { whiteSpace: 'nowrap' } }, label); }
@@ -42,6 +45,36 @@
   function qte(n, uniteCode) { return `${ui.formatNombre(n == null ? 0 : n)}${uniteCode ? ' ' + uniteCode : ''}`; }
   function libUnite(code) { return code ? ui.libelle('unites', code) : ''; }
   function badgeType(type) { const t = TYPES[type]; return t ? ui.badge(t.label, t.couleur) : ui.badge(type || '?'); }
+  /** Badge « Dédiée » (équipements autorisés en infobulle), ou « À réaffecter » pour une pièce dédiée sans équipement. */
+  function badgeDediee(a) {
+    if (!a || !a.reservee) return null;
+    if (a.sansEquipement) return ui.badge('Dédiée — à réaffecter', ROUGE, { titre: 'Pièce dédiée sans équipement : à réaffecter' });
+    return ui.badge('Dédiée', VIOLET, { titre: `Pièce dédiée : utilisable uniquement sur ${a.reserveeTexte || 'les équipements choisis'}` });
+  }
+  /** Nombre d'équipements choisis d'une pièce dédiée (visibles et hors périmètre). */
+  const nbEquipementsDediee = (a) => (a.reserveeEquipements || []).length + (Number(a.reserveeHorsPerimetre) || 0);
+  /**
+   * Forme courte des équipements autorisés pour les listes (« Presse 250 t et 9 autres équipements ») ; le texte complet
+   * (reserveeTexte, calculé par le serveur) reste dans l'infobulle et sur la fiche.
+   */
+  function texteCourtDediee(a) {
+    const vis = a.reserveeEquipements || [];
+    const total = nbEquipementsDediee(a);
+    if (total <= 2 || !vis.length) return a.reserveeTexte || '';
+    return `${vis[0].nom} et ${total - 1} autres équipements`;
+  }
+  /** Équipement : « Nom (n°) », complété du parent et de la mention « réformé ». */
+  function libelleEquipement(e, parents) {
+    const parent = parents && e.parentId != null ? parents.get(Number(e.parentId)) : null;
+    const etat = e.reforme ? ' — réformé' : (e.actif === false ? ' — inactif' : '');
+    return `${e.numero ? e.numero + ' — ' : ''}${e.nom}${parent ? ` (${parent.nom})` : ''}${etat}`;
+  }
+  /** Colonne Équipement d'un mouvement : lien vers la fiche, mention neutre hors périmètre, libellé conservé si supprimé. */
+  function celluleEquipement(m) {
+    if (m.equipementMasque) return el('span', { class: 'texte-2', title: 'Équipement hors de votre périmètre' }, 'Hors périmètre');
+    if (m.equipementExiste && m.equipementId) return lienVue('#/equipements/' + m.equipementId, m.equipementNom || m.equipementNumero || '#' + m.equipementId);
+    return m.equipementNom ? el('span', { class: 'texte-2' }, m.equipementNom) : el('span', { class: 'texte-2' }, '—');
+  }
   function badgeDispo(a) {
     if (a.actif === false) return ui.badge('Désactivé', '#6b7280');
     if (Number(a.quantite) <= 0) return ui.badge('Rupture', ROUGE);
@@ -120,10 +153,38 @@
     const creation = !existant || !!copie;
     const source = existant || {};
     const selection = (source.equipementIds || []).map(Number);
+    const reformes = new Set(((refs.equipements || []).filter((e) => e.reforme)).map((e) => Number(e.id)));
+    const parId = new Map(equipements.map((e) => [Number(e.id), e]));
     const optionsEq = equipements
       .filter((e) => e.actif !== false || selection.includes(Number(e.id)))
       .slice().sort((a, b) => String(a.nom || '').localeCompare(String(b.nom || ''), 'fr'))
-      .map((e) => ({ value: e.id, label: `${e.numero ? e.numero + ' — ' : ''}${e.nom}${e.actif === false ? ' (inactif)' : ''}` }));
+      .map((e) => ({ value: e.id, label: libelleEquipement(Object.assign({}, e, { reforme: reformes.has(Number(e.id)) || e.actif === false }), parId) }));
+    const horsPerimetre = Number(source.reserveeHorsPerimetre) || 0;
+    // Réservation (case « Pièce dédiée », sous-équipements, équipements autorisés) : droit Stock › Créer, et verrouillée
+    // tant que la pièce est aussi dédiée à des équipements hors du périmètre de l'utilisateur (règle du serveur)
+    const peutGerer = GMAO.estAdmin() || GMAO.can(MODULE, 'creer');
+    const verrouHors = !creation && !!source.reservee && horsPerimetre > 0;
+    const verrouDroit = !creation && !peutGerer;
+    const caseVerrouillee = verrouHors || verrouDroit;
+    const listeVerrouillee = verrouHors || (verrouDroit && !!source.reservee);
+    const motifVerrou = verrouHors
+      ? `Cette pièce est aussi dédiée à ${horsPerimetre} équipement(s) hors de votre périmètre : seul un utilisateur qui voit tous ses équipements autorisés peut modifier sa réservation.`
+      : 'Le caractère dédié d\'une pièce et ses équipements autorisés se modifient avec le droit Stock › Créer.';
+    const libelleEq = (dediee) => (dediee ? 'Équipements autorisés' : 'Équipements compatibles');
+    const aideEq = (dediee) => (dediee
+      ? `La pièce ne pourra être sortie du stock, consommée sur un OT ou prévue dans un plan préventif que pour ces équipements${horsPerimetre ? ` (et ${horsPerimetre} équipement(s) hors de votre périmètre, conservé(s))` : ''}`
+      : 'Liste indicative : la pièce apparaîtra dans l\'onglet des pièces de ces équipements et en tête des pièces proposées sur leurs OT');
+    /** Libellé, aide et erreur du choix des équipements selon la case « Pièce dédiée ». */
+    const majLibelleEq = (form, dediee) => {
+      const wrap = form.champ('equipementIds') || form.champ('equipementsInfo');
+      if (!wrap) return;
+      const lbl = wrap.querySelector('label');
+      if (lbl && lbl.firstChild) lbl.firstChild.textContent = libelleEq(dediee);
+      const aide = wrap.querySelector('.aide');
+      if (aide && form.champ('equipementIds')) aide.textContent = aideEq(dediee);
+      // L'erreur « choisissez au moins un équipement autorisé » ne concerne qu'une pièce dédiée
+      if (!dediee) form.erreur('equipementIds', '');
+    };
     let optionsSect = ui.optionsSecteurs({ vide: '— Magasin central (tous secteurs) —' });
     if (GMAO.perms && GMAO.perms.portee === 'secteurs' && !GMAO.estAdmin()) {
       const miens = (GMAO.perms.secteurIds || []).map(Number);
@@ -147,18 +208,26 @@
       { type: 'separateur', label: 'Approvisionnement' },
       { nom: 'fournisseurId', label: 'Fournisseur habituel', type: 'select', options: optionsFournisseurs(refs, source.fournisseurId), aide: (refs.fournisseurs || []).length ? '' : 'Aucun fournisseur enregistré' },
       { nom: 'referenceFournisseur', label: 'Référence fournisseur', type: 'texte', placeholder: 'ex. 6205-2RSH', maxLength: 120 },
-      { type: 'separateur', label: 'Compatibilité' },
+      { type: 'separateur', label: 'Équipements' },
+      source.reservee && source.sansEquipement && !copie ? { type: 'html', rendu: () => ui.alerte('Pièce dédiée sans équipement : à réaffecter. Choisissez au moins un équipement autorisé, ou décochez « Pièce dédiée ».', 'danger') } : null,
+      caseVerrouillee ? { type: 'html', rendu: () => ui.alerte(motifVerrou, 'info') } : null,
+      { nom: 'reservee', label: 'Pièce dédiée : utilisable uniquement sur les équipements choisis', type: 'booleen', pleineLargeur: true, disabled: caseVerrouillee,
+        aide: 'Cochée, la pièce est réservée aux équipements choisis : toute sortie de stock, consommation sur un OT ou prévision dans un plan préventif pour un autre équipement est refusée. Non cochée, la liste ci-dessous reste indicative.',
+        onChange: (v, f) => majLibelleEq(f, !!v) },
       optionsEq.length
-        ? { nom: 'equipementIds', label: 'Équipements compatibles', type: 'multiselect', options: optionsEq, pleineLargeur: true, aide: 'La pièce apparaîtra dans l\'onglet « Pièces compatibles » de ces équipements' }
-        : { nom: 'equipementsInfo', label: 'Équipements compatibles', type: 'lecture', valeur: el('span', { class: 'texte-2' }, 'Aucun équipement accessible'), pleineLargeur: true },
+        ? { nom: 'equipementIds', label: libelleEq(!!source.reservee), type: 'multiselect', options: optionsEq, pleineLargeur: true, aide: aideEq(!!source.reservee), disabled: listeVerrouillee,
+          valider: (ids, v) => (v.reservee && !listeVerrouillee && !(ids || []).length && !horsPerimetre ? 'Choisissez au moins un équipement autorisé pour une pièce dédiée' : '') }
+        : { nom: 'equipementsInfo', label: libelleEq(!!source.reservee), type: 'lecture', valeur: el('span', { class: 'texte-2' }, 'Aucun équipement accessible'), pleineLargeur: true },
+      { nom: 'inclureSousEquipements', label: 'Inclure les sous-équipements', type: 'booleen', pleineLargeur: true, afficherSi: (v) => !!v.reservee, disabled: caseVerrouillee,
+        aide: 'La pièce est aussi utilisable sur les sous-équipements des équipements choisis (par exemple les machines d\'une ligne).' },
       { nom: 'description', label: 'Description / caractéristiques techniques', type: 'texte_long', lignes: 3 },
       !creation ? { nom: 'actif', label: 'Article actif', type: 'booleen', aide: 'Un article désactivé est conservé pour l\'historique mais n\'accepte plus d\'entrée ni de sortie' } : null,
       ...ui.champsPersoDefs('articles'),
     ];
     const unites = GMAO.liste('unites');
     const valeurs = existant
-      ? Object.assign({}, existant, { fournisseurId: existant.fournisseurId == null ? '' : existant.fournisseurId, secteurId: existant.secteurId == null ? '' : existant.secteurId, categorieCode: existant.categorieCode || '' }, ui.champsPersoInitiaux(existant))
-      : { uniteCode: unites.length ? unites[0].code : '', seuilMin: 0, quantiteCommande: 0, prixUnitaire: 0, quantite: 0, actif: true };
+      ? Object.assign({}, existant, { fournisseurId: existant.fournisseurId == null ? '' : existant.fournisseurId, secteurId: existant.secteurId == null ? '' : existant.secteurId, categorieCode: existant.categorieCode || '', reservee: !!existant.reservee, inclureSousEquipements: existant.inclureSousEquipements !== false }, ui.champsPersoInitiaux(existant))
+      : { uniteCode: unites.length ? unites[0].code : '', seuilMin: 0, quantiteCommande: 0, prixUnitaire: 0, quantite: 0, actif: true, reservee: false, inclureSousEquipements: true };
     if (copie) Object.assign(valeurs, { code: '', designation: `${existant.designation} (copie)`, quantite: 0 });
     ui.formModal({
       titre: copie ? `Dupliquer l'article ${existant.code}` : (creation ? 'Nouvel article' : `Modifier l'article ${existant.code}`),
@@ -167,11 +236,22 @@
         const body = Object.assign({}, v, { champs: ui.champsPersoValeurs(v) });
         for (const k of Object.keys(body)) if (k.startsWith('champs.')) delete body[k];
         delete body.quantiteLecture; delete body.equipementsInfo;
+        body.reservee = !!v.reservee;
+        body.inclureSousEquipements = v.inclureSousEquipements !== false;
         for (const k of ['fournisseurId', 'secteurId', 'categorieCode']) if (body[k] === '') body[k] = null;
         if (!optionsEq.length) delete body.equipementIds;
+        // Réservation verrouillée : champs non envoyés (inchangés)
+        if (caseVerrouillee) { delete body.reservee; delete body.inclureSousEquipements; }
+        if (listeVerrouillee) delete body.equipementIds;
         if (!creation) delete body.quantite;
         const res = creation ? await api.post('/api/articles', body) : await api.put('/api/articles/' + existant.id, body);
         toast(creation ? `Article ${res.code} créé` : `Article ${res.code} enregistré`, 'succes');
+        // Plans préventifs qui prévoient désormais la pièce sur un équipement non autorisé : à corriger
+        const nonConformes = (res.plansNonConformes || []).length + (Number(res.plansNonConformesHorsPerimetre) || 0);
+        if (nonConformes) {
+          const noms = (res.plansNonConformes || []).slice(0, 3).map((p) => p.numero || p.nom).join(', ');
+          toast(`${nonConformes > 1 ? `${nonConformes} plans préventifs actifs prévoient` : 'Un plan préventif actif prévoit'} cette pièce sur un équipement non autorisé${noms ? ` (${noms}${(res.plansNonConformes || []).length > 3 ? '…' : ''})` : ''} : elle ne sera pas reprise sur leurs prochains OT. Corrigez les pièces ${nonConformes > 1 ? 'de ces plans' : 'de ce plan'}.`, 'alerte', 9000);
+        }
         cacheRefs = null;
         majBadge(true);
         if (apres) apres(res);
@@ -223,11 +303,13 @@
       ui.vider(infoEl);
       if (!a) { infoEl.appendChild(el('span', null, 'Choisissez l\'article concerné.')); return; }
       infoEl.appendChild(frag(
-        el('strong', null, `${a.code} — ${a.designation}`), el('br'),
+        el('strong', null, `${a.code} — ${a.designation}`), ' ', badgeDediee(a), el('br'),
         `Stock actuel : `, el('strong', null, qte(a.quantite, a.uniteCode)), ` · seuil minimum ${qte(a.seuilMin, a.uniteCode)}`,
         a.emplacement ? ` · ${a.emplacement}` : '',
-        a.actif !== false && a.sousSeuil ? frag(' · ', el('span', { class: 'texte-danger texte-gras' }, 'sous le seuil')) : null));
+        a.actif !== false && a.sousSeuil ? frag(' · ', el('span', { class: 'texte-danger texte-gras' }, 'sous le seuil')) : null,
+        a.reservee && typeDe(v) === 'sortie' ? frag(el('br'), el('span', { class: a.sansEquipement ? 'texte-danger' : null }, a.sansEquipement ? 'Pièce dédiée sans équipement : à réaffecter avant toute sortie.' : `Pièce dédiée : sortie uniquement pour ${a.reserveeTexte}.`)) : null));
       majEcart(form);
+      if (form) majDestinataires(form, a);
     };
     const majEcart = (form) => {
       ui.vider(ecartEl);
@@ -239,6 +321,39 @@
       ecartEl.appendChild(frag('Écart d\'inventaire : ', el('strong', { class: e < 0 ? 'texte-danger' : e > 0 ? 'texte-ok' : 'texte-2' }, `${e > 0 ? '+' : ''}${qte(e, a.uniteCode)}`), e === 0 ? ' (stock conforme)' : ''));
     };
     const ots = refs.otOuverts || [];
+    // Équipement destinataire d'une sortie : équipements autorisés d'une pièce dédiée (calculés par le serveur), sinon tous
+    const equipementsRefs = refs.equipements || [];
+    const parentsEq = new Map(equipementsRefs.map((e) => [Number(e.id), e]));
+    const optionsDestinataires = (a) => {
+      const autorises = a && a.reservee ? new Set((a.equipementsAutorisesIds || []).map(Number)) : null;
+      const liste = equipementsRefs.filter((e) => (autorises ? autorises.has(Number(e.id)) : e.actif !== false));
+      const vide = autorises ? (liste.length ? '— Choisir l\'équipement autorisé —' : '— Aucun équipement autorisé accessible —') : '— Non précisé —';
+      return [{ value: '', label: vide }].concat(liste.map((e) => ({ value: e.id, label: libelleEquipement(e, parentsEq) })));
+    };
+    /** OT refusé pour une pièce dédiée : équipement de l'OT absent des équipements autorisés (calculés par le serveur). */
+    const otRefuse = (a, o) => !!(a && a.reservee) && !(o && o.equipementId != null && (a.equipementsAutorisesIds || []).map(Number).includes(Number(o.equipementId)));
+    const optionsOt = (a) => [{ value: '', label: '— Aucun (sortie hors OT) —' }].concat(ots.map((o) => {
+      const refuse = otRefuse(a, o);
+      return { value: o.id, label: `${o.numero} — ${o.titre}${refuse ? ' (équipement non autorisé pour cette pièce dédiée)' : ''}`, disabled: refuse };
+    }));
+    let articleDestinataires;
+    function majDestinataires(form, a) {
+      if (articleDestinataires === a) return;
+      articleDestinataires = a;
+      const avant = form.get('equipementId');
+      form.majOptions('equipementId', optionsDestinataires(a));
+      if (form.get('equipementId') !== avant) form.set('equipementId', '');
+      if (ots.length) {
+        form.majOptions('otId', optionsOt(a));
+        // Un OT choisi avant l'article, désormais désactivé, ne reste pas sélectionné
+        const otChoisi = form.get('otId');
+        if (otChoisi !== '' && otChoisi != null && otRefuse(a, ots.find((o) => Number(o.id) === Number(otChoisi)))) {
+          form.set('otId', '');
+          form.erreur('otId', 'OT non autorisé pour cette pièce dédiée : choisissez un OT d\'un équipement autorisé, ou une sortie hors OT');
+          form.rafraichirVisibilite();
+        }
+      }
+    }
     const champs = [
       fixe ? null : { nom: 'articleId', label: 'Article', type: 'select', requis: true, pleineLargeur: true, options: [{ value: '', label: '— Choisir un article —' }].concat(actifs.map((a) => ({ value: a.id, label: `${a.code} — ${a.designation} (stock : ${qte(a.quantite, a.uniteCode)})` }))), onChange: (x, f) => majInfo(f) },
       fixe ? { nom: 'type', type: 'cache', valeur: type } : { nom: 'type', label: 'Type de mouvement', type: 'radio', requis: true, pleineLargeur: true, options: ['entree', 'sortie', 'inventaire'].map((t) => ({ value: t, label: TYPES[t].label, couleur: TYPES[t].couleur })), onChange: (x, f) => majInfo(f) },
@@ -254,7 +369,14 @@
       { type: 'html', rendu: () => ecartEl, afficherSi: (v) => typeDe(v) === 'inventaire' },
       { nom: 'prixUnitaire', label: 'Prix unitaire d\'achat HT', type: 'nombre', min: 0, step: 0.01, afficherSi: (v) => typeDe(v) === 'entree', aide: 'Facultatif : met à jour le coût moyen pondéré de l\'article' },
       { nom: 'fournisseurId', label: 'Fournisseur', type: 'select', options: optionsFournisseurs(refs, article && article.fournisseurId, '— Non précisé —'), afficherSi: (v) => typeDe(v) === 'entree' },
-      ots.length ? { nom: 'otId', label: 'Imputer à un ordre de travail', type: 'select', pleineLargeur: true, options: [{ value: '', label: '— Aucun (sortie hors OT) —' }].concat(ots.map((o) => ({ value: o.id, label: `${o.numero} — ${o.titre}` }))), afficherSi: (v) => typeDe(v) === 'sortie', aide: 'La pièce sera ajoutée aux pièces consommées de l\'OT et à son coût' } : null,
+      ots.length ? { nom: 'otId', label: 'Imputer à un ordre de travail', type: 'select', pleineLargeur: true, options: optionsOt(article), afficherSi: (v) => typeDe(v) === 'sortie', aide: 'La pièce sera ajoutée aux pièces consommées de l\'OT et à son coût ; l\'équipement destinataire est celui de l\'OT',
+        onChange: (x, f) => f.erreur('otId', ''),
+        valider: (x, v) => (typeDe(v) === 'sortie' && x !== '' && x != null && otRefuse(courant(v), ots.find((o) => Number(o.id) === Number(x))) ? 'OT non autorisé pour cette pièce dédiée' : '') } : null,
+      { nom: 'equipementId', label: 'Équipement destinataire', type: 'select', pleineLargeur: true, options: optionsDestinataires(article),
+        afficherSi: (v) => typeDe(v) === 'sortie' && !v.otId,
+        onChange: (x, f) => f.erreur('equipementId', ''),
+        aide: 'Enregistré sur le mouvement (traçabilité) ; obligatoire pour une pièce dédiée',
+        valider: (x, v) => { const a = courant(v); return typeDe(v) === 'sortie' && !v.otId && a && a.reservee && (x === '' || x == null) ? 'Pièce dédiée : choisissez l\'équipement destinataire' : ''; } },
       { nom: 'motif', label: 'Motif / commentaire', type: 'texte', pleineLargeur: true, maxLength: 500, placeholder: 'ex. Réception commande CDE-2026-0123, dépannage convoyeur, inventaire tournant zone A…' },
     ];
     const valeurs = {
@@ -273,6 +395,7 @@
         const body = { type: t, quantite: t === 'inventaire' ? v.quantiteConstatee : v.quantite, motif: v.motif || '' };
         if (t === 'entree') { if (v.prixUnitaire !== null && v.prixUnitaire !== '') body.prixUnitaire = v.prixUnitaire; body.fournisseurId = v.fournisseurId === '' ? null : v.fournisseurId; }
         if (t === 'sortie' && v.otId) body.otId = v.otId;
+        else if (t === 'sortie' && v.equipementId !== '' && v.equipementId != null) body.equipementId = v.equipementId;
         const r = await api.post(`/api/articles/${a.id}/mouvements`, body);
         toast(`${TYPES[t].enregistre} — stock : ${qte(r.article.quantite, r.article.uniteCode)}`, 'succes');
         if (r.article.actif !== false && r.article.sousSeuil && t !== 'entree') toast(`« ${r.article.designation} » est sous le seuil minimum (${qte(r.article.seuilMin, r.article.uniteCode)}) : à réapprovisionner`, 'alerte', 6000);
@@ -288,6 +411,7 @@
     const filtres = {
       recherche: query.recherche || '', categorieCode: query.categorieCode || '', fournisseurId: query.fournisseurId || '', secteurId: query.secteurId || '',
       dispo: query.sousSeuil === '1' || query.sousSeuil === 'true' ? 'sous_seuil' : '', inactifs: query.actif === '0' || query.actif === 'tous', equipementId: query.equipementId || '',
+      reservee: query.reservee === '1' || query.reservee === '0' ? query.reservee : '',
     };
     const filtresMvt = { type: query.type || '', articleId: query.articleId || '', userId: '', otId: query.otId || '', du: query.du || '', au: query.au || '', recherche: '' };
     let articles = [];
@@ -345,7 +469,15 @@
         if (filtres.categorieCode && (filtres.categorieCode === 'aucune' ? a.categorieCode : a.categorieCode !== filtres.categorieCode)) return false;
         if (filtres.fournisseurId && (filtres.fournisseurId === 'aucun' ? a.fournisseurId != null : Number(a.fournisseurId) !== Number(filtres.fournisseurId))) return false;
         if (filtres.secteurId && (filtres.secteurId === 'aucun' ? a.secteurId != null : Number(a.secteurId) !== Number(filtres.secteurId))) return false;
-        if (filtres.equipementId && !(a.equipementIds || []).map(Number).includes(Number(filtres.equipementId))) return false;
+        // Pièces d'un équipement : pièces libres compatibles et pièces dédiées utilisables sur lui (résultat du serveur,
+        // sous-équipements compris)
+        if (filtres.equipementId) {
+          const e = Number(filtres.equipementId);
+          const ids = a.reservee ? (a.equipementsAutorisesIds || []) : (a.equipementIds || []);
+          if (!ids.map(Number).includes(e)) return false;
+        }
+        if (filtres.reservee === '1' && !a.reservee) return false;
+        if (filtres.reservee === '0' && a.reservee) return false;
         if (filtres.dispo === 'sous_seuil' && !(a.actif !== false && a.sousSeuil)) return false;
         if (filtres.dispo === 'rupture' && !(Number(a.quantite) <= 0)) return false;
         if (filtres.dispo === 'disponible' && a.sousSeuil) return false;
@@ -364,6 +496,7 @@
       if (filtres.secteurId) p.set('secteurId', filtres.secteurId);
       if (filtres.equipementId) p.set('equipementId', filtres.equipementId);
       if (filtres.dispo === 'sous_seuil') p.set('sousSeuil', '1');
+      if (filtres.reservee) p.set('reservee', filtres.reservee);
       if (!filtres.inactifs) p.set('actif', '1');
       return p.toString();
     }
@@ -378,7 +511,12 @@
         ligneClasse: (a) => (a.actif === false ? 'inactif' : ''),
         colonnes: [
           colCode(),
-          { cle: 'designation', label: 'Désignation', rendu: (a) => el('div', { style: { minWidth: '230px' } }, el('div', { class: 'cellule-principale' }, a.designation), (a.referenceFournisseur || a.actif === false) ? el('div', { class: 'cellule-secondaire' }, a.actif === false ? 'Désactivé' : '', a.actif === false && a.referenceFournisseur ? ' · ' : '', a.referenceFournisseur ? `Réf. ${a.referenceFournisseur}` : '') : null) },
+          { cle: 'designation', label: 'Désignation', rendu: (a) => el('div', { style: { minWidth: '230px' } },
+            el('div', { class: 'cellule-principale' }, a.designation, a.reservee ? ' ' : null, badgeDediee(a)),
+            (a.referenceFournisseur || a.actif === false) ? el('div', { class: 'cellule-secondaire' }, a.actif === false ? 'Désactivé' : '', a.actif === false && a.referenceFournisseur ? ' · ' : '', a.referenceFournisseur ? `Réf. ${a.referenceFournisseur}` : '') : null,
+            // Le rouge est porté par un élément enfant : la couleur de .cellule-secondaire l'emporterait sur .texte-danger
+            a.reservee ? el('div', { class: 'cellule-secondaire', title: a.sansEquipement ? 'Pièce dédiée sans équipement : à réaffecter' : `Réservée à ${a.reserveeTexte}` },
+              a.sansEquipement ? el('span', { class: 'texte-danger' }, 'Sans équipement : à réaffecter') : `Réservée à ${texteCourtDediee(a)}`) : null) },
           { cle: 'categorieCode', label: 'Catégorie', liste: 'categoriesArticles' },
           { cle: 'quantite', label: 'Quantité', aligner: 'droite', rendu: quantiteCellule, valeurTri: (a) => Number(a.quantite) || 0 },
           { cle: 'uniteCode', label: 'Unité', rendu: (a) => libUnite(a.uniteCode) },
@@ -406,12 +544,20 @@
       const selCat = el('select', { title: 'Catégorie', onchange: () => { filtres.categorieCode = selCat.value; appliquer(); } }, selectOpts([{ value: '', label: 'Toutes les catégories' }].concat(ui.optionsListe('categoriesArticles', { vide: false })).concat([{ value: 'aucune', label: 'Sans catégorie' }]), filtres.categorieCode));
       const selFour = el('select', { title: 'Fournisseur', onchange: () => { filtres.fournisseurId = selFour.value; appliquer(); } }, selectOpts([{ value: '', label: 'Tous les fournisseurs' }].concat(Array.from(fournisseurs.entries()).sort((a, b) => a[1].localeCompare(b[1], 'fr')).map(([id, n]) => ({ value: id, label: n }))).concat([{ value: 'aucun', label: 'Sans fournisseur' }]), filtres.fournisseurId));
       const selDispo = el('select', { title: 'Disponibilité', onchange: () => { filtres.dispo = selDispo.value; appliquer(); } }, selectOpts([{ value: '', label: 'Toutes disponibilités' }, { value: 'sous_seuil', label: 'Sous le seuil minimum' }, { value: 'rupture', label: 'En rupture' }, { value: 'disponible', label: 'Au-dessus du seuil' }], filtres.dispo));
+      const selDediee = el('select', { title: 'Pièces dédiées ou libres', 'aria-label': 'Pièces dédiées ou libres', onchange: () => { filtres.reservee = selDediee.value; appliquer(); } }, selectOpts([{ value: '', label: 'Pièces dédiées et libres' }, { value: '1', label: 'Pièces dédiées' }, { value: '0', label: 'Pièces libres' }], filtres.reservee));
       const secteursUtilises = Array.from(new Set(articles.filter((a) => a.secteurId != null).map((a) => Number(a.secteurId))));
       const selSect = secteursUtilises.length ? el('select', { title: 'Magasin / secteur', onchange: () => { filtres.secteurId = selSect.value; appliquer(); } }, selectOpts([{ value: '', label: 'Tous les magasins' }, { value: 'aucun', label: 'Magasin central' }].concat(secteursUtilises.map((id) => ({ value: id, label: ui.nomSecteur(id) }))), filtres.secteurId)) : null;
       const cbInactifs = el('input', { type: 'checkbox', checked: filtres.inactifs, onchange: () => { filtres.inactifs = cbInactifs.checked; appliquer(); } });
-      const puceEq = filtres.equipementId ? el('span', { class: 'badge contour', style: { display: 'inline-flex', alignItems: 'center', gap: '6px' } }, icone('equipements'), `Compatibles : ${equipementFiltre ? equipementFiltre.nom : '#' + filtres.equipementId}`,
+      const puceEq = filtres.equipementId ? el('span', { class: 'badge contour', style: { display: 'inline-flex', alignItems: 'center', gap: '6px' } }, icone('equipements'), `Pièces de : ${equipementFiltre ? equipementFiltre.nom : '#' + filtres.equipementId}`,
         el('button', { type: 'button', class: 'btn btn-lien btn-sm', title: 'Retirer ce filtre', onclick: () => { filtres.equipementId = ''; onglets.activer('articles'); } }, '×')) : null;
-      cont.appendChild(el('div', { class: 'barre-outils' }, recherche, selCat, selFour, selDispo, selSect, el('label', { class: 'inline' }, cbInactifs, 'Inclure les désactivés'), puceEq,
+      // Pièces dédiées restées sans équipement (équipement supprimé) : signalées en tête de liste
+      const aReaffecter = articles.filter((a) => a.reservee && a.sansEquipement && a.actif !== false);
+      if (aReaffecter.length) {
+        cont.appendChild(ui.alerte(frag(icone('alerte'), ' ', el('strong', null, `Pièce${aReaffecter.length > 1 ? 's' : ''} dédiée${aReaffecter.length > 1 ? 's' : ''} sans équipement : à réaffecter`), ' — ',
+          aReaffecter.slice(0, 5).map((a, i) => frag(i ? ', ' : '', lienVue('#/stock/' + a.id, `${a.code} ${a.designation}`))), aReaffecter.length > 5 ? ` et ${aReaffecter.length - 5} autre(s)` : '',
+          aReaffecter.length > 1 ? '. Ces pièces ne peuvent être utilisées sur aucun équipement tant qu\'elles ne sont pas réaffectées.' : '. Cette pièce ne peut être utilisée sur aucun équipement tant qu\'elle n\'est pas réaffectée.'), 'danger'));
+      }
+      cont.appendChild(el('div', { class: 'barre-outils' }, recherche, selCat, selFour, selDispo, selDediee, selSect, el('label', { class: 'inline' }, cbInactifs, 'Inclure les désactivés'), puceEq,
         el('span', { class: 'espace' }), resume,
         can('exporter') ? ui.bouton('Exporter CSV', { icone: 'export', classe: 'btn-sm', onClic: () => api.telecharger('/api/articles-export?' + paramsExport()).catch(erreur) }) : null));
       cont.appendChild(tableau.el);
@@ -430,6 +576,7 @@
           { cle: 'quantiteApres', label: 'Stock', aligner: 'droite', rendu: (m) => el('span', { class: 'texte-2', style: { whiteSpace: 'nowrap' } }, `${ui.formatNombre(m.quantiteAvant)} → `, el('span', { class: 'texte-gras', style: { color: 'var(--texte)' } }, ui.formatNombre(m.quantiteApres))) },
           colMontant('valeur', 'Valeur', { rendu: (m) => el('span', { style: { whiteSpace: 'nowrap' }, title: `${ui.formatNombre(m.quantite)} × ${ui.formatMontant(m.prixUnitaire || 0)}` }, ui.formatMontant(m.valeur || 0)) }),
           { cle: 'otNumero', label: 'OT', rendu: celluleOt },
+          { cle: 'equipementNom', label: 'Équipement', rendu: celluleEquipement, valeurTri: (m) => (m.equipementMasque ? '' : String(m.equipementNom || '').toLowerCase()) },
           { cle: 'motif', label: 'Motif', rendu: (m) => tronque(m.fournisseurNom && m.type === 'entree' ? `${m.motif ? m.motif + ' · ' : ''}${m.fournisseurNom}` : (m.motif || ''), '180px') },
           { cle: 'userNom', label: 'Par', rendu: (m) => nowrap(m.userNom || '') },
         ],
@@ -465,7 +612,7 @@
       const selOt = el('select', { title: 'Imputation', onchange: () => { filtresMvt.otId = selOt.value; charger(); } }, selectOpts([{ value: '', label: 'Avec ou sans OT' }, { value: 'tous', label: 'Imputés à un OT' }, { value: 'aucun', label: 'Hors OT' }].concat(filtresMvt.otId && !['tous', 'aucun'].includes(filtresMvt.otId) ? [{ value: filtresMvt.otId, label: `OT #${filtresMvt.otId}` }] : []), filtresMvt.otId));
       const du = el('input', { type: 'date', value: filtresMvt.du, title: 'Du', onchange: () => { filtresMvt.du = du.value; charger(); } });
       const au = el('input', { type: 'date', value: filtresMvt.au, title: 'Au', onchange: () => { filtresMvt.au = au.value; charger(); } });
-      const recherche = el('input', { type: 'search', placeholder: 'Motif, article, OT…', value: filtresMvt.recherche, style: { maxWidth: '200px' } });
+      const recherche = el('input', { type: 'search', placeholder: 'Motif, article, OT, équipement…', value: filtresMvt.recherche, style: { maxWidth: '220px' } });
       recherche.addEventListener('input', ui.debounce(() => { filtresMvt.recherche = recherche.value.trim(); charger(); }, 300));
       const periode = (jours) => () => { const d = new Date(); d.setDate(d.getDate() - jours); filtresMvt.du = ui.dateISO(d); filtresMvt.au = ''; du.value = filtresMvt.du; au.value = ''; charger(); };
       cont.appendChild(el('div', { class: 'barre-outils' }, recherche, selType, selArticle, selUser, selOt,
@@ -632,7 +779,7 @@
     const mvt = (type) => () => ouvrirMouvement({ article: a, type, apres: recharger });
 
     container.appendChild(ui.pageEntete({
-      titre: frag(a.designation, ' ', a.categorieCode ? ui.badgeListe('categoriesArticles', a.categorieCode) : null, ' ', badgeDispo(a)),
+      titre: frag(a.designation, ' ', a.categorieCode ? ui.badgeListe('categoriesArticles', a.categorieCode) : null, ' ', badgeDispo(a), a.reservee ? ' ' : null, badgeDediee(a)),
       icone: 'stock',
       filAriane: [{ label: GMAO.moduleLabel(MODULE), href: '#/stock' }].concat(a.secteurId != null ? [{ label: ui.nomSecteur(a.secteurId), href: '#/stock?secteurId=' + a.secteurId }] : []).concat([{ label: a.code }]),
       sousTitre: [a.code, a.emplacement, a.referenceFournisseur ? `Réf. fournisseur ${a.referenceFournisseur}` : null].filter(Boolean).join(' · '),
@@ -653,6 +800,12 @@
       !actif && can('modifier') ? ui.bouton('Réactiver', { icone: 'check', classe: 'btn-sm btn-ok', onClic: () => reactiver(a, recharger) }) : null,
       actif && can('supprimer') ? ui.bouton('Supprimer', { icone: 'supprimer', classe: 'btn-sm btn-danger', onClic: () => supprimer(a, (r) => (r.desactive ? recharger() : GMAO.navigate('#/stock'))) }) : null));
 
+    if (a.reservee && a.sansEquipement) {
+      container.appendChild(ui.alerte(frag(el('strong', null, 'Pièce dédiée sans équipement : à réaffecter. '), 'L\'équipement auquel elle était dédiée a été supprimé : la pièce n\'est utilisable sur aucun équipement tant qu\'elle n\'est pas réaffectée',
+        can('modifier') && (GMAO.estAdmin() || can('creer')) ? frag(' (bouton « Modifier », champ « Équipements autorisés »), ou rendue libre en décochant « Pièce dédiée ».') : '.'), 'danger'));
+    } else if (a.reservee) {
+      container.appendChild(ui.alerte(frag(el('strong', null, 'Pièce dédiée. '), `Utilisable uniquement sur ${a.reserveeTexte} : sorties de stock, consommations sur un OT et plans préventifs sont refusés pour tout autre équipement.`), 'info'));
+    }
     if (!actif) container.appendChild(ui.alerte('Cet article est désactivé : il est conservé pour l\'historique mais n\'accepte plus d\'entrée ni de sortie.', 'alerte'));
     else if (Number(a.quantite) <= 0) container.appendChild(ui.alerte(frag(el('strong', null, 'Rupture de stock. '), `Quantité à commander : ${qte(a.quantiteACommander, u)}${a.fournisseurNom ? ' auprès de ' + a.fournisseurNom : ''}.`), 'danger'));
     else if (a.sousSeuil) container.appendChild(ui.alerte(frag(el('strong', null, 'Stock sous le seuil minimum. '), `Quantité à commander : ${qte(a.quantiteACommander, u)}${a.fournisseurNom ? ' auprès de ' + a.fournisseurNom : ''}.`), 'alerte'));
@@ -668,7 +821,7 @@
       { cle: 'infos', label: 'Informations', icone: 'info', rendu: () => rendreInfos(a) },
       { cle: 'mouvements', label: 'Mouvements', icone: 'liste', badge: a.nbMouvements || null, rendu: () => rendreMouvementsArticle(a, recharger) },
       { cle: 'consommation', label: 'Consommation par OT', icone: 'ot', badge: (a.ots || []).length || null, rendu: () => rendreConsommation(a) },
-      { cle: 'equipements', label: 'Équipements', icone: 'equipements', badge: (a.equipements || []).length || null, rendu: () => rendreEquipements(a) },
+      { cle: 'equipements', label: a.reservee ? 'Équipements autorisés' : 'Équipements', icone: 'equipements', badge: (a.equipements || []).length || null, rendu: () => rendreEquipements(a) },
     ], { hash: true }).el);
   }
 
@@ -685,6 +838,10 @@
           { label: 'Emplacement', valeur: a.emplacement },
           { label: 'Magasin / secteur', valeur: a.secteurId != null ? ui.cheminSecteur(a.secteurId) : 'Magasin central (tous secteurs)' },
           { label: 'Statut', valeur: badgeDispo(a) },
+          // Forme courte (colonne étroite) : le détail figure dans l'alerte en tête de fiche et dans l'onglet des équipements
+          { label: 'Utilisation', valeur: a.reservee
+            ? frag(badgeDediee(a), a.sansEquipement ? null : el('span', { class: 'texte-2 texte-petit nowrap', title: `Uniquement sur ${a.reserveeTexte}` }, ` ${nbEquipementsDediee(a)} équipement${nbEquipementsDediee(a) > 1 ? 's autorisés' : ' autorisé'}`))
+            : el('span', { class: 'texte-2', title: 'Équipements compatibles indicatifs' }, 'Pièce libre') },
           { label: 'Dernier inventaire', valeur: st.dernierInventaire ? ui.formatDateHeure(st.dernierInventaire) : 'jamais' },
           { label: 'Créé le', valeur: ui.formatDateHeure(a.createdAt) },
           { label: 'Créé par', valeur: a.createdBy != null ? ui.nomUser(a.createdBy) : '' },
@@ -717,7 +874,8 @@
         { cle: 'quantiteApres', label: 'Stock avant → après', aligner: 'droite', rendu: (m) => el('span', { class: 'texte-2', style: { whiteSpace: 'nowrap' } }, `${ui.formatNombre(m.quantiteAvant)} → `, el('span', { class: 'texte-gras', style: { color: 'var(--texte)' } }, ui.formatNombre(m.quantiteApres))) },
         colMontant('prixUnitaire', 'Prix unit.'),
         { cle: 'otNumero', label: 'OT', rendu: celluleOt },
-        { cle: 'motif', label: 'Motif', rendu: (m) => tronque(m.type === 'entree' && m.fournisseurNom ? `${m.motif ? m.motif + ' · ' : ''}${m.fournisseurNom}` : m.motif || '', '320px') },
+        { cle: 'equipementNom', label: 'Équipement', rendu: celluleEquipement, valeurTri: (m) => (m.equipementMasque ? '' : String(m.equipementNom || '').toLowerCase()) },
+        { cle: 'motif', label: 'Motif', rendu: (m) => tronque(m.type === 'entree' && m.fournisseurNom ? `${m.motif ? m.motif + ' · ' : ''}${m.fournisseurNom}` : m.motif || '', '280px') },
         { cle: 'userNom', label: 'Par', rendu: (m) => nowrap(m.userNom || '') },
       ].filter(Boolean),
       actions: [
@@ -779,25 +937,40 @@
     return cont;
   }
 
+  function tableEquipements(eqs, { avecOrigine } = {}) {
+    return ui.table({
+      lignes: eqs, recherche: eqs.length > 10 ? 'Rechercher un équipement…' : false, compact: true, pagination: false,
+      onClic: (e) => GMAO.navigate('#/equipements/' + e.id), ligneClasse: (e) => (e.actif === false ? 'inactif' : ''),
+      colonnes: [
+        { cle: 'numero', label: 'Numéro', rendu: (e) => lienVue('#/equipements/' + e.id, e.numero || '#' + e.id) },
+        { cle: 'nom', label: 'Équipement', rendu: (e) => el('div', null, el('div', { class: 'cellule-principale' }, e.nom, e.reforme ? ' ' : null, e.reforme ? ui.badge('réformé', '#6b7280', { titre: e.actif === false ? 'Équipement désactivé ou réformé : il reste dans la liste' : 'Équipement réformé : il reste dans la liste' }) : null), e.localisation ? el('div', { class: 'cellule-secondaire' }, e.localisation) : null) },
+        avecOrigine ? { cle: 'viaNom', label: 'Autorisé par', rendu: (e) => (e.viaId ? lienVue('#/equipements/' + e.viaId, e.viaNom) : el('span', { class: 'texte-2' }, 'équipement parent')) } : null,
+        { cle: 'secteurId', label: 'Secteur', rendu: (e) => (e.secteurId != null ? ui.cheminSecteur(e.secteurId) : '—') },
+        { cle: 'typeCode', label: 'Type', rendu: (e) => (e.typeCode ? ui.libelle('typesEquipement', e.typeCode) : '—') },
+        { cle: 'etatCode', label: 'État', liste: 'etatsEquipement' },
+        { cle: 'criticiteCode', label: 'Criticité', liste: 'criticites' },
+      ].filter(Boolean),
+    }).el;
+  }
+
   function rendreEquipements(a) {
     const cont = el('div');
     const eqs = a.equipements || [];
-    if (!eqs.length) cont.appendChild(ui.vide('Aucun équipement compatible n\'est déclaré pour cet article.', 'equipements'));
-    else {
-      cont.appendChild(ui.table({
-        lignes: eqs, recherche: eqs.length > 10 ? 'Rechercher un équipement…' : false, compact: true, pagination: false,
-        onClic: (e) => GMAO.navigate('#/equipements/' + e.id), ligneClasse: (e) => (e.actif === false ? 'inactif' : ''),
-        colonnes: [
-          { cle: 'numero', label: 'Numéro', rendu: (e) => lienVue('#/equipements/' + e.id, e.numero || '#' + e.id) },
-          { cle: 'nom', label: 'Équipement', rendu: (e) => el('div', null, el('div', { class: 'cellule-principale' }, e.nom), e.localisation ? el('div', { class: 'cellule-secondaire' }, e.localisation) : null) },
-          { cle: 'secteurId', label: 'Secteur', rendu: (e) => (e.secteurId != null ? ui.cheminSecteur(e.secteurId) : '—') },
-          { cle: 'typeCode', label: 'Type', rendu: (e) => (e.typeCode ? ui.libelle('typesEquipement', e.typeCode) : '—') },
-          { cle: 'etatCode', label: 'État', liste: 'etatsEquipement' },
-          { cle: 'criticiteCode', label: 'Criticité', liste: 'criticites' },
-        ],
-      }).el);
+    const hors = Number(a.reserveeHorsPerimetre) || 0;
+    if (a.reservee) {
+      cont.appendChild(el('p', { class: 'texte-2 mb' }, a.sansEquipement
+        ? 'Pièce dédiée sans équipement : à réaffecter. Elle n\'est utilisable sur aucun équipement.'
+        : `Pièce dédiée : utilisable uniquement sur ces équipements${a.inclureSousEquipements !== false ? ' et leurs sous-équipements' : ' (sous-équipements exclus)'}.`));
     }
-    cont.appendChild(el('p', { class: 'texte-2 texte-petit mt' }, 'La compatibilité se modifie depuis le formulaire de l\'article (bouton « Modifier », champ « Équipements compatibles »).'));
+    if (!eqs.length) {
+      if (!a.reservee || !a.sansEquipement) cont.appendChild(ui.vide(a.reservee ? 'Aucun équipement autorisé de votre périmètre.' : 'Aucun équipement compatible n\'est déclaré pour cet article.', 'equipements'));
+    } else cont.appendChild(tableEquipements(eqs));
+    if (hors) cont.appendChild(el('p', { class: 'texte-2 texte-petit mt' }, `Et ${hors} équipement(s) hors de votre périmètre.`));
+    const sous = a.sousEquipementsAutorises || [];
+    if (a.reservee && sous.length) cont.appendChild(ui.carte(`Sous-équipements autorisés (${sous.length})`, tableEquipements(sous, { avecOrigine: true }), { classe: 'mt' }));
+    cont.appendChild(el('p', { class: 'texte-2 texte-petit mt' }, a.reservee
+      ? 'Les équipements autorisés se modifient depuis le formulaire de l\'article (bouton « Modifier », champ « Équipements autorisés »).'
+      : 'La compatibilité se modifie depuis le formulaire de l\'article (bouton « Modifier », champ « Équipements compatibles »).'));
     return cont;
   }
 
@@ -815,10 +988,11 @@
     html += ligne('Valeur du stock', ui.formatMontant(a.valeur));
     html += ligne('Fournisseur', a.fournisseurNom);
     html += ligne('Référence fournisseur', a.referenceFournisseur);
+    html += ligne('Pièce dédiée', a.reservee ? (a.sansEquipement ? 'Oui — sans équipement : à réaffecter' : `Oui — uniquement sur ${a.reserveeTexte}`) : 'Non');
     for (const c of ui.champsPersoAffichage('articles', a)) html += ligne(c.label, c.valeur);
     html += '</dl>';
     if (a.description) html += `<h2>Description</h2><p style="white-space:pre-wrap">${esc(a.description)}</p>`;
-    if ((a.equipements || []).length) html += `<h2>Équipements compatibles</h2><table><thead><tr><th>Numéro</th><th>Équipement</th><th>Secteur</th></tr></thead><tbody>${a.equipements.map((e) => `<tr><td>${esc(e.numero)}</td><td>${esc(e.nom)}</td><td>${esc(e.secteurId != null ? ui.cheminSecteur(e.secteurId) : '')}</td></tr>`).join('')}</tbody></table>`;
+    if ((a.equipements || []).length) html += `<h2>${a.reservee ? 'Équipements autorisés' : 'Équipements compatibles'}</h2><table><thead><tr><th>Numéro</th><th>Équipement</th><th>Secteur</th></tr></thead><tbody>${a.equipements.map((e) => `<tr><td>${esc(e.numero)}</td><td>${esc(e.nom)}</td><td>${esc(e.secteurId != null ? ui.cheminSecteur(e.secteurId) : '')}</td></tr>`).join('')}</tbody></table>`;
     const mv = (a.mouvements || []).slice(0, 20);
     if (mv.length) html += `<h2>Derniers mouvements</h2><table><thead><tr><th>Date</th><th>Type</th><th>Quantité</th><th>Stock après</th><th>OT</th><th>Motif</th><th>Par</th></tr></thead><tbody>${mv.map((m) => `<tr><td>${esc(ui.formatDateHeure(m.date))}</td><td>${esc((TYPES[m.type] || {}).label || m.type)}</td><td>${esc(m.type === 'inventaire' ? '= ' + ui.formatNombre(m.quantite) : ((m.type === 'sortie' ? '−' : '+') + ui.formatNombre(m.quantite)))}</td><td>${esc(ui.formatNombre(m.quantiteApres))}</td><td>${esc(m.otNumero || (m.otMasque ? 'Hors périmètre' : ''))}</td><td>${esc(m.motif || '')}</td><td>${esc(m.userNom || '')}</td></tr>`).join('')}</tbody></table>`;
     ui.imprimer(`Fiche article ${a.code}`, html);

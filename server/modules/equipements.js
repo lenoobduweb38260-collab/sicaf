@@ -9,6 +9,9 @@
  *                    'equipement:compteur' ({ equipement, ancien, nouveau }),
  *                    'equipement:modifie' ({ equipement, ancien, secteur }) — `secteur` décrit un changement de
  *                    secteur ({ ancien, nouveau, equipementIds, ot, plans, demandes }) ou vaut null.
+ * Pièces : la fiche distingue les pièces dédiées à l'équipement (règle du module Stock, ctx.services.stock.dediesA,
+ * directement ou par un équipement parent) des pièces compatibles ; la suppression d'un équipement le retire des
+ * articles par ctx.services.stock.retirerEquipement (pièce dédiée sans équipement signalée et notifiée).
  * Changement de secteur : les OT non clôturés, les plans préventifs et les demandes non closes de l'équipement
  * (et de ses sous-équipements déplacés) reprennent le nouveau secteur, puisque la portée des autres modules
  * repose sur le secteurId copié de l'équipement.
@@ -131,6 +134,8 @@ function register(ctx) {
       demandes: db.count('demandes', (d) => Number(d.equipementId) === id),
       plans: db.count('plansPreventifs', (p) => Number(p.equipementId) === id),
       articles: db.count('articles', (a) => (a.equipementIds || []).map(Number).includes(id)),
+      // Sorties de stock enregistrées pour l'équipement (traçabilité des pièces consommées)
+      mouvements: db.count('mouvementsStock', (m) => m.equipementId != null && Number(m.equipementId) === id),
     };
   }
 
@@ -149,6 +154,27 @@ function register(ctx) {
       dernierReleve: (compteurReleves || []).length ? compteurReleves[compteurReleves.length - 1].date : null,
       photoIndex: (documents || []).findIndex((d) => estImage(d.type)),
     });
+  }
+
+  /**
+   * Pièces de la fiche : pièces dédiées utilisables sur l'équipement (règle du module Stock : choisi directement, ou
+   * équipement parent avec sous-équipements inclus) et pièces compatibles (liste indicative, pièces libres).
+   */
+  function piecesDeLEquipement(req, e, visibles, peut) {
+    const ligne = (a) => ({ id: a.id, code: a.code, designation: a.designation, categorieCode: a.categorieCode, uniteCode: a.uniteCode, quantite: a.quantite, seuilMin: a.seuilMin, emplacement: a.emplacement, prixUnitaire: a.prixUnitaire, actif: a.actif !== false, reservee: a.reservee === true });
+    const triDesignation = (a, b) => String(a.designation || '').localeCompare(String(b.designation || ''), 'fr');
+    if (!peut('stock')) return { articlesCompatibles: [], articlesDedies: [] };
+    const stock = ctx.services.stock;
+    let dedies = [];
+    if (stock && typeof stock.dediesA === 'function') {
+      dedies = stock.dediesA(e.id, req).map((a) => {
+        const via = a.viaId != null ? db.get(ENTITE, a.viaId) : null;
+        return Object.assign(ligne(a), { direct: !!a.direct, viaId: via && peutVoir(req, via) ? via.id : null, viaNom: via && peutVoir(req, via) ? via.nom || '' : '' });
+      });
+    }
+    const idsDedies = new Set(dedies.map((a) => a.id));
+    const compatibles = visibles('stock', db.list('articles', (a) => a.reservee !== true && !idsDedies.has(a.id) && (a.equipementIds || []).map(Number).includes(e.id)));
+    return { articlesDedies: dedies.sort(triDesignation), articlesCompatibles: compatibles.sort(triDesignation).map(ligne) };
   }
 
   /** Fiche complète. */
@@ -180,7 +206,7 @@ function register(ctx) {
       nbDemandesTotal: demandes.length,
       nbDemandesOuvertes: demandes.filter((d) => !finauxDi.has(d.statut)).length,
       plansPreventifs: visibles('preventif', db.list('plansPreventifs', (p) => Number(p.equipementId) === e.id)).sort(triNom).map((p) => ({ id: p.id, numero: p.numero, nom: p.nom, typeCode: p.typeCode, periodicite: p.periodicite, prochaineEcheance: p.prochaineEcheance, derniereExecution: p.derniereExecution, technicienId: p.technicienId, dureeEstimee: p.dureeEstimee, actif: p.actif !== false })),
-      articlesCompatibles: visibles('stock', db.list('articles', (a) => (a.equipementIds || []).map(Number).includes(e.id))).sort((a, b) => String(a.designation || '').localeCompare(String(b.designation || ''), 'fr')).map((a) => ({ id: a.id, code: a.code, designation: a.designation, categorieCode: a.categorieCode, uniteCode: a.uniteCode, quantite: a.quantite, seuilMin: a.seuilMin, emplacement: a.emplacement, prixUnitaire: a.prixUnitaire, actif: a.actif !== false })),
+      ...piecesDeLEquipement(req, e, visibles, peut),
       documents: (e.documents || []).map(resumeDoc),
       compteurReleves: (e.compteurReleves || []).slice().sort((a, b) => String(b.date).localeCompare(String(a.date))).map((r) => Object.assign({}, r, { userNom: ctx.nomUser(r.userId) })),
       historiqueEtats: (e.historiqueEtats || []).slice().sort((a, b) => String(b.date).localeCompare(String(a.date))).map((h) => Object.assign({}, h, { userNom: ctx.nomUser(h.userId) })),
@@ -464,19 +490,23 @@ function register(ctx) {
     const nbEnfants = db.count(ENTITE, (x) => Number(x.parentId) === existant.id);
     if (nbEnfants) throw new HttpError(400, `Cet équipement possède ${nbEnfants} sous-équipement(s) : supprimez-les ou rattachez-les ailleurs d'abord`);
     const refs = nbReferences(existant.id);
-    const detailsRefs = [refs.ot ? `${refs.ot} OT` : '', refs.demandes ? `${refs.demandes} demande(s)` : '', refs.plans ? `${refs.plans} plan(s) préventif(s)` : ''].filter(Boolean);
+    const detailsRefs = [refs.ot ? `${refs.ot} OT` : '', refs.demandes ? `${refs.demandes} demande(s)` : '', refs.plans ? `${refs.plans} plan(s) préventif(s)` : '', refs.mouvements ? `${refs.mouvements} mouvement(s) de stock` : ''].filter(Boolean);
     if (detailsRefs.length) {
       // Traçabilité : un équipement référencé est désactivé, jamais supprimé
       db.update(ENTITE, existant.id, { actif: false });
       ctx.audit(req, 'desactivation', ENTITE, existant.id, `Équipement ${existant.numero} ${existant.nom} (référencé par ${detailsRefs.join(', ')}, désactivé)`);
       return { ok: true, desactive: true, references: refs };
     }
-    // Retrait des compatibilités d'articles
-    for (const a of db.list('articles', (a) => (a.equipementIds || []).map(Number).includes(existant.id))) db.update('articles', a.id, { equipementIds: a.equipementIds.filter((x) => Number(x) !== existant.id) });
+    // Retrait de l'équipement des articles (compatibilités et pièces dédiées) : règle du module Stock, qui signale et
+    // notifie une pièce dédiée restée sans équipement
+    let aReaffecter = [];
+    const stock = ctx.services.stock;
+    if (stock && typeof stock.retirerEquipement === 'function') aReaffecter = stock.retirerEquipement(existant, req).aReaffecter || [];
+    else for (const a of db.list('articles', (a) => (a.equipementIds || []).map(Number).includes(existant.id))) db.update('articles', a.id, { equipementIds: a.equipementIds.filter((x) => Number(x) !== existant.id) });
     db.remove(ENTITE, existant.id);
-    ctx.audit(req, 'suppression', ENTITE, existant.id, `Équipement ${existant.numero} ${existant.nom}`);
+    ctx.audit(req, 'suppression', ENTITE, existant.id, `Équipement ${existant.numero} ${existant.nom}${aReaffecter.length ? ` (${aReaffecter.length} pièce(s) dédiée(s) désormais sans équipement : à réaffecter)` : ''}`);
     ctx.emit('equipement:supprime', { equipement: existant });
-    return { ok: true, desactive: false };
+    return { ok: true, desactive: false, piecesAReaffecter: aReaffecter.length };
   }, { perm: [ENTITE, 'supprimer'] });
 
   router.post('/api/equipements/:id/dupliquer', async (req) => {

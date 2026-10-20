@@ -12,6 +12,8 @@
   const ENTITE = 'ot';
   const TAILLE_MAX_DOC = 5 * 1024 * 1024;
   const LIMITE_KANBAN_FINAL = 30;
+  /** Couleur du badge des pièces dédiées (identique à la vue Stock). */
+  const VIOLET_DEDIEE = '#7c3aed';
   const can = (a) => GMAO.can(ENTITE, a);
   const moi = () => (GMAO.user ? GMAO.user.id : null);
   /** Icône dimensionnée explicitement (hors boutons). */
@@ -266,6 +268,8 @@
         const res = creation ? await api.post('/api/ot', body) : await api.put('/api/ot/' + existant.id, body);
         invalider('techniciens', 'equipements');
         toast(creation ? `Ordre de travail ${res.numero} créé` : 'Ordre de travail enregistré', 'succes');
+        // Pièces prévues non reprises ou retirées (pièces dédiées non autorisées pour l'équipement de l'OT)
+        (res.avertissements || []).forEach((a) => toast(a, 'alerte', 9000));
         majBadge();
         if (apres) apres(res);
       },
@@ -645,7 +649,9 @@
       cont.appendChild(el('div', { class: 'mt texte-droite' }, el('strong', null, 'Total pièces : ' + ui.formatMontant(o.coutPieces))));
     } else cont.appendChild(el('p', { class: 'texte-2 texte-petit' }, 'Aucune pièce consommée.'));
     if ((o.piecesPrevues || []).length) {
-      cont.appendChild(el('div', { class: 'mt texte-petit' }, el('strong', null, 'Pièces prévues par la gamme : '), o.piecesPrevues.map((p, i) => frag(i ? ' ; ' : '', `${ui.formatNombre(p.quantite)} × ${p.code ? p.code + ' ' : ''}${p.designation || '#' + p.articleId}`, p.disponible != null ? el('span', { class: p.disponible < p.quantite ? 'texte-danger' : 'texte-2' }, ` (stock ${ui.formatNombre(p.disponible)})`) : null))));
+      cont.appendChild(el('div', { class: 'mt texte-petit' }, el('strong', null, 'Pièces prévues par la gamme : '), o.piecesPrevues.map((p, i) => frag(i ? ' ; ' : '', `${ui.formatNombre(p.quantite)} × ${p.code ? p.code + ' ' : ''}${p.designation || '#' + p.articleId}`,
+        p.disponible != null ? el('span', { class: p.disponible < p.quantite ? 'texte-danger' : 'texte-2' }, ` (stock ${ui.formatNombre(p.disponible)})`) : null,
+        p.reservee ? frag(' ', p.utilisable ? ui.badge('Dédiée', VIOLET_DEDIEE, { titre: `Pièce dédiée : ${p.reserveeTexte}` }) : ui.badge('Non autorisée', '#dc2626', { titre: p.raison })) : null))));
     }
     if (a.realiser) {
       if (!o.stockDisponible) {
@@ -662,19 +668,63 @@
           try { maj(await api.post(`/api/ot/${o.id}/pieces`, { articleId, quantite })); toast('Sortie de stock enregistrée', 'succes'); } catch (e) { erreur(e); btn.disabled = false; }
         } }, icone('piece'), 'Sortir du stock');
         const info = el('div', { class: 'aide' });
+        // Aide sur les pièces dédiées grisées : élément distinct, conservé quand l'article choisi change
+        const aideRefus = el('div', { class: 'aide' });
         cont.appendChild(el('div', { class: 'mt', style: FLEX({ flexWrap: 'wrap' }) }, sel, inQte, btn));
         cont.appendChild(info);
+        cont.appendChild(aideRefus);
         api.get('/api/ot-articles', { otId: o.id }).then((r) => {
           ui.vider(sel);
           if (!r.disponible) { sel.appendChild(el('option', { value: '' }, 'Module Stock indisponible')); info.textContent = 'La saisie des pièces est désactivée.'; return; }
           if (!r.articles.length) { sel.appendChild(el('option', { value: '' }, 'Aucun article en stock')); return; }
           sel.appendChild(el('option', { value: '' }, '— Choisir un article —'));
-          const option = (x) => el('option', { value: String(x.id), disabled: !r.stockNegatif && x.quantite <= 0 }, `${x.code ? x.code + ' — ' : ''}${x.designation} (stock : ${ui.formatNombre(x.quantite)}${x.uniteCode ? ' ' + ui.libelle('unites', x.uniteCode).toLowerCase() : ''})`);
-          const compat = r.articles.filter((x) => x.compatible);
+          const libelleStock = (x) => `${x.code ? x.code + ' — ' : ''}${x.designation} (stock : ${ui.formatNombre(x.quantite)}${x.uniteCode ? ' ' + ui.libelle('unites', x.uniteCode).toLowerCase() : ''})`;
+          const option = (x) => el('option', { value: String(x.id), disabled: !r.stockNegatif && x.quantite <= 0 }, libelleStock(x));
+          // Pièces dédiées (règle du serveur) : utilisables en tête avec la mention « Dédiée », les autres désactivées avec la raison
+          const dediees = r.articles.filter((x) => x.reservee && x.utilisable);
+          const refusees = r.articles.filter((x) => x.reservee && !x.utilisable && !x.sansEquipement);
+          const orphelines = r.articles.filter((x) => x.reservee && !x.utilisable && x.sansEquipement);
+          // OT sans équipement : une pièce dédiée n'est utilisable qu'une fois l'équipement de l'OT renseigné
+          const sansEquipementOt = r.equipementId == null;
+          const compat = r.articles.filter((x) => !x.reservee && x.compatible);
+          const autres = r.articles.filter((x) => !x.reservee && !x.compatible);
+          if (dediees.length) sel.appendChild(el('optgroup', { label: 'Pièces dédiées à cet équipement' }, dediees.map((x) => el('option', { value: String(x.id), disabled: !r.stockNegatif && x.quantite <= 0, title: `Pièce dédiée : ${x.reserveeTexte}`, dataset: { dediee: '1' } }, `Dédiée · ${libelleStock(x)}`))));
           if (compat.length) sel.appendChild(el('optgroup', { label: 'Compatibles avec l\'équipement' }, compat.map(option)));
-          sel.appendChild(el('optgroup', { label: compat.length ? 'Autres articles' : 'Articles' }, r.articles.filter((x) => !x.compatible).map(option)));
+          if (autres.length) sel.appendChild(el('optgroup', { label: dediees.length || compat.length ? 'Autres articles' : 'Articles' }, autres.map(option)));
+          if (refusees.length) {
+            sel.appendChild(el('optgroup', { label: sansEquipementOt ? 'Pièces dédiées (renseignez d\'abord l\'équipement de l\'OT)' : 'Pièces dédiées à d\'autres équipements (non utilisables)' }, refusees.map((x) => el('option', {
+              value: String(x.id), disabled: true, dataset: { dediee: '1', refusee: '1' },
+              title: sansEquipementOt ? `Pièce dédiée à ${x.reserveeTexte} : renseignez d'abord l'équipement de l'ordre de travail` : x.raison,
+            }, `${x.code ? x.code + ' — ' : ''}${x.designation} — réservée à ${x.reserveeTexte}`))));
+          }
+          if (orphelines.length) {
+            sel.appendChild(el('optgroup', { label: 'Pièces dédiées sans équipement (à réaffecter)' }, orphelines.map((x) => el('option', { value: String(x.id), disabled: true, title: x.raison, dataset: { dediee: '1', refusee: '1' } },
+              `${x.code ? x.code + ' — ' : ''}${x.designation} — pièce dédiée sans équipement (à réaffecter)`))));
+          }
           sel.disabled = false; btn.disabled = false;
-          sel.addEventListener('change', () => { const x = r.articles.find((y) => String(y.id) === sel.value); info.textContent = x ? `${x.emplacement ? 'Emplacement : ' + x.emplacement + ' · ' : ''}Prix unitaire : ${ui.formatMontant(x.prixUnitaire)}${x.seuilMin != null && x.quantite <= x.seuilMin ? ' · stock sous le seuil minimum' : ''}` : ''; });
+          sel.addEventListener('change', () => {
+            const x = r.articles.find((y) => String(y.id) === sel.value);
+            ui.vider(info);
+            if (!x) return;
+            if (x.reservee) info.appendChild(frag(ui.badge('Pièce dédiée', VIOLET_DEDIEE), ` Utilisable uniquement sur ${x.reserveeTexte}. `));
+            info.appendChild(document.createTextNode(`${x.emplacement ? 'Emplacement : ' + x.emplacement + ' · ' : ''}Prix unitaire : ${ui.formatMontant(x.prixUnitaire)}${x.seuilMin != null && x.quantite <= x.seuilMin ? ' · stock sous le seuil minimum' : ''}`));
+          });
+          const aides = [];
+          if (refusees.length && sansEquipementOt) {
+            aides.push(refusees.length > 1
+              ? `${refusees.length} pièces dédiées sont grisées en fin de liste : renseignez d'abord l'équipement de l'ordre de travail (seules les pièces autorisées pour cet équipement pourront être utilisées).`
+              : '1 pièce dédiée est grisée en fin de liste : renseignez d\'abord l\'équipement de l\'ordre de travail (seules les pièces autorisées pour cet équipement pourront être utilisées).');
+          } else if (refusees.length) {
+            aides.push(refusees.length > 1
+              ? `${refusees.length} pièces dédiées à d'autres équipements sont grisées en fin de liste : elles ne sont pas utilisables sur cet ordre de travail.`
+              : '1 pièce dédiée à d\'autres équipements est grisée en fin de liste : elle n\'est pas utilisable sur cet ordre de travail.');
+          }
+          if (orphelines.length) {
+            aides.push(orphelines.length > 1
+              ? `${orphelines.length} pièces dédiées sans équipement sont grisées : elles sont à réaffecter dans le stock.`
+              : '1 pièce dédiée sans équipement est grisée : elle est à réaffecter dans le stock.');
+          }
+          aideRefus.textContent = aides.join(' ');
         }).catch((e) => { ui.vider(sel); sel.appendChild(el('option', { value: '' }, 'Articles indisponibles')); info.textContent = e.message; });
       }
     }

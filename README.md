@@ -13,12 +13,12 @@ plus ou moins de choses, ajustable utilisateur par utilisateur) et **secteurs**.
 | Module | Contenu |
 |---|---|
 | **Tableau de bord** | Indicateurs (OT ouverts / en retard, demandes à valider, préventifs à échéance, alertes stock, coûts du mois), graphiques, « Mes OT », activités récentes |
-| **Équipements** | Arborescence secteurs → équipements → sous-équipements, fiches (état, criticité, compteur, documents, pièces compatibles), historique des interventions |
+| **Équipements** | Arborescence secteurs → équipements → sous-équipements, fiches (état, criticité, compteur, documents, pièces dédiées et pièces compatibles), historique des interventions |
 | **Demandes d'intervention** | Signalement de panne par n'importe quel utilisateur, circuit de validation (par le supérieur hiérarchique si souhaité), conversion automatique en ordre de travail, notifications |
 | **Ordres de travail** | Correctif / préventif / amélioration…, affectation aux techniciens, kanban par statut, temps passé, pièces consommées (stock), compte rendu, coûts, bon de travail imprimable |
 | **Maintenance préventive** | Plans et gammes périodiques (jours, semaines, mois ou compteur), génération automatique des OT à échéance, échéancier |
 | **Planning** | Calendrier mois / semaine / par technicien, glisser-déposer, charge de travail, OT non planifiés |
-| **Stock & pièces** | Articles, mouvements (entrées / sorties / inventaires), seuils et alertes, valorisation, liste à commander |
+| **Stock & pièces** | Articles, pièces dédiées à une ou plusieurs machines, mouvements (entrées / sorties / inventaires, équipement destinataire des sorties), seuils et alertes, valorisation, liste à commander |
 | **Fournisseurs** | Fournisseurs et prestataires, contacts, articles et équipements fournis, interventions externes |
 | **Rapports & historique** | MTTR, MTBF, respect des délais, taux de préventif, coûts par secteur / équipement / mois, charge des techniciens, historique complet, fiche de vie d'un équipement, exports CSV |
 | **Utilisateurs** | Comptes internes, hiérarchie (supérieur N+1, organigramme), rattachement aux secteurs, droits individuels |
@@ -110,6 +110,41 @@ l'application.
   (*Configuration › Profils & secteurs*, et directement dans les listes).
 - **Modules** : chaque module peut être désactivé, renommé ou réordonné pour tout le monde
   (*Configuration › Modules*).
+
+## Réserver une pièce à une ou plusieurs machines
+
+Une pièce peut être **dédiée** : elle n'est alors utilisable que sur les équipements choisis (pièce appairée,
+réglée ou sous garantie constructeur, par exemple).
+
+1. *Stock & pièces* › fiche de l'article › **Modifier** (ou **Nouvel article**).
+2. Cochez **Pièce dédiée : utilisable uniquement sur les équipements choisis** : le champ devient
+   **Équipements autorisés**. Choisissez une ou plusieurs machines (au moins une).
+3. **Inclure les sous-équipements** (coché par défaut) : la pièce est aussi utilisable sur les sous-équipements
+   des machines choisies (les machines d'une ligne, par exemple). Décochez pour la réserver aux seules machines
+   choisies.
+
+La réservation (case, sous-équipements, équipements autorisés) se modifie avec le droit **Stock › Créer** ; le droit
+Stock › Modifier, celui des sorties de pièces, ne suffit pas. Elle reste verrouillée tant que la pièce est aussi dédiée
+à des machines hors de votre périmètre. Quand une pièce cesse d'être dédiée, les gestionnaires du stock sont prévenus.
+
+Ensuite :
+- une **sortie de stock** d'une pièce dédiée demande l'**équipement destinataire** (limité aux équipements autorisés) ;
+  l'équipement est enregistré sur le mouvement et figure dans l'historique et l'export des mouvements ;
+- sur un **ordre de travail**, les pièces dédiées à sa machine sont proposées en tête (« Dédiée ») ; celles des autres
+  machines sont grisées, avec la raison, et ne peuvent pas être sorties ; l'équipement d'un OT qui a déjà consommé une
+  pièce dédiée ne peut être changé que pour un équipement autorisé ;
+- un **plan préventif** n'accepte une pièce dédiée que si l'équipement du plan est autorisé ; un plan devenu non
+  conforme (pièce réservée ensuite à une autre machine, équipement déplacé) est signalé « Pièce non autorisée » : ses
+  OT sont générés sans cette pièce et son responsable est prévenu ;
+- la fiche de chaque équipement distingue les **pièces dédiées à cet équipement** des pièces compatibles.
+
+Sans la case, la liste des équipements reste **indicative** (pièces compatibles) : les articles existants ne changent pas
+de comportement. Les entrées, réceptions de commandes, inventaires et retours en stock ne sont jamais restreints. Si
+l'équipement d'une pièce dédiée est supprimé et qu'il n'en reste aucun, la pièce reste dédiée mais n'est plus utilisable :
+elle est signalée « Pièce dédiée sans équipement : à réaffecter » dans le stock et les gestionnaires du stock sont
+prévenus. Un équipement qui a reçu des pièces (sorties de stock) est désactivé au lieu d'être supprimé. Un équipement
+réformé reste dans la liste (mention « réformé »). Le filtre **Pièces dédiées / Pièces libres**
+de la liste et les colonnes **Dédiée** et **Équipements** de l'export CSV permettent de les suivre.
 
 ## Tout est modifiable
 

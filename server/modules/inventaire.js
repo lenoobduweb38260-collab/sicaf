@@ -300,6 +300,17 @@ function register(ctx) {
     return autresInventairesEnCours(req, articleId, null);
   }
 
+  /**
+   * Pièce dédiée (règle du module Stock) : restriction indiquée à la lecture du code, selon la portée du lecteur.
+   * L'inventaire lui-même n'est jamais restreint.
+   */
+  function restrictionDediee(req, a) {
+    const stock = ctx.services.stock;
+    const d = stock && typeof stock.infosDediee === 'function' ? stock.infosDediee(a, req) : null;
+    if (!d || !d.reservee) return { reservee: false, reserveeA: [], reserveeTexte: '', sansEquipement: false };
+    return { reservee: true, reserveeA: d.reserveeA, reserveeTexte: d.reserveeTexte, reserveeHorsPerimetre: d.reserveeHorsPerimetre, sansEquipement: d.sansEquipement, equipementsAutorisesIds: d.equipementsAutorisesIds };
+  }
+
   /** Résolution d'un code (null si rien de visible ne correspond). */
   function resoudreCode(req, brut) {
     const k = cleCode(brut);
@@ -318,6 +329,7 @@ function register(ctx) {
             actif: a.actif !== false, categorieCode: a.categorieCode || null, referenceFournisseur: a.referenceFournisseur || '',
             fournisseurNom: nomFournisseur(a.fournisseurId), secteurId: a.secteurId == null || a.secteurId === '' ? null : Number(a.secteurId),
             inventairesEnCours: inventairesEnCours(req, a.id),
+            ...restrictionDediee(req, a),
           },
         };
       }

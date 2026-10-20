@@ -215,11 +215,15 @@
   }
 
   async function supprimer(e, apres) {
-    const ok = await ui.confirm({ titre: 'Supprimer l\'équipement', message: `Supprimer ${libelleEq(e)} ? S'il est référencé par des interventions, des demandes ou des plans préventifs, il sera désactivé (archivé) au lieu d'être supprimé.`, okLabel: 'Supprimer', danger: true });
+    const ok = await ui.confirm({ titre: 'Supprimer l\'équipement', message: `Supprimer ${libelleEq(e)} ? S'il est référencé par des interventions, des demandes, des plans préventifs ou des sorties de stock, il sera désactivé (archivé) au lieu d'être supprimé.`, okLabel: 'Supprimer', danger: true });
     if (!ok) return;
     try {
       const r = await api.del('/api/equipements/' + e.id);
       toast(r.desactive ? 'Équipement désactivé (référencé dans l\'historique de maintenance)' : 'Équipement supprimé', 'succes');
+      if (r.piecesAReaffecter) {
+        const n = Number(r.piecesAReaffecter);
+        toast(n > 1 ? `${n} pièces dédiées à cet équipement n'ont plus aucun équipement : à réaffecter dans le stock` : 'Une pièce dédiée à cet équipement n\'a plus aucun équipement : à réaffecter dans le stock', 'alerte', 8000);
+      }
       if (apres) apres(r);
     } catch (err) { erreur(err); }
   }
@@ -264,6 +268,7 @@
     if ((e.enfants || []).length) html += '<h2>Sous-équipements</h2>' + tableau(['Numéro', 'Désignation', 'Type', 'État', 'Criticité'], e.enfants.map((x) => [esc(x.numero), esc(x.nom), lib('typesEquipement', x.typeCode), lib('etatsEquipement', x.etatCode), lib('criticites', x.criticiteCode)]));
     if ((e.derniersOt || []).length) html += `<h2>Derniers ordres de travail (${e.nbOtTotal} au total, ${e.nbOtOuverts} ouvert(s))</h2>` + tableau(['N°', 'Titre', 'Type', 'Statut', 'Technicien', 'Prévu le', 'Terminé le'], e.derniersOt.map((o) => [esc(o.numero), esc(o.titre), lib('typesIntervention', o.typeCode), lib('statutsOT', o.statut), esc(ui.nomUser(o.technicienId)), esc(ui.formatDate(o.datePrevue)), esc(ui.formatDate(o.dateFin))]));
     if ((e.plansPreventifs || []).length) html += '<h2>Plans de maintenance préventive</h2>' + tableau(['N°', 'Plan', 'Périodicité', 'Dernière exécution', 'Prochaine échéance', 'Actif'], e.plansPreventifs.map((p) => [esc(p.numero), esc(p.nom), esc(periodiciteLisible(p.periodicite, unite)), esc(echeanceLisible(p.derniereExecution, p.periodicite, unite)), esc(echeanceLisible(p.prochaineEcheance, p.periodicite, unite)), p.actif === false ? 'Non' : 'Oui']));
+    if ((e.articlesDedies || []).length) html += '<h2>Pièces dédiées à cet équipement</h2>' + tableau(['Code', 'Désignation', 'Stock', 'Seuil', 'Emplacement', 'Dédiée'], e.articlesDedies.map((a) => [esc(a.code), esc(a.designation), esc(ui.formatNombre(a.quantite)), esc(ui.formatNombre(a.seuilMin)), esc(a.emplacement), a.direct ? 'à cet équipement' : esc(`par ${a.viaNom || 'l\'équipement parent'}`)]));
     if ((e.articlesCompatibles || []).length) html += '<h2>Pièces compatibles</h2>' + tableau(['Code', 'Désignation', 'Stock', 'Seuil', 'Emplacement'], e.articlesCompatibles.map((a) => [esc(a.code), esc(a.designation), esc(ui.formatNombre(a.quantite)), esc(ui.formatNombre(a.seuilMin)), esc(a.emplacement)]));
     if ((e.compteurReleves || []).length) html += '<h2>Derniers relevés de compteur</h2>' + tableau(['Date', `Valeur (${esc(unite)})`, 'Relevé par', 'Commentaire'], e.compteurReleves.slice(0, 15).map((r) => [esc(ui.formatDateHeure(r.date)), esc(ui.formatNombre(r.valeur)), esc(r.userNom), esc(r.commentaire)]));
     if ((e.documents || []).length) html += '<h2>Documents joints</h2><ul>' + e.documents.map((d) => `<li>${esc(d.nom)} (${esc(tailleLisible(d.taille))}, ${esc(ui.formatDate(d.date))})</li>`).join('') + '</ul>';
@@ -610,25 +615,39 @@
     return cont;
   }
 
+  function tablePieces(articles, { dediees } = {}) {
+    return ui.table({
+      compact: true, recherche: articles.length > 8 ? 'Rechercher une pièce…' : false, pagination: false, lignes: articles, onClic: (a) => GMAO.navigate('#/stock/' + a.id), ligneClasse: (a) => (a.actif === false ? 'inactif' : ''),
+      colonnes: [
+        { cle: 'code', label: 'Code', rendu: (a) => lienVue('#/stock/' + a.id, a.code || ('#' + a.id)) },
+        { cle: 'designation', label: 'Désignation', rendu: (a) => el('span', { class: 'cellule-principale' }, a.designation) },
+        dediees ? { cle: 'direct', label: 'Dédiée', rendu: (a) => (a.direct
+          ? ui.badge('à cet équipement', '#7c3aed')
+          // Contour à la couleur des liens (--lien, ajustée à chaque thème) : un violet fixe serait illisible en thème sombre
+          : frag(ui.badge('par héritage', 'var(--lien)', { contour: true, titre: 'Pièce dédiée à un équipement parent, sous-équipements compris' }), ' ', a.viaId ? lienVue('#/equipements/' + a.viaId, a.viaNom) : el('span', { class: 'texte-2' }, 'équipement parent'))), valeurTri: (a) => (a.direct ? 0 : 1) } : null,
+        { cle: 'categorieCode', label: 'Catégorie', liste: 'categoriesArticles' },
+        { cle: 'quantite', label: 'En stock', aligner: 'droite', rendu: (a) => `${ui.formatNombre(a.quantite)} ${ui.libelle('unites', a.uniteCode) !== String(a.uniteCode || '') ? ui.libelle('unites', a.uniteCode) : (a.uniteCode || '')}`.trim() },
+        { cle: 'seuilMin', label: 'Seuil mini', aligner: 'droite', type: 'nombre' },
+        { cle: 'emplacement', label: 'Emplacement' },
+        { cle: 'prixUnitaire', label: 'Prix unitaire', aligner: 'droite', type: 'montant' },
+        { cle: 'alerte', label: 'Disponibilité', aligner: 'centre', rendu: (a) => (Number(a.quantite) <= 0 ? ui.badge('Rupture', '#dc2626') : (a.seuilMin != null && Number(a.quantite) <= Number(a.seuilMin) ? ui.badge('Sous le seuil', '#f59e0b') : ui.badge('Disponible', '#16a34a'))) },
+      ].filter(Boolean),
+    }).el;
+  }
+
   function rendrePieces(e) {
     const cont = el('div');
+    const dediees = e.articlesDedies || [];
     const articles = e.articlesCompatibles || [];
+    cont.appendChild(ui.carte(`Pièces dédiées à cet équipement (${dediees.length})`,
+      dediees.length ? frag(el('p', { class: 'texte-2 texte-petit', style: { marginTop: 0 } }, 'Pièces réservées : utilisables uniquement sur les équipements autorisés (celui-ci, ou un équipement parent dont les sous-équipements sont inclus).'), tablePieces(dediees, { dediees: true }))
+        : el('p', { class: 'texte-2', style: { margin: 0 } }, 'Aucune pièce n\'est dédiée à cet équipement.'),
+      { classe: 'mb', actions: GMAO.can('stock', 'voir') ? ui.bouton('Pièces dédiées du stock', { icone: 'stock', classe: 'btn-sm', onClic: () => GMAO.navigate('#/stock?reservee=1') }) : null }));
     cont.appendChild(ui.carte(`Pièces compatibles (${articles.length})`,
-      articles.length ? ui.table({
-        compact: true, recherche: articles.length > 8 ? 'Rechercher une pièce…' : false, pagination: false, lignes: articles, onClic: (a) => GMAO.navigate('#/stock/' + a.id), ligneClasse: (a) => (a.actif === false ? 'inactif' : ''),
-        colonnes: [
-          { cle: 'code', label: 'Code', rendu: (a) => lienVue('#/stock/' + a.id, a.code || ('#' + a.id)) },
-          { cle: 'designation', label: 'Désignation', rendu: (a) => el('span', { class: 'cellule-principale' }, a.designation) },
-          { cle: 'categorieCode', label: 'Catégorie', liste: 'categoriesArticles' },
-          { cle: 'quantite', label: 'En stock', aligner: 'droite', rendu: (a) => `${ui.formatNombre(a.quantite)} ${ui.libelle('unites', a.uniteCode) !== String(a.uniteCode || '') ? ui.libelle('unites', a.uniteCode) : (a.uniteCode || '')}`.trim() },
-          { cle: 'seuilMin', label: 'Seuil mini', aligner: 'droite', type: 'nombre' },
-          { cle: 'emplacement', label: 'Emplacement' },
-          { cle: 'prixUnitaire', label: 'Prix unitaire', aligner: 'droite', type: 'montant' },
-          { cle: 'alerte', label: 'Disponibilité', aligner: 'centre', rendu: (a) => (Number(a.quantite) <= 0 ? ui.badge('Rupture', '#dc2626') : (a.seuilMin != null && Number(a.quantite) <= Number(a.seuilMin) ? ui.badge('Sous le seuil', '#f59e0b') : ui.badge('Disponible', '#16a34a'))) },
-        ],
-      }).el : el('p', { class: 'texte-2', style: { margin: 0 } }, 'Aucune pièce de rechange n\'est déclarée compatible avec cet équipement.'),
-      { actions: GMAO.can('stock', 'voir') ? ui.bouton('Ouvrir le stock', { icone: 'stock', classe: 'btn-sm', onClic: () => GMAO.navigate('#/stock?equipementId=' + e.id) }) : null }));
-    cont.appendChild(el('p', { class: 'texte-2 texte-petit' }, 'La compatibilité équipement ↔ pièce se définit sur la fiche de l\'article (module Stock & pièces, champ « Équipements compatibles »).'));
+      articles.length ? tablePieces(articles) : el('p', { class: 'texte-2', style: { margin: 0 } }, 'Aucune pièce de rechange n\'est déclarée compatible avec cet équipement.'),
+      // Le stock filtré sur l'équipement montre ses pièces dédiées et compatibles (puce « Pièces de : … »)
+      { actions: GMAO.can('stock', 'voir') ? ui.bouton('Ouvrir le stock', { icone: 'stock', classe: 'btn-sm', titre: 'Pièces dédiées et compatibles de cet équipement dans le stock', onClic: () => GMAO.navigate('#/stock?equipementId=' + e.id) }) : null }));
+    cont.appendChild(el('p', { class: 'texte-2 texte-petit' }, 'La compatibilité (indicative) et la réservation d\'une pièce à des équipements (case « Pièce dédiée », champ « Équipements autorisés ») se définissent sur la fiche de l\'article, module Stock & pièces.'));
     return cont;
   }
 
@@ -711,7 +730,7 @@
       GMAO.can('ot', 'voir') || GMAO.can('demandes', 'voir') ? { cle: 'interventions', label: 'Interventions', icone: 'ot', badge: (e.nbOtOuverts || 0) || null, rendu: () => rendreInterventions(e) } : null,
       GMAO.can('preventif', 'voir') ? { cle: 'preventif', label: 'Préventif', icone: 'preventif', badge: (e.plansPreventifs || []).length || null, rendu: () => rendrePreventif(e) } : null,
       { cle: 'documents', label: 'Documents', icone: 'piece_jointe', badge: (e.documents || []).length || null, rendu: () => rendreDocuments(e, recharger) },
-      GMAO.can('stock', 'voir') ? { cle: 'pieces', label: 'Pièces compatibles', icone: 'piece', badge: (e.articlesCompatibles || []).length || null, rendu: () => rendrePieces(e) } : null,
+      GMAO.can('stock', 'voir') ? { cle: 'pieces', label: 'Pièces', icone: 'piece', badge: ((e.articlesDedies || []).length + (e.articlesCompatibles || []).length) || null, rendu: () => rendrePieces(e) } : null,
       { cle: 'compteur', label: 'Compteur', icone: 'horloge', rendu: () => rendreCompteur(e, recharger) },
     ].filter(Boolean), { hash: true }).el);
   }
