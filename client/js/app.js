@@ -37,13 +37,22 @@
 
     /**
      * Fonctions appelées à chaque connexion (après l'amorçage, avant l'affichage de la première vue) : les modules
-     * peuvent y initialiser leurs compteurs du menu. Appelée aussitôt si un utilisateur est déjà connecté.
+     * peuvent y initialiser leurs compteurs du menu. Appelée aussitôt si un utilisateur est déjà connecté. Tant qu'un
+     * écran est imposé (changement de mot de passe, enrôlement de la double authentification), ces fonctions attendent :
+     * elles sont appelées une fois l'écran imposé terminé (`GMAO.refresh`).
      */
     _surConnexion: [],
     onConnexion(fn) {
       if (typeof fn !== 'function') return;
       this._surConnexion.push(fn);
-      if (this.user && !this.changementMdpRequis()) { try { fn(this.user); } catch (e) { console.error(e); } }
+      if (this.user && !this.ecranImpose()) { try { fn(this.user); } catch (e) { console.error(e); } }
+    },
+    /** Changement de mot de passe ou enrôlement de la double authentification imposé : aucune donnée avant. */
+    ecranImpose() { return this.changementMdpRequis() || this.deuxFacteursRequis(); },
+    /** Crochets de connexion et notifications : après l'amorçage, ou une fois l'écran imposé terminé. */
+    _apresConnexion() {
+      for (const fn of this._surConnexion) { try { fn(this.user); } catch (e) { console.error(e); } }
+      majNotifications();
     },
     /** Sortie de la vue affichée (changement de vue, déconnexion) : appelle son crochet `quitter()` s'il existe. */
     _quitterVue() {
@@ -79,7 +88,9 @@
 
     /** Recharge l'amorçage (droits, config, références) sans recharger la page. */
     async refresh(rerendre = true) {
-      const changementEtaitRequis = this.changementMdpRequis() || !!this._changementMdpEffectue;
+      // Écran imposé en cours ou tout juste terminé (changement de mot de passe, enrôlement) : les crochets de connexion
+      // (compteurs du menu…) et les notifications n'ont pas encore été appelés
+      const etaitImpose = this.ecranImpose() || !!this._changementMdpEffectue;
       this._changementMdpEffectue = false;
       const data = await api.get('/api/auth/me', null, { silent401: true });
       appliquerBootstrap(data);
@@ -88,17 +99,13 @@
       majRappelMdp();
       if (rerendre) this.rendre();
       if (GMAO.changementMdpRequis()) imposerChangementMdp();
-      else {
-        if (GMAO.deuxFacteursRequis()) imposerEnrolement();
-        // Changement de mot de passe imposé tout juste effectué : les crochets de connexion (compteurs du menu…)
-        // n'avaient pas encore été appelés à l'amorçage
-        if (changementEtaitRequis) this._surConnexion.forEach((fn) => { try { fn(this.user); } catch (e) { console.error(e); } });
-      }
+      else if (GMAO.deuxFacteursRequis()) imposerEnrolement();
+      else if (etaitImpose) this._apresConnexion();
     },
     async refreshRefs() { return this.refresh(false); },
 
     onNonAuthentifie() {
-      if (GMAO.user) { GMAO.user = null; GMAO._badges = {}; toast('Session expirée, veuillez vous reconnecter', 'alerte'); afficherConnexion(); }
+      if (GMAO.user) { GMAO.user = null; GMAO._badges = {}; ui.fermerToasts(); toast('Session expirée, veuillez vous reconnecter', 'alerte'); afficherConnexion(); }
     },
 
     /**
@@ -120,6 +127,7 @@
       try { await api.post('/api/auth/logout'); } catch (e) { /* ignore */ }
       GMAO.user = null; GMAO.perms = null;
       GMAO._badges = {}; // compteurs du menu propres à la session
+      ui.fermerToasts(); // rien de la session (code de secours utilisé, mot de passe modifié…) pour la personne suivante
       location.hash = '';
       afficherConnexion();
     },
@@ -141,7 +149,7 @@
       };
       // Mot de passe actuel : toujours demandé, sauf changement imposé dès l'ouverture de la session (il vient d'être saisi)
       const ancienRequis = !force || etat.ancienRequis !== false;
-      const f = ui.form({ colonnes: 1, champs: [
+      const f = ui.form({ colonnes: 1, entreeSoumet: true, champs: [
         ancienRequis ? { nom: 'ancien', label: 'Mot de passe actuel', type: 'mdp', requis: true } : null,
         { nom: 'nouveau', label: 'Nouveau mot de passe', type: 'mdp', requis: true },
         { nom: 'confirmation', label: 'Confirmer le nouveau mot de passe', type: 'mdp', requis: true, valider: (v, vals) => (v !== vals.nouveau ? 'Les mots de passe ne correspondent pas' : '') },
@@ -167,7 +175,18 @@
             if (!f.valider()) return false;
             if (!regles.conforme()) { f.erreur('nouveau', 'Le nouveau mot de passe ne respecte pas toutes les règles indiquées'); f.controles.nouveau.input.focus(); return false; }
             const v = f.valeurs();
-            await api.post('/api/auth/mot-de-passe', { ancien: v.ancien, nouveau: v.nouveau });
+            try {
+              await api.post('/api/auth/mot-de-passe', { ancien: v.ancien, nouveau: v.nouveau });
+            } catch (e) {
+              // Refus du serveur (mot de passe actuel incorrect, historique, politique) : message sous le champ concerné,
+              // qui reprend le focus
+              if (e.status !== 400) throw e;
+              const champ = ancienRequis && /mot de passe actuel|ancien mot de passe incorrect/i.test(e.message) ? 'ancien' : 'nouveau';
+              f.erreur(champ, e.message);
+              f.controles[champ].input.select();
+              f.controles[champ].input.focus();
+              return false;
+            }
             GMAO.user.doitChangerMdp = false;
             if (GMAO.motDePasse) GMAO.motDePasse = Object.assign({}, GMAO.motDePasse, { doitChanger: false, raison: null, rappel: false });
             majRappelMdp();
@@ -244,7 +263,7 @@
           r.then((n) => { if (GMAO._vueCourante !== module || !conteneur.isConnected) return; const ch = conteneur.querySelector(':scope > .chargement'); if (ch) ch.remove(); if (n instanceof Node) conteneur.appendChild(n); })
             .catch((e) => {
               const ch = conteneur.querySelector(':scope > .chargement'); if (ch) ch.remove();
-              if (e && e.details && e.details.deuxFacteursRequis) { GMAO.refresh(true).catch(() => {}); return; } // obligation activée entre-temps
+              if (e && e.details && e.details.deuxFacteursRequis) { if (!GMAO.deuxFacteursRequis()) GMAO.refresh(true).catch(() => {}); return; } // obligation activée entre-temps
               if (e && e.details && e.details.changementMdpRequis) return; // fenêtre de changement déjà imposée (api.js)
               conteneur.appendChild(ui.alerte('Erreur : ' + (e.message || e), 'danger')); console.error(e);
             });
@@ -290,9 +309,9 @@
     const fonds = theme === 'sombre' ? [[30, 41, 59], [15, 23, 42], [39, 52, 73]] : [[255, 255, 255], [243, 244, 246], [249, 250, 251]];
     const vers = theme === 'sombre' ? 255 : 0;
     const base = hexToRgb(couleur);
-    // Fond « --primaire-clair » (élément actif d'un arbre, groupe de boutons) posé sur la surface
+    // Fond « --primaire-clair » (élément actif d'un arbre, groupe de boutons) posé sur la surface ou sur le fond de page
     const alpha = theme === 'sombre' ? 0.28 : 0.14;
-    fonds.push(fonds[0].map((v, i) => Math.round(base[i] * alpha + v * (1 - alpha))));
+    fonds.slice(0, 2).forEach((fd) => fonds.push(fd.map((v, i) => Math.round(base[i] * alpha + v * (1 - alpha)))));
     for (let f = 0; f <= 1.0001; f += 0.05) {
       const rgb = base.map((v) => Math.round(v + (vers - v) * f));
       if (fonds.every((fd) => contraste(rgb, fd) >= 4.6)) return `rgb(${rgb.join(',')})`;
@@ -331,14 +350,17 @@
 
   // ----- Page de connexion -----------------------------------------------
   /**
-   * Page de connexion ; `message` : erreur à afficher d'emblée (ex. délai de saisie du code dépassé).
+   * Page de connexion ; `message` : erreur à afficher d'emblée (ex. délai de saisie du code dépassé) ; `login` :
+   * identifiant prérempli (nouvelle saisie du mot de passe seulement).
    * La même carte affiche, selon le lien choisi : la connexion, la demande de réinitialisation
    * (« Mot de passe oublié ? ») et le nouveau mot de passe avec un code de réinitialisation ou un code
    * de l'application d'authentification.
    */
-  async function afficherConnexion(message) {
+  async function afficherConnexion(message, login) {
     const app = document.getElementById('app');
+    // Fin de session : aucune fenêtre ne reste ouverte (code ou mot de passe temporaire affiché, saisie en cours)
     fermerModalesImposees();
+    ui.fermerModales(true);
     let infos = { societe: {}, general: {} };
     try { infos = await api.get('/api/auth/infos'); } catch (e) { /* serveur injoignable */ }
     GMAO.config = { societe: infos.societe, general: infos.general };
@@ -352,15 +374,20 @@
       (infos.general || {}).messageAccueil ? el('div', { class: 'connexion-accueil' }, infos.general.messageAccueil) : null,
       err, zone,
       el('div', { class: 'connexion-pied' }, `GMAO ${infos.version ? 'v' + infos.version : ''}${infos.premierDemarrage ? ' · Première connexion : admin / admin (mot de passe à changer immédiatement)' : ''}`))));
-    const c = { zone, err, infos, login: '' };
+    const c = { zone, err, infos, login: login || '' };
     vueConnexion(c);
     if (message) erreurConnexion(c, message);
   }
 
-  /** Message d'erreur de la carte de connexion (vide = masqué). */
+  /**
+   * Message d'erreur de la carte de connexion (vide = masqué). La carte peut dépasser la hauteur de l'écran (nouveau
+   * mot de passe avec un code) et la page être défilée jusqu'au bouton d'envoi : le message, en haut de la carte, est
+   * ramené dans la zone visible avant que le champ concerné ne reprenne le focus.
+   */
   function erreurConnexion(c, message) {
     c.err.textContent = message || '';
     c.err.classList.toggle('masque', !message);
+    if (message && typeof c.err.scrollIntoView === 'function') c.err.scrollIntoView({ block: 'nearest' });
   }
   /** Liens discrets sous un formulaire de la carte de connexion : [[libellé, action, classe?], …]. */
   function liensConnexion(liens) {
@@ -402,7 +429,7 @@
       try {
         await pendantEnvoi(btn, 'Connexion…', async () => {
           const data = await api.post('/api/auth/login', f.valeurs(), { silent401: true });
-          if (data && data.deuxFacteurs === true && data.jeton) { etapeCode(c.zone, c.err, data.jeton); return; }
+          if (data && data.deuxFacteurs === true && data.jeton) { c.login = inLogin.value.trim(); etapeCode(c, data.jeton); return; }
           await demarrer(data);
         });
       } catch (e) {
@@ -575,7 +602,7 @@
       return;
     }
     if (data && data.deuxFacteurs === true && data.jeton) {
-      etapeCode(c.zone, c.err, data.jeton, viaApplication
+      etapeCode(c, data.jeton, viaApplication
         ? 'Nouveau mot de passe enregistré. Pour vous connecter, saisissez le prochain code affiché par votre application (celui que vous venez d\'utiliser n\'est plus valable).'
         : 'Nouveau mot de passe enregistré. La double authentification reste exigée : saisissez le code de votre application pour vous connecter.');
       return;
@@ -611,9 +638,10 @@
    * Seconde étape de la connexion : code de l'application d'authentification ou code de secours.
    * `info` : message affiché au-dessus (ex. nouveau mot de passe enregistré après une réinitialisation).
    */
-  function etapeCode(zone, err, jeton, info) {
+  function etapeCode(c, jeton, info) {
+    const zone = c.zone;
     ui.vider(zone);
-    err.classList.add('masque');
+    erreurConnexion(c, '');
     let secours = false;
     let envoi = false;
     const input = champCode('f_code', () => soumettre());
@@ -636,15 +664,16 @@
       if (envoi) return;
       const code = input.value.trim();
       if (!code) { input.focus(); return; }
-      envoi = true; btn.disabled = true; err.classList.add('masque');
+      envoi = true; btn.disabled = true; erreurConnexion(c, '');
       try {
         const data = await api.post('/api/auth/login/code', { jeton, code }, { silent401: true });
         await demarrer(data);
         const cnx = data.connexion || {};
         if (cnx.codeSecours) toast(`Connexion avec un code de secours : il vous en reste ${cnx.codesSecoursRestants}.${cnx.codesSecoursRestants <= 2 ? ' Générez-en de nouveaux (menu de votre compte › Double authentification).' : ''}`, cnx.codesSecoursRestants <= 2 ? 'alerte' : 'info', 9000);
       } catch (e) {
-        if (e && e.details && e.details.recommencer) { afficherConnexion(e.message); return; }
-        err.textContent = e.message; err.classList.remove('masque');
+        // Nouvelle saisie du mot de passe demandée : l'identifiant reste rempli (seul « Changer d'identifiant » le vide)
+        if (e && e.details && e.details.recommencer) { afficherConnexion(e.message, c.login); return; }
+        erreurConnexion(c, e.message);
         input.value = ''; input.focus();
       } finally { envoi = false; btn.disabled = false; }
     }
@@ -674,7 +703,10 @@
       el('div', { class: 'entete-titre' }),
       el('div', { class: 'entete-site' }),
       el('div', { style: { position: 'relative' } }, el('button', { class: 'btn btn-icone btn-notifs', title: 'Notifications', onclick: (ev) => { ev.stopPropagation(); basculerNotifications(); } }, icone('cloche'))),
-      el('div', { style: { position: 'relative' } }, el('div', { class: 'entete-utilisateur', onclick: (ev) => { ev.stopPropagation(); basculerMenuUtilisateur(); } },
+      el('div', { style: { position: 'relative' } }, el('div', { class: 'entete-utilisateur', role: 'button', tabindex: '0', 'aria-haspopup': 'true', title: 'Mon compte',
+        onclick: (ev) => { ev.stopPropagation(); basculerMenuUtilisateur(); },
+        // Au clavier (Entrée, Espace) : menu ouvert sur sa première entrée
+        onkeydown: (ev) => { if (ev.key !== 'Enter' && ev.key !== ' ') return; ev.preventDefault(); ev.stopPropagation(); basculerMenuUtilisateur(); const item = document.querySelector('.menu-utilisateur .menu-item'); if (item) item.focus(); } },
         ui.avatar(`${GMAO.user.prenom || ''} ${GMAO.user.nom || ''}`.trim() || GMAO.user.login),
         el('div', null, el('div', { class: 'u-nom' }, `${GMAO.user.prenom || ''} ${GMAO.user.nom || ''}`.trim() || GMAO.user.login), el('div', { class: 'u-profil' }, GMAO.perms.profilNom || '')),
         icone('chevron_bas'))));
@@ -685,13 +717,13 @@
     document.addEventListener('click', fermerMenus);
     majRappelMdp();
     GMAO.rendre();
-    // Écrans imposés : nouveau mot de passe, puis enrôlement de la double authentification si elle est obligatoire
-    if (GMAO.changementMdpRequis()) imposerChangementMdp();
-    else if (GMAO.deuxFacteursRequis()) imposerEnrolement();
-    majNotifications();
     if (GMAO._notifTimer) clearInterval(GMAO._notifTimer);
     GMAO._notifTimer = setInterval(majNotifications, 60000);
-    if (!GMAO.changementMdpRequis()) for (const fn of GMAO._surConnexion) { try { fn(GMAO.user); } catch (e) { console.error(e); } }
+    // Écrans imposés : nouveau mot de passe, puis enrôlement de la double authentification si elle est obligatoire ;
+    // crochets de connexion et notifications ensuite seulement (GMAO.refresh), aucune donnée avant
+    if (GMAO.changementMdpRequis()) imposerChangementMdp();
+    else if (GMAO.deuxFacteursRequis()) imposerEnrolement();
+    else GMAO._apresConnexion();
   }
 
   /** Sélecteur de site (multi-site) : affiché dès qu'au moins un site est accessible. */
@@ -746,13 +778,30 @@
   }
 
   // ----- Menus de l'en-tête -----------------------------------------------
-  function fermerMenus() { document.querySelectorAll('.menu-deroulant').forEach((m) => m.remove()); }
+  /**
+   * Ferme les menus de l'en-tête. Si le focus y était (entrée choisie), il revient au bouton du menu, qui le reprendra
+   * aussi à la fermeture d'une fenêtre ouverte depuis le menu.
+   */
+  function fermerMenus() {
+    document.querySelectorAll('.menu-deroulant').forEach((m) => {
+      const focusDedans = m.contains(document.activeElement);
+      m.remove();
+      if (focusDedans && m.declencheur && m.declencheur.isConnected) m.declencheur.focus({ preventScroll: true });
+    });
+  }
+  /** Menu de l'en-tête : Échap le ferme. */
+  function menuDeroulant(classe, declencheur, ...enfants) {
+    const menu = el('div', { class: 'menu-deroulant ' + classe, onclick: (ev) => ev.stopPropagation(),
+      onkeydown: (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); fermerMenus(); } } }, ...enfants);
+    menu.declencheur = declencheur;
+    return menu;
+  }
   function basculerMenuUtilisateur() {
     const existant = document.querySelector('.menu-utilisateur');
     fermerMenus();
     if (existant) return;
     const theme = document.documentElement.getAttribute('data-theme');
-    const menu = el('div', { class: 'menu-deroulant menu-utilisateur', onclick: (ev) => ev.stopPropagation() },
+    const menu = menuDeroulant('menu-utilisateur', document.querySelector('.entete-utilisateur'),
       el('div', { class: 'menu-entete' }, `Connecté en tant que ${GMAO.user.login}`, el('br'), `Profil : ${GMAO.perms.profilNom || '—'} · Portée : ${(GMAO.catalogue.portees || {})[GMAO.perms.portee] || GMAO.perms.portee}`),
       el('div', { class: 'menu-sep' }),
       el('button', { class: 'menu-item', onclick: () => { fermerMenus(); afficherMonCompte(); } }, icone('utilisateur'), 'Mon compte'),
@@ -802,7 +851,7 @@
   /** Fenêtre de changement imposée (une seule à la fois) ; ensuite, amorçage rechargé (droits, enrôlement éventuel). */
   function imposerChangementMdp() {
     if (modaleMdpImposee || !GMAO.user) return;
-    GMAO.ouvrirChangementMdp(true, () => { GMAO.refresh(true).then(() => majNotifications()).catch(erreur); });
+    GMAO.ouvrirChangementMdp(true, () => { GMAO.refresh(true).catch(erreur); }); // crochets de connexion et notifications rejoués
   }
 
   /** « aujourd'hui », « demain », « dans 5 jours ». */
@@ -850,11 +899,11 @@
   GMAO.ouvrirDoubleAuthentification = () => {
     if (GMAO.deuxFacteursRequis()) return imposerEnrolement();
     if (GMAO.deuxFacteurs && GMAO.deuxFacteurs.actif) return afficherEtatDeuxFacteurs();
-    return enrolerDeuxFacteurs(false).then((active) => { if (active) GMAO.refresh(false).catch(erreur); });
+    return enrolerDeuxFacteurs(false).then((active) => { if (active && GMAO.user) GMAO.refresh(false).catch(erreur); });
   };
 
   function badgeDeuxFacteurs(etat) {
-    if (etat && etat.actif) return frag(ui.badge('Activée', '#16a34a'), etat.activeLe ? el('span', { class: 'texte-2 texte-petit' }, ` depuis le ${ui.formatDate(etat.activeLe)}`) : null);
+    if (etat && etat.actif) return frag(ui.badge('Activée', '#15803d'), etat.activeLe ? el('span', { class: 'texte-2 texte-petit' }, ` depuis le ${ui.formatDate(etat.activeLe)}`) : null);
     if (etat && etat.exige) return ui.badge('Obligatoire, à activer', '#f59e0b');
     return ui.badge('Désactivée', '#6b7280');
   }
@@ -876,7 +925,7 @@
 
   /** Champ de mot de passe ou de code dans un petit formulaire (Entrée = bouton principal de la modale). */
   function formulaireConfirmation(m, avecCode) {
-    const f = ui.form({ colonnes: 1, champs: [
+    const f = ui.form({ colonnes: 1, entreeSoumet: true, champs: [
       { nom: 'motDePasse', label: 'Mot de passe actuel', type: 'mdp', requis: true },
       avecCode ? { nom: 'code', label: 'Code de l\'application ou code de secours', type: 'texte', requis: true, placeholder: '000000' } : null,
     ] });
@@ -890,6 +939,22 @@
     }
     f.el.addEventListener('submit', (ev) => { ev.preventDefault(); const b = m.pied.querySelector('.btn-primaire, .btn-danger'); if (b) b.click(); });
     return f;
+  }
+  /**
+   * Envoi d'un formulaire de confirmation : un refus du serveur (mot de passe ou code incorrect) est affiché sous le
+   * champ concerné, qui reprend le focus ; les autres erreurs remontent (message de la fenêtre).
+   */
+  async function envoyerConfirmation(f, url) {
+    try {
+      return await api.post(url, f.valeurs());
+    } catch (e) {
+      if (e.status !== 400) throw e;
+      const champ = f.controles.code && /code/i.test(e.message) ? 'code' : 'motDePasse';
+      f.erreur(champ, e.message);
+      f.controles[champ].input.select();
+      f.controles[champ].input.focus();
+      return null;
+    }
   }
 
   /** Liste des codes de secours avec impression, téléchargement et copie. */
@@ -905,11 +970,11 @@
         + '<p><button type="button" data-imprimer>Imprimer</button></p>';
       ui.imprimer('Codes de secours — double authentification', html);
     };
+    // Repli par sélection d'ui.copier sur une adresse http (poste client du réseau), comme pour le code de réinitialisation
     const copier = async () => {
-      try { await navigator.clipboard.writeText(texte); toast('Codes copiés dans le presse-papiers', 'succes'); } catch (e) {
-        const sel = window.getSelection(); const r = document.createRange(); r.selectNodeContents(grille); sel.removeAllRanges(); sel.addRange(r);
-        toast('Copie automatique impossible : les codes sont sélectionnés, utilisez Ctrl+C', 'info');
-      }
+      if (await ui.copier(texte)) { toast('Codes copiés dans le presse-papiers', 'succes'); return; }
+      const sel = window.getSelection(); const r = document.createRange(); r.selectNodeContents(grille); sel.removeAllRanges(); sel.addRange(r);
+      toast('Copie automatique impossible : les codes sont sélectionnés, utilisez Ctrl+C', 'info');
     };
     return el('div', { class: 'codes-secours' },
       grille,
@@ -988,6 +1053,9 @@
 
       function etapeCodesSecours(codes) {
         m.setTitre('Codes de secours');
+        // Double authentification déjà active et codes affichés une seule fois : ni croix, ni fond, ni Échap, seulement
+        // « Terminer » après la case « J'ai conservé mes codes » (fenêtre fermée en fin de session, afficherConnexion)
+        m.setFermable(false);
         const cb = el('input', { type: 'checkbox', id: 'f_codes_conserves' });
         corps(
           ui.alerte('La double authentification est activée. Les autres postes connectés avec votre compte ont été déconnectés.', 'ok'),
@@ -1030,7 +1098,10 @@
     m.corps.appendChild(frag(el('p', null, 'Les codes de secours actuels deviendront inutilisables. Confirmez votre identité :'), f.el));
     m.setBoutons([{ label: 'Annuler' }, { label: 'Générer', classe: 'btn-primaire', onClic: async () => {
       if (!f.valider()) return false;
-      const r = await api.post('/api/auth/2fa/codes-secours', f.valeurs());
+      const r = await envoyerConfirmation(f, '/api/auth/2fa/codes-secours');
+      if (!r) return false;
+      // Nouveaux codes affichés une seule fois : fermeture par le bouton seulement
+      m.setFermable(false);
       ui.vider(m.corps);
       m.corps.appendChild(frag(ui.alerte('Nouveaux codes générés : les anciens ne fonctionnent plus. Ils ne seront plus affichés.', 'ok'), blocCodesSecours(r.codesSecours)));
       m.setBoutons([{ label: 'Fermer', classe: 'btn-primaire' }]);
@@ -1048,7 +1119,7 @@
       f.el));
     m.setBoutons([{ label: 'Annuler' }, { label: 'Désactiver', classe: 'btn-danger', onClic: async () => {
       if (!f.valider()) return false;
-      await api.post('/api/auth/2fa/desactiver', f.valeurs());
+      if (!(await envoyerConfirmation(f, '/api/auth/2fa/desactiver'))) return false;
       toast('Double authentification désactivée', 'succes');
       await GMAO.refresh(false); // impose aussitôt un nouvel enrôlement si elle est obligatoire
       return true;
@@ -1058,7 +1129,7 @@
   // ----- Notifications ----------------------------------------------------
   let notifs = { nonLues: 0, notifications: [] };
   async function majNotifications() {
-    if (!GMAO.user || GMAO.changementMdpRequis()) return; // aucune donnée avant le changement de mot de passe imposé
+    if (!GMAO.user || GMAO.ecranImpose()) return; // aucune donnée avant le changement de mot de passe ou l'enrôlement imposé
     try {
       notifs = await api.get('/api/notifications', null, { silent401: true });
       const btn = document.querySelector('.btn-notifs');
@@ -1085,7 +1156,7 @@
         else if (n.lien) GMAO.navigate(n.lien);
       } }, el('div', { class: 'notif-titre' }, n.titre), el('div', { class: 'notif-message' }, n.message), el('div', { class: 'notif-date' }, ui.relatif(n.date))));
     }
-    const menu = el('div', { class: 'menu-deroulant notif-panneau', onclick: (ev) => ev.stopPropagation() },
+    const menu = menuDeroulant('notif-panneau', document.querySelector('.btn-notifs'),
       el('div', { class: 'menu-entete', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } }, el('strong', null, 'Notifications'), notifs.nonLues ? el('button', { class: 'btn btn-lien btn-sm', onclick: async () => { await api.post('/api/notifications/lues', {}); fermerMenus(); majNotifications(); } }, 'Tout marquer lu') : null),
       liste);
     document.querySelector('.btn-notifs').parentNode.appendChild(menu);

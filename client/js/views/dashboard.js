@@ -443,7 +443,7 @@
         el('span', { class: 'pastille', style: { background: COULEURS_ACTION[a.action] || GRIS, margin: '0', flexShrink: '0' } }),
         el('span', { class: 'texte-gras', style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, a.actionLibelle || a.action),
         el('span', { class: 'texte-2', style: { marginLeft: 'auto', whiteSpace: 'nowrap', fontSize: '11.5px' } }, ui.relatif(a.date))),
-      el('div', { style: { fontSize: '13px', fontWeight: '600', color: a.lien ? 'var(--primaire)' : 'var(--texte-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: '3px' } }, cible),
+      el('div', { style: { fontSize: '13px', fontWeight: '600', color: a.lien ? 'var(--lien)' : 'var(--texte-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: '3px' } }, cible),
       el('div', { class: 'texte-2', style: { fontSize: '11.5px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: '1px' } }, joindre([qui || null, a.details || null])));
     })) : vide('Aucune activité récente.', 'horloge');
     return carte('Dernières activités', contenu, {

@@ -346,11 +346,13 @@
     // ----- Éléments graphiques -----------------------------------------------------------------------------
     function evtOt(o, opts = {}) {
       const coul = couleurType(o.typeCode, o.couleur);
+      // Texte blanc ou foncé selon la couleur du type (configurable) : contraste d'au moins 4,5:1
+      const lisible = ui.couleursBadge(coul);
       const n = el('div', {
         class: 'cal-evt', title: infobulleOt(o), dataset: { ot: o.id },
         style: Object.assign({
-          display: 'block', padding: '2px 5px', borderRadius: '4px', marginBottom: '2px', color: '#fff', fontSize: '11px', cursor: 'pointer', lineHeight: 1.45,
-          background: coul, borderLeft: `4px solid ${couleurStatut(o.statut, o.couleurStatut)}`,
+          display: 'block', padding: '2px 5px', borderRadius: '4px', marginBottom: '2px', color: lisible.texte || '#fff', fontSize: '11px', cursor: 'pointer', lineHeight: 1.45,
+          background: lisible.fond, borderLeft: `4px solid ${couleurStatut(o.statut, o.couleurStatut)}`,
           opacity: o.final ? 0.5 : (opts.intervenant ? 0.7 : 1), textDecoration: o.annule ? 'line-through' : '',
           boxShadow: o.enRetard ? `0 0 0 2px ${ROUGE}` : '', outline: opts.intervenant ? '1px dotted rgba(255,255,255,0.9)' : '', outlineOffset: '-3px',
         }, ELLIPSE),
@@ -476,7 +478,7 @@
         const total = heuresDe(items.ot);
         cal.appendChild(el('div', { class: 'cal-entete', style: { textAlign: 'left', padding: '8px 10px', background: estAuj ? 'var(--primaire-clair)' : '' } },
           el('div', { style: FLEX({ justifyContent: 'space-between' }) },
-            el('span', { style: { color: estAuj ? 'var(--primaire)' : 'var(--texte)', fontSize: '13px', cursor: 'pointer' }, title: `Détail du ${libelleJour(jour)}`, onclick: () => ouvrirJour(jour) }, `${JOURS_COURTS[i]} ${jourCourt(jour)}`),
+            el('span', { style: { color: estAuj ? 'var(--lien)' : 'var(--texte)', fontSize: '13px', cursor: 'pointer' }, title: `Détail du ${libelleJour(jour)}`, onclick: () => ouvrirJour(jour) }, `${JOURS_COURTS[i]} ${jourCourt(jour)}`),
             peutCreerOt() ? el('button', { type: 'button', class: 'btn btn-icone btn-sm', style: { padding: '1px' }, title: 'Nouvel OT ce jour', onclick: () => nouvelOt(jour) }, icone('plus')) : null),
           el('div', { style: { fontWeight: 400, fontSize: '11.5px' } },
             items.ot.length ? `${pluriel(items.ot.length, 'OT', 'OT')} · ${duree(total)}` : 'Aucun OT',

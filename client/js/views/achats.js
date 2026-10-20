@@ -72,7 +72,7 @@
 .ach-etape .ach-puce { width: 24px; height: 24px; border-radius: 50%; border: 2px solid var(--bordure-2); display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 11px; background: var(--surface); flex-shrink: 0; }
 .ach-etape .ach-puce svg { width: 13px; height: 13px; }
 .ach-etape.faite .ach-puce { background: var(--ok); border-color: var(--ok); color: #fff; }
-.ach-etape.courante .ach-puce { border-color: var(--primaire); color: var(--primaire); box-shadow: 0 0 0 3px var(--primaire-clair); }
+.ach-etape.courante .ach-puce { border-color: var(--primaire); color: var(--lien); box-shadow: 0 0 0 3px var(--primaire-clair); }
 .ach-etape.courante { color: var(--texte); font-weight: 600; }
 .ach-etape.echec .ach-puce { background: var(--danger); border-color: var(--danger); color: #fff; }
 .ach-etape.echec { color: var(--danger); font-weight: 600; }

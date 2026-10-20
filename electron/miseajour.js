@@ -19,16 +19,21 @@
  *  2. Version publiée strictement supérieure à la version installée : aucun retour à une version
  *     antérieure, même signée.
  *  3. Source GitHub : manifeste et installateur téléchargés en HTTPS depuis les seuls hôtes de GitHub,
- *     y compris après redirection (lorsque l'implémentation de fetch expose l'adresse finale).
+ *     y compris après redirection : chaque redirection est contrôlée avant d'être suivie (creerFetchControle,
+ *     utilisé par l'application de bureau) ou, à défaut, l'adresse finale de la réponse ; une réponse dont
+ *     l'adresse finale est inconnue est refusée.
  *  4. Taille et empreinte SHA-256 de l'installateur conformes au manifeste.
  * Sans clé publique configurée, seuls la version, la taille et l'empreinte SHA-256 publiées dans le
  * manifeste sont contrôlées (comportement historique).
  *
- * `fetch` est injectable (net.fetch d'Electron en production — proxy système —, fetch de Node en test).
+ * `fetch` est injectable : creerFetchControle(net.request) d'Electron en production (proxy système), fetch
+ * de Node en test. net.fetch d'Electron ne convient pas : il suit les redirections sans exposer l'adresse
+ * finale (Response.url toujours vide), ce qui empêcherait tout contrôle des hôtes.
  */
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { Readable } = require('stream');
 
 const ALGORITHME = 'ed25519';
 /** Champs du manifeste couverts par la signature, dans l'ordre canonique (tri alphabétique). */
@@ -46,6 +51,9 @@ const LONGUEUR_MAX_NOTES = 20000;
 const NB_MAX_CLES = 5;
 const DELAI_REQUETE_MS = 60 * 1000;
 const DELAI_INACTIVITE_MS = 2 * 60 * 1000;
+const REDIRECTIONS_MAX = 10;
+const MSG_ADRESSE_FINALE_INCONNUE = 'Mise à jour refusée : l\'adresse finale de la réponse est inconnue (implémentation réseau '
+  + 'qui ne permet pas de contrôler les redirections). Prévenez le pôle informatique.';
 
 const MSG_CLE_INVALIDE = 'Clé publique de mise à jour invalide (package.json › gmao.clePubliqueMaj) : clé Ed25519 attendue, '
   + 'au format SPKI encodé en base64 ou PEM « PUBLIC KEY ». Les mises à jour sont bloquées tant qu\'elle n\'est pas corrigée.';
@@ -230,16 +238,101 @@ function controlerAdresse(adresse, hotes) {
   return u.toString();
 }
 
-/** Contrôle l'adresse finale d'une réponse (après redirections), si fetch l'expose. */
-function controlerAdresseFinale(r, hotes) {
+function annulerCorps(r) {
+  try { if (r && r.body && typeof r.body.cancel === 'function') r.body.cancel().catch(() => {}); } catch (x) { /* ignore */ }
+}
+
+/**
+ * Contrôle l'adresse finale d'une réponse (après redirections). Une adresse inconnue n'est admise que si
+ * l'implémentation de fetch a contrôlé chaque redirection elle-même (`sautsControles`) ; sinon, refus.
+ */
+function controlerAdresseFinale(r, hotes, sautsControles) {
   const finale = r && typeof r.url === 'string' ? r.url : '';
-  if (!finale) return;
+  if (!finale) {
+    if (sautsControles) return;
+    annulerCorps(r);
+    throw new Error(MSG_ADRESSE_FINALE_INCONNUE);
+  }
   try {
     controlerAdresse(finale, hotes);
   } catch (e) {
-    try { if (r.body && typeof r.body.cancel === 'function') r.body.cancel().catch(() => {}); } catch (x) { /* ignore */ }
+    annulerCorps(r);
     throw new Error(`Redirection refusée : ${e.message}`);
   }
+}
+
+function raisonAbandon(signal) {
+  return (signal && signal.reason) || Object.assign(new Error('Requête interrompue'), { name: 'AbortError' });
+}
+
+/**
+ * fetch construit sur net.request d'Electron (ou une fonction de même contrat) avec `redirect: 'manual'` :
+ * chaque redirection est soumise à `options.controlerRedirection(adresse)` avant d'être suivie (une
+ * exception l'interrompt), et la réponse porte l'adresse finale (`url`). Contrat de net.request : événement
+ * « redirect » (statut, méthode, adresse) pendant lequel followRedirect() doit être appelé de façon
+ * synchrone pour suivre, événements « response » (IncomingMessage) et « error », abort().
+ * @param {(options: object) => object} requeteNet
+ * @returns {Function} fetch(adresse, { method, headers, signal, controlerRedirection }) → Promise<Response>
+ */
+function creerFetchControle(requeteNet, { redirectionsMax = REDIRECTIONS_MAX } = {}) {
+  const fetchControle = (adresse, options = {}) => new Promise((resolve, reject) => {
+    const signal = options.signal;
+    if (signal && signal.aborted) { reject(raisonAbandon(signal)); return; }
+    const methode = String(options.method || 'GET').toUpperCase();
+    let finale = String(adresse);
+    let redirections = 0;
+    let termine = false;
+    let reponse = null;
+    let req;
+    const surAbandon = () => {
+      const e = raisonAbandon(signal);
+      try { req.abort(); } catch (x) { /* ignore */ }
+      if (reponse) { try { reponse.destroy(e); } catch (x) { /* ignore */ } }
+      if (!termine) { termine = true; reject(e); }
+    };
+    const echec = (e) => {
+      if (termine) return;
+      termine = true;
+      if (signal) signal.removeEventListener('abort', surAbandon);
+      reject(e);
+    };
+    try {
+      req = requeteNet({ method: methode, url: finale, redirect: 'manual' });
+      for (const [k, v] of Object.entries(options.headers || {})) req.setHeader(k, v);
+    } catch (e) { reject(e); return; }
+    if (signal) signal.addEventListener('abort', surAbandon, { once: true });
+    req.on('redirect', (statut, nouvelleMethode, suivante) => {
+      try {
+        redirections += 1;
+        if (redirections > redirectionsMax) throw new Error('Téléchargement refusé : trop de redirections');
+        const cible = new URL(String(suivante), finale).toString();
+        if (typeof options.controlerRedirection === 'function') options.controlerRedirection(cible);
+        finale = cible;
+        req.followRedirect();
+      } catch (e) {
+        // Redirection non suivie : la requête est interrompue avant toute connexion à l'adresse refusée
+        echec(e);
+        try { req.abort(); } catch (x) { /* ignore */ }
+      }
+    });
+    req.on('response', (resp) => {
+      if (termine) { try { resp.destroy(); } catch (x) { /* ignore */ } return; }
+      reponse = resp;
+      try {
+        const headers = new Headers();
+        for (const [k, v] of Object.entries(resp.headers || {})) headers.set(k, Array.isArray(v) ? v.join(', ') : String(v));
+        const sansCorps = [101, 204, 205, 304].includes(resp.statusCode) || methode === 'HEAD';
+        const r = new Response(sansCorps ? null : Readable.toWeb(resp), { status: resp.statusCode, statusText: resp.statusMessage || '', headers });
+        Object.defineProperty(r, 'url', { value: finale });
+        termine = true;
+        resolve(r);
+      } catch (e) { echec(e); }
+    });
+    req.on('error', (e) => echec(e));
+    req.end();
+  });
+  fetchControle.redirectionsControlees = true;
+  return fetchControle;
 }
 
 /** Lit le corps d'une réponse en texte, sans dépasser `max` octets. */
@@ -303,16 +396,23 @@ function delai(ms) {
 function creerGestionnaire(o) {
   const fetchFn = o.fetch || (typeof fetch === 'function' ? fetch : null);
   if (!fetchFn) throw new Error('fetch indisponible');
+  // Implémentation qui contrôle elle-même chaque redirection (creerFetchControle)
+  const sautsControles = fetchFn.redirectionsControlees === true;
   const ua = o.agent || 'GMAO-SICAF-Bureau';
   const cles = chargerClesPubliques(o.clePublique !== undefined ? o.clePublique : clePubliqueParDefaut());
   const signatureExigee = cles.length > 0;
   const source = (o.config || {}).source;
   const sourceGithub = !['dossier', 'url', 'aucune'].includes(source);
 
-  async function requete(url, options) {
+  /** Requête ; `hotes` : hôtes admis pour chaque redirection (source GitHub), contrôlés avant de la suivre. */
+  async function requete(url, options, hotes) {
+    const o2 = hotes ? Object.assign({}, options, { controlerRedirection: (u) => {
+      try { controlerAdresse(u, hotes); } catch (e) { throw new Error(`Redirection refusée : ${e.message}`); }
+    } }) : options;
     try {
-      return await fetchFn(url, options);
+      return await fetchFn(url, o2);
     } catch (e) {
+      if (e && /^Redirection refusée/.test(e.message || '')) throw e;
       if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) throw new Error(`Délai dépassé pour ${hoteDe(url)}`);
       throw new Error(`Connexion impossible à ${hoteDe(url)}${e && e.message ? ` (${e.message})` : ''}`);
     }
@@ -322,8 +422,8 @@ function creerGestionnaire(o) {
     const r = await requete(url, {
       headers: { 'User-Agent': ua, Accept: 'application/vnd.github+json, application/json' },
       signal: delai(DELAI_REQUETE_MS),
-    });
-    if (hotes) controlerAdresseFinale(r, hotes);
+    }, hotes);
+    if (hotes) controlerAdresseFinale(r, hotes, sautsControles);
     if (!r.ok) throw new Error(`Réponse ${r.status} de ${hoteDe(url)}`);
     return analyserJson(await lireTexte(r, TAILLE_MAX_JSON), hoteDe(url));
   }
@@ -391,8 +491,8 @@ function creerGestionnaire(o) {
     rearmer();
     let sortie = null;
     try {
-      const r = await requete(adresse, { headers: { 'User-Agent': ua }, signal: ctrl.signal });
-      if (sourceGithub) controlerAdresseFinale(r, HOTES_TELECHARGEMENT_GITHUB);
+      const r = await requete(adresse, { headers: { 'User-Agent': ua }, signal: ctrl.signal }, sourceGithub ? HOTES_TELECHARGEMENT_GITHUB : null);
+      if (sourceGithub) controlerAdresseFinale(r, HOTES_TELECHARGEMENT_GITHUB, sautsControles);
       if (!r.ok || !r.body) throw new Error(`Téléchargement impossible (réponse ${r.status})`);
       const annonce = Number(r.headers.get('content-length')) || 0;
       if (annonce > limite) throw new Error('Mise à jour refusée : installateur plus volumineux qu\'annoncé dans le manifeste');
@@ -467,6 +567,6 @@ function creerGestionnaire(o) {
 module.exports = {
   creerGestionnaire, comparerVersions, validerManifeste, sha256Fichier, nomSur,
   contenuSigne, verifierSignature, controlerManifeste, chargerClesPubliques, empreinteClePublique,
-  clePubliqueIntegree, controlerAdresse,
+  clePubliqueIntegree, controlerAdresse, creerFetchControle,
   ALGORITHME, CHAMPS_SIGNES, HOTES_TELECHARGEMENT_GITHUB,
 };

@@ -99,9 +99,8 @@
   }
   function celluleEcheance(p) {
     const type = (p.periodicite || {}).type;
-    const coul = (ETATS[p.etat] || ETATS.a_jour).couleur;
     return el('div', { style: { minWidth: '120px' } },
-      el('div', { class: 'inline', style: { flexWrap: 'wrap', gap: '4px 6px' } }, el('span', { class: 'texte-gras', style: p.etat === 'en_retard' ? { color: coul } : null }, valeurEcheance(p.periodicite, p.echeance, p.uniteCompteur)), badgeEtat(p.etat)),
+      el('div', { class: 'inline', style: { flexWrap: 'wrap', gap: '4px 6px' } }, el('span', { class: 'texte-gras' + (p.etat === 'en_retard' ? ' texte-danger' : '') }, valeurEcheance(p.periodicite, p.echeance, p.uniteCompteur)), badgeEtat(p.etat)),
       el('div', { class: 'cellule-secondaire' }, texteRestant(p), type === 'compteur' && p.echeanceEstimee ? el('span', { title: 'Date estimée d\'après le rythme d\'utilisation de l\'équipement' }, ' (estimée)') : null));
   }
 

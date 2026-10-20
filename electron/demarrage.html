@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-50qfEYeXBApoET7Eje/+cfcY1nZAFkhK2CCq+yeBuDA='; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-Bs/GqkMNHs/z74+Uq0ZB+kLNId6/fC9UXTc1xZpW9nE='; base-uri 'none'; form-action 'none'">
   <title>GMAO SICAF — Paramètres de connexion</title>
   <style>
     :root { --primaire: #2563eb; --fond: #0f172a; --carte: #ffffff; --texte: #111827; --texte2: #6b7280; --bordure: #e5e7eb; --ok: #15803d; --danger: #b91c1c; --alerte: #b45309; }
@@ -211,6 +211,20 @@
     }
     const vider = (n) => { while (n.firstChild) n.removeChild(n.firstChild); };
 
+    /**
+     * Texte d'une erreur à afficher : sans le préfixe technique ajouté par Electron aux refus du processus
+     * principal (« Error invoking remote method '…': Error: »), qui envoie déjà des messages en français.
+     */
+    function texteErreur(e) {
+      let t = String((e && e.message) || e || '').trim();
+      let type = e && typeof e.name === 'string' ? e.name : 'Error';
+      const m = /^Error invoking remote method '[^']*':\s*(?:([A-Za-z]*Error):\s*)?([\s\S]*)$/.exec(t);
+      if (m) { type = m[1] || 'Error'; t = m[2].trim(); }
+      // Erreur technique inattendue (TypeError…) : jamais affichée telle quelle
+      if (!t || type !== 'Error' || /^[A-Za-z]*Error\b/.test(t)) return 'Opération impossible. Réessayez ; si le problème persiste, prévenez le pôle informatique.';
+      return t;
+    }
+
     /** Empreinte affichée en deux lignes de 16 octets pour faciliter la comparaison. */
     function blocEmpreinte(fp) {
       const octets = String(fp || '').split(':');
@@ -329,7 +343,7 @@
         return t;
       } catch (e) {
         dernierTest = null;
-        r.className = 'resultat ko'; r.textContent = e.message || String(e);
+        r.className = 'resultat ko'; r.textContent = texteErreur(e);
         return null;
       } finally { bouton.disabled = false; }
     }
@@ -361,7 +375,7 @@
     ['opt-serveur', 'opt-client'].forEach((id) => $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choisir(id === 'opt-client' ? 'client' : 'serveur'); } }));
     $('partage').addEventListener('change', majInfosPartage);
     $('port').addEventListener('input', majInfosPartage);
-    $('btn-dossier').addEventListener('click', async () => { try { const d = await B.choisirDossier(); if (d) $('dossier').value = d; } catch (e) { erreur(e.message || String(e)); } });
+    $('btn-dossier').addEventListener('click', async () => { try { const d = await B.choisirDossier(); if (d) $('dossier').value = d; } catch (e) { erreur(texteErreur(e)); } });
     $('btn-tester').addEventListener('click', () => { tester(); });
     $('url').addEventListener('keydown', (e) => { if (e.key === 'Enter') tester(); });
     $('url').addEventListener('input', () => { dernierTest = null; $('resultat-test').textContent = ''; vider($('bloc-certificat')); $('bloc-certificat').className = 'masque'; $('empreinte-confirmee').classList.add('masque'); });
@@ -375,19 +389,38 @@
     }
     $('maj-source').addEventListener('change', majSourceAffichage);
     $('btn-quitter').addEventListener('click', () => B.quitter());
-    $('btn-reessayer').addEventListener('click', () => B.reessayer());
+    $('btn-reessayer').addEventListener('click', async () => {
+      const bouton = $('btn-reessayer');
+      if (bouton.disabled) return;
+      const libelle = bouton.textContent;
+      bouton.disabled = true; bouton.textContent = 'Ouverture…';
+      try {
+        // En cas de nouvel échec, la page est rechargée avec la nouvelle cause
+        await B.reessayer();
+      } catch (e) {
+        erreur(texteErreur(e));
+      } finally { bouton.disabled = false; bouton.textContent = libelle; }
+    });
     $('btn-deverrouiller').addEventListener('click', deverrouiller);
-    $('code').addEventListener('keydown', (e) => { if (e.key === 'Enter') deverrouiller(); });
+    $('code').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); deverrouiller(); } });
 
     async function deverrouiller() {
-      const bouton = $('btn-deverrouiller'); bouton.disabled = true;
+      const bouton = $('btn-deverrouiller');
+      const champ = $('code');
+      // Un essai à la fois (touche Entrée maintenue, double-clic) ; une saisie vide n'est jamais envoyée
+      if (bouton.disabled) return;
+      if (!champ.value) { $('resultat-code').textContent = 'Saisissez le code du pôle informatique'; champ.focus(); return; }
+      bouton.disabled = true; champ.disabled = true;
+      $('resultat-code').textContent = '';
       try {
-        const r = await B.deverrouiller($('code').value);
-        if (!r.ok) { $('resultat-code').textContent = r.message || 'Code incorrect'; $('code').select(); return; }
-        $('code').value = '';
+        const r = await B.deverrouiller(champ.value);
+        if (!r || !r.ok) { $('resultat-code').textContent = (r && r.message) || 'Code incorrect'; champ.disabled = false; champ.select(); return; }
+        champ.value = '';
         $('resultat-code').textContent = '';
         await charger();
-      } finally { bouton.disabled = false; }
+      } catch (e) {
+        $('resultat-code').textContent = texteErreur(e);
+      } finally { bouton.disabled = false; champ.disabled = false; }
     }
 
     $('btn-valider').addEventListener('click', async () => {
@@ -417,7 +450,7 @@
           throw Object.assign(new Error((r && r.message) || 'Enregistrement impossible'), { securite: !!(r && (r.usurpation || r.declassement)) });
         }
       } catch (e) {
-        erreur(e.message || String(e), !!e.securite);
+        erreur(texteErreur(e), !!e.securite);
         btn.disabled = false; btn.textContent = libelle;
       }
     });
@@ -499,7 +532,7 @@
         resultat.textContent = '';
         await chargerComptes();
       } catch (e) {
-        resultat.className = 'resultat ko'; resultat.textContent = e.message || String(e);
+        resultat.className = 'resultat ko'; resultat.textContent = texteErreur(e);
       } finally { bouton.disabled = false; $('rec-code').disabled = false; }
     }
 
@@ -530,7 +563,7 @@
         if (!r || !r.ok) { if (r && r.verrouille) retourCode(r.message); else resultat.textContent = (r && r.message) || 'Génération du code impossible'; return; }
         afficherCode(r);
       } catch (e) {
-        resultat.textContent = e.message || String(e);
+        resultat.textContent = texteErreur(e);
       } finally { bouton.disabled = false; }
     }
 
@@ -581,11 +614,16 @@
       const securite = q.get('alerte') === 'securite';
       if (q.get('erreur')) {
         erreur(q.get('erreur'), securite);
+        // Serveur de ce poste toujours en service : seule la fenêtre de la GMAO est à rouvrir
+        if (q.get('reprise') === 'rouvrir') {
+          $('btn-reessayer').textContent = 'Rouvrir la GMAO';
+          $('aide-reessayer').textContent = 'Le serveur GMAO de ce poste fonctionne toujours : seule la fenêtre de l\'application s\'est fermée.';
+        }
         if (securite) $('aide-reessayer').textContent = 'Ne vous connectez pas tant que le pôle informatique n\'a pas vérifié le poste serveur.';
         $('bloc-reessayer').classList.remove('masque');
       }
       await charger();
-    })().catch((e) => erreur(e.message || String(e)));
+    })().catch((e) => erreur(texteErreur(e)));
   })();
   </script>
 </body>

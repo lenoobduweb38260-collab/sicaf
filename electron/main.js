@@ -18,11 +18,12 @@
  *   est téléchargé, vérifié (SHA-256) puis installé en silence, et l'application redémarre.
  */
 const { app, BrowserWindow, Menu, Tray, shell, dialog, ipcMain, nativeImage, Notification, net, session, clipboard } = require('electron');
+const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 const { Parametres, normaliserUrl } = require('./parametres');
-const { creerGestionnaire } = require('./miseajour');
+const { creerGestionnaire, creerFetchControle } = require('./miseajour');
 const { hashPassword, verifyPassword } = require('../server/auth');
 const tlsGmao = require('../server/tls');
 
@@ -48,7 +49,11 @@ const MESSAGE_NON_CHIFFRE = 'Les mots de passe et les données circulent en clai
   + 'Mettez à jour l\'application sur le poste serveur et activez le partage réseau pour bénéficier du chiffrement.';
 
 let parametres = null;
-let serveur = null;        // application GMAO intégrée (mode serveur)
+let serveur = null;        // application GMAO intégrée en service (mode serveur)
+const serveursVivants = new Set(); // instances créées et pas encore arrêtées : toutes sont arrêtées avant une relance
+let fileArret = Promise.resolve(); // arrêts du serveur intégré, traités un par un
+let fileLancement = Promise.resolve(false); // démarrages (lancer), traités un par un
+let lancementsEnCours = 0;
 let ecoute = null;         // écoute réseau du serveur partagé (HTTPS + redirection des requêtes HTTP)
 let certificatLocal = null; // certificat du serveur intégré partagé { empreinte, empreinteCle, … }
 let epinglage = null;      // { hote, empreinte, empreinteCle } : seul certificat accepté pour ce nom d'hôte
@@ -61,6 +66,7 @@ let quitter = false;
 let infoBulleMontree = false;
 let majEnCours = false;
 let minuterieMaj = null;
+let premiereVerificationMaj = null;
 let modeAssistant = 'parametres'; // 'parametres' | 'recuperation' (récupération d'urgence d'un compte)
 let assistantDeverrouille = false; // code du pôle informatique saisi pour la fenêtre de paramètres ouverte
 let recuperationDeverrouillee = null; // { fenetre, jusqua } : code saisi dans la fenêtre de récupération ouverte
@@ -120,51 +126,196 @@ function empreinteAffichee() {
   return epinglage ? epinglage.empreinte : '';
 }
 
+// ----- Messages d'erreur affichés au pôle informatique ---------------------------------------
+
+/** Erreur dont le message, rédigé pour le pôle informatique, peut être affiché tel quel. */
+function erreurPoste(message, cause) {
+  const e = new Error(message);
+  e.messagePoste = message;
+  if (cause) e.cause = cause;
+  return e;
+}
+
+const RAISONS_SYSTEME = {
+  EACCES: 'accès refusé', EPERM: 'opération refusée par Windows', ENOENT: 'chemin introuvable',
+  ENOTDIR: 'un élément du chemin n\'est pas un dossier', EISDIR: 'un dossier porte le nom d\'un fichier attendu',
+  EROFS: 'support en lecture seule', EBUSY: 'fichier utilisé par un autre programme', ENOSPC: 'disque plein',
+  EIO: 'erreur de lecture ou d\'écriture du disque', EEXIST: 'un fichier du même nom existe déjà',
+};
+
+/** Échec de l'écoute réseau du serveur intégré (code Node.js) → message français. */
+function erreurEcoute(e, port) {
+  const code = e && e.code;
+  if (code === 'EADDRINUSE') return erreurPoste(`Le port ${port} est déjà utilisé sur ce poste par un autre programme. Choisissez un autre port dans les paramètres de connexion.`, e);
+  if (code === 'EACCES' || code === 'EPERM') return erreurPoste(`Le port ${port} est réservé par Windows ou bloqué sur ce poste. Choisissez un autre port dans les paramètres de connexion.`, e);
+  if (code === 'EADDRNOTAVAIL') return erreurPoste('L\'adresse réseau de ce poste n\'est pas disponible : vérifiez sa connexion au réseau, puis réessayez.', e);
+  return erreurPoste(`Le serveur GMAO n'a pas pu écouter sur le port ${port}${/^[A-Z0-9_]{2,40}$/.test(code || '') ? ` (code ${code})` : ''}. Choisissez un autre port dans les paramètres de connexion.`, e);
+}
+
+/** Échec d'accès au dossier des données (création, lecture, écriture) → message français. */
+function erreurDonnees(e, dossier) {
+  if (e && e.messagePoste) return e;
+  const code = e && typeof e.code === 'string' ? e.code : '';
+  if (!/^E[A-Z]+$/.test(code)) return e; // erreur de la GMAO (texte français) ou erreur inattendue : voir messageDemarrage
+  return erreurPoste(`Le dossier des données « ${dossier} » n'est pas accessible (${RAISONS_SYSTEME[code] || `code ${code}`}). `
+    + 'Vérifiez que le lecteur ou le partage réseau est disponible et que la session Windows peut y écrire, ou choisissez un autre dossier dans les paramètres de connexion.', e);
+}
+
+/** Message affiché dans l'assistant pour un démarrage manqué : jamais de texte technique brut. */
+function messageDemarrage(e) {
+  if (e && e.messagePoste) return e.messagePoste;
+  // Erreur levée par la GMAO elle-même (message rédigé en français, sans code système)
+  if (e && Object.getPrototypeOf(e) === Error.prototype && !e.code && typeof e.message === 'string' && e.message) return e.message.slice(0, 500);
+  const code = e && typeof e.code === 'string' && /^[A-Z0-9_]{2,40}$/.test(e.code) ? ` (code ${e.code})` : '';
+  return `La GMAO n'a pas pu démarrer${code}. Réessayez ; si le problème persiste, prévenez le pôle informatique.`;
+}
+
+/** Échec de chargement d'une page par Chromium (code d'erreur réseau négatif) → message français. */
+function messageEchecChargement(code) {
+  const n = Number(code);
+  let cause = 'la page n\'a pas pu être chargée';
+  if (n <= -1 && n > -100) cause = 'le chargement a été interrompu (réseau du poste modifié, délai dépassé ou incident local)';
+  else if (n <= -100 && n > -200) cause = 'la connexion au serveur GMAO a été interrompue ou refusée';
+  else if (n <= -300 && n > -400) cause = 'le serveur GMAO a renvoyé une réponse vide ou invalide';
+  else if (n <= -800 && n > -900) cause = 'le nom du serveur GMAO est introuvable sur le réseau';
+  return `Impossible d'ouvrir la GMAO : ${cause}${Number.isInteger(n) ? ` (code ${n})` : ''}.`;
+}
+
 // ----- Serveur intégré -------------------------------------------------------------------
-async function demarrerServeur() {
+
+/** Crée une instance du serveur GMAO ; elle reste suivie jusqu'à son arrêt (jamais deux instances sur la même base). */
+function creerInstance(options) {
   const { createApp } = require('../server/server');
+  let s;
+  try {
+    s = createApp(options);
+  } catch (e) {
+    throw erreurDonnees(e, options.dataDir);
+  }
+  serveursVivants.add(s);
+  return s;
+}
+
+/** Arrête une instance : minuteurs des modules, écriture des données en attente, fermeture de l'écoute. */
+async function arreterInstance(s) {
+  serveursVivants.delete(s);
+  if (serveur === s) serveur = null;
+  try { await s.stop(); } catch (e) { journal('Arrêt du serveur GMAO :', e && e.message ? e.message : e); }
+}
+
+async function demarrerServeur() {
   const p = parametres.valeurs.serveur;
+  const dossier = dossierDonnees();
+  // Les variables globales (serveur, écoute, certificat, adresse) ne sont affectées qu'après une écoute réussie
   if (p.partageReseau) {
     // Partage réseau : HTTPS obligatoire, certificat du poste créé ou renouvelé automatiquement
-    certificatLocal = tlsGmao.chargerOuCreer(dossierDonnees(), { log: journal });
-    serveur = createApp({ dataDir: dossierDonnees(), log: journal, bureau: true, tls: { key: certificatLocal.cle, cert: certificatLocal.certificat } });
+    const clePrecedente = parametres.valeurs.certificatServeur.empreinteCle || empreinteCleEnPlace(dossier);
+    let certificat;
     try {
-      ecoute = await tlsGmao.ecouterMixte(serveur.server, p.port, '0.0.0.0');
+      certificat = tlsGmao.chargerOuCreer(dossier, { log: journal });
     } catch (e) {
-      try { await serveur.stop(); } catch (x) { /* ignore */ }
-      serveur = null;
-      if (e && e.code === 'EADDRINUSE') throw new Error(`Le port ${p.port} est déjà utilisé sur ce poste. Choisissez un autre port dans les paramètres de connexion.`);
-      throw e;
+      throw erreurDonnees(e, dossier);
     }
-    epinglage = { hote: '127.0.0.1', empreinte: certificatLocal.empreinte, empreinteCle: certificatLocal.empreinteCle };
-    urlApplication = `https://127.0.0.1:${ecoute.adresse.port}/`;
-    journal('Serveur GMAO démarré en HTTPS (partage réseau)', urlApplication, 'empreinte du certificat :', certificatLocal.empreinte, 'données :', dossierDonnees());
+    const s = creerInstance({ dataDir: dossier, log: journal, bureau: true, tls: { key: certificat.cle, cert: certificat.certificat } });
+    let e2;
+    try {
+      e2 = await tlsGmao.ecouterMixte(s.server, p.port, '0.0.0.0');
+    } catch (e) {
+      await arreterInstance(s);
+      throw erreurEcoute(e, p.port);
+    }
+    serveur = s;
+    ecoute = e2;
+    certificatLocal = certificat;
+    epinglage = { hote: '127.0.0.1', empreinte: certificat.empreinte, empreinteCle: certificat.empreinteCle };
+    urlApplication = `https://127.0.0.1:${e2.adresse.port}/`;
+    journal('Serveur GMAO démarré en HTTPS (partage réseau)', urlApplication, 'empreinte du certificat :', certificat.empreinte, 'données :', dossier);
+    suivreCertificat(certificat, clePrecedente);
     return urlApplication;
   }
   // Poste seul : écoute sur 127.0.0.1 uniquement, aucun trafic réseau à protéger
-  certificatLocal = null;
-  epinglage = null;
-  serveur = createApp({ dataDir: dossierDonnees(), log: journal, bureau: true });
+  const s = creerInstance({ dataDir: dossier, log: journal, bureau: true });
   let addr;
   try {
-    addr = await serveur.start(p.port, '127.0.0.1');
+    try {
+      addr = await s.start(p.port, '127.0.0.1');
+    } catch (e) {
+      if (!(e && e.code === 'EADDRINUSE')) throw e;
+      addr = await s.start(0, '127.0.0.1'); // n'importe quel port libre convient
+    }
   } catch (e) {
-    if (e && e.code === 'EADDRINUSE') addr = await serveur.start(0, '127.0.0.1'); // n'importe quel port libre convient
-    else throw e;
+    // Instance jamais à l'écoute : arrêtée (minuteurs, base) avant de signaler l'échec
+    await arreterInstance(s);
+    throw erreurEcoute(e, p.port);
   }
+  serveur = s;
   urlApplication = `http://127.0.0.1:${addr.port}/`;
-  journal('Serveur GMAO démarré', urlApplication, 'données :', dossierDonnees());
+  journal('Serveur GMAO démarré', urlApplication, 'données :', dossier);
   return urlApplication;
 }
 
-async function arreterServeur() {
-  if (ecoute) {
-    try { await ecoute.fermer(); } catch (e) { /* ignore */ }
+/** Arrête l'écoute réseau et toutes les instances du serveur intégré encore en service. */
+function arreterServeur() {
+  const arret = fileArret.then(async () => {
+    const e = ecoute;
     ecoute = null;
+    serveur = null;
+    certificatLocal = null;
+    if (parametres && parametres.valeurs.mode === 'serveur') epinglage = null;
+    urlApplication = '';
+    if (e) { try { await e.fermer(); } catch (x) { /* ignore */ } }
+    for (const s of [...serveursVivants]) await arreterInstance(s);
+  });
+  fileArret = arret.catch(() => {});
+  return arret;
+}
+
+/** Serveur intégré démarré et à l'écoute (mode serveur). */
+function serveurEnService() {
+  return !!parametres && parametres.valeurs.mode === 'serveur' && !!serveur && !!urlApplication;
+}
+
+// ----- Certificat du serveur partagé : renouvellement et changement de clé ------------------------
+
+/** Empreinte de clé du certificat présent dans le dossier des données, avant tout renouvellement ('' si aucun). */
+function empreinteCleEnPlace(dossier) {
+  try { return tlsGmao.empreinteCle(fs.readFileSync(path.join(dossier, 'tls', 'certificat.pem'), 'utf8')); } catch (e) { return ''; }
+}
+
+const CAUSES_NOUVELLE_CLE = {
+  'première génération': 'fichier de la clé privée absent',
+  'clé privée illisible': 'fichier de la clé privée illisible ou corrompu',
+  'type de clé non pris en charge': 'type de clé privée non pris en charge',
+};
+
+/**
+ * Signale au pôle informatique un certificat recréé. Un renouvellement qui conserve la clé est seulement
+ * inscrit au journal d'activité (les postes clients le reconnaissent par l'empreinte de sa clé) ; une
+ * nouvelle clé bloque tous les postes clients épinglés jusqu'à la confirmation de la nouvelle empreinte :
+ * elle est journalisée, notifiée (droit Système › Modifier) et annoncée sur ce poste.
+ * @param {{ empreinte: string, empreinteCle: string, regenere: boolean, raison: string }} c
+ * @param {string} precedente  empreinte de clé connue avant ce démarrage ('' au premier partage)
+ */
+function suivreCertificat(c, precedente) {
+  const cleChangee = !!precedente && !tlsGmao.empreintesEgales(precedente, c.empreinteCle);
+  if (cleChangee) {
+    const cause = c.regenere ? (CAUSES_NOUVELLE_CLE[c.raison] || c.raison) : 'fichiers du certificat remplacés ou dossier des données changé';
+    const message = `La clé du certificat HTTPS de ce poste serveur a changé (${cause}). Chaque poste client bloque la connexion `
+      + `(alerte d'usurpation) tant que le pôle informatique n'a pas confirmé la nouvelle empreinte : ${c.empreinte}. `
+      + 'Si personne n\'a réinstallé le poste serveur ni changé le dossier des données, vérifiez le dossier « tls » des données.';
+    journal('Attention : nouvelle clé pour le certificat du serveur partagé', cause, c.empreinte);
+    journaliserPoste('renouvellement', message, { titre: 'Clé du certificat du serveur GMAO changée', message, lien: '#/audit?action=renouvellement' }, { entite: 'systeme', toujours: true });
+    try {
+      if (Notification.isSupported()) new Notification({ title: NOM, body: 'La clé du certificat du serveur a changé : les postes clients doivent confirmer la nouvelle empreinte (Empreinte du certificat…).', icon: ICONE }).show();
+    } catch (e) { /* notification facultative */ }
+  } else if (c.regenere) {
+    journaliserPoste('renouvellement', precedente
+      ? `Certificat HTTPS du poste serveur renouvelé (${c.raison}), clé conservée : les postes clients le reconnaissent sans nouvelle confirmation. Empreinte : ${c.empreinte}`
+      : `Certificat HTTPS du poste serveur créé (${c.raison}). Empreinte à confirmer sur chaque poste client : ${c.empreinte}`, null, { entite: 'systeme' });
   }
-  if (!serveur) return;
-  try { await serveur.stop(); } catch (e) { /* ignore */ }
-  serveur = null;
+  if (!tlsGmao.empreintesEgales(parametres.valeurs.certificatServeur.empreinteCle, c.empreinteCle)) {
+    try { parametres.enregistrer({ certificatServeur: { empreinteCle: c.empreinteCle } }); } catch (e) { journal('Paramètres du poste non enregistrés :', e.message); }
+  }
 }
 
 // ----- Connexion à un serveur distant (mode client) -------------------------------------------
@@ -291,60 +442,78 @@ function origineAutorisee(url) {
   try { return !!urlApplication && new URL(url).origin === new URL(urlApplication).origin; } catch (e) { return false; }
 }
 
-function creerFenetrePrincipale(url) {
+/**
+ * @param {string} url
+ * @param {{ cachee?: boolean }} [options]  cachee : démarrage avec Windows (--cache), fenêtre gardée masquée
+ */
+function creerFenetrePrincipale(url, { cachee = false } = {}) {
   const f = parametres.valeurs.fenetre;
-  fenetre = new BrowserWindow({
+  const fen = new BrowserWindow({
     width: f.largeur, height: f.hauteur, minWidth: 1000, minHeight: 650, show: false,
     title: NOM, icon: ICONE, autoHideMenuBar: true, backgroundColor: '#f3f4f6',
     // plugins : lecteur PDF intégré (aperçu des factures et documents dans la GMAO)
     webPreferences: { preload: PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true, spellcheck: true, plugins: true },
   });
-  if (f.maximisee) fenetre.maximize();
-  fenetre.once('ready-to-show', () => { if (!DEMARRAGE_CACHE) fenetre.show(); });
-  fenetre.loadURL(url);
+  fenetre = fen;
+  if (f.maximisee) fen.maximize();
+  fen.once('ready-to-show', () => { if (!cachee) fen.show(); });
+  fen.loadURL(url);
 
   // Fenêtres secondaires : impressions (about:blank) et pages de l'application ; liens externes → navigateur
-  fenetre.webContents.setWindowOpenHandler(({ url: u }) => {
+  fen.webContents.setWindowOpenHandler(({ url: u }) => {
     if (u === 'about:blank' || origineAutorisee(u)) {
       return { action: 'allow', overrideBrowserWindowOptions: { icon: ICONE, autoHideMenuBar: true, webPreferences: { contextIsolation: true, sandbox: true, plugins: true } } };
     }
     if (/^(https?|mailto):/i.test(u)) shell.openExternal(u);
     return { action: 'deny' };
   });
-  fenetre.webContents.on('will-navigate', (ev, u) => { if (!origineAutorisee(u)) { ev.preventDefault(); if (/^https?:/i.test(u)) shell.openExternal(u); } });
-  fenetre.webContents.on('did-fail-load', (ev, code, description, u, principal) => {
-    if (!principal || code === -3) return;
+  fen.webContents.on('will-navigate', (ev, u) => { if (!origineAutorisee(u)) { ev.preventDefault(); if (/^https?:/i.test(u)) shell.openExternal(u); } });
+  fen.webContents.on('did-fail-load', (ev, code, description, u, principal) => {
+    if (!principal || code === -3 || fenetre !== fen) return;
     if (Date.now() - dernierRefus < 30000) return; // alerte de sécurité déjà affichée
     if (code <= -200 && code > -300) { afficherErreur(MESSAGE_USURPATION, 'securite'); return; } // erreurs de certificat
-    afficherErreur(`Impossible d'ouvrir la GMAO (${description}).`);
+    journal('Échec du chargement de la GMAO :', code, description, u);
+    afficherErreur(messageEchecChargement(code));
   });
   // La caméra (scan des codes-barres) est autorisée pour l'application elle-même uniquement
-  fenetre.webContents.session.setPermissionRequestHandler((wc, permission, rappel, details) => {
+  fen.webContents.session.setPermissionRequestHandler((wc, permission, rappel, details) => {
     const ok = ['media', 'clipboard-sanitized-write', 'notifications', 'fullscreen'].includes(permission) && origineAutorisee(details.requestingUrl || wc.getURL());
     rappel(ok);
   });
 
-  fenetre.on('close', (ev) => {
-    if (!fenetre.isMaximized()) {
-      const [largeur, hauteur] = fenetre.getSize();
+  fen.on('close', (ev) => {
+    if (!fen.isMaximized()) {
+      const [largeur, hauteur] = fen.getSize();
       parametres.enregistrer({ fenetre: { largeur, hauteur, maximisee: false } });
     } else parametres.enregistrer({ fenetre: { maximisee: true } });
     if (!quitter && garderEnArrierePlan()) {
       ev.preventDefault();
-      fenetre.hide();
+      fen.hide();
       if (!infoBulleMontree && Notification.isSupported()) {
         infoBulleMontree = true;
         new Notification({ title: NOM, body: 'La GMAO reste active dans la zone de notification (les autres postes peuvent continuer à travailler). Clic droit sur l\'icône › Quitter pour l\'arrêter.', icon: ICONE }).show();
       }
     }
   });
-  fenetre.on('closed', () => { fenetre = null; });
+  // Une fenêtre remplacée (fermée après l'ouverture de la suivante) ne touche pas à sa remplaçante
+  fen.on('closed', () => { if (fenetre === fen) fenetre = null; });
   construireMenu();
 }
 
-/** En mode serveur partagé, fermer la fenêtre ne doit pas couper la GMAO des autres postes. */
+/**
+ * En mode serveur partagé (ou démarrage avec Windows), fermer la fenêtre ne doit pas couper la GMAO des
+ * autres postes. Rien n'est gardé en arrière-plan quand rien ne tourne (serveur non démarré, connexion au
+ * serveur distant non établie) : l'application ne reste jamais sans fenêtre ni icône.
+ */
 function garderEnArrierePlan() {
-  return parametres.valeurs.reduireDansZoneNotification && (partageActif() || DEMARRAGE_CACHE || parametres.valeurs.demarrerAvecWindows);
+  return !!urlApplication && parametres.valeurs.reduireDansZoneNotification && (partageActif() || DEMARRAGE_CACHE || parametres.valeurs.demarrerAvecWindows);
+}
+
+/** Arrêt complet quand plus aucune fenêtre n'est ouverte et que rien ne tourne. */
+function quitterSansFenetre() {
+  if (quitter) return;
+  quitter = true;
+  arreterServeur().finally(() => app.quit());
 }
 
 /**
@@ -355,13 +524,25 @@ function garderEnArrierePlan() {
 function ouvrirAssistant(erreur, type, mode = 'parametres') {
   const recuperation = mode === 'recuperation';
   if (recuperation && !serviceRecuperation()) return;
-  if (fenetreAssistant) {
-    if (modeAssistant === mode) { fenetreAssistant.show(); fenetreAssistant.focus(); return; }
-    // Autre mode : la fenêtre est remplacée et le code du pôle informatique sera redemandé
-    const ancienne = fenetreAssistant;
-    fenetreAssistant = null;
-    ancienne.destroy();
+  const query = {};
+  if (recuperation) query.mode = 'recuperation';
+  if (erreur) {
+    query.erreur = String(erreur).slice(0, 1000);
+    if (type === 'securite') query.alerte = 'securite';
+    // Serveur intégré toujours en service (seule la fenêtre a échoué) : il suffit de la rouvrir
+    if (serveurEnService()) query.reprise = 'rouvrir';
   }
+  if (fenetreAssistant && modeAssistant === mode) {
+    // Un nouveau message (erreur, alerte de sécurité) est toujours affiché : la page est rechargée avec
+    // lui, la saisie du code du pôle informatique reste valable pour cette fenêtre
+    if (erreur) fenetreAssistant.loadFile(PAGE_DEMARRAGE, { query });
+    fenetreAssistant.show();
+    fenetreAssistant.focus();
+    return;
+  }
+  // Autre mode : la fenêtre est remplacée (fermée après l'ouverture de la nouvelle) et le code du pôle
+  // informatique sera redemandé
+  const ancienne = fenetreAssistant;
   modeAssistant = recuperation ? 'recuperation' : 'parametres';
   recuperationDeverrouillee = null;
   // Premier lancement : pas encore de code pour les paramètres ; la récupération l'exige toujours
@@ -371,29 +552,46 @@ function ouvrirAssistant(erreur, type, mode = 'parametres') {
     webPreferences: { preload: PRELOAD, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   fenetreAssistant = f;
-  const query = {};
-  if (recuperation) query.mode = 'recuperation';
-  if (erreur) query.erreur = String(erreur).slice(0, 1000);
-  if (erreur && type === 'securite') query.alerte = 'securite';
   f.loadFile(PAGE_DEMARRAGE, { query });
   f.webContents.setWindowOpenHandler(({ url: u }) => { if (/^https?:/i.test(u)) shell.openExternal(u); return { action: 'deny' }; });
   f.on('closed', () => {
     if (fenetreAssistant === f) fenetreAssistant = null;
     // Une fenêtre remplacée ne touche pas à l'état de sa remplaçante
     if (!fenetreAssistant) { assistantDeverrouille = false; recuperationDeverrouillee = null; }
-    if (!fenetre && !fenetreAssistant && !quitter && !parametres.valeurs.configure) { quitter = true; app.quit(); }
+    // Plus aucune fenêtre et rien en service (premier lancement, démarrage manqué) : l'application s'arrête
+    if (!fenetre && !fenetreAssistant && !lancementsEnCours && (!parametres.valeurs.configure || !urlApplication)) quitterSansFenetre();
   });
+  if (ancienne) ancienne.destroy();
+}
+
+/** Ferme la fenêtre de l'assistant donnée si elle est toujours celle affichée. */
+function fermerFenetreAssistant(f) {
+  if (!f || fenetreAssistant !== f) return;
+  fenetreAssistant = null;
+  f.destroy();
 }
 
 function afficherErreur(message, type) {
-  if (fenetre) { fenetre.destroy(); fenetre = null; }
+  // L'assistant s'ouvre avant la fermeture de la fenêtre principale : l'application n'est jamais sans fenêtre
+  const principale = fenetre;
+  fenetre = null;
   ouvrirAssistant(message, type);
+  if (principale) principale.destroy();
+}
+
+/** Affiche la fenêtre principale, créée au besoin ; faux si rien n'est en service. */
+function afficherPrincipale() {
+  if (fenetre) { if (fenetre.isMinimized()) fenetre.restore(); fenetre.show(); fenetre.focus(); return true; }
+  if (!urlApplication) return false;
+  creerFenetrePrincipale(urlApplication);
+  return true;
 }
 
 function afficher() {
-  if (fenetre) { if (fenetre.isMinimized()) fenetre.restore(); fenetre.show(); fenetre.focus(); return; }
+  if (fenetre) { afficherPrincipale(); return; }
   if (fenetreAssistant) { fenetreAssistant.show(); fenetreAssistant.focus(); return; }
-  if (urlApplication) creerFenetrePrincipale(urlApplication);
+  // Rien d'affiché ni en service (démarrage manqué) : nouvelle tentative, qui rouvre l'assistant en cas d'échec
+  if (!afficherPrincipale() && !lancementsEnCours && !quitter) lancer();
 }
 
 // ----- Démarrage selon le mode -------------------------------------------------------------
@@ -428,24 +626,44 @@ async function connecterClient() {
   return true;
 }
 
-async function lancer() {
+/**
+ * Démarre la GMAO selon le mode du poste (serveur intégré ou connexion au serveur distant) et ouvre la
+ * fenêtre principale ; en cas d'échec, l'assistant affiche la cause. Les démarrages sont traités un par
+ * un et commencent toujours par l'arrêt du serveur intégré précédent : jamais deux serveurs sur la même base.
+ * @param {{ cachee?: boolean }} [options]  cachee : fenêtre principale gardée masquée (démarrage avec Windows)
+ * @returns {Promise<boolean>} vrai si la fenêtre principale a été ouverte
+ */
+function lancer(options) {
+  lancementsEnCours += 1;
+  const p = fileLancement.then(() => lancerMaintenant(options || {})).finally(() => { lancementsEnCours -= 1; });
+  fileLancement = p.catch(() => false);
+  return p;
+}
+
+async function lancerMaintenant({ cachee = false }) {
   const p = parametres.valeurs;
-  if (!p.configure) return ouvrirAssistant();
+  if (!p.configure) { ouvrirAssistant(); return false; }
   try {
+    await arreterServeur();
+    epinglage = null;
     if (p.mode === 'client') {
-      if (!(await connecterClient())) return undefined;
+      if (!(await connecterClient())) return false;
     } else {
       await demarrerServeur();
     }
-    creerFenetrePrincipale(urlApplication);
+    const ancienne = fenetre;
+    creerFenetrePrincipale(urlApplication, { cachee });
+    if (ancienne) ancienne.destroy(); // fenêtre d'un démarrage précédent, remplacée
     construireTray();
     appliquerDemarrageWindows();
     programmerMisesAJour();
+    return true;
   } catch (e) {
-    journal('Erreur au démarrage', e && e.message ? e.message : e);
-    afficherErreur(e.message || String(e));
+    // Détail technique au journal du poste ; l'assistant affiche un message en français
+    journal('Erreur au démarrage', e && e.cause ? e.cause : '', e && e.stack ? e.stack : e);
+    afficherErreur(messageDemarrage(e));
+    return false;
   }
-  return undefined;
 }
 
 async function redemarrer() {
@@ -562,7 +780,9 @@ function gestionnaireMaj() {
     // Clé publique de signature des manifestes (package.json › gmao.clePubliqueMaj) : dès qu'elle est définie, un
     // manifeste non signé ou mal signé est refusé
     clePublique: (PKG.gmao && PKG.gmao.clePubliqueMaj) || undefined,
-    fetch: (u, o) => net.fetch(u, o),
+    // net.request (proxy système) avec contrôle de chaque redirection : net.fetch suit les redirections
+    // sans exposer l'adresse finale, ce qui empêcherait de vérifier les hôtes de téléchargement
+    fetch: creerFetchControle((o) => net.request(o)),
     dossierTelechargement: path.join(app.getPath('temp'), 'gmao-sicaf-maj'),
     agent: `GMAO-SICAF/${app.getVersion()}`,
   });
@@ -570,8 +790,11 @@ function gestionnaireMaj() {
 
 function programmerMisesAJour() {
   if (minuterieMaj) clearInterval(minuterieMaj);
+  if (premiereVerificationMaj) clearTimeout(premiereVerificationMaj);
+  minuterieMaj = null;
+  premiereVerificationMaj = null;
   if (!app.isPackaged || !parametres.valeurs.misesAJour.automatique || parametres.valeurs.misesAJour.source === 'aucune') return;
-  setTimeout(() => verifierMisesAJour(false), 30 * 1000);
+  premiereVerificationMaj = setTimeout(() => verifierMisesAJour(false), 30 * 1000);
   minuterieMaj = setInterval(() => verifierMisesAJour(false), 6 * 60 * 60 * 1000);
 }
 
@@ -636,7 +859,14 @@ function gerer(canal, fn, { application = false, recuperation = false } = {}) {
     // Récupération d'urgence : l'appel doit venir de la fenêtre créée par l'application pour cet usage
     if (recuperation) autorise = autorise && modeAssistant === 'recuperation' && estFenetreAssistant(ev && ev.sender);
     if (!autorise) throw new Error('Appel non autorisé');
-    return fn(ev, ...args);
+    try {
+      return await fn(ev, ...args);
+    } catch (e) {
+      // Message destiné au pôle informatique, ou incident technique (détail au journal du poste seulement)
+      if (e && e.messagePoste) throw new Error(e.messagePoste);
+      journal(`Erreur du canal ${canal} :`, e && e.stack ? e.stack : e);
+      throw new Error('Opération impossible sur ce poste. Réessayez ; si le problème persiste, prévenez le pôle informatique.');
+    }
   });
 }
 
@@ -649,7 +879,7 @@ function estFenetreAssistant(expediteur) {
 
 /** Les paramètres de connexion ne se modifient qu'après saisie du code du pôle informatique. */
 function exigerDeverrouillage() {
-  if (parametres.valeurs.codeInformatique && !assistantDeverrouille) throw new Error('Code du pôle informatique requis');
+  if (parametres.valeurs.codeInformatique && !assistantDeverrouille) throw erreurPoste('Code du pôle informatique requis');
 }
 
 /**
@@ -683,14 +913,16 @@ function originePoste() {
 
 /**
  * Inscrit un événement de ce poste au journal d'activité de la GMAO (mode serveur, serveur démarré).
- * `alerte` : notification au pôle informatique (droit Système › Modifier).
+ * `alerte` : notification au pôle informatique (droit Système › Modifier), sauf si la configuration
+ * désactive la notification des blocages (`toujours` : notification émise dans tous les cas).
+ * @param {{ entite?: string, toujours?: boolean }} [options]
  */
-function journaliserPoste(action, details, alerte) {
+function journaliserPoste(action, details, alerte, { entite = 'users', toujours = false } = {}) {
   if (parametres.valeurs.mode !== 'serveur' || !serveur || !serveur.ctx) return;
   try {
     const ctx = serveur.ctx;
-    ctx.audit({ user: { id: null, login: originePoste() } }, action, 'users', null, details);
-    if (alerte && (ctx.config().securite || {}).notifierBlocages !== false) {
+    ctx.audit({ user: { id: null, login: originePoste() } }, action, entite, null, details);
+    if (alerte && (toujours || (ctx.config().securite || {}).notifierBlocages !== false)) {
       ctx.notify(ctx.usersAvecDroit('systeme', 'modifier').map((u) => u.id), Object.assign({ type: 'alerte' }, alerte));
     }
   } catch (e) { journal('Journal d\'activité de la GMAO indisponible :', e.message); }
@@ -762,6 +994,16 @@ function etatRecuperation() {
   };
 }
 
+/**
+ * Saisie vide du code du pôle informatique : refusée sans compter d'essai incorrect (aucun délai, aucune
+ * entrée de journal) ; un blocage en cours reste signalé. Renvoie null pour une saisie à vérifier.
+ */
+function saisieCodeVide(code) {
+  if (typeof code === 'string' && code !== '') return null;
+  const bloque = blocageCode();
+  return { ok: false, bloque: !!bloque, message: bloque ? messageBlocage(bloque) : 'Saisissez le code du pôle informatique' };
+}
+
 const recuperationVerrouillee = () => ({ ok: false, verrouille: true, message: 'Saisissez de nouveau le code du pôle informatique (délai de 5 minutes dépassé ou code déjà utilisé pour une récupération).' });
 
 /** Copie des données reçues d'une page, sans clés pouvant altérer les prototypes. */
@@ -776,11 +1018,21 @@ function enregistrerIpc() {
   gerer('bureau:etat-verrou', () => ({ codeDefini: !!parametres.valeurs.codeInformatique, deverrouille: assistantDeverrouille }));
   gerer('bureau:deverrouiller', async (ev, code) => {
     if (!parametres.valeurs.codeInformatique) { assistantDeverrouille = true; return { ok: true }; }
+    const vide = saisieCodeVide(code);
+    if (vide) return { ok: false, message: vide.message };
     const r = await verifierCodeInformatique(code, 'paramètres de connexion');
     assistantDeverrouille = r.ok;
     return { ok: r.ok, message: r.ok ? '' : r.message };
   });
-  gerer('bureau:reessayer', () => { if (fenetreAssistant) { const f = fenetreAssistant; fenetreAssistant = null; f.destroy(); } lancer(); return true; });
+  gerer('bureau:reessayer', async () => {
+    const f = fenetreAssistant;
+    // Serveur intégré en service (seule la fenêtre a échoué) : la fenêtre est rouverte, sans relancer le serveur ;
+    // sinon nouveau démarrage (le serveur précédent éventuel est d'abord arrêté). L'assistant reste ouvert tant
+    // que la fenêtre principale n'est pas ouverte ; en cas d'échec, il affiche la nouvelle cause.
+    const ok = serveurEnService() ? afficherPrincipale() : await lancer();
+    if (ok) fermerFenetreAssistant(f);
+    return ok;
+  });
   gerer('bureau:infos', () => ({
     version: app.getVersion(), mode: parametres.valeurs.mode, url: urlApplication, portable: PORTABLE,
     dossierDonnees: parametres.valeurs.mode === 'serveur' ? dossierDonnees() : '', dossierDonneesDefaut: path.join(app.getPath('userData'), 'data'),
@@ -824,16 +1076,16 @@ function enregistrerIpc() {
     parametres.enregistrer(n);
     appliquerDemarrageWindows();
     const apres = JSON.stringify([parametres.valeurs.mode, parametres.valeurs.serveur, parametres.valeurs.client]);
+    const f = fenetreAssistant;
     if (!etaitConfigure || !urlApplication) {
-      if (fenetreAssistant) { const f = fenetreAssistant; fenetreAssistant = null; f.destroy(); }
-      lancer();
+      // Démarrage (le serveur précédent éventuel est arrêté d'abord) ; l'assistant se ferme une fois la GMAO ouverte
+      lancer().then((ok) => { if (ok) fermerFenetreAssistant(f); });
     } else if (avant !== apres) {
       setTimeout(() => redemarrer(), 300);
     } else {
       programmerMisesAJour();
       if (tray) construireTray();
-      if (fenetreAssistant) { const f = fenetreAssistant; fenetreAssistant = null; f.destroy(); }
-      afficher();
+      if (afficherPrincipale()) fermerFenetreAssistant(f);
     }
     return { ok: true, redemarrage: etaitConfigure && avant !== apres };
   });
@@ -863,6 +1115,8 @@ function enregistrerIpc() {
   gerer('bureau:recuperation-deverrouiller', async (ev, code) => {
     const etat = etatRecuperation();
     if (!etat.disponible) return { ok: false, message: etat.message };
+    const vide = saisieCodeVide(code);
+    if (vide) return vide;
     const appelante = fenetreAssistant;
     const r = await verifierCodeInformatique(code, 'récupération d\'urgence');
     if (!r.ok) return { ok: false, bloque: !!r.bloque, message: r.message };
@@ -915,15 +1169,18 @@ app.whenReady().then(() => {
   parametres = new Parametres(app.getPath('userData'));
   installerVerificationCertificats();
   enregistrerIpc();
-  lancer();
+  lancer({ cachee: DEMARRAGE_CACHE });
 });
 
 app.on('window-all-closed', () => {
   // L'application reste dans la zone de notification si elle sert le réseau ; sinon elle s'arrête.
+  // Un démarrage en cours ouvrira la fenêtre principale ou l'assistant
+  if (lancementsEnCours && !quitter) return;
   if (quitter || !garderEnArrierePlan()) { quitter = true; arreterServeur().finally(() => app.quit()); }
 });
 
 app.on('before-quit', () => { quitter = true; });
-app.on('will-quit', () => { if (serveur) { try { serveur.db.saveNow(); } catch (e) { /* ignore */ } } });
+// Dernier recours (arrêt de Windows…) : les données en attente de toutes les instances encore en service sont écrites
+app.on('will-quit', () => { for (const s of serveursVivants) { try { s.db.saveNow(); } catch (e) { /* ignore */ } } });
 
 module.exports = { garderEnArrierePlan, adressesReseau, testerServeur, verifierCertificat };

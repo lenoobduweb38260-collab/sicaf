@@ -2,7 +2,12 @@
 'use strict';
 /**
  * Produit <dossier>/latest.json (manifeste de mise à jour) après la construction de l'installateur :
- *   node scripts/manifeste-maj.js <dossier dist> [version] [fichier notes]
+ *   node scripts/manifeste-maj.js <dossier dist> [version] [fichier notes] [notes nettoyées]
+ *
+ * Les notes (message du commit) sont nettoyées avant d'être signées (nettoyerNotes) : en-têtes de fin
+ * (Co-Authored-By:, Signed-off-by:…), lignes de mention ajoutées par les outils de développement ou par
+ * une fusion (identifiants de session, adresses seules, « Generated with … »). Le 4e argument reçoit les
+ * notes nettoyées, reprises telles quelles comme texte de la publication GitHub.
  *
  * Le manifeste est publié avec l'installateur ; l'application l'utilise pour détecter la nouvelle
  * version et vérifier l'installateur téléchargé (taille et empreinte SHA-256).
@@ -46,6 +51,45 @@ function lireClePrivee(valeur) {
   if (!cle) throw new Error('MAJ_CLE_PRIVEE illisible : clé privée Ed25519 au format PEM non chiffré « BEGIN PRIVATE KEY » attendue (scripts/generer-cle-maj.js)');
   if (cle.asymmetricKeyType !== maj.ALGORITHME) throw new Error('MAJ_CLE_PRIVEE : une clé Ed25519 est attendue');
   return cle;
+}
+
+/** En-tête de fin de message à la manière de git (« Clé: valeur », clé sans espace ni accent). */
+const RE_EN_TETE = /^[A-Za-z0-9][A-Za-z0-9-]*:\s+\S/;
+/** Lignes de mention, où qu'elles se trouvent dans le message. */
+const RES_MENTION = [
+  /^\s*[a-z0-9]+(-[a-z0-9]+)*-(by|session)\s*:/i,        // Co-Authored-By:, Signed-off-by:, Outil-Session:…
+  /^\s*session\s*:/i,                                    // Session: …
+  /session_[A-Za-z0-9]/,                                 // identifiant ou adresse de session
+  /^\s*<?https?:\/\/\S+>?\s*$/i,                            // adresse seule sur la ligne
+  /^[^\p{L}\p{N}]*generated (with|by)\b/iu,                 // « Generated with … » en tête de ligne
+  /^[^\p{L}\p{N}]*g[ée]n[ée]r[ée]e? (avec|par)\b.*(\]\(|https?:\/\/)/iu, // « Généré avec [outil](…) »
+];
+
+/**
+ * Notes de version publiées à partir du message d'un commit : sujet et corps, sans le bloc d'en-têtes de
+ * fin (dernier paragraphe composé uniquement de lignes « Clé: valeur », comme git interpret-trailers) ni
+ * les lignes de mention ; lignes vides consécutives réduites à une.
+ * @param {string} texte
+ * @returns {string}
+ */
+function nettoyerNotes(texte) {
+  const lignes = String(texte == null ? '' : texte).replace(/\r\n?/g, '\n').split('\n');
+  // Dernier paragraphe : bloc d'en-têtes de fin (jamais le sujet seul)
+  let fin = lignes.length;
+  while (fin > 0 && !lignes[fin - 1].trim()) fin -= 1;
+  let debut = fin;
+  while (debut > 0 && lignes[debut - 1].trim()) debut -= 1;
+  const paragraphe = lignes.slice(debut, fin);
+  const conservees = debut > 0 && paragraphe.length && paragraphe.every((l) => RE_EN_TETE.test(l.trim())) ? lignes.slice(0, debut) : lignes;
+  const sortie = [];
+  for (const l of conservees) {
+    if (RES_MENTION.some((re) => re.test(l))) continue;
+    const ligne = l.replace(/\s+$/, '');
+    if (!ligne && (!sortie.length || !sortie[sortie.length - 1])) continue;
+    sortie.push(ligne);
+  }
+  while (sortie.length && !sortie[sortie.length - 1]) sortie.pop();
+  return sortie.join('\n');
 }
 
 /** Clés publiques intégrées aux postes (package.json › gmao.clePubliqueMaj). */
@@ -124,13 +168,15 @@ function resume(lignes) {
 }
 
 function principal(args) {
-  const [dossier = 'dist', version, fichierNotes] = args;
-  const notes = fichierNotes && fs.existsSync(fichierNotes) ? fs.readFileSync(fichierNotes, 'utf8') : '';
+  const [dossier = 'dist', version, fichierNotes, sortieNotes] = args;
+  const notes = nettoyerNotes(fichierNotes && fs.existsSync(fichierNotes) ? fs.readFileSync(fichierNotes, 'utf8') : '');
   // La clé est retirée de l'environnement dès sa lecture
   const brute = process.env.MAJ_CLE_PRIVEE;
   delete process.env.MAJ_CLE_PRIVEE;
   const cle = lireClePrivee(brute);
   const m = manifeste(dossier, version, notes, { clePrivee: cle });
+  // Texte de la publication : exactement les notes signées
+  if (sortieNotes) fs.writeFileSync(sortieNotes, m.notes ? `${m.notes}\n` : '');
   console.log(`latest.json : version ${m.version}, ${m.fichier}, ${m.taille} octets, sha256 ${m.sha256}`);
   const lignes = ['### Manifeste de mise à jour (latest.json)', '', `- Version : ${m.version}`, `- Installateur : ${m.fichier} (${m.taille} octets)`, `- SHA-256 : \`${m.sha256}\``];
   if (m.signature) {
@@ -161,4 +207,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { manifeste, signerManifeste, lireClePrivee };
+module.exports = { manifeste, signerManifeste, lireClePrivee, nettoyerNotes };

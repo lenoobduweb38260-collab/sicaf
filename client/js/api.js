@@ -27,11 +27,16 @@
       const s = qs.toString();
       if (s) url += (url.includes('?') ? '&' : '?') + s;
     }
-    // Changement de mot de passe imposé : aucune donnée n'est demandée au serveur avant le nouveau mot de passe
-    // (badges et rafraîchissements périodiques des vues compris), hors authentification
-    if (window.GMAO && typeof window.GMAO.changementMdpRequis === 'function' && window.GMAO.changementMdpRequis()
-      && /^\/api\//.test(url) && !/^\/api\/(auth\/|views)/.test(url)) {
-      throw new ApiError(403, 'Vous devez changer votre mot de passe avant de continuer.', { changementMdpRequis: true });
+    // Changement de mot de passe ou enrôlement de la double authentification imposé : aucune donnée n'est demandée au
+    // serveur avant (badges et rafraîchissements périodiques des vues compris), hors authentification
+    const G = window.GMAO;
+    if (G && /^\/api\//.test(url) && !/^\/api\/(auth\/|views)/.test(url)) {
+      if (typeof G.changementMdpRequis === 'function' && G.changementMdpRequis()) {
+        throw new ApiError(403, 'Vous devez changer votre mot de passe avant de continuer.', { changementMdpRequis: true });
+      }
+      if (typeof G.deuxFacteursRequis === 'function' && G.deuxFacteursRequis()) {
+        throw new ApiError(403, 'Vous devez activer la double authentification avant de continuer.', { deuxFacteursRequis: true });
+      }
     }
     const headers = { 'X-Requested-With': 'GMAO' };
     const site = siteCourant();

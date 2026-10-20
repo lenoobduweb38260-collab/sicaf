@@ -118,6 +118,60 @@ describe('Configuration « sécurité » et bases existantes', () => {
     seed(db2);
     assert.deepEqual(db2.getConfig().journal.actions, ['creation']);
   });
+
+  test('base existante, importée ou restaurée : réglages illisibles ou hors bornes ramenés comme s\'ils avaient été saisis', () => {
+    const db = new Db(path.join(os.tmpdir(), 'gmao-en-memoire'), { inMemory: true }).load();
+    db.setConfig({ securite: {
+      expirationMdpJours: 3, historiqueMdp: 'abc', rappelExpirationJours: -5, dureeCodeReinitialisationMinutes: 1, longueurMinMdp: 200,
+      inactiviteMinutes: '0', dureeSessionHeures: 7.6, complexite: 'non', motDePasseOublie: 0, reinitialisationAutonome: 'oui',
+      deuxFacteurs: 'obligatoire', forcerChangementMdpInitial: false,
+    } });
+    seed(db);
+    let s = db.getConfig().securite;
+    assert.equal(s.expirationMdpJours, 0, 'expiration de moins de 30 jours désactivée (aucun compte n\'expire au bout de 3 jours)');
+    assert.equal(s.historiqueMdp, 5, 'historique illisible : valeur par défaut, jamais désactivé');
+    assert.equal(s.rappelExpirationJours, 1);
+    assert.equal(s.dureeCodeReinitialisationMinutes, 5);
+    assert.equal(s.longueurMinMdp, 64);
+    assert.equal(s.inactiviteMinutes, 60, 'valeur nulle : valeur par défaut, comme à l\'usage');
+    assert.equal(s.dureeSessionHeures, 7);
+    assert.equal(s.complexite, true);
+    assert.equal(s.motDePasseOublie, true);
+    assert.equal(s.reinitialisationAutonome, false);
+    assert.equal(s.deuxFacteurs, 'facultatif');
+    assert.equal(s.forcerChangementMdpInitial, false, 'réglage valide conservé');
+    // Expiration valide, rappel aussi long qu'elle : ramené juste en dessous ; valeurs valides (texte numérique compris) conservées
+    db.setConfig(Object.assign(db.getConfig(), { securite: Object.assign({}, s, { expirationMdpJours: '45', rappelExpirationJours: 60, historiqueMdp: 0, longueurMinMdp: 12 }) }));
+    seed(db);
+    s = db.getConfig().securite;
+    assert.equal(s.expirationMdpJours, 45);
+    assert.equal(s.rappelExpirationJours, 44);
+    assert.equal(s.historiqueMdp, 0);
+    assert.equal(s.longueurMinMdp, 12);
+  });
+
+  test('import d\'une base aux réglages « sécurité » modifiés à la main : ramenés dans les bornes, aucun compte expiré d\'un coup', async () => {
+    const srv = await demarrer();
+    try {
+      const admin = srv.client();
+      await admin.login('admin', 'admin');
+      const profils = await admin.ok('GET', '/api/profils');
+      const tech = await admin.ok('POST', '/api/utilisateurs', { login: 'tech', nom: 'Tech', profilId: profils.find((p) => p.nom === 'Technicien').id, password: 'tech-mdp1', doitChangerMdp: false });
+      const data = srv.db.exportAll();
+      data.config.securite = Object.assign({}, data.config.securite, { expirationMdpJours: 3, historiqueMdp: 'abc', rappelExpirationJours: -5, dureeCodeReinitialisationMinutes: 1 });
+      assert.equal((await admin.post('/api/import', data)).status, 200);
+      await admin.login('admin', 'admin');
+      const s = (await admin.ok('GET', '/api/configuration')).securite;
+      assert.equal(s.expirationMdpJours, 0);
+      assert.equal(s.historiqueMdp, 5);
+      assert.equal(s.rappelExpirationJours, 1);
+      assert.equal(s.dureeCodeReinitialisationMinutes, 5);
+      srv.db.update('users', tech.id, { dateMdp: new Date(Date.now() - 4 * JOUR).toISOString() });
+      const b = await srv.client().login('tech', 'tech-mdp1');
+      assert.equal(b.motDePasse.doitChanger, false);
+      assert.equal(b.motDePasse.expireLe, null);
+    } finally { await srv.stop(); }
+  });
 });
 
 // =====================================================================================================
@@ -191,6 +245,25 @@ describe('Mots de passe (API)', () => {
     const c2 = await admin.ok('PUT', '/api/configuration', { securite: { longueurMinMdp: 10 } });
     assert.equal(c2.securite.expirationMdpJours, 30, 'réglage absent du corps conservé');
     await securite({ dureeCodeReinitialisationMinutes: 60, expirationMdpJours: 0, rappelExpirationJours: 14, historiqueMdp: 5, motDePasseOublie: true, reinitialisationAutonome: false });
+  });
+
+  test('PUT /api/configuration : rappel d\'expiration inférieur à la durée d\'expiration, sinon refusé (rappel permanent)', async () => {
+    for (const corps of [{ expirationMdpJours: 30, rappelExpirationJours: 60 }, { expirationMdpJours: 30, rappelExpirationJours: 30 }]) {
+      const r = await admin.put('/api/configuration', { securite: corps });
+      assert.equal(r.status, 400, JSON.stringify(corps));
+      assert.match(r.body.erreur, /inférieur à la durée d'expiration \(30 jours\)/);
+    }
+    assert.equal(srv.db.getConfig().securite.expirationMdpJours, 0, 'rien n\'est enregistré');
+    await securite({ expirationMdpJours: 30, rappelExpirationJours: 14 });
+    // Le contrôle porte sur le résultat : un rappel seul, trop long pour l'expiration enregistrée, est refusé
+    assert.equal((await admin.put('/api/configuration', { securite: { rappelExpirationJours: 45 } })).status, 400);
+    await compte('rappel1', 'Technicien');
+    const c = await connecte('rappel1');
+    await c.ok('POST', '/api/auth/mot-de-passe', { ancien: 'rappel1-mdp1', nouveau: 'rappel1-mdp2' });
+    const etat = (await c.ok('GET', '/api/auth/me')).motDePasse;
+    assert.equal(etat.joursRestants, 30);
+    assert.equal(etat.rappel, false, 'aucun rappel le jour du changement');
+    await securite({ expirationMdpJours: 0, rappelExpirationJours: 14 });
   });
 
   test('GET /api/auth/infos : liens de l\'écran de connexion et règles du mot de passe, rien de sensible', async () => {
@@ -1029,6 +1102,39 @@ describe('Changement de mot de passe imposé par le serveur', () => {
     const b = await srv.client().login('nouvel', 'Engrenage-Vis#31');
     assert.equal(b.motDePasse.doitChanger, false, 'le mot de passe choisi avec le code n\'est pas à changer');
   });
+
+  test('amorçage pendant un changement imposé ou un enrôlement imposé : ni comptes, ni secteurs, ni configuration de l\'application', async () => {
+    const admin = srv.client();
+    await admin.login('admin', 'Pompe-Centrale#2026');
+    const profils = await admin.ok('GET', '/api/profils');
+    const u = await admin.ok('POST', '/api/utilisateurs', { login: 'amorce', nom: 'Amorce', profilId: profils.find((p) => p.nom === 'Technicien').id, password: 'Soupape-Bride#12', doitChangerMdp: false });
+    const reduit = (b, quoi) => {
+      assert.deepEqual(b.references, { secteurs: [], profils: [], users: [] }, quoi);
+      assert.deepEqual(b.modules, [], quoi);
+      assert.deepEqual(Object.keys(b.config).sort(), ['general', 'securite', 'societe'], quoi);
+      assert.equal(b.config.securite.longueurMinMdp, 10, 'règles du nouveau mot de passe transmises');
+      assert.equal(b.user.login, 'amorce');
+    };
+    const t = await admin.ok('POST', `/api/utilisateurs/${u.id}/reinitialiser-mdp`, { mode: 'temporaire' });
+    const c = srv.client();
+    const b = await c.login('amorce', t.motDePasse);
+    assert.equal(b.motDePasse.doitChanger, true);
+    reduit(b, 'réponse de connexion');
+    reduit(await c.ok('GET', '/api/auth/me'), 'amorçage');
+    await c.ok('POST', '/api/auth/mot-de-passe', { nouveau: 'Joint-Torique#64' });
+    const complet = await c.ok('GET', '/api/auth/me');
+    assert.ok(complet.references.users.length >= 2, 'amorçage complet après le changement');
+    assert.ok(complet.references.secteurs.length && complet.modules.length && complet.config.listes);
+    // Double authentification obligatoire et pas encore activée : même amorçage réduit jusqu'à l'activation
+    const cfg = srv.db.getConfig(); cfg.securite.deuxFacteurs = 'obligatoire_tous'; srv.db.setConfig(cfg);
+    try {
+      const b2 = await srv.client().login('amorce', 'Joint-Torique#64');
+      assert.equal(b2.deuxFacteurs.enrolementRequis, true);
+      reduit(b2, 'enrôlement imposé');
+    } finally {
+      const cfg2 = srv.db.getConfig(); cfg2.securite.deuxFacteurs = 'facultatif'; srv.db.setConfig(cfg2);
+    }
+  });
 });
 
 // =====================================================================================================
@@ -1179,5 +1285,60 @@ describe('Routes publiques et prise en main : limites par poste, session ouverte
     const s = srv.db.getConfig().securite;
     assert.equal(s.reinitialisationAutonome, false);
     assert.equal(s.motDePasseOublie, true);
+  });
+
+  test('demande d\'un compte que le gestionnaire ne peut pas prendre en main : ni listée ni rejetable par lui', async () => {
+    await compte('chef6', 'Chef de secteur', { secteurIds: [secteur('PROD')], overrides: { utilisateurs: { voir: true, modifier: true } } });
+    await compte('tech6', 'Technicien', { secteurIds: [secteur('PROD')], overrides: { stock: { supprimer: true } } });
+    await compte('tech7', 'Technicien', { secteurIds: [secteur('PROD')] });
+    const chef = await connecte('chef6');
+    for (const login of ['tech6', 'tech7']) assert.equal((await appelDepuis('127.0.0.90', 'POST', '/api/auth/mot-de-passe-oublie', { login })).status, 200);
+    await new Promise((r) => setTimeout(r, 50));
+    const demande = (login) => srv.db.findOne('demandesMdp', (d) => d.login === login && d.statut === 'en_attente');
+    const d6 = demande('tech6');
+    const d7 = demande('tech7');
+    assert.ok(d6 && d7);
+    // Même règle que les destinataires de la demande et que la remise d'un code
+    assert.equal(srv.ctx.motsDePasse.gestionnaires(user('tech6')).some((u) => u.login === 'chef6'), false);
+    assert.equal((await chef.post(`/api/utilisateurs/${user('tech6').id}/reinitialiser-mdp`, { mode: 'code', demandeId: d6.id })).status, 403);
+    for (const url of ['/api/utilisateurs-demandes-mdp', '/api/utilisateurs-demandes-mdp?toutes=1']) {
+      const liste = await chef.ok('GET', url);
+      assert.equal(liste.some((d) => d.id === d6.id), false, url);
+      assert.equal(liste.some((d) => d.id === d7.id), true, `${url} : compte qu'il peut prendre en main`);
+    }
+    assert.equal((await chef.post(`/api/utilisateurs-demandes-mdp/${d6.id}/rejeter`, {})).status, 404);
+    assert.equal(srv.db.get('demandesMdp', d6.id).statut, 'en_attente', 'demande laissée aux gestionnaires compétents');
+    assert.equal(notifs('tech6', (n) => n.titre === 'Demande de réinitialisation refusée').length, 0);
+    // L'administrateur, prévenu, la voit et peut la traiter ; le chef traite celle qu'il peut prendre en main
+    assert.ok((await admin.ok('GET', '/api/utilisateurs-demandes-mdp')).some((d) => d.id === d6.id));
+    await admin.ok('POST', `/api/utilisateurs-demandes-mdp/${d6.id}/rejeter`, {});
+    await chef.ok('POST', `/api/utilisateurs-demandes-mdp/${d7.id}/rejeter`, {});
+  });
+
+  test('demande répétée depuis un autre poste signalée aussitôt ; depuis le même poste, au plus toutes les 30 minutes', async () => {
+    await compte('tech8', 'Technicien');
+    const titre = (n) => /^Demande de réinitialisation/.test(n.titre) && /\(tech8\)/.test(n.message);
+    await appelDepuis('127.0.0.91', 'POST', '/api/auth/mot-de-passe-oublie', { login: 'tech8' });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(notifs('admin', titre).length, 1);
+    await appelDepuis('127.0.0.92', 'POST', '/api/auth/mot-de-passe-oublie', { login: 'tech8' });
+    await new Promise((r) => setTimeout(r, 50));
+    const n = notifs('admin', titre);
+    assert.equal(n.length, 2, 'autre poste : notification sans attendre 30 minutes');
+    assert.equal(n[1].titre, 'Demande de réinitialisation depuis plusieurs postes');
+    assert.match(n[1].message, /2 postes différents/);
+    await appelDepuis('127.0.0.92', 'POST', '/api/auth/mot-de-passe-oublie', { login: 'tech8' });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(notifs('admin', titre).length, 2, 'poste déjà connu : pas de nouvelle notification avant 30 minutes');
+  });
+
+  test('le poste serveur lui-même (adresse locale) n\'est pas soumis à la limite de 20 échecs par poste', async () => {
+    srv.app.sessions.quotas.clear();
+    const statuts = new Set();
+    for (let i = 0; i < 25; i++) statuts.add((await srv.client().post('/api/auth/login', { login: 'serveur' + i, password: 'x' })).status);
+    assert.deepEqual(Array.from(statuts), [401]);
+    assert.equal((await srv.client().post('/api/auth/login', { login: 'serveur99', password: 'x' })).status, 401);
+    assert.equal(journal((a) => a.action === 'blocage' && a.ip === '127.0.0.1').length, 0);
+    srv.app.sessions.tentatives.clear();
   });
 });

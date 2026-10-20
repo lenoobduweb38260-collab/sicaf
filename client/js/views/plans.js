@@ -191,7 +191,7 @@
       .p3d-barre .espace { flex: 1 1 0; min-width: 0; }
       .p3d-barre .btn { padding: 5px 9px; white-space: nowrap; flex-shrink: 0; }
       .p3d-barre .btn-icone { padding: 6px; border: 1px solid var(--bordure-2); background: var(--surface); }
-      .p3d-barre .btn-icone.actif { background: var(--primaire-clair); color: var(--primaire); border-color: var(--primaire); }
+      .p3d-barre .btn-icone.actif { background: var(--primaire-clair); color: var(--lien); border-color: var(--primaire); }
       .p3d-titre { display: flex; flex-direction: column; flex: 0 1 auto; min-width: 60px; margin: 0 6px 0 2px; }
       .p3d-titre .t { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
       .p3d-titre .s { font-size: 12px; color: var(--texte-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
@@ -200,7 +200,7 @@
       .p3d-outils { width: 50px; flex-shrink: 0; border-right: 1px solid var(--bordure); display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 0; background: var(--surface-2); overflow-y: auto; scrollbar-width: thin; }
       .p3d-outil { width: 38px; height: 36px; display: flex; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--texte-2); cursor: pointer; flex-shrink: 0; }
       .p3d-outil:hover:not(:disabled) { background: var(--fond); color: var(--texte); }
-      .p3d-outil.actif { background: var(--primaire-clair); color: var(--primaire); border-color: var(--primaire); }
+      .p3d-outil.actif { background: var(--primaire-clair); color: var(--lien); border-color: var(--primaire); }
       .p3d-outil svg { width: 19px; height: 19px; }
       .p3d-outil:disabled { opacity: .35; cursor: default; }
       .p3d-sep { width: 26px; border-top: 1px solid var(--bordure-2); margin: 5px 0; flex-shrink: 0; }
@@ -229,7 +229,7 @@
       .p3d-cmd { width: 34px; height: 32px; display: flex; align-items: center; justify-content: center; background: transparent; border: 0; border-bottom: 1px solid var(--bordure); color: var(--texte-2); cursor: pointer; padding: 0; }
       .p3d-cmd:last-child { border-bottom: 0; }
       .p3d-cmd:hover:not(:disabled) { background: var(--fond); color: var(--texte); }
-      .p3d-cmd.actif { background: var(--primaire-clair); color: var(--primaire); }
+      .p3d-cmd.actif { background: var(--primaire-clair); color: var(--lien); }
       .p3d-cmd:disabled { opacity: .35; cursor: default; }
       .p3d-cmd svg { width: 17px; height: 17px; }
       .p3d-legende { position: absolute; left: 10px; bottom: 34px; background: color-mix(in srgb, var(--surface) 93%, transparent); border: 1px solid var(--bordure); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: var(--ombre); max-height: 46%; overflow: auto; z-index: 3; min-width: 150px; color: var(--texte); }
@@ -248,7 +248,7 @@
       .p3d-resultats .p3d-item.actif { background: var(--primaire-clair); }
       .p3d-palette { position: absolute; left: 8px; top: 8px; z-index: 5; width: 236px; background: var(--surface); border: 1px solid var(--bordure); border-radius: 10px; box-shadow: var(--ombre-2); padding: 6px; max-height: calc(100% - 50px); overflow-y: auto; }
       .p3d-palette .pt { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--texte-2); font-weight: 700; padding: 4px 6px; }
-      .p3d-palette .p3d-item.actif { background: var(--primaire-clair); color: var(--primaire); font-weight: 600; }
+      .p3d-palette .p3d-item.actif { background: var(--primaire-clair); color: var(--lien); font-weight: 600; }
       .p3d-bandeau { position: absolute; left: 50%; top: 10px; transform: translateX(-50%); z-index: 5; display: flex; gap: 8px; align-items: center; background: var(--surface); border: 1px solid var(--bordure); border-radius: 10px; box-shadow: var(--ombre-2); padding: 7px 10px; font-size: 13px; max-width: calc(100% - 40px); }
       .p3d-lien-eq { border: 1px solid var(--bordure); border-radius: 8px; padding: 8px 10px; background: var(--surface-2); display: flex; flex-direction: column; gap: 6px; }
       .p3d-recherche-eq { position: relative; }

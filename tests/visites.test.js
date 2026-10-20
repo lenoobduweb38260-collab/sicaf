@@ -522,3 +522,331 @@ describe('Audits & visites : données de démonstration', () => {
     assert.equal(srv.db.count('visites'), 5);
   });
 });
+
+describe('Audits & visites : non-régression de la revue (droits, périmètre, données personnelles, validation)', () => {
+  let srv, admin, secteurs, profils, site, prod, maint, valreas, valProd, usineB;
+  let qualite, respMaint, chef, chefLecteur, qualVal, lecteurVal;
+  let idQualite, idChefLecteur, idQualVal;
+
+  const profil = (nom) => profils.find((p) => p.nom === nom).id;
+  const notifs = (userId) => srv.db.list('notifications', (n) => n.userId === userId);
+  async function creerUtilisateur(login, nomProfil, secteurIds, extra = {}) {
+    const u = await admin.ok('POST', '/api/utilisateurs', Object.assign({ login, nom: login, prenom: 'Test', profilId: profil(nomProfil), secteurIds, password: 'motdepasse1', doitChangerMdp: false }, extra));
+    const c = srv.client();
+    await c.login(login, 'motdepasse1');
+    return { c, id: u.id };
+  }
+  const base = (extra = {}) => Object.assign({ titre: 'Audit client', typeCode: 'audit_client', secteurId: site.id, organisme: 'Client SAS', dateDebut: heure(48), dateFin: heure(56) }, extra);
+  async function actionVerifiee(v, libelle) {
+    const c = (await qualite.ok('POST', `/api/visites/${v.id}/constats`, { typeCode: 'nc_mineure', description: 'NC ' + libelle })).constats.slice(-1)[0];
+    const a = (await qualite.ok('POST', `/api/visites/${v.id}/constats/${c.id}/actions`, { libelle, responsableUserId: idQualite })).constats.find((x) => x.id === c.id).actions[0];
+    await qualite.ok('PUT', `/api/visites/${v.id}/constats/${c.id}/actions/${a.id}`, { statut: 'realisee' });
+    await qualite.ok('POST', `/api/visites/${v.id}/constats/${c.id}/actions/${a.id}/valider`, { efficace: true, commentaire: 'Contrôle fait' });
+    return { c, a };
+  }
+
+  before(async () => {
+    srv = await demarrer();
+    admin = srv.client();
+    await admin.login('admin', 'admin');
+    profils = await admin.ok('GET', '/api/profils');
+    valreas = await admin.ok('POST', '/api/secteurs', { nom: 'Usine de Valréas', code: 'VAL', type: 'site' });
+    valProd = await admin.ok('POST', '/api/secteurs', { nom: 'Production Valréas', code: 'VAL-PROD', type: 'service', parentId: valreas.id });
+    usineB = await admin.ok('POST', '/api/secteurs', { nom: 'Usine B', code: 'USB', type: 'site' });
+    secteurs = await admin.ok('GET', '/api/secteurs');
+    site = secteurs.find((s) => s.code === 'SITE');
+    prod = secteurs.find((s) => s.code === 'PROD');
+    maint = secteurs.find((s) => s.code === 'MAINT');
+    ({ c: qualite, id: idQualite } = await creerUtilisateur('qualite', 'Responsable qualité', [site.id]));
+    ({ c: respMaint } = await creerUtilisateur('respmaint', 'Responsable maintenance', []));
+    ({ c: chef } = await creerUtilisateur('chefprod', 'Chef de secteur', [prod.id]));
+    ({ c: chefLecteur, id: idChefLecteur } = await creerUtilisateur('cheflecteur', 'Chef de secteur', [prod.id], { overrides: { visites: { modifier: false } } }));
+    ({ c: qualVal, id: idQualVal } = await creerUtilisateur('qualval', 'Responsable qualité', [valreas.id]));
+    ({ c: lecteurVal } = await creerUtilisateur('lecteurval', 'Responsable qualité', [site.id], { siteAcces: [{ siteId: valreas.id, mode: 'lecture' }] }));
+  });
+  after(async () => { await srv.stop(); });
+
+  test('constat avec une action vérifiée efficace : suppression réservée au droit supprimer', async () => {
+    const v = await qualite.ok('POST', '/api/visites', base({ titre: 'Audit avec action vérifiée' }));
+    const { c, a } = await actionVerifiee(v, 'Corriger');
+    assert.equal((await respMaint.del(`/api/visites/${v.id}/constats/${c.id}/actions/${a.id}`)).status, 403, 'action vérifiée : droit supprimer');
+    const r = await respMaint.del(`/api/visites/${v.id}/constats/${c.id}`);
+    assert.equal(r.status, 403, 'constat contenant une action vérifiée : droit supprimer');
+    assert.match(r.body.erreur, /Supprimer/);
+    const apres = srv.db.get('visites', v.id);
+    assert.equal(apres.constats.length, 1);
+    assert.equal(apres.constats[0].actions[0].verifiePar, idQualite, 'vérification conservée');
+    // Sans action vérifiée, le droit modifier suffit
+    const c2 = (await qualite.ok('POST', `/api/visites/${v.id}/constats`, { typeCode: 'observation', description: 'Observation' })).constats[1];
+    await qualite.ok('POST', `/api/visites/${v.id}/constats/${c2.id}/actions`, { libelle: 'Action ouverte', responsableUserId: idQualite });
+    assert.equal((await respMaint.del(`/api/visites/${v.id}/constats/${c2.id}`)).status, 200);
+    assert.equal((await qualite.del(`/api/visites/${v.id}/constats/${c.id}`)).status, 200, 'responsable qualité : droit supprimer');
+  });
+
+  test('statut final : passage d\'« annulée » à « terminée » réservé au droit valider, motif d\'annulation effacé', async () => {
+    const v = await respMaint.ok('POST', '/api/visites', base({ titre: 'Audit annulé', dateDebut: heure(48), dateFin: heure(52) }));
+    await respMaint.ok('POST', `/api/visites/${v.id}/statut`, { statut: 'annulee', motif: 'Client absent' });
+    assert.equal((await respMaint.put('/api/visites/' + v.id, { titre: 'Modifiée' })).status, 400);
+    assert.equal((await respMaint.post(`/api/visites/${v.id}/statut`, { statut: 'confirmee' })).status, 403);
+    const t = await respMaint.post(`/api/visites/${v.id}/statut`, { statut: 'terminee' });
+    assert.equal(t.status, 403, 'annulée → terminée : droit valider');
+    assert.equal(srv.db.get('visites', v.id).statut, 'annulee');
+    assert.equal((await respMaint.put('/api/visites/' + v.id, { titre: 'Modifiée après annulation' })).status, 400, 'toujours non modifiable');
+    const ok = await qualite.ok('POST', `/api/visites/${v.id}/statut`, { statut: 'terminee' });
+    assert.equal(ok.statut, 'terminee');
+    assert.equal(ok.motifAnnulation, '', 'motif d\'annulation effacé en quittant « annulée »');
+    assert.equal((await respMaint.post(`/api/visites/${v.id}/statut`, { statut: 'annulee', motif: 'Erreur' })).status, 403, 'terminée → annulée : droit valider');
+  });
+
+  test('action close : le responsable sans droit modifier ne peut pas la rouvrir', async () => {
+    const v = await qualite.ok('POST', '/api/visites', base({ titre: 'Audit atelier', secteurId: prod.id, dateDebut: heure(-30), dateFin: heure(-25) }));
+    const c = (await qualite.ok('POST', `/api/visites/${v.id}/constats`, { typeCode: 'observation', description: 'Obs' })).constats[0];
+    const a = (await qualite.ok('POST', `/api/visites/${v.id}/constats/${c.id}/actions`, { libelle: 'Action', responsableUserId: idChefLecteur })).constats[0].actions[0];
+    const url = `/api/visites/${v.id}/constats/${c.id}/actions/${a.id}`;
+    await qualite.ok('PUT', url, { statut: 'abandonnee', commentaire: 'Abandon décidé en revue' });
+    const avant = notifs(idQualite).filter((n) => /à vérifier/.test(n.titre)).length;
+    for (const statut of ['en_cours', 'realisee', 'a_faire']) {
+      const r = await chefLecteur.put(url, { statut });
+      assert.equal(r.status, 403, `abandonnée → ${statut}`);
+      assert.match(r.body.erreur, /gestionnaire/);
+    }
+    assert.equal((await chefLecteur.put(url, { commentaire: 'Retouche' })).status, 403, 'action close : aucune retouche');
+    assert.equal(srv.db.get('visites', v.id).constats[0].actions[0].statut, 'abandonnee');
+    assert.equal(notifs(idQualite).filter((n) => /à vérifier/.test(n.titre)).length, avant, 'aucune notification « à vérifier »');
+    assert.equal((await qualite.ok('PUT', url, { statut: 'en_cours' })).constats[0].actions[0].statut, 'en_cours', 'le gestionnaire rouvre l\'action');
+  });
+
+  test('désignations : hôte, participant, accompagnateur et responsables limités au périmètre de l\'auteur', async () => {
+    assert.notEqual((await qualite.get('/api/utilisateurs/' + idQualVal)).status, 200, 'compte hors du périmètre de l\'organisateur');
+    const r = await qualite.post('/api/visites', base({ titre: 'Audit D3', hoteUserId: idQualVal, visiteurs: [{ nom: 'Garcia', prenom: 'Inès', telephone: '06 12 34 56 78' }] }));
+    assert.equal(r.status, 403, 'hôte hors périmètre');
+    assert.match(r.body.erreur, /périmètre/);
+    assert.equal((await qualite.post('/api/visites', base({ titre: 'Audit D4', participantsUserIds: [idQualVal] }))).status, 403, 'participant hors périmètre');
+    const v = await qualite.ok('POST', '/api/visites', base({ titre: 'Audit D5', dateDebut: heure(-1), dateFin: heure(4), visiteurs: [{ nom: 'Garcia', telephone: '06 12 34 56 78' }] }));
+    assert.equal((await qualVal.get('/api/visites/' + v.id)).status, 404, 'non désigné : visite fermée');
+    assert.equal((await qualite.put('/api/visites/' + v.id, { hoteUserId: idQualVal })).status, 403);
+    assert.equal((await qualite.post(`/api/visites/${v.id}/visiteurs`, { nom: 'Autre', accompagnateurUserId: idQualVal })).status, 403, 'accompagnateur hors périmètre');
+    assert.equal((await qualite.put(`/api/visites/${v.id}/visiteurs/${v.visiteurs[0].id}`, { accompagnateurUserId: idQualVal })).status, 403);
+    assert.equal((await qualite.post(`/api/visites/${v.id}/visiteurs/${v.visiteurs[0].id}/arrivee`, { charteAcceptee: true, accompagnateurUserId: idQualVal })).status, 403, 'accompagnateur désigné à l\'arrivée');
+    assert.equal((await qualite.post(`/api/visites/${v.id}/preparation`, { libelle: 'Salle', responsableUserId: idQualVal })).status, 403, 'responsable de préparation');
+    const c = (await qualite.ok('POST', `/api/visites/${v.id}/constats`, { typeCode: 'observation', description: 'Obs' })).constats[0];
+    assert.equal((await qualite.post(`/api/visites/${v.id}/constats/${c.id}/actions`, { libelle: 'Action', responsableUserId: idQualVal })).status, 403, 'responsable d\'action');
+    assert.equal((await qualVal.get('/api/visites/' + v.id)).status, 404, 'aucune désignation enregistrée');
+    // Administrateur : désignation libre ; une désignation déjà enregistrée reste acceptée
+    await admin.ok('PUT', '/api/visites/' + v.id, { hoteUserId: idQualVal });
+    assert.equal((await qualite.ok('PUT', '/api/visites/' + v.id, { titre: 'Audit D5 modifié' })).hoteUserId, idQualVal, 'hôte déjà enregistré conservé');
+    await qualite.ok('POST', `/api/visites/${v.id}/visiteurs/${v.visiteurs[0].id}/arrivee`, { charteAcceptee: true });
+    await qualite.ok('POST', `/api/visites/${v.id}/visiteurs/${v.visiteurs[0].id}/depart`, {});
+  });
+
+  test('contact de l\'organisme : coordonnées réservées aux gestionnaires et anonymisées par la purge', async () => {
+    const contact = { nom: 'Claire Morel', email: 'claire.morel@client.example', telephone: '06 00 00 41 12' };
+    const v = await qualite.ok('POST', '/api/visites', base({ titre: 'Audit atelier contact', secteurId: prod.id, contactOrganisme: contact }));
+    assert.deepEqual((await qualite.ok('GET', '/api/visites/' + v.id)).contactOrganisme, Object.assign({ anonymiseLe: null }, contact), 'gestionnaire : coordonnées complètes');
+    const lu = await chefLecteur.ok('GET', '/api/visites/' + v.id);
+    assert.deepEqual(lu.contactOrganisme, { nom: 'Claire Morel' }, 'consultation seule : nom du contact uniquement');
+    assert.ok(!JSON.stringify(lu).includes('claire.morel@client.example'));
+
+    const fin = new Date(Date.now() - 500 * 86400000);
+    const ancienne = srv.db.insert('visites', {
+      numero: 'VIS-ANCIEN-9', titre: 'Visite ancienne', typeCode: 'visite_client', statut: 'terminee', secteurId: site.id, organisme: 'Ancien client',
+      contactOrganisme: contact, dateDebut: new Date(fin.getTime() - 3600000).toISOString(), dateFin: fin.toISOString(), hoteUserId: idQualite, participantsUserIds: [],
+      visiteurs: [{ id: 1, nom: 'Morel', prenom: 'Claire', email: contact.email, telephone: '06 00 00 41 13', arrivee: fin.toISOString(), depart: fin.toISOString(), badgeNumero: 'VB99999981' }],
+      constats: [], preparation: [], documents: [], historique: [], sequence: 1, createdBy: idQualite,
+    });
+    const r = await qualite.ok('POST', '/api/visites/purger', {});
+    assert.equal(r.contacts, 1);
+    const apres = srv.db.get('visites', ancienne.id);
+    assert.equal(apres.visiteurs[0].email, '');
+    assert.deepEqual([apres.contactOrganisme.nom, apres.contactOrganisme.email, apres.contactOrganisme.telephone], ['Claire Morel', '', ''], 'contact anonymisé, nom conservé');
+    assert.ok(apres.contactOrganisme.anonymiseLe);
+    assert.equal(srv.db.get('visites', v.id).contactOrganisme.email, contact.email, 'visite récente conservée');
+    const lecture = await qualite.ok('GET', '/api/visites/' + ancienne.id);
+    assert.ok(lecture.contactOrganisme.anonymiseLe);
+    assert.ok(/contact de l'organisme/.test(lecture.historique[0].details));
+  });
+
+  test('plan 3D et équipement hors de la portée du lecteur : masqués sur la fiche, plan illisible refusé à la saisie', async () => {
+    const plan = srv.db.insert('plans', { numero: 'PL-900', nom: 'Plan confidentiel maintenance', secteurId: maint.id, objets: [{ id: 'o1', nom: 'Local transformateur HT', type: 'zone' }] });
+    const eq = srv.db.insert('equipements', { numero: 'EQ-SECRET', nom: 'Transformateur HT poste 2', secteurId: maint.id, actif: true });
+    assert.equal((await chef.get('/api/plans/' + plan.id)).status, 404);
+    assert.equal((await chef.get('/api/equipements/' + eq.id)).status, 404);
+    const v = await admin.ok('POST', '/api/visites', base({ titre: 'Visite atelier', secteurId: prod.id, planId: plan.id, objetIds: ['o1'] }));
+    await admin.ok('POST', `/api/visites/${v.id}/constats`, { typeCode: 'observation', description: 'Obs', equipementId: eq.id });
+    const vu = await chef.ok('GET', '/api/visites/' + v.id);
+    assert.equal(vu.plan.masque, true);
+    assert.deepEqual(vu.plan.objets, []);
+    assert.equal(vu.constats[0].equipement.masque, true);
+    const texteFiche = JSON.stringify(vu);
+    for (const secret of ['PL-900', 'Plan confidentiel', 'Local transformateur', 'EQ-SECRET', 'Transformateur HT']) assert.ok(!texteFiche.includes(secret), `« ${secret} » non divulgué`);
+    const pourAdmin = await admin.ok('GET', '/api/visites/' + v.id);
+    assert.equal(pourAdmin.plan.nom, 'Plan confidentiel maintenance');
+    assert.equal(pourAdmin.constats[0].equipement.numero, 'EQ-SECRET');
+    // Le chef ne peut pas rattacher un plan qu'il ne peut pas lire (même réponse qu'un plan inexistant)
+    const sienne = await admin.ok('POST', '/api/visites', base({ titre: 'Visite du chef', secteurId: prod.id }));
+    const refus = await chef.put('/api/visites/' + sienne.id, { planId: plan.id });
+    assert.equal(refus.status, 400);
+    assert.ok(!JSON.stringify(refus.body).includes('confidentiel'));
+    // Plan et équipement déjà rattachés : conservés lors des modifications du chef
+    const maj = await chef.ok('PUT', '/api/visites/' + v.id, { titre: 'Visite atelier modifiée' });
+    assert.equal(srv.db.get('visites', v.id).planId, plan.id);
+    assert.equal(maj.plan.masque, true);
+    assert.equal((await chef.put('/api/visites/' + v.id, { objetIds: [] })).status, 403, 'objets d\'un plan illisible non modifiables');
+    const c = (await chef.ok('PUT', `/api/visites/${v.id}/constats/${vu.constats[0].id}`, { description: 'Obs reformulée' })).constats[0];
+    assert.equal(srv.db.get('visites', v.id).constats[0].equipementId, eq.id, 'équipement conservé');
+    assert.equal(c.equipement.masque, true);
+  });
+
+  test('registre et plan d\'actions : droits calculés par ligne (site en lecture seule)', async () => {
+    const v = await admin.ok('POST', '/api/visites', base({ titre: 'Visite à Valréas', secteurId: valreas.id, dateDebut: heure(-1), dateFin: heure(4), visiteurs: [{ nom: 'Bonnet' }] }));
+    const c = (await admin.ok('POST', `/api/visites/${v.id}/constats`, { typeCode: 'observation', description: 'Obs' })).constats[0];
+    await admin.ok('POST', `/api/visites/${v.id}/constats/${c.id}/actions`, { libelle: 'Action Valréas', responsableUserId: idQualite });
+    const ici = await qualite.ok('POST', '/api/visites', base({ titre: 'Visite ici', dateDebut: heure(-1), dateFin: heure(4), visiteurs: [{ nom: 'Arnaud' }] }));
+    const reg = await lecteurVal.ok('GET', '/api/visites-registre');
+    const ligneVal = reg.attendus.find((l) => l.visiteId === v.id);
+    assert.ok(ligneVal, 'visite du site en lecture seule listée');
+    assert.equal(ligneVal.droits.accueil, false, 'site en lecture seule : pas d\'accueil');
+    assert.equal(reg.attendus.find((l) => l.visiteId === ici.id).droits.accueil, true);
+    assert.equal((await lecteurVal.post(`/api/visites/${v.id}/visiteurs/${ligneVal.visiteurId}/arrivee`, { charteAcceptee: true })).status, 403, 'le serveur confirme');
+    const actions = await lecteurVal.ok('GET', '/api/visites-actions?visiteId=' + v.id);
+    assert.deepEqual(actions[0].droits, { gestion: false, avancement: false, verifier: false, demande: false });
+    const pourQualite = await qualVal.ok('GET', '/api/visites-actions?visiteId=' + v.id);
+    assert.equal(pourQualite[0].droits.gestion, true);
+    assert.equal(pourQualite[0].droits.demande, true);
+    const pourResponsable = await qualite.ok('GET', '/api/visites-actions?responsableUserId=moi');
+    assert.equal(pourResponsable.find((a) => a.visiteId === v.id).droits.avancement, true, 'responsable de l\'action : avancement possible');
+  });
+
+  test('registre : indicateur de pièce d\'identité déjà saisie (jamais sa valeur)', async () => {
+    const cfg = srv.db.getConfig();
+    cfg.visites.demanderPieceIdentite = true;
+    srv.db.setConfig(cfg);
+    try {
+      const v = await qualite.ok('POST', '/api/visites', base({ titre: 'Visite identité', dateDebut: heure(-1), dateFin: heure(3), visiteurs: [{ nom: 'Martin', pieceIdentite: 'CNI 1234567' }, { nom: 'Sans pièce' }] }));
+      assert.equal(v.visiteurs[0].pieceIdentiteRenseignee, true);
+      const reg = await qualite.ok('GET', '/api/visites-registre');
+      const l = reg.attendus.find((x) => x.visiteId === v.id && x.nom === 'Martin');
+      assert.equal(l.pieceIdentiteRenseignee, true);
+      assert.equal(reg.attendus.find((x) => x.visiteId === v.id && x.nom === 'Sans pièce').pieceIdentiteRenseignee, false);
+      assert.ok(!JSON.stringify(reg).includes('1234567'), 'valeur jamais transmise au registre');
+      await qualite.ok('POST', `/api/visites/${v.id}/visiteurs/${l.visiteurId}/arrivee`, { charteAcceptee: true });
+      assert.equal(srv.db.get('visites', v.id).visiteurs[0].pieceIdentite, 'CNI 1234567', 'pièce enregistrée conservée');
+      await qualite.ok('POST', `/api/visites/${v.id}/visiteurs/${l.visiteurId}/depart`, {});
+    } finally {
+      cfg.visites.demanderPieceIdentite = false;
+      srv.db.setConfig(cfg);
+    }
+  });
+
+  test('registre : heure d\'arrivée bornée à la veille du début de la visite', async () => {
+    const v = await qualite.ok('POST', '/api/visites', base({ titre: 'Visite bornée', dateDebut: heure(-1), dateFin: heure(4), visiteurs: [{ nom: 'Avant' }] }));
+    const url = `/api/visites/${v.id}/visiteurs/${v.visiteurs[0].id}/arrivee`;
+    const r = await qualite.post(url, { charteAcceptee: true, horodatage: heure(-24 * 6) });
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /antérieure à la visite/);
+    assert.equal(srv.db.get('visites', v.id).visiteurs[0].arrivee, null);
+    const ok = await qualite.ok('POST', url, { charteAcceptee: true, horodatage: heure(-0.5) });
+    assert.ok(ok.visiteurs[0].arrivee);
+    const d = `/api/visites/${v.id}/visiteurs/${v.visiteurs[0].id}/depart`;
+    assert.equal((await qualite.post(d, { horodatage: heure(-0.75) })).status, 400, 'départ avant l\'arrivée');
+    await qualite.ok('POST', d, {});
+  });
+
+  test('validation : textes non textuels, identifiants hexadécimaux et nombres en exposant refusés', async () => {
+    const r = await qualite.post('/api/visites', base({ titre: true }));
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /texte attendu/);
+    assert.equal((await qualite.post('/api/visites', base({ titre: 'Organisme numérique', organisme: 12345 }))).status, 400);
+    assert.equal((await qualite.post('/api/visites', base({ titre: 'Hexa', hoteUserId: '0x3' }))).status, 400);
+    assert.equal((await qualite.post('/api/visites', base({ titre: 'Hexa', secteurId: '0x1' }))).status, 400);
+    assert.equal((await qualite.post('/api/visites', base({ titre: 'Exposant', secteurId: '1e0' }))).status, 400);
+    assert.equal((await qualite.post('/api/visites/purger', { jours: '1e3' })).status, 400);
+    assert.equal((await qualite.post('/api/visites/purger', { jours: '0x10' })).status, 400);
+    assert.equal((await qualite.ok('POST', '/api/visites/purger', { jours: '400' })).jours, 400, 'écriture décimale acceptée');
+    const v = await qualite.ok('POST', '/api/visites', base({ titre: 'Identifiants', secteurId: String(site.id), visiteurs: [{ nom: 'Test' }] }));
+    assert.equal(v.secteurId, site.id, 'identifiant en chaîne décimale accepté');
+    assert.equal((await qualite.get('/api/visites/0x' + v.id.toString(16))).status, 404, 'identifiant d\'URL hexadécimal');
+    assert.equal((await qualite.get(`/api/visites/${v.id}/visiteurs/0x${v.visiteurs[0].id.toString(16)}`)).status, 404);
+    assert.equal((await qualite.post(`/api/visites/${v.id}/visiteurs`, { nom: 'Faux', societe: 42 })).status, 400);
+    assert.equal((await qualite.post('/api/visites-registre/scan', { code: 12345678 })).status, 400);
+  });
+
+  test('date de réalisation d\'une action : jamais dans le futur', async () => {
+    const v = await qualite.ok('POST', '/api/visites', base({ titre: 'Audit réalisation', secteurId: prod.id }));
+    const c = (await qualite.ok('POST', `/api/visites/${v.id}/constats`, { typeCode: 'observation', description: 'Obs' })).constats[0];
+    const a = (await qualite.ok('POST', `/api/visites/${v.id}/constats/${c.id}/actions`, { libelle: 'Action', responsableUserId: idChefLecteur })).constats[0].actions[0];
+    const url = `/api/visites/${v.id}/constats/${c.id}/actions/${a.id}`;
+    const r = await chefLecteur.put(url, { statut: 'realisee', dateRealisation: '2099-12-31' });
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /futur/);
+    assert.equal((await qualite.put(url, { statut: 'realisee', dateRealisation: dansJours(1) })).status, 400, 'gestionnaire : même règle');
+    const ok = await chefLecteur.ok('PUT', url, { statut: 'realisee', dateRealisation: dansJours(-2) });
+    assert.equal(ok.constats[0].actions[0].dateRealisation, dansJours(-2));
+  });
+
+  test('journal d\'activité : libellés français des arrivées, départs et liaisons', async () => {
+    const v = await qualite.ok('POST', '/api/visites', base({ titre: 'Visite journal', dateDebut: heure(-1), dateFin: heure(3), visiteurs: [{ nom: 'Journal' }] }));
+    const vid = v.visiteurs[0].id;
+    await qualite.ok('POST', `/api/visites/${v.id}/visiteurs/${vid}/arrivee`, { charteAcceptee: true });
+    await qualite.ok('POST', `/api/visites/${v.id}/visiteurs/${vid}/depart`, {});
+    const j = await admin.ok('GET', '/api/audit?entite=visites');
+    assert.ok(j.actions.includes('arrivee') && j.actions.includes('depart'));
+    assert.equal(j.libellesActions.arrivee, 'Arrivée d\'un visiteur');
+    assert.equal(j.libellesActions.depart, 'Départ d\'un visiteur');
+    assert.equal(j.libellesActions.liaison, 'Liaison à une demande d\'intervention');
+    const csv = await admin.get('/api/audit/export?entite=visites');
+    assert.ok(csv.body.includes('Arrivée d\'un visiteur') && csv.body.includes('Départ d\'un visiteur'));
+  });
+
+  test('demande d\'intervention refusée : responsable prévenu, nouvelle demande possible, ancienne conservée', async () => {
+    const v = await qualite.ok('POST', '/api/visites', base({ titre: 'Audit sécurité', dateDebut: heure(-10), dateFin: heure(-8) }));
+    const c = (await qualite.ok('POST', `/api/visites/${v.id}/constats`, { typeCode: 'observation', description: 'Zone non matérialisée', secteurId: prod.id })).constats[0];
+    const a = (await qualite.ok('POST', `/api/visites/${v.id}/constats/${c.id}/actions`, { libelle: 'Matérialiser la zone', responsableUserId: idChefLecteur, echeance: dansJours(10) })).constats[0].actions[0];
+    const url = `/api/visites/${v.id}/constats/${c.id}/actions/${a.id}/creer-demande`;
+    const r = await qualite.ok('POST', url, {});
+    assert.equal(srv.db.get('demandes', r.demande.id).statut, 'soumise');
+    const avant = notifs(idChefLecteur).length;
+    await admin.ok('POST', `/api/demandes/${r.demande.id}/refuser`, { motif: 'Hors budget' });
+    const n = notifs(idChefLecteur).slice(avant);
+    assert.ok(n.some((x) => /refusée/.test(x.titre) && /Hors budget/.test(x.message) && x.lien === `#/visites/${v.id}?onglet=constats`), 'responsable de l\'action prévenu du refus');
+    const fiche = await qualite.ok('GET', '/api/visites/' + v.id);
+    const act = fiche.constats[0].actions[0];
+    assert.equal(act.statut, 'en_cours');
+    assert.equal(act.demande.refusee, true);
+    assert.ok(fiche.historique.some((h) => /refusée/.test(h.details) && /Hors budget/.test(h.details)), 'refus inscrit à l\'historique');
+    const lignes = await qualite.ok('GET', '/api/visites-actions?visiteId=' + v.id);
+    assert.equal(lignes[0].droits.demande, true, 'nouvelle demande proposée');
+    const r2 = await qualite.ok('POST', url, { titre: 'Matérialiser la zone (devis réduit)' });
+    assert.notEqual(r2.demande.id, r.demande.id);
+    const act2 = r2.visite.constats[0].actions[0];
+    assert.equal(act2.demandeId, r2.demande.id);
+    assert.equal(act2.demande.refusee, false);
+    assert.deepEqual(act2.demandesPrecedentes.map((x) => [x.id, x.statut]), [[r.demande.id, 'refusee']], 'demande refusée conservée');
+    assert.equal((await qualite.post(url, {})).status, 409, 'demande en cours : une seule');
+    assert.equal((await qualite.del(`/api/visites/${v.id}/constats/${c.id}/actions/${a.id}`)).status, 400, 'action liée : suppression toujours refusée');
+  });
+
+  test('changement de site d\'une visite refusé tant que ses constats portent sur l\'ancien site', async () => {
+    const v = await admin.ok('POST', '/api/visites', base({ titre: 'Visite déplacée', secteurId: site.id }));
+    const c = (await admin.ok('POST', `/api/visites/${v.id}/constats`, { typeCode: 'observation', description: 'Obs', secteurId: prod.id })).constats[0];
+    const r = await admin.put('/api/visites/' + v.id, { secteurId: usineB.id });
+    assert.equal(r.status, 400);
+    assert.match(r.body.erreur, /1 constat\(s\).*Site principal/);
+    assert.equal(srv.db.get('visites', v.id).secteurId, site.id);
+    assert.equal((await admin.ok('PUT', '/api/visites/' + v.id, { secteurId: prod.id })).secteurId, prod.id, 'même site : changement de secteur libre');
+    await admin.ok('PUT', `/api/visites/${v.id}/constats/${c.id}`, { secteurId: null });
+    const ok = await admin.ok('PUT', '/api/visites/' + v.id, { secteurId: usineB.id });
+    assert.equal(ok.siteId, usineB.id);
+  });
+
+  test('exports CSV : règle d\'échappement commune (server/csv.js)', async () => {
+    const { csvEscape } = require('../server/csv');
+    assert.equal(require('../server/modules/visites').csvCellule, undefined, 'aucune copie locale de la règle');
+    await qualite.ok('POST', '/api/visites', base({ titre: 'Export échappement', organisme: '+12', referentiel: '+33 6 00 00 00 00' }));
+    const csv = await qualite.get('/api/visites-export/visites');
+    const ligne = csv.body.split('\r\n').find((l) => l.includes('Export échappement'));
+    assert.ok(ligne.includes(';' + csvEscape('+12') + ';'), 'nombre signé conservé comme par csvEscape');
+    assert.ok(ligne.includes(';' + csvEscape('+33 6 00 00 00 00') + ';'), 'texte commençant par + neutralisé');
+    assert.ok(!ligne.includes('\'+12'));
+  });
+});

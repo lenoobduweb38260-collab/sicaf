@@ -3,6 +3,12 @@
 Procédure destinée au pôle informatique. Elle couvre la signature des mises à jour (clé Ed25519), la
 signature de code Windows (Authenticode) et la publication interne par dossier réseau, sans accès Internet.
 
+> **Prérequis de livraison.** La version livrée n'intègre aucune clé publique (`gmao.clePubliqueMaj` absent de
+> `package.json`) : tant que les sections 2 à 4 n'ont pas été appliquées, aucun poste n'exige de signature et seuls
+> les contrôles de la colonne « sans clé publique » ci-dessous s'appliquent. Le pôle informatique les applique avant
+> le premier déploiement, **dans l'ordre** : paire de clés, secret `MAJ_CLE_PRIVEE`, puis clé publique. Une clé
+> publique intégrée sans le secret correspondant bloquerait toutes les mises à jour suivantes (section 8).
+
 ## 1. Principe
 
 À chaque version publiée, GitHub Actions (`.github/workflows/build-windows.yml`) construit l'installateur
@@ -20,8 +26,9 @@ Contrôles effectués par chaque poste avant l'installation :
 |---|---|---|
 | Signature Ed25519 du manifeste (version, fichier, empreinte, taille, date, notes) | non | **obligatoire** : manifeste non signé ou mal signé → refus |
 | Version publiée strictement supérieure à la version installée | oui | oui, même pour un manifeste signé |
-| Source GitHub : HTTPS, hôtes `github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com` | oui | oui |
-| Taille et empreinte SHA-256 de l'installateur | oui | oui (obligatoires dans le manifeste) |
+| Source GitHub : HTTPS, hôtes `github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`, y compris pour chaque redirection (contrôlée avant d'être suivie) | oui | oui |
+| Taille de l'installateur | oui | oui (obligatoire dans le manifeste) |
+| Empreinte SHA-256 de l'installateur | oui si le manifeste `latest.json` la publie ; publication GitHub sans manifeste : taille seule | oui (obligatoire dans le manifeste) |
 
 Les contrôles s'appliquent quelle que soit la source : publications GitHub, dossier réseau ou adresse web
 interne. Les notes de version affichées aux utilisateurs font partie du contenu signé.
@@ -49,35 +56,65 @@ Conservation de la clé privée :
 
 1. Enregistrez-la dans le coffre-fort de mots de passe de l'entreprise et sur un support chiffré rangé en
    lieu sûr (deux exemplaires).
-2. Ajoutez-la comme secret GitHub (section 3).
+2. Ajoutez-la comme secret de l'environnement GitHub `publication` (section 3).
 3. Supprimez le fichier du poste d'administration.
 
 Sans cette clé, plus aucune mise à jour ne peut être installée automatiquement par les postes qui
 intègrent la clé publique (voir section 5).
 
-## 3. Secret GitHub `MAJ_CLE_PRIVEE`
+## 3. Secret GitHub `MAJ_CLE_PRIVEE` (environnement protégé `publication`)
 
-1. Sur la page du dépôt : **Settings › Secrets and variables › Actions › New repository secret**.
-2. Nom : `MAJ_CLE_PRIVEE`.
-3. Valeur : tout le contenu du fichier de clé privée, lignes `-----BEGIN PRIVATE KEY-----` et
-   `-----END PRIVATE KEY-----` comprises.
+Les secrets de signature ne doivent **jamais** être des secrets du dépôt : ceux-ci sont transmis à toute
+exécution lancée par une personne ou un jeton disposant du droit d'écriture, depuis n'importe quelle branche,
+avec le workflow de cette branche (éventuellement modifié) ; la protection de la branche par défaut ne s'y
+applique pas. Ils sont rangés dans l'environnement GitHub `publication`, que seule la branche par défaut peut
+utiliser.
 
-Avec l'outil en ligne de commande GitHub : `gh secret set MAJ_CLE_PRIVEE < E:\Coffre\gmao-signature-maj.pem`.
+1. Sur la page du dépôt : **Settings › Environments › New environment**, nom : `publication`.
+2. **Deployment branches and tags** : « Selected branches and tags », avec une seule règle : la branche par
+   défaut (par exemple `main`). Aucune autre branche, aucune étiquette.
+3. (Recommandé) **Required reviewers** : un ou deux membres du pôle informatique, qui approuvent chaque
+   publication, avec « Prevent self-review ».
+4. **Environment secrets › Add environment secret** : nom `MAJ_CLE_PRIVEE`, valeur : tout le contenu du fichier
+   de clé privée, lignes `-----BEGIN PRIVATE KEY-----` et `-----END PRIVATE KEY-----` comprises.
+5. Supprimez les éventuels secrets `MAJ_CLE_PRIVEE`, `CSC_LINK` et `CSC_KEY_PASSWORD` de
+   **Settings › Secrets and variables › Actions › Repository secrets**.
+
+Avec l'outil en ligne de commande GitHub :
+`gh secret set MAJ_CLE_PRIVEE --env publication < E:\Coffre\gmao-signature-maj.pem`.
 
 Utilisation par le workflow :
 
-- le secret n'est transmis qu'à l'étape « Manifeste de mise à jour », et seulement pour une version
-  publiée (branche par défaut hors commit `[wip]`, ou étiquette `v*`) ; les constructions de branches
-  produisent un manifeste non signé ;
-- la clé n'est jamais écrite sur disque ni affichée dans le journal ;
+- le job de construction n'utilise l'environnement `publication`, donc ses secrets, que pour une version
+  publiée : push sur la branche par défaut hors commit `[wip]`, ou exécution manuelle (« Run workflow ») sur
+  cette branche. GitHub refuse cet environnement à toute autre branche, même si le workflow y est modifié ;
+  aucune étiquette ne déclenche de construction ni de publication. Les constructions de branches produisent
+  des exécutables et un manifeste non signés ;
+- le secret n'est transmis qu'à l'étape « Manifeste de mise à jour » ; la clé n'est jamais écrite sur disque
+  ni affichée dans le journal ;
+- la Release GitHub est créée par un job distinct (« Publication de la version »), seul à disposer du droit
+  d'écriture sur le dépôt, qui n'exécute ni le code du dépôt ni aucun paquet npm et ne reçoit aucun secret ;
 - le résumé du job indique si le manifeste est signé et l'empreinte de la clé publique utilisée ;
 - si une clé publique est configurée dans `package.json` et que la clé privée ne lui correspond pas, la
   construction s'arrête (les postes refuseraient la mise à jour).
 
+Chaîne de construction verrouillée (le contenu signé ne doit dépendre que de fichiers relus) :
+
+- les actions GitHub sont épinglées par empreinte de commit complète, leur version en commentaire : une
+  nouvelle version d'action n'est utilisée qu'après une modification relue du workflow (Dependabot peut
+  proposer ces mises à jour avec les écosystèmes `github-actions` et `npm`) ;
+- Electron et electron-builder sont installés par `npm ci` depuis `package-lock.json`, versionné avec le code.
+  Une version publiée n'est jamais construite sans ce fichier (le job s'arrête). Pour le créer ou le mettre à
+  jour, sur un poste de confiance : `npm install --package-lock-only --ignore-scripts`, puis relisez la
+  différence (paquets, versions, empreintes `integrity`) avant de la pousser.
+
 Recommandations pour le dépôt : authentification à deux facteurs obligatoire, protection de la branche par
-défaut avec relecture des modifications (en particulier `.github/workflows/`, `scripts/`, `electron/` et
-`package.json`), nombre d'administrateurs limité. Toute personne qui peut modifier le workflow sur la branche
-par défaut peut en effet utiliser les secrets.
+défaut avec relecture obligatoire des modifications (en particulier `.github/workflows/`, `scripts/`,
+`electron/`, `package.json` et `package-lock.json`), nombre d'administrateurs limité, règle (ruleset) qui
+réserve la création, la modification et la suppression des étiquettes `v*` aux administrateurs. Toute personne
+qui peut fusionner sur la branche par défaut sans relecture peut utiliser les secrets. Enfin, tant que la clé
+publique n'est pas intégrée aux postes (section 4), une personne disposant du droit d'écriture peut encore
+publier une Release acceptée par les postes : seule la signature du manifeste protège réellement les postes.
 
 ## 4. Intégrer la clé publique à l'application
 
@@ -98,8 +135,9 @@ nouvelle paire.
 Mise en service :
 
 1. Créez d'abord le secret `MAJ_CLE_PRIVEE` (section 3), puis poussez la modification de `package.json`.
-2. Cette première version est encore acceptée par les postes selon l'ancienne règle (empreinte seule).
-   Une fois installée, chaque poste exige une signature valide pour toutes les versions suivantes.
+2. Cette première version est encore acceptée par les postes selon l'ancienne règle (empreinte du manifeste non
+   signé ; taille seule pour une publication GitHub sans `latest.json`). Une fois installée, chaque poste exige une
+   signature valide pour toutes les versions suivantes.
 3. Pour une confiance complète dès la mise en service, installez cette version manuellement ou par votre
    outil de déploiement (GPO, Intune…) à partir d'un installateur signé Authenticode (section 6).
 
@@ -114,6 +152,13 @@ Mise en service :
   restant hors ligne (coffre). Elle permet de continuer à publier si la clé principale est perdue.
 - **Clé privée compromise** : publiez au plus vite une version signée avec une clé saine (secours ou
   nouvelle clé) dont le tableau ne contient plus la clé compromise ; remplacez le secret GitHub.
+- **Version signée défectueuse ou vulnérable** : publier une version corrective ne suffit pas toujours. Un poste
+  encore en version inférieure accepte toute version signée supérieure à la sienne, même antérieure à la
+  dernière publiée : la date signée n'est pas comparée. Une personne qui contrôle une source (dossier réseau,
+  adresse web interne) peut donc y remettre le manifeste et l'installateur, intacts, d'une version signée
+  remplacée depuis, et y maintenir les postes (rejeu d'une version signée). Retirez cette version de toutes
+  les sources (Release GitHub, dossiers, serveurs internes), vérifiez la version installée sur chaque poste
+  (**Aide › À propos**) et mettez à jour manuellement ceux qui ne l'ont pas dépassée.
 - **Clé perdue sans clé de secours** : les postes devront être mis à jour manuellement avec une version
   intégrant une nouvelle clé publique.
 
@@ -143,8 +188,8 @@ signature Authenticode avant l'installation silencieuse.
    ```
 
    Le résultat de `certutil -encode` est également accepté (les lignes `BEGIN` / `END` sont ignorées).
-2. Créez le secret `CSC_LINK` avec ce texte, puis le secret `CSC_KEY_PASSWORD` avec le mot de passe du
-   fichier `.pfx`.
+2. Dans l'environnement `publication` (section 3, jamais dans les secrets du dépôt), créez le secret
+   `CSC_LINK` avec ce texte, puis le secret `CSC_KEY_PASSWORD` avec le mot de passe du fichier `.pfx`.
 
 Fonctionnement dans le workflow :
 
@@ -166,7 +211,10 @@ Get-AuthenticodeSignature .\GMAO-SICAF-Setup-1.0.42.exe | Format-List Status, Si
 
 Les postes peuvent recevoir les mises à jour depuis un partage réseau, par exemple
 `\\NAS\gmao\mises-a-jour`. La signature y est vérifiée exactement comme pour GitHub : même un partage
-compromis ne permet pas d'installer un exécutable modifié.
+compromis ne permet pas d'installer un exécutable modifié. Il permet en revanche de retenir les postes sur
+une version (en retirant `latest.json`) ou d'y remettre une version signée plus ancienne que la dernière
+publiée mais supérieure à celle des postes : ne laissez sur le partage que la dernière version et appliquez
+la section 5 (« Version signée défectueuse ou vulnérable ») si une version doit être retirée.
 
 ### Obtenir les fichiers
 
@@ -212,30 +260,43 @@ compromis ne permet pas d'installer un exécutable modifié.
 | « algorithme de signature absent ou non pris en charge » / « signature mal formée » | manifeste altéré ou produit par un autre outil | republier avec `scripts/manifeste-maj.js` |
 | « Clé publique de mise à jour invalide » | valeur de `gmao.clePubliqueMaj` erronée dans `package.json` | corriger la clé et redéployer l'application manuellement |
 | « La version publiée (…) est antérieure à la version installée » | publication d'un numéro inférieur | publier un numéro supérieur |
-| « l'hôte … n'appartient pas à GitHub » / « Redirection refusée » | réponse ou redirection vers un autre serveur (mandataire, détournement) | vérifier le mandataire réseau ; utiliser la source « dossier » si nécessaire |
+| « l'hôte … n'appartient pas à GitHub » / « Redirection refusée » | réponse ou redirection vers un autre serveur (mandataire, détournement) : chaque redirection est contrôlée avant d'être suivie | vérifier le mandataire réseau ; utiliser la source « dossier » si nécessaire |
+| « l'adresse finale de la réponse est inconnue » | outil de téléchargement qui ne permet pas de contrôler les redirections (version de l'application modifiée) | réinstaller l'application depuis un installateur signé ; prévenir le pôle informatique |
 | « Empreinte de l'installateur incorrecte » / « Taille de l'installateur incorrecte » | téléchargement corrompu ou fichier substitué | relancer ; si le problème persiste, vérifier la source |
 
 ## 9. Publication refusée par GitHub
 
 Lorsqu'un commit modifie lui-même un fichier de `.github/workflows`, GitHub refuse au jeton du workflow la
 création de l'étiquette de version. L'exécution n'échoue pas : le résumé du job affiche « version non
-publiée » et les exécutables restent disponibles dans les artefacts. Pour publier, poussez un commit suivant
-qui ne modifie pas les workflows, ou créez l'étiquette depuis un poste autorisé :
+publiée » et les exécutables, déjà signés avec leur manifeste, restent disponibles dans les artefacts. Pour
+publier, poussez un commit suivant qui ne modifie pas les workflows, ou créez la Release depuis un poste
+autorisé (compte d'un administrateur) avec ces fichiers, sans les modifier :
 
 ```bash
-git tag v1.0.42 <commit>
-git push origin v1.0.42
+gh run download <numéro de l'exécution> --name GMAO-SICAF-1.0.42 --dir dist
+gh release create v1.0.42 dist/GMAO-SICAF-Setup-1.0.42.exe dist/GMAO-SICAF-Portable-1.0.42.exe dist/latest.json \
+  --target <commit> --title "GMAO SICAF 1.0.42" --notes-file dist/notes.txt --latest
 ```
 
-Le workflow se relance sur l'étiquette et publie la version correspondante.
+Pousser une étiquette `v*` ne déclenche plus aucune publication : une étiquette peut être posée sur n'importe
+quel commit, y compris un commit d'une branche jamais relue.
 
 ## 10. Liste de contrôle
 
+Avant le premier déploiement (prérequis de livraison, dans cet ordre) :
+
 - [ ] Paire de clés générée hors du dépôt ; deux copies hors ligne de la clé privée ; fichier supprimé du poste.
-- [ ] Secret `MAJ_CLE_PRIVEE` créé ; résumé du dernier job : « Signature : ed25519 ».
+- [ ] Environnement `publication` créé, réservé à la branche par défaut (relecteurs obligatoires recommandés) ;
+      aucun secret de signature dans les secrets du dépôt.
+- [ ] Secret `MAJ_CLE_PRIVEE` créé dans l'environnement `publication` ; résumé du dernier job : « Signature : ed25519 ».
+- [ ] `package-lock.json` généré sur un poste de confiance, relu et versionné (sans lui, aucune version n'est publiée).
 - [ ] `gmao.clePubliqueMaj` renseigné dans `package.json` ; empreinte identique à celle du résumé du job.
+
+Ensuite :
+
 - [ ] (Facultatif) clé de secours ajoutée au tableau, clé privée au coffre.
-- [ ] Certificat de signature de code : secrets `CSC_LINK` et `CSC_KEY_PASSWORD` ; état des exécutables
-      vérifié dans le résumé du job.
+- [ ] Certificat de signature de code : secrets `CSC_LINK` et `CSC_KEY_PASSWORD` dans l'environnement
+      `publication` ; état des exécutables vérifié dans le résumé du job.
 - [ ] Branche par défaut protégée, relecture obligatoire, authentification à deux facteurs.
+- [ ] Étiquettes `v*` protégées par une règle (création, modification et suppression réservées aux administrateurs).
 - [ ] Partage réseau de mises à jour (si utilisé) : lecture seule pour les postes.

@@ -9,21 +9,27 @@ name: Application Windows (.exe)
 # Chaque push sur la branche par défaut publie une nouvelle version (Release GitHub « v1.0.<n> ») :
 # les postes équipés de l'application la détectent et l'installent automatiquement.
 # Les autres branches, et les commits marqués [wip], produisent les .exe en artefacts (onglet Actions)
-# sans les publier.
+# sans les publier ni les signer. Aucune étiquette ne déclenche de publication : une étiquette peut être
+# posée sur n'importe quel commit, sans relecture.
 #
-# Secrets facultatifs (Settings › Secrets and variables › Actions), voir docs/MISES-A-JOUR.md :
+# Secrets de signature, voir docs/MISES-A-JOUR.md :
 #   - MAJ_CLE_PRIVEE    clé privée Ed25519 de signature du manifeste (scripts/generer-cle-maj.js) ;
 #   - CSC_LINK          certificat de signature de code Windows (.pfx encodé en base64) ;
 #   - CSC_KEY_PASSWORD  mot de passe de ce certificat.
-# Ils ne sont utilisés que pour les versions publiées, et chacun uniquement par l'étape qui en a besoin.
+# Ils sont rangés dans l'environnement GitHub « publication », réservé à la branche par défaut
+# (Settings › Environments › publication › Deployment branches and tags), et non dans les secrets du
+# dépôt : une exécution lancée depuis une autre branche, même avec un workflow modifié, ne les reçoit
+# jamais. Ils ne servent qu'aux versions publiées, et chacun uniquement à l'étape qui en a besoin.
+#
+# Chaîne de construction verrouillée : actions épinglées par empreinte de commit (version en commentaire),
+# dépendances installées avec « npm ci » depuis package-lock.json (obligatoire pour une version publiée).
 
 on:
   push:
     branches: ['**']
-    tags: ['v*']
   workflow_dispatch:
 
-# Droits minimaux par défaut ; seul le job de construction peut créer une Release.
+# Droits minimaux par défaut ; seul le job de publication peut créer une Release.
 permissions:
   contents: read
 
@@ -35,11 +41,14 @@ jobs:
   tests:
     name: Tests
     runs-on: ubuntu-latest
+    outputs:
+      # « oui » pour une version à publier : branche par défaut, hors commit [wip]
+      publication: ${{ (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && !contains(github.event.head_commit.message, '[wip]')) && 'oui' || 'non' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - name: Tests API et application de bureau
@@ -49,35 +58,46 @@ jobs:
     name: Installateur Windows
     needs: tests
     runs-on: windows-latest
+    # Environnement protégé (secrets de signature) uniquement pour une version publiée
+    environment: ${{ needs.tests.outputs.publication == 'oui' && 'publication' || '' }}
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     env:
-      # « oui » pour une version à publier : branche par défaut (hors commit [wip]) ou étiquette v*
-      PUBLICATION: ${{ ((github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && !contains(github.event.head_commit.message, '[wip]')) || startsWith(github.ref, 'refs/tags/v')) && 'oui' || 'non' }}
+      PUBLICATION: ${{ needs.tests.outputs.publication }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Le jeton n'est pas conservé dans .git/config : les scripts d'installation npm ne peuvent pas s'en servir
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
 
       - name: Numéro de version
+        id: version
         shell: bash
         run: |
           BASE=$(node -p "require('./package.json').version.split('.').slice(0,2).join('.')")
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
-          else
-            VERSION="$BASE.${GITHUB_RUN_NUMBER}"
-          fi
+          VERSION="$BASE.${GITHUB_RUN_NUMBER}"
           npm pkg set version="$VERSION"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version : $VERSION"
 
-      - name: Installation d'Electron et d'electron-builder
-        run: npm install --no-audit --no-fund
+      - name: Installation d'Electron et d'electron-builder (versions verrouillées)
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          elif [ "$PUBLICATION" = "oui" ]; then
+            echo "::error title=Dépendances non verrouillées::package-lock.json est absent : une version signée et publiée ne peut pas être construite avec des dépendances résolues au moment de la construction (docs/MISES-A-JOUR.md, section 3)."
+            exit 1
+          else
+            echo "::warning title=Dépendances non verrouillées::package-lock.json est absent : construction d'essai avec les dernières versions compatibles (aucune publication)."
+            npm install --no-audit --no-fund
+          fi
 
       # Placée après l'installation des paquets npm : leurs scripts d'installation ne voient jamais le certificat.
       - name: Certificat de signature de code (Authenticode)
@@ -121,7 +141,7 @@ jobs:
         shell: bash
         run: |
           rm -f "$(cygpath -u "$RUNNER_TEMP")/certificat-signature.pfx"
-          # Variables vidées : les étapes suivantes (dont les actions de publication) n'y ont plus accès
+          # Variables vidées : les étapes suivantes n'y ont plus accès
           echo "CSC_LINK=" >> "$GITHUB_ENV"
           echo "CSC_KEY_PASSWORD=" >> "$GITHUB_ENV"
 
@@ -141,45 +161,59 @@ jobs:
           $lignes | Write-Output
           if ($echec) { Write-Output '::error title=Signature de code::Un exécutable n''est pas signé alors que le certificat est configuré.'; exit 1 }
 
-      - name: Notes de version
-        # Message du commit, sans les lignes de mention ajoutées par git ou les outils de développement
-        # (Co-Authored-By:, Signed-off-by:, Reviewed-by:, identifiants de session…).
+      - name: Message du commit (notes de version)
         shell: bash
-        run: |
-          git log -1 --pretty=format:"%s%n%n%b" \
-            | grep -viE '^[[:space:]]*[a-z0-9]+(-[a-z0-9]+)*-(by|session):' > notes.txt || true
+        run: git log -1 --pretty=format:"%s%n%n%b" > notes-commit.txt
 
       - name: Manifeste de mise à jour (latest.json)
         # Signé (Ed25519) avec le secret MAJ_CLE_PRIVEE pour une version publiée. Sans ce secret, le manifeste
         # n'est pas signé (avertissement) : les postes dont la clé publique est configurée le refuseront.
+        # Les notes sont nettoyées (en-têtes de fin, mentions d'outils, identifiants de session) par
+        # scripts/manifeste-maj.js, qui écrit aussi dist/notes.txt : le texte de la publication est celui signé.
         shell: bash
         env:
           MAJ_CLE_PRIVEE: ${{ env.PUBLICATION == 'oui' && secrets.MAJ_CLE_PRIVEE || '' }}
-        run: node scripts/manifeste-maj.js dist "$VERSION" notes.txt
+        run: node scripts/manifeste-maj.js dist "$VERSION" notes-commit.txt dist/notes.txt
 
       - name: Artefacts (.exe)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: GMAO-SICAF-${{ env.VERSION }}
           path: |
             dist/GMAO-SICAF-Setup-*.exe
             dist/GMAO-SICAF-Portable-*.exe
             dist/latest.json
+            dist/notes.txt
           if-no-files-found: error
+
+  publication:
+    name: Publication de la version
+    # Job distinct, sans aucun code du dépôt ni paquet npm : seul lui détient le droit d'écrire (Release)
+    needs: [tests, windows]
+    if: needs.tests.outputs.publication == 'oui'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.windows.outputs.version }}
+    steps:
+      - name: Fichiers construits et signés
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: GMAO-SICAF-${{ needs.windows.outputs.version }}
+          path: dist
 
       - name: Publication de la version (mises à jour automatiques)
         id: publication
-        # Pas de publication pour un travail en cours (message de commit contenant [wip])
-        if: env.PUBLICATION == 'oui'
         # GitHub refuse de créer l'étiquette lorsque le commit modifie lui-même un fichier de .github/workflows
         # (le jeton du workflow n'a pas ce droit) : l'échec n'interrompt pas le job et il est signalé ci-dessous.
         continue-on-error: true
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          tag_name: v${{ env.VERSION }}
-          name: GMAO SICAF ${{ env.VERSION }}
+          tag_name: v${{ needs.windows.outputs.version }}
+          name: GMAO SICAF ${{ needs.windows.outputs.version }}
           target_commitish: ${{ github.sha }}
-          body_path: notes.txt
+          body_path: dist/notes.txt
           make_latest: true
           files: |
             dist/GMAO-SICAF-Setup-*.exe
@@ -202,8 +236,8 @@ jobs:
               *".github/workflows/"*) echo; echo "C'est le cas ici : ce commit modifie un fichier de workflow." ;;
             esac
             echo
-            echo "Les exécutables et latest.json restent disponibles dans les artefacts de cette exécution."
-            echo "Pour publier : poussez un commit suivant qui ne modifie pas les workflows, ou créez l'étiquette depuis"
-            echo "un poste autorisé : \`git tag v$VERSION $GITHUB_SHA\` puis \`git push origin v$VERSION\`."
+            echo "Les exécutables et latest.json (déjà signés) restent disponibles dans les artefacts de cette exécution."
+            echo "Pour publier : poussez un commit suivant qui ne modifie pas les workflows, ou créez la Release depuis un"
+            echo "poste autorisé avec ces fichiers (docs/MISES-A-JOUR.md, section 9)."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::warning title=Version non publiée::GitHub a refusé la publication de v$VERSION (voir le résumé du job). Les .exe sont dans les artefacts."

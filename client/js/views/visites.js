@@ -30,9 +30,11 @@
     'Vérifier les actions de la visite précédente (soldées ou en cours)',
   ];
   const CATEGORIES_DOC = [{ value: 'programme', label: 'Programme' }, { value: 'rapport', label: 'Rapport d\'audit' }, { value: 'certificat', label: 'Certificat' }, { value: 'autre', label: 'Autre document' }];
-  const ETATS_VISITEUR = { attendu: { label: 'Attendu', couleur: '#6b7280' }, present: { label: 'Sur le site', couleur: '#16a34a' }, parti: { label: 'Parti', couleur: '#2563eb' } };
+  /** Teintes des badges pleins (texte blanc) : contraste d'au moins 4,5:1. */
+  const VERT = '#15803d'; const ORANGE = '#b45309'; const ROUGE = '#dc2626'; const GRIS = '#6b7280'; const BLEU = '#2563eb';
+  const ETATS_VISITEUR = { attendu: { label: 'Attendu', couleur: GRIS }, present: { label: 'Sur le site', couleur: VERT }, parti: { label: 'Parti', couleur: BLEU } };
 
-  /** État conservé entre deux affichages (filtres, mode d'affichage, format de badge, écoute de la douchette). */
+  /** État conservé entre deux affichages (filtres, mode d'affichage, format de badge, écoute de secours de la douchette). */
   const memo = {
     mode: 'liste', mois: null, filtres: { typeCode: '', statut: '', secteurId: '', du: '', au: '', recherche: '' },
     filtresActions: { responsableUserId: '', echeance: '', secteurId: '', typeCode: '', toutes: false },
@@ -58,6 +60,8 @@
     return d === f ? `${ui.formatDate(v.dateDebut)} · ${ui.formatHeure(v.dateDebut)} – ${ui.formatHeure(v.dateFin || v.dateDebut)}` : `${ui.formatDateHeure(v.dateDebut)} → ${ui.formatDateHeure(v.dateFin)}`;
   }
   function badgeEtat(etat) { const e = ETATS_VISITEUR[etat] || ETATS_VISITEUR.attendu; return ui.badge(e.label, e.couleur); }
+  /** Badge contour : texte aux couleurs du thème (lisible en clair comme en sombre), seule la bordure est colorée. */
+  function badgeContour(label, couleur) { const b = ui.badge(label, null, { contour: true }); b.style.borderColor = couleur; return b; }
   function tailleLisible(o) { const n = Number(o) || 0; return n < 1024 ? `${n} o` : n < 1048576 ? `${Math.round(n / 1024)} Ko` : `${(n / 1048576).toFixed(1)} Mo`; }
   function nettoyer(v) { const o = Object.assign({}, v); for (const k of Object.keys(o)) if (o[k] === '') o[k] = null; return o; }
   function progression(faits, total) {
@@ -93,40 +97,60 @@
     ui.lancerImpression(w, options);
   }
 
-  /** Badges visiteurs : [{ visiteur, visite }] ; format « carte » (86 × 54 mm) ou « a6 ». */
+  /** Couleur de texte lisible (blanc ou presque noir) sur un fond « #rrggbb » : contraste d'au moins 4,5:1. */
+  function texteSurFond(fond) {
+    const m = /^#([0-9a-f]{6})$/i.exec(fond || '');
+    if (!m) return '#fff';
+    const lin = (c) => { const x = c / 255; return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4); };
+    const n = parseInt(m[1], 16);
+    const l = 0.2126 * lin((n >> 16) & 255) + 0.7152 * lin((n >> 8) & 255) + 0.0722 * lin(n & 255);
+    return 1.05 / (l + 0.05) >= 4.5 ? '#fff' : '#111';
+  }
+
+  /**
+   * Badges visiteurs : [{ visiteur, visite }] ; format « carte » (86 × 54 mm) ou « a6 ».
+   * Le code-barres et la mention d'accompagnement gardent toujours leur place : le nom, la société et les
+   * zones sont limités en nombre de lignes (points de suspension) et le bloc d'informations se réduit au besoin.
+   */
   function imprimerBadges(elements, format) {
     if (!elements.length) return toast('Aucun badge à imprimer', 'info');
     const a6 = (format || memo.formatBadge) === 'a6';
     const avecCode = cfg().badgeAvecCodeBarre !== false && window.CodeBarre;
     const societe = ((GMAO.config.societe || {}).nom) || '';
     const accompagne = cfg().accompagnementObligatoire !== false;
-    const l = a6 ? { w: 105, h: 148, nom: 9, soc: 5, info: 3.6, bandeau: 5, code: 16, mod: 0.42 } : { w: 86, h: 54, nom: 5.2, soc: 3.3, info: 2.5, bandeau: 3.2, code: 9, mod: 0.3 };
+    const l = a6
+      ? { w: 105, h: 148, nom: 9, soc: 5, info: 3.6, bandeau: 5, code: 16, mod: 0.42, lignesNom: 3, lignesSoc: 2, lignesZones: 4 }
+      : { w: 86, h: 54, nom: 5, soc: 3.2, info: 2.5, bandeau: 3.2, code: 9, mod: 0.3, lignesNom: 2, lignesSoc: 1, lignesZones: 2 };
+    const limite = (n) => `display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: ${n}; line-clamp: ${n}; overflow: hidden;`;
     const style = `@page { size: ${l.w}mm ${l.h}mm; margin: 0; }
       * { box-sizing: border-box; }
       body { margin: 0; font-family: 'Segoe UI', Arial, sans-serif; color: #111; background: #e5e7eb; }
       .outils { padding: 10px; text-align: center; } .outils button { font: inherit; padding: 6px 16px; cursor: pointer; }
       .badge { width: ${l.w}mm; height: ${l.h}mm; background: #fff; margin: 5mm auto; overflow: hidden; display: flex; flex-direction: column; border: 0.2mm solid #bbb; page-break-after: always; break-after: page; }
-      .bandeau { color: #fff; padding: ${a6 ? 3 : 1.4}mm ${a6 ? 5 : 3}mm; display: flex; justify-content: space-between; align-items: center; font-weight: 700; font-size: ${l.bandeau}mm; letter-spacing: 0.3mm; }
-      .bandeau span:last-child { font-weight: 400; font-size: ${l.bandeau * 0.8}mm; }
-      .corps { flex: 1; padding: ${a6 ? 6 : 2}mm ${a6 ? 6 : 3}mm ${a6 ? 3 : 1}mm; display: flex; flex-direction: column; min-height: 0; }
-      .nom { font-size: ${l.nom}mm; font-weight: 700; line-height: 1.1; word-break: break-word; }
-      .societe { font-size: ${l.soc}mm; color: #333; margin-top: ${a6 ? 2 : 0.6}mm; }
-      .infos { font-size: ${l.info}mm; color: #222; margin-top: ${a6 ? 5 : 1.2}mm; line-height: 1.4; }
+      .bandeau { flex-shrink: 0; padding: ${a6 ? 3 : 1.1}mm ${a6 ? 5 : 3}mm; display: flex; justify-content: space-between; align-items: center; gap: 2mm; font-weight: 700; font-size: ${l.bandeau}mm; line-height: 1.25; letter-spacing: 0.3mm; }
+      .bandeau span:last-child { font-weight: 400; font-size: ${l.bandeau * 0.8}mm; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+      .corps { flex: 1; padding: ${a6 ? 6 : 1.6}mm ${a6 ? 6 : 3}mm ${a6 ? 3 : 0.8}mm; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+      .nom { flex-shrink: 0; font-size: ${l.nom}mm; font-weight: 700; line-height: 1.05; word-break: break-word; ${limite(l.lignesNom)} }
+      .societe { flex-shrink: 0; font-size: ${l.soc}mm; line-height: 1.2; color: #333; margin-top: ${a6 ? 2 : 0.5}mm; ${limite(l.lignesSoc)} }
+      .infos { flex: 0 1 auto; min-height: 0; overflow: hidden; font-size: ${l.info}mm; color: #222; margin-top: ${a6 ? 5 : 1}mm; line-height: 1.25; }
+      .infos > div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .infos > div.zones { white-space: normal; ${limite(l.lignesZones)} }
       .infos b { font-weight: 600; }
-      .mention { font-size: ${l.info}mm; font-weight: 700; color: #b91c1c; margin-top: ${a6 ? 3 : 0.8}mm; }
-      .code { margin-top: auto; text-align: center; } .code svg { height: ${l.code + (a6 ? 5 : 3)}mm; width: auto; max-width: ${l.w - 8}mm; }
-      .numero { margin-top: auto; text-align: center; font-family: monospace; font-size: ${l.soc}mm; letter-spacing: 0.5mm; }
+      .mention { flex-shrink: 0; font-size: ${l.info}mm; line-height: 1.2; font-weight: 700; color: #b91c1c; margin-top: ${a6 ? 3 : 0.6}mm; }
+      .code { flex-shrink: 0; margin-top: auto; padding-top: ${a6 ? 2 : 0.6}mm; text-align: center; line-height: 0; } .code svg { height: ${l.code + (a6 ? 5 : 2.5)}mm; width: auto; max-width: ${l.w - 8}mm; }
+      .numero { flex-shrink: 0; margin-top: auto; text-align: center; font-family: monospace; font-size: ${l.soc}mm; letter-spacing: 0.5mm; }
       @media print { body { background: #fff; } .outils { display: none; } .badge { margin: 0; border: 0; } }`;
     const corps = elements.map(({ visiteur: x, visite: v }) => {
-      const couleur = /^#[0-9a-f]{3,8}$/i.test(ui.couleur('typesVisite', v.typeCode)) ? ui.couleur('typesVisite', v.typeCode) : '#2563eb';
+      const couleur = /^#[0-9a-f]{6}$/i.test(ui.couleur('typesVisite', v.typeCode)) ? ui.couleur('typesVisite', v.typeCode) : BLEU;
       let code = '';
       if (x.badgeNumero && avecCode) { try { code = `<div class="code">${window.CodeBarre.svg(x.badgeNumero, { hauteur: l.code, largeurModule: l.mod, unite: 'mm', taillePolice: a6 ? 3.4 : 2.4 })}</div>`; } catch (e) { code = ''; } }
       if (!code && x.badgeNumero) code = `<div class="numero">${esc(x.badgeNumero)}</div>`;
       const zones = (v.zones || []).join(', ');
-      return `<div class="badge"><div class="bandeau" style="background:${couleur}"><span>VISITEUR</span><span>${esc(societe)}</span></div><div class="corps">`
+      const hote = `<b>Hôte :</b> ${esc(v.hoteNom || '—')}${x.accompagnateurNom && x.accompagnateurNom !== v.hoteNom ? ` · <b>Accompagnateur :</b> ${esc(x.accompagnateurNom)}` : ''}`;
+      return `<div class="badge"><div class="bandeau" style="background:${couleur};color:${texteSurFond(couleur)}"><span>VISITEUR</span><span>${esc(societe)}</span></div><div class="corps">`
         + `<div class="nom">${esc(nomVisiteur(x))}</div>${x.societe ? `<div class="societe">${esc(x.societe)}${x.fonction && a6 ? ' — ' + esc(x.fonction) : ''}</div>` : ''}`
-        + `<div class="infos"><b>Date :</b> ${esc(periode(v))}<br><b>Hôte :</b> ${esc(v.hoteNom || '—')}${x.accompagnateurNom && x.accompagnateurNom !== v.hoteNom ? ` · <b>Accompagnateur :</b> ${esc(x.accompagnateurNom)}` : ''}`
-        + `<br><b>Zones autorisées :</b> ${esc(zones || 'accueil et salles de réunion')}${a6 ? `<br><b>Visite :</b> ${esc(v.numero)} — ${esc(v.titre)}` : ''}</div>`
+        + `<div class="infos"><div><b>Date :</b> ${esc(periode(v))}</div><div>${hote}</div>`
+        + `<div class="zones"><b>Zones autorisées :</b> ${esc(zones || 'accueil et salles de réunion')}</div>${a6 ? `<div><b>Visite :</b> ${esc(v.numero)} — ${esc(v.titre)}</div>` : ''}</div>`
         + (accompagne ? '<div class="mention">Doit être accompagné(e) en permanence</div>' : '')
         + `${code}</div></div>`;
     }).join('');
@@ -152,7 +176,8 @@
       + `<dt>Type</dt><dd>${esc(ui.libelle('typesVisite', v.typeCode))}</dd><dt>Statut</dt><dd>${esc(ui.libelle('statutsVisite', v.statut))}</dd>`
       + `<dt>Date</dt><dd>${esc(periode(v))}</dd><dt>Site visité</dt><dd>${esc(v.secteurChemin || '—')}</dd>`
       + `<dt>Organisme</dt><dd>${esc(v.organisme || '—')}</dd><dt>Référentiel</dt><dd>${esc(v.referentiel || '—')}</dd>`
-      + `<dt>Contact</dt><dd>${esc([v.contactOrganisme.nom, v.contactOrganisme.email, v.contactOrganisme.telephone].filter(Boolean).join(' · ') || '—')}</dd>`
+      // Contact : nom seulement (minimisation des données personnelles sur les documents imprimés)
+      + `<dt>Contact</dt><dd>${esc((v.contactOrganisme || {}).nom || '—')}</dd>`
       + `<dt>Hôte</dt><dd>${esc(v.hoteNom || '—')}</dd><dt>Participants</dt><dd>${esc(v.participants.map((p) => p.nom).join(', ') || '—')}</dd></dl>`;
   }
   function imprimerProgramme(v) {
@@ -178,7 +203,7 @@
     if (!v.constats.length) html += '<p>Aucun constat enregistré.</p>';
     v.constats.forEach((c, i) => {
       html += `<h3 style="font-size:13.5px;margin:14px 0 4px">${i + 1}. <span class="badge">${esc(ui.libelle('typesConstat', c.typeCode))}</span> ${esc(c.exigence || '')}</h3>`
-        + `<p>${esc(c.description).replace(/\n/g, '<br>')}</p>${c.preuve ? `<p><em>Preuve : ${esc(c.preuve)}</em></p>` : ''}${c.secteurNom || c.equipement ? `<p>${esc([c.secteurNom, c.equipement ? `${c.equipement.numero} ${c.equipement.nom}` : ''].filter(Boolean).join(' · '))}</p>` : ''}`;
+        + `<p>${esc(c.description).replace(/\n/g, '<br>')}</p>${c.preuve ? `<p><em>Preuve : ${esc(c.preuve)}</em></p>` : ''}${c.secteurNom || c.equipement ? `<p>${esc([c.secteurNom, c.equipement ? [c.equipement.numero, c.equipement.nom].filter(Boolean).join(' ') : ''].filter(Boolean).join(' · '))}</p>` : ''}`;
       if (c.actions.length) html += `<table><thead><tr><th>Action</th><th>Responsable</th><th>Échéance</th><th>Statut</th><th>Vérification</th></tr></thead><tbody>${c.actions.map((a) => `<tr><td>${esc(a.libelle)}${a.demande ? '<br>Demande ' + esc(a.demande.numero) : ''}</td><td>${esc(a.responsableNom)}</td><td>${esc(ui.formatDate(a.echeance))}${a.enRetard ? ' (en retard)' : ''}</td><td>${esc(ui.libelle('statutsAction', a.statut))}</td><td>${a.dateVerification ? esc(`${ui.formatDate(a.dateVerification)} — ${a.verifieParNom}`) + (a.commentaireVerification ? '<br>' + esc(a.commentaireVerification) : '') : '—'}</td></tr>`).join('')}</tbody></table>`;
     });
     html += '<div class="signature"><div>Responsable qualité</div><div>Date / visa</div></div>';
@@ -189,7 +214,9 @@
   async function ouvrirFormulaire(existant, options = {}) {
     const creation = !existant;
     const portee = (GMAO.perms || {}).portee;
-    const avecPlans = GMAO.moduleVisible('plans');
+    // Plan hors du périmètre de l'utilisateur : conservé tel quel (ni proposé, ni effacé à l'enregistrement)
+    const planMasque = !!(existant && existant.plan && existant.plan.masque);
+    const avecPlans = GMAO.moduleVisible('plans') && !planMasque;
     let plans = [];
     const chargerPlans = async (secteurId) => {
       if (!avecPlans) return [];
@@ -243,12 +270,13 @@
       avecPlans ? { nom: 'planId', label: 'Plan 3D du site', type: 'select', options: optionsPlans(), aide: 'Facultatif : localisation des zones visitées sur le plan 3D.',
         onChange: async (val, f) => { objets = await chargerObjets(val); f.majOptions('objetIds', objets); } } : null,
       avecPlans ? { nom: 'objetIds', label: 'Zones / équipements du plan', type: 'multiselect', options: objets, pleineLargeur: true, afficherSi: (vals) => !!vals.planId } : null,
+      planMasque ? { nom: 'planLecture', label: 'Plan 3D du site', type: 'lecture', valeur: existant.plan.nom, aide: 'Plan conservé tel quel.' } : null,
       ...ui.champsPersoDefs(MODULE),
     ];
     const valeurs = existant
       ? Object.assign({}, existant, {
         secteurId: existant.secteurId == null ? '' : existant.secteurId, hoteUserId: existant.hoteUserId == null ? '' : existant.hoteUserId,
-        contactNom: existant.contactOrganisme.nom, contactEmail: existant.contactOrganisme.email, contactTelephone: existant.contactOrganisme.telephone,
+        contactNom: existant.contactOrganisme.nom || '', contactEmail: existant.contactOrganisme.email || '', contactTelephone: existant.contactOrganisme.telephone || '',
         planId: existant.planId == null ? '' : existant.planId, objetIds: (existant.objetIds || []).map(String),
       }, ui.champsPersoInitiaux(existant))
       : { typeCode: (GMAO.liste('typesVisite')[0] || {}).code || '', statut: (statutsInitiaux[0] || {}).value || '', secteurId: secteurInitial, hoteUserId: GMAO.user.id, dateDebut: debutDefaut, dateFin: finDefaut, participantsUserIds: [], zonesVisitees: [] };
@@ -422,6 +450,8 @@
     if (GMAO.can('equipements', 'voir')) { try { equipements = await api.get('/api/equipements', { actif: '1' }); } catch (e) { equipements = []; } }
     const siteId = v.siteId;
     const eqSite = equipements.filter((e) => siteId == null || (ui.secteur(e.secteurId) || {}).siteId === siteId);
+    // Équipement hors du périmètre de l'utilisateur : conservé tel quel (ni proposé, ni effacé à l'enregistrement)
+    const eqMasque = !!(existant && existant.equipement && existant.equipement.masque);
     ui.formModal({
       titre: existant ? 'Modifier le constat' : 'Nouveau constat', taille: 'large',
       champs: [
@@ -430,11 +460,14 @@
         { nom: 'description', label: 'Description du constat', type: 'texte_long', lignes: 4, requis: true },
         { nom: 'preuve', label: 'Preuve / élément observé', type: 'texte_long', lignes: 2 },
         { nom: 'secteurId', label: 'Secteur concerné', type: 'select', options: [{ value: '', label: '— Aucun —' }].concat(optionsZones(v.secteurId)) },
-        eqSite.length ? { nom: 'equipementId', label: 'Équipement concerné', type: 'select', options: [{ value: '', label: '— Aucun —' }].concat(eqSite.map((e) => ({ value: e.id, label: `${e.numero} · ${e.nom}` }))), aide: 'Le secteur de l\'équipement est repris.' } : null,
+        eqSite.length && !eqMasque ? { nom: 'equipementId', label: 'Équipement concerné', type: 'select', options: [{ value: '', label: '— Aucun —' }].concat(eqSite.map((e) => ({ value: e.id, label: `${e.numero} · ${e.nom}` }))), aide: 'Le secteur de l\'équipement est repris.' } : null,
+        eqMasque ? { nom: 'equipementLecture', label: 'Équipement concerné', type: 'lecture', valeur: existant.equipement.nom, aide: 'Équipement conservé tel quel ; son secteur est repris.' } : null,
       ],
       valeurs: existant ? Object.assign({}, existant, { secteurId: existant.secteurId == null ? '' : existant.secteurId, equipementId: existant.equipementId == null ? '' : existant.equipementId }) : { typeCode: (GMAO.liste('typesConstat')[0] || {}).code },
       onSubmit: async (x) => {
         const body = nettoyer(x);
+        delete body.equipementLecture;
+        if (eqMasque) { delete body.equipementId; delete body.secteurId; }
         const res = existant ? await api.put(`/api/visites/${v.id}/constats/${existant.id}`, body) : await api.post(`/api/visites/${v.id}/constats`, body);
         toast('Constat enregistré', 'succes');
         apres(res);
@@ -656,15 +689,18 @@
           ligneClasse: (v) => (v.statut === 'annulee' ? 'inactif' : ''),
           colonnes: [
             { cle: 'numero', label: 'Numéro', rendu: (v) => el('span', { class: 'cellule-principale', style: { whiteSpace: 'nowrap' } }, v.numero), valeurTri: (v) => v.numero },
-            { cle: 'titre', label: 'Visite', largeur: '28%', rendu: (v) => el('div', { title: v.referentiel ? 'Référentiel : ' + v.referentiel : null }, el('div', { class: 'cellule-principale' }, v.titre), el('div', { class: 'cellule-secondaire' }, v.organisme || '')), valeurTri: (v) => String(v.titre).toLowerCase() },
-            { cle: 'typeCode', label: 'Type', liste: 'typesVisite' },
+            // Type sous le titre (pastille et libellé qui peut passer à la ligne) : tableau lisible sans défilement à 1366 px
+            { cle: 'titre', label: 'Visite', largeur: '30%', rendu: (v) => el('div', { title: v.referentiel ? 'Référentiel : ' + v.referentiel : null }, el('div', { class: 'cellule-principale' }, v.titre),
+              el('div', { class: 'cellule-secondaire' }, ui.pastille(ui.couleur('typesVisite', v.typeCode)), ' ', [ui.libelle('typesVisite', v.typeCode), v.organisme].filter(Boolean).join(' · '))), valeurTri: (v) => String(v.titre).toLowerCase() },
             { cle: 'statut', label: 'Statut', liste: 'statutsVisite' },
             { cle: 'dateDebut', label: 'Date', rendu: (v) => el('span', { class: 'texte-petit' }, periode(v)), valeurTri: (v) => v.dateDebut },
             { cle: 'secteurChemin', label: 'Site', rendu: (v) => v.secteurChemin || el('span', { class: 'texte-2' }, 'Tous les sites') },
             { cle: 'hoteNom', label: 'Hôte' },
-            { cle: 'nbVisiteurs', label: 'Visiteurs', aligner: 'centre', rendu: (v) => frag(String(v.nbVisiteurs), v.nbPresents ? frag(' ', ui.badge(`${v.nbPresents} sur site`, '#16a34a')) : null), valeurTri: (v) => v.nbVisiteurs },
-            { cle: 'nbConstats', label: 'Constats', aligner: 'centre', rendu: (v) => (v.nbConstats ? frag(String(v.nbConstats), v.ncOuvertes ? frag(' ', ui.badge(`${v.ncOuvertes} NC`, '#f59e0b')) : null) : el('span', { class: 'texte-2' }, '—')), valeurTri: (v) => v.nbConstats },
-            { cle: 'actionsEnRetard', label: 'Retards', aligner: 'centre', rendu: (v) => (v.actionsEnRetard ? ui.badge(String(v.actionsEnRetard), '#dc2626') : el('span', { class: 'texte-2' }, '0')), valeurTri: (v) => v.actionsEnRetard },
+            { cle: 'nbVisiteurs', label: 'Visiteurs', aligner: 'centre', rendu: (v) => el('div', null, String(v.nbVisiteurs), v.nbPresents ? el('div', null, ui.badge(`${v.nbPresents} sur site`, VERT)) : null), valeurTri: (v) => v.nbVisiteurs },
+            { cle: 'nbConstats', label: 'Constats / retards', aligner: 'centre', rendu: (v) => (v.nbConstats ? el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '3px', justifyContent: 'center' } }, el('span', null, String(v.nbConstats)),
+              v.ncOuvertes ? ui.badge(`${v.ncOuvertes} NC`, ORANGE, { titre: 'Non-conformités ouvertes' }) : null,
+              v.actionsEnRetard ? ui.badge(`${v.actionsEnRetard} en retard`, ROUGE, { titre: 'Actions en retard' }) : null) : el('span', { class: 'texte-2' }, '—')),
+            valeurTri: (v) => v.actionsEnRetard * 10000 + v.ncOuvertes * 100 + v.nbConstats },
           ],
         }).el);
         return out;
@@ -675,8 +711,29 @@
   }
 
   // ----- Accueil : onglet Registre d'accueil ----------------------------------------------------------------------
-  function ongletRegistre() {
+  /** Libère l'écoute de secours de la douchette et le détournement du scan global vers le registre. */
+  function arreterScanRegistre() {
     if (memo.arreterDouchette) { memo.arreterDouchette(); memo.arreterDouchette = null; }
+  }
+  /**
+   * Scan du badge à la sortie, sans double traitement : les codes lus à la douchette sont détournés vers le
+   * registre par GMAO.definirScanLocal (écoute unique de la vue Étiquettes & inventaire) tant que `cont` est
+   * affiché ; une écoute propre ne sert qu'en secours, quand cette écoute globale est absente ou inactive.
+   */
+  function ecouterScanRegistre(cont, fn) {
+    arreterScanRegistre();
+    const scanLocal = typeof GMAO.definirScanLocal === 'function';
+    if (scanLocal) GMAO.definirScanLocal(cont, fn);
+    const ecouteGlobale = () => {
+      const m = typeof GMAO.moduleDef === 'function' ? GMAO.moduleDef('inventaire') : null;
+      return scanLocal && !!window.__gmaoDouchetteInventaire && !!(m && m.actif);
+    };
+    if (!window.CodeBarre) return;
+    memo.arreterDouchette = window.CodeBarre.ecouterDouchette((code) => fn(code), { actif: () => cont.isConnected && !ecouteGlobale() });
+  }
+
+  function ongletRegistre() {
+    arreterScanRegistre();
     const cont = el('div');
     const peutAccueillir = can('modifier');
     if (!memo.dateRegistre) memo.dateRegistre = ui.aujourdhui();
@@ -704,11 +761,9 @@
         maj();
       } catch (e) { if (window.CodeBarre) window.CodeBarre.bip(false); erreur(e); }
     }
-    if (peutAccueillir && window.CodeBarre) {
-      const arreter = window.CodeBarre.ecouterDouchette((code) => { if (!cont.isConnected) { arreter(); return; } scanner(code); });
-      memo.arreterDouchette = arreter;
-    }
+    if (peutAccueillir) ecouterScanRegistre(cont, (code) => { if (cont.isConnected) scanner(code); });
 
+    const accueil = (l) => peutAccueillir && !!(l.droits && l.droits.accueil) && !GMAO.siteLectureSeule(l.secteurId);
     function tableau(lignes, vide, avecRecherche) {
       return ui.table({
         lignes, recherche: avecRecherche ? 'Recherche rapide : nom, société, badge…' : false, pagination: false, vide,
@@ -724,8 +779,9 @@
           { cle: 'badgeNumero', label: 'Badge', rendu: (l) => el('code', { class: 'texte-petit' }, l.badgeNumero) },
         ],
         actions: [
-          { icone: 'check', titre: 'Enregistrer l\'arrivée', classe: 'texte-ok', visible: (l) => peutAccueillir && l.etat === 'attendu' && !estFinal(l.statut), onClic: (l) => ouvrirArrivee(l.visiteId, l, l.hoteUserId, () => maj()) },
-          { icone: 'deconnexion', titre: 'Enregistrer le départ', classe: 'texte-danger', visible: (l) => peutAccueillir && l.etat === 'present', onClic: (l) => enregistrerDepart(l.visiteId, l.visiteurId, nomVisiteur(l), () => maj()) },
+          // Droits calculés par le serveur pour chaque ligne (site en lecture seule, personne concernée)
+          { icone: 'check', titre: 'Enregistrer l\'arrivée', classe: 'texte-ok', visible: (l) => accueil(l) && l.etat === 'attendu' && !estFinal(l.statut), onClic: (l) => ouvrirArrivee(l.visiteId, l, l.hoteUserId, () => maj()) },
+          { icone: 'deconnexion', titre: 'Enregistrer le départ', classe: 'texte-danger', visible: (l) => accueil(l) && l.etat === 'present', onClic: (l) => enregistrerDepart(l.visiteId, l.visiteurId, nomVisiteur(l), () => maj()) },
           { icone: 'imprimer', titre: 'Imprimer le badge', visible: (l) => l.etat !== 'parti', onClic: (l) => imprimerBadges([badgeDepuisRegistre(l)]) },
         ],
       }).el;
@@ -776,7 +832,7 @@
     async function maj() {
       await charger(zone, async () => {
         const rows = await api.get('/api/visites-actions', params());
-        const moi = GMAO.user.id;
+        const droitLigne = (a, cle) => !!(a.droits && a.droits[cle]) && !GMAO.siteLectureSeule(a.secteurId);
         return ui.table({
           lignes: rows, recherche: 'Rechercher une action, une visite, un responsable…', vide: 'Aucune action ne correspond aux filtres',
           rechercheDans: (a) => `${a.constatDescription} ${a.organisme} ${a.visiteTitre}`,
@@ -789,12 +845,13 @@
             { cle: 'responsableNom', label: 'Responsable' },
             { cle: 'echeance', label: 'Échéance', rendu: (a) => (a.echeance ? el('span', { class: a.enRetard ? 'texte-danger texte-gras' : '' }, ui.formatDate(a.echeance), a.enRetard ? ' (retard)' : '') : el('span', { class: 'texte-2' }, '—')), valeurTri: (a) => a.echeance || '9999' },
             { cle: 'statut', label: 'Statut', liste: 'statutsAction' },
-            { cle: 'demande', label: 'Demande', rendu: (a) => (a.demande ? lienVue('#/demandes/' + a.demande.id, a.demande.numero || ('#' + a.demande.id)) : el('span', { class: 'texte-2' }, '—')), valeurTri: (a) => (a.demande ? a.demande.numero : '') },
+            { cle: 'demande', label: 'Demande', rendu: (a) => (a.demande ? el('div', null, lienVue('#/demandes/' + a.demande.id, a.demande.numero || ('#' + a.demande.id)), a.demande.refusee ? el('div', { class: 'cellule-secondaire texte-danger' }, 'Refusée') : null) : el('span', { class: 'texte-2' }, '—')), valeurTri: (a) => (a.demande ? a.demande.numero : '') },
           ],
           actions: [
-            { icone: 'modifier', titre: 'Mettre à jour l\'avancement', visible: (a) => !a.final && (can('modifier') || Number(a.responsableUserId) === moi), onClic: (a) => ouvrirAction(a.visiteId, a.constatId, a, false, () => maj()) },
-            { icone: 'check', titre: 'Vérifier l\'efficacité', classe: 'texte-ok', visible: (a) => can('valider') && a.statut === 'realisee', onClic: (a) => ouvrirVerification(a.visiteId, a.constatId, a, () => maj()) },
-            { icone: 'demandes', titre: 'Créer une demande d\'intervention', visible: (a) => !a.final && !a.demande && can('modifier') && GMAO.can('demandes', 'creer'), onClic: (a) => ouvrirCreationDemande(a.visiteId, a.constatId, a, () => maj()) },
+            // Droits calculés par le serveur pour chaque ligne (site en lecture seule, responsable de l'action, demande refusée)
+            { icone: 'modifier', titre: 'Mettre à jour l\'avancement', visible: (a) => !a.final && droitLigne(a, 'avancement'), onClic: (a) => ouvrirAction(a.visiteId, a.constatId, a, false, () => maj()) },
+            { icone: 'check', titre: 'Vérifier l\'efficacité', classe: 'texte-ok', visible: (a) => droitLigne(a, 'verifier'), onClic: (a) => ouvrirVerification(a.visiteId, a.constatId, a, () => maj()) },
+            { icone: 'demandes', titre: 'Créer une demande d\'intervention', visible: (a) => droitLigne(a, 'demande') && GMAO.can('demandes', 'creer'), onClic: (a) => ouvrirCreationDemande(a.visiteId, a.constatId, a, () => maj()) },
           ],
         }).el;
       });
@@ -831,11 +888,11 @@
       { label: 'Site visité', valeur: v.secteurChemin || 'Tous les sites' },
       { label: 'Client / organisme', valeur: v.organisme },
       { label: 'Référentiel', valeur: v.referentiel },
-      { label: 'Contact', valeur: [c.nom, c.email, c.telephone].filter(Boolean).join(' · ') },
+      { label: 'Contact', valeur: frag([c.nom, c.email, c.telephone].filter(Boolean).join(' · '), c.anonymiseLe ? el('span', { class: 'texte-2 texte-petit' }, ` (coordonnées anonymisées le ${ui.formatDate(c.anonymiseLe)})`) : null) },
       { label: 'Hôte', valeur: v.hoteNom },
       { label: 'Participants', valeur: v.participants.map((p) => p.nom).join(', ') },
       { label: 'Zones visitées', valeur: v.zones.length ? el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 14px' } }, v.zones.map((z) => el('span', { class: 'inline', style: { gap: '5px' }, title: z.chemin }, ui.pastille(z.couleur || '#6b7280'), z.nom))) : '' },
-      v.plan ? { label: 'Plan 3D', valeur: frag(lienVue('#/plans/' + v.plan.id, `${v.plan.numero} · ${v.plan.nom}`), v.plan.objets.length ? el('div', { class: 'texte-petit texte-2' }, v.plan.objets.map((o) => o.nom).join(', ')) : null) } : null,
+      v.plan ? { label: 'Plan 3D', valeur: v.plan.masque ? el('span', { class: 'texte-2' }, v.plan.nom) : frag(lienVue('#/plans/' + v.plan.id, `${v.plan.numero} · ${v.plan.nom}`), v.plan.objets.length ? el('div', { class: 'texte-petit texte-2' }, v.plan.objets.map((o) => o.nom).join(', ')) : null) } : null,
       { label: 'Créée', valeur: `${ui.formatDateHeure(v.createdAt)}${v.createdByNom ? ' par ' + v.createdByNom : ''}` },
       { label: 'Dernière modification', valeur: ui.formatDateHeure(v.updatedAt) },
       ...ui.champsPersoAffichage(MODULE, v),
@@ -846,7 +903,7 @@
     cont.appendChild(ui.carte('Résultat', ui.details([
       { label: 'Conclusion', valeur: r.conclusion ? el('span', { style: { whiteSpace: 'pre-wrap' } }, r.conclusion) : '' },
       { label: 'Note / score', valeur: r.note },
-      { label: 'Certificat', valeur: r.certificatObtenu == null ? 'Sans objet' : (r.certificatObtenu ? ui.badge('Obtenu', '#16a34a') : ui.badge('Non obtenu', '#dc2626')) },
+      { label: 'Certificat', valeur: r.certificatObtenu == null ? 'Sans objet' : (r.certificatObtenu ? ui.badge('Obtenu', VERT) : ui.badge('Non obtenu', ROUGE)) },
       { label: 'Date du rapport', valeur: ui.formatDate(r.dateRapport) },
     ]), { actions: d.modifier && v.statut !== 'annulee' ? ui.bouton('Saisir le résultat', { icone: 'modifier', classe: 'btn-sm', onClic: () => ouvrirResultat(v, recharger) }) : null }));
     return cont;
@@ -914,7 +971,7 @@
         { cle: 'nom', label: 'Visiteur', rendu: (x) => el('div', null, el('div', { class: 'cellule-principale' }, nomVisiteur(x)), el('div', { class: 'cellule-secondaire' }, [x.societe, x.fonction].filter(Boolean).join(' · '))) },
         avecCoordonnees ? { cle: 'telephone', label: 'Coordonnées', rendu: (x) => (x.anonymiseLe ? el('span', { class: 'texte-2 texte-petit' }, `Anonymisées le ${ui.formatDate(x.anonymiseLe)}`) : el('div', { class: 'texte-petit' }, [x.telephone, x.email, x.vehicule ? 'Véhicule ' + x.vehicule : '', x.pieceIdentite ? 'Pièce ' + x.pieceIdentite : ''].filter(Boolean).join(' · ') || '—')) } : null,
         { cle: 'accompagnateurNom', label: 'Accompagnateur' },
-        { cle: 'charteAcceptee', label: 'Charte', aligner: 'centre', rendu: (x) => (x.charteAcceptee ? ui.badge('Acceptée', '#16a34a', { titre: ui.formatDateHeure(x.charteAccepteeLe) }) : el('span', { class: 'texte-2' }, '—')) },
+        { cle: 'charteAcceptee', label: 'Charte', aligner: 'centre', rendu: (x) => (x.charteAcceptee ? ui.badge('Acceptée', VERT, { titre: ui.formatDateHeure(x.charteAccepteeLe) }) : el('span', { class: 'texte-2' }, '—')) },
         { cle: 'epiFournis', label: 'EPI', rendu: (x) => el('span', { class: 'texte-petit' }, (x.epiFournis || []).join(', ')) },
         { cle: 'arrivee', label: 'Arrivée', type: 'datetime' },
         { cle: 'depart', label: 'Départ', type: 'datetime' },
@@ -954,28 +1011,31 @@
           { cle: 'responsableNom', label: 'Responsable' },
           { cle: 'echeance', label: 'Échéance', rendu: (a) => (a.echeance ? el('span', { class: a.enRetard ? 'texte-danger texte-gras' : '' }, ui.formatDate(a.echeance), a.enRetard ? ' (retard)' : '') : el('span', { class: 'texte-2' }, '—')) },
           { cle: 'statut', label: 'Statut', liste: 'statutsAction' },
-          { cle: 'demande', label: 'Demande / OT', rendu: (a) => (a.demande ? el('div', null, lienVue('#/demandes/' + a.demande.id, a.demande.numero || '#' + a.demande.id), a.demande.statut ? frag(' ', ui.badgeListe('statutsDemande', a.demande.statut)) : null, a.demande.ot ? el('div', { class: 'cellule-secondaire' }, lienVue('#/ot/' + a.demande.ot.id, a.demande.ot.numero)) : null) : el('span', { class: 'texte-2' }, '—')) },
+          { cle: 'demande', label: 'Demande / OT', rendu: (a) => (a.demande ? el('div', null, lienVue('#/demandes/' + a.demande.id, a.demande.numero || '#' + a.demande.id), a.demande.statut ? frag(' ', ui.badgeListe('statutsDemande', a.demande.statut)) : (a.demande.refusee ? el('span', { class: 'texte-danger texte-petit' }, ' (refusée)') : null),
+            a.demande.ot ? el('div', { class: 'cellule-secondaire' }, lienVue('#/ot/' + a.demande.ot.id, a.demande.ot.numero)) : null,
+            (a.demandesPrecedentes || []).length ? el('div', { class: 'cellule-secondaire', title: a.demandesPrecedentes.map((x) => x.numero || '#' + x.id).join(', ') }, `${a.demandesPrecedentes.length} demande(s) précédente(s) refusée(s)`) : null) : el('span', { class: 'texte-2' }, '—')) },
         ],
         actions: [
           { icone: 'modifier', titre: 'Modifier / avancement', visible: (a) => modifiable && (d.modifier || (Number(a.responsableUserId) === moi && !a.final)), onClic: (a) => ouvrirAction(v.id, c.id, a, d.modifier, recharger) },
           { icone: 'check', titre: 'Vérifier l\'efficacité', classe: 'texte-ok', visible: (a) => modifiable && d.valider && a.statut === 'realisee', onClic: (a) => ouvrirVerification(v.id, c.id, a, recharger) },
-          { icone: 'demandes', titre: 'Créer une demande d\'intervention', visible: (a) => modifiable && d.modifier && !a.final && !a.demande && GMAO.can('demandes', 'creer'), onClic: (a) => ouvrirCreationDemande(v.id, c.id, a, recharger) },
+          { icone: 'demandes', titre: 'Créer une demande d\'intervention', visible: (a) => modifiable && d.modifier && !a.final && (!a.demande || a.demande.refusee || !a.demande.existe) && GMAO.can('demandes', 'creer'), onClic: (a) => ouvrirCreationDemande(v.id, c.id, a, recharger) },
           { icone: 'supprimer', titre: 'Supprimer', classe: 'texte-danger', visible: (a) => modifiable && d.modifier && !a.demande && (a.statut !== 'verifiee' || d.supprimer), onClic: async (a) => {
             if (!(await ui.confirm({ titre: 'Supprimer l\'action', message: `Supprimer « ${a.libelle} » ?`, okLabel: 'Supprimer', danger: true }))) return;
             try { recharger(await api.del(`/api/visites/${v.id}/constats/${c.id}/actions/${a.id}`)); toast('Action supprimée', 'succes'); } catch (e) { erreur(e); }
           } },
         ],
       });
-      const titre = frag(`${i + 1}. `, ui.badgeListe('typesConstat', c.typeCode), ' ', c.exigence || '', ' ', c.ouvert ? ui.badge('Ouvert', '#f59e0b', { contour: true }) : (c.actions.length ? ui.badge('Soldé', '#16a34a', { contour: true }) : null));
+      const titre = frag(`${i + 1}. `, ui.badgeListe('typesConstat', c.typeCode), ' ', c.exigence || '', ' ', c.ouvert ? badgeContour('Ouvert', ORANGE) : (c.actions.length ? badgeContour('Soldé', VERT) : null));
       cont.appendChild(ui.carte(titre, frag(
         el('p', { style: { whiteSpace: 'pre-wrap', marginTop: 0 } }, c.description),
         c.preuve ? el('p', { class: 'texte-2 texte-petit', style: { whiteSpace: 'pre-wrap' } }, 'Preuve : ', c.preuve) : null,
-        c.secteurNom || c.equipement ? el('p', { class: 'texte-petit' }, c.secteurNom || '', c.equipement ? frag(c.secteurNom ? ' · ' : '', lienVue('#/equipements/' + c.equipement.id, `${c.equipement.numero} · ${c.equipement.nom}`)) : null) : null,
+        c.secteurNom || c.equipement ? el('p', { class: 'texte-petit' }, c.secteurNom || '', c.equipement ? frag(c.secteurNom ? ' · ' : '', c.equipement.masque ? el('span', { class: 'texte-2' }, c.equipement.nom) : lienVue('#/equipements/' + c.equipement.id, `${c.equipement.numero} · ${c.equipement.nom}`)) : null) : null,
         c.actions.length ? actions.el : (c.ouvert ? ui.alerte('Aucune action définie pour ce constat.', 'alerte') : null)),
       { actions: d.modifier && modifiable ? frag(
         ui.bouton('Action', { icone: 'plus', classe: 'btn-sm', titre: 'Ajouter une action', onClic: () => ouvrirAction(v.id, c.id, null, true, recharger) }),
         ui.bouton('', { icone: 'modifier', classe: 'btn-sm btn-icone', titre: 'Modifier le constat', onClic: () => ouvrirConstat(v, c, recharger) }),
-        c.actions.some((a) => a.demande) ? null : ui.bouton('', { icone: 'supprimer', classe: 'btn-sm btn-icone texte-danger', titre: 'Supprimer le constat', onClic: async () => {
+        // Action liée à une demande : jamais ; action vérifiée efficace : droit supprimer (traçabilité de la vérification)
+        c.actions.some((a) => a.demande) || (!d.supprimer && c.actions.some((a) => a.statut === 'verifiee')) ? null : ui.bouton('', { icone: 'supprimer', classe: 'btn-sm btn-icone texte-danger', titre: 'Supprimer le constat', onClic: async () => {
           if (!(await ui.confirm({ titre: 'Supprimer le constat', message: `Supprimer ce constat et ses ${c.actions.length} action(s) ?`, okLabel: 'Supprimer', danger: true }))) return;
           try { recharger(await api.del(`/api/visites/${v.id}/constats/${c.id}`)); toast('Constat supprimé', 'succes'); } catch (e) { erreur(e); }
         } })) : null }));
@@ -1041,7 +1101,8 @@
         filAriane: [{ label: GMAO.moduleLabel(MODULE), href: '#/visites?onglet=visites' }, { label: v.numero }],
         sousTitre: [v.numero, ui.libelle('typesVisite', v.typeCode), v.organisme, periode(v)].filter(Boolean).join(' · '),
         actions: [
-          d.modifier ? ui.bouton('Statut', { icone: 'rafraichir', onClic: () => ouvrirStatut(v, dessiner) }) : null,
+          // Sortie d'un statut final (réouverture, annulée → terminée) : droit valider, comme côté serveur
+          d.modifier && (!estFinal(v.statut) || d.valider) ? ui.bouton('Statut', { icone: 'rafraichir', onClic: () => ouvrirStatut(v, dessiner) }) : null,
           d.modifier && v.statut !== 'annulee' ? ui.bouton('Modifier', { icone: 'modifier', classe: 'btn-primaire', onClic: () => ouvrirFormulaire(v, { apres: dessiner }) }) : null,
         ],
       }));
@@ -1076,10 +1137,15 @@
   GMAO.registerView(MODULE, {
     titre: 'Audits & visites', icone: 'visite',
     async rendu(container, { params, query }) {
-      if (memo.arreterDouchette) { memo.arreterDouchette(); memo.arreterDouchette = null; }
+      arreterScanRegistre();
       const id = params[0] ? Number(params[0]) : null;
       if (params[0] && !Number.isInteger(id)) { container.appendChild(ui.vide('Visite introuvable', 'alerte')); return; }
       if (id) await afficherFiche(container, id); else await afficherAccueil(container, query);
+    },
+    /** Sortie de la vue : écoute de la douchette libérée, scan global rendu à la vue Étiquettes & inventaire. */
+    quitter() {
+      arreterScanRegistre();
+      if (typeof GMAO.definirScanLocal === 'function') GMAO.definirScanLocal(null, null);
     },
   });
 })();

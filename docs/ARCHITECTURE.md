@@ -178,6 +178,10 @@ Stockage : les pièces jointes volumineuses (chaînes `data:` de 64 Ko et plus) 
 `reinitialisation` `{ empreinte (scrypt du code), expireLe, creeLe, creePar (id, ou null pour la récupération d'urgence), origine ('pole_informatique' | 'recuperation_urgence'), essais }` (un seul code actif par compte).
 Champs transmis : `dateMdp` (dernier changement), `dateReferenceMdp` (date de référence de l'expiration pour un compte sans `dateMdp`), `doitChangerMdp`, `raisonChangementMdp` (`initial` | `reinitialise` | `expire` | `administrateur`).
 `auth.cleanUser` retire les secrets ; en dernier recours, toute réponse JSON contenant un `passwordHash`, un `historiqueMdp` (tableau) ou un objet `reinitialisation` en est expurgée (`sendJson`, `server/server.js`).
+`reinitialisation` ne quitte jamais `gmao.json` : absent de l'export complet, des sauvegardes et des copies du dossier `backups` (sauf la copie
+quotidienne exacte), jamais repris d'un fichier importé ou restauré (`server/db.js` : `expurger`, `exportAll`, `exporterParMorceaux`,
+`backupNow`, `importAll`, `restoreBackup`). `passwordHash`, `historiqueMdp` et la double authentification restent dans les sauvegardes,
+nécessaires à une restauration.
 
 ## 4. Droits, portée, hiérarchie, multi-site
 
@@ -197,7 +201,7 @@ Champs transmis : `dateMdp` (dernier changement), `dateReferenceMdp` (date de r�
 
 Règles d'enregistrement (`PUT /api/configuration { listes }`) : le code d'une valeur existante est conservé tel quel (casse comprise : `A`, `B`, `C`), un nouveau code est normalisé en minuscules ; un code encore porté par des éléments (`USAGES_LISTES` dans `server/modules/configuration.js`) ne peut être ni supprimé, ni renommé, ni changer de caractère final ; les statuts du circuit d'un module (liste par défaut avec `final`, ou `LISTES_CODES_FIXES`) restent présents ; une liste de statuts garde au moins un statut final et un non final. `GET /api/configuration/listes/:nom/usages` renseigne l'écran des listes. Une liste propre à un module doit donc être déclarée dans `USAGES_LISTES` avec le champ qui porte ses codes.
 
-Sections de configuration des modules (valeurs par défaut dans `server/seed.js`, modifiables via `PUT /api/configuration { section: {...} }` — seules les clés existantes sont acceptées, avec le même type ; un booléen doit être un vrai booléen, les valeurs énumérées (`VALEURS_PERMISES`) et les bornes numériques (`BORNES`) sont contrôlées, refus 400 sinon) : `etiquettes` (format, symbologie, hauteurCodeMm, decalage, contenu{…}, formatPersonnalise{…}), `inventaire` (aveugle, modeScan ∈ quantite | unitaire, sons, nonComptesAZero, scanGlobal), `achats` (tauxTVA, seuilValidationHT, delaiPaiementJours, entreeStockAReception, alerteEcheanceJours), `rh` (alerteJoursAvantEcheance, afficherAbsencesPlanning, heuresHebdo), `plans` (grilleM, uniteAffichage ∈ m | cm | mm, couleurParDefaut ∈ etat | ot | criticite | secteur | origine, afficherEtiquettes), `visites` (charteSecurite, accompagnementObligatoire, rappelJoursAvant 0–60, badgeAvecCodeBarre, demanderPieceIdentite, conserverVisiteursJours 1–3650), `sauvegardes` (clés non secrètes : automatique, frequenceHeures, heure, conserverLocal, compresser, chiffrer, accepterReception, conserverRecues, nomServeur — modifiables ici uniquement avec Système › Modifier et l'accès à tous les sites, comme par les routes du module ; `destinations`, `cleReception`, `cleReceptionDate`, `motDePasseChiffrement` sont des **secrets** : jamais renvoyés au client, jamais modifiables par PUT /api/configuration, retirés de l'export complet, conservés lors d'un import ou d'une restauration, et la section ne peut pas être réinitialisée depuis Configuration ; le module sauvegardes les gère par ses propres routes et `db.getConfig()/db.setConfig()`). Numérotation : `numerotation.{ot,di,eq,art,pp,inv,vis,cmd,fac,pl,mat}`. Champs personnalisés : entités `equipements`, `ot`, `demandes`, `plansPreventifs`, `articles`, `fournisseurs`, `utilisateurs`, `personnel`, `commandes`, `factures`, `visites`. Chaque élément : `{ code, label, couleur?, ordre, final?, delaiHeures? }`. Toujours lire via `ctx.liste(...)` / `GMAO.liste(...)` et afficher via `ui.badgeListe`.
+Sections de configuration des modules (valeurs par défaut dans `server/seed.js`, modifiables via `PUT /api/configuration { section: {...} }` — seules les clés existantes sont acceptées, avec le même type ; un booléen doit être un vrai booléen, les valeurs énumérées (`VALEURS_PERMISES`) et les bornes numériques (`BORNES`) sont contrôlées, refus 400 sinon) : `etiquettes` (format, symbologie, hauteurCodeMm, decalage, contenu{…}, formatPersonnalise{…}), `inventaire` (aveugle, modeScan ∈ quantite | unitaire, sons, nonComptesAZero, scanGlobal), `achats` (tauxTVA, seuilValidationHT, delaiPaiementJours, entreeStockAReception, alerteEcheanceJours), `rh` (alerteJoursAvantEcheance, afficherAbsencesPlanning, heuresHebdo), `plans` (grilleM, uniteAffichage ∈ m | cm | mm, couleurParDefaut ∈ etat | ot | criticite | secteur | origine, afficherEtiquettes), `visites` (charteSecurite, accompagnementObligatoire, rappelJoursAvant 0–60, badgeAvecCodeBarre, demanderPieceIdentite, conserverVisiteursJours 1–3650), `sauvegardes` (clés non secrètes : automatique, frequenceHeures, heure, conserverLocal, compresser, chiffrer, accepterReception, conserverRecues, nomServeur — modifiables ici uniquement avec Système › Modifier et l'accès à tous les sites, comme par les routes du module ; `destinations`, `cleReception`, `cleReceptionDate`, `motDePasseChiffrement` sont des **secrets** : jamais renvoyés au client, jamais modifiables par PUT /api/configuration, retirés de l'export complet, des sauvegardes et des copies du dossier `backups` (`db.exportAll`, `db.exporterParMorceaux`, `db.backupNow` ; seule la copie quotidienne, qui sert au redémarrage sur un fichier endommagé, est exacte), conservés lors d'un import ou d'une restauration, et la section ne peut pas être réinitialisée depuis Configuration ; le module sauvegardes les gère par ses propres routes et `db.getConfig()/db.setConfig()`). Numérotation : `numerotation.{ot,di,eq,art,pp,inv,vis,cmd,fac,pl,mat}`. Champs personnalisés : entités `equipements`, `ot`, `demandes`, `plansPreventifs`, `articles`, `fournisseurs`, `utilisateurs`, `personnel`, `commandes`, `factures`, `visites`. Chaque élément : `{ code, label, couleur?, ordre, final?, delaiHeures? }`. Toujours lire via `ctx.liste(...)` / `GMAO.liste(...)` et afficher via `ui.badgeListe`.
 
 ## 6. Services et événements inter-modules (contrat)
 
@@ -247,6 +251,11 @@ Réactions attendues : demandes écoute `ot:termine` (clôture la DI si `cloture
 Configuration (`config.securite`) : `motDePasseOublie` (défaut vrai), `dureeCodeReinitialisationMinutes` (5–1440, défaut 60),
 `reinitialisationAutonome` (défaut faux), `expirationMdpJours` (0 = jamais, sinon 30–730), `rappelExpirationJours` (1–60, défaut 14),
 `historiqueMdp` (0–24, défaut 5 : mots de passe précédents refusés, en plus de l'actuel), `forcerChangementMdpInitial`.
+Bornes communes (`server/seed.js` : `BORNES_SECURITE`, `EXPIRATION_MDP_MIN_JOURS`, `MODES_DEUX_FACTEURS`) : `PUT /api/configuration` refuse
+une valeur hors bornes (400), ainsi qu'un rappel supérieur ou égal à la durée d'expiration ; `seed()` (démarrage, import, restauration)
+applique `normaliserSecurite` : oui / non ou mode illisible → défaut, nombre illisible ou nul pour un réglage qui ne peut pas l'être →
+défaut, autre nombre → entier ramené dans les bornes, expiration de moins de 30 jours → 0, rappel ramené sous l'expiration (longueur
+minimale : plancher de 4 du contrôle des mots de passe).
 
 **Amorçage** (`GET /api/auth/me`, réponse de `POST /api/auth/login` ou `/api/auth/login/code`) : clé de premier niveau
 `motDePasse` = `{ doitChanger, raison, dateMdp, expireLe, joursRestants, rappel }` → `GMAO.motDePasse` côté client.
@@ -254,6 +263,9 @@ Configuration (`config.securite`) : `motDePasseOublie` (défaut vrai), `dureeCod
 `forcerChangementMdpInitial !== false`) ; `raison` : raison du changement attendu (ou null) ; `expireLe` / `joursRestants` : null sans
 expiration ; `rappel` : vrai si `joursRestants ≤ rappelExpirationJours` (et pas de changement imposé). L'expiration est évaluée à la
 connexion et à chaque amorçage ; un compte sans `dateMdp` reçoit une `dateReferenceMdp` à la première évaluation (rien n'expire d'un coup).
+Amorçage réduit tant que le changement est imposé ou qu'une double authentification obligatoire n'est pas activée : `user`, `permissions`,
+`deuxFacteurs`, `motDePasse`, `catalogue`, `libelles`, `version`, `serveur`, `config` limitée à `societe`, `general` et `securite`, `modules`
+et `references` vides ; le client recharge l'amorçage complet (`GMAO.refresh`) après le changement ou l'activation.
 
 **Changement imposé** : tant que `doitChanger` est vrai, toute route authentifiée hors `/api/auth/*` (notifications comprises : aucune
 donnée de l'application avant le changement) renvoie `403 { erreur, changementMdpRequis: true, details: { changementMdpRequis: true, raison } }`.
@@ -263,8 +275,9 @@ Côté client, `api.js` n'interroge plus le serveur (hors authentification) tant
 **Routes publiques** (aucune n'ouvre de session : le poste enchaîne une connexion normale, double authentification comprise) :
 - `POST /api/auth/mot-de-passe-oublie { login, message? }` → toujours `200 { ok: true }` (traitement après la réponse ; compte inconnu
   ou désactivé : journal seulement) ; `403` si `motDePasseOublie` est faux ; `429` au-delà de 5 demandes par poste en 15 minutes.
-  Une demande en attente est mise à jour (`repetitions` = nombre de demandes reçues), notifications au plus toutes les 30 minutes aux
-  comptes ayant Utilisateurs › Modifier qui peuvent gérer et voir le compte, et au titulaire.
+  Une demande en attente est mise à jour (`repetitions` = nombre de demandes reçues), notifications au plus toutes les 30 minutes (sauf
+  demande venue d'un nouveau poste, signalée aussitôt) aux comptes ayant Utilisateurs › Modifier qui peuvent voir et prendre en main le
+  compte (`ctx.motsDePasse.gestionnaires`), et au titulaire.
 - `POST /api/auth/reinitialiser { login, code, nouveau }` → `200 { ok: true }` ; sinon `400` générique ; message de la politique
   seulement après un code valide (code non consommé) ; `429` après 8 échecs (clés `reinit|ip|login` et `reinit-compte|login`).
 - `POST /api/auth/reinitialiser-autonome { login, code, nouveau }` (si `reinitialisationAutonome`) : code à 6 chiffres de
@@ -283,7 +296,9 @@ annulés par un changement de mot de passe, une nouvelle réinitialisation ou la
 - `GET /api/utilisateurs/:id` : `motDePasse { dateMdp, expireLe, doitChanger (indicateur du compte), raison, codeActif, codeExpireLe, codeOrigine }` pour les gestionnaires.
 - `GET /api/utilisateurs-demandes-mdp` : demandes en attente `{ id, userId, login, nom, profilNom, message, ip, poste, repetitions,
   createdAt, derniereDemande, statut }` ; `?toutes=1` ajoute les 50 dernières traitées ou rejetées (`mode`, `traiteePar`, `traiteeParNom`, `traiteeLe`, `motifRejet`).
-- `POST /api/utilisateurs-demandes-mdp/:id/rejeter { motif? }`.
+  Seules les demandes des comptes que l'appelant peut voir et prendre en main (même règle que les destinataires des notifications et que
+  la remise d'un code : aucun `depassementsGestion`) sont listées.
+- `POST /api/utilisateurs-demandes-mdp/:id/rejeter { motif? }` : même règle (404 sinon).
 
 Collection `demandesMdp` : `{ id, userId, login, message (≤ 300 caractères, texte brut), ip, poste (≤ 200), statut ('en_attente' | 'traitee' |
 'rejetee'), repetitions, derniereDemande, createdAt, traiteePar, traiteeLe, mode ('code' | 'temporaire' | 'utilisateur' | 'rejet'), motifRejet,
@@ -348,7 +363,10 @@ Routes : `GET /api/visites`, `/api/visites-tableau`, `/api/visites-registre`, `/
     Sans empreinte confirmée, ou avec une empreinte différente, rien n'est envoyé (`tls.connect({ rejectUnauthorized: false })` puis
     `verifierEpinglage(socket.getPeerCertificate(true).raw, destination)` avant le moindre en-tête).
   - Copies locales : les copies `gmao-avant-import-*` faites par la base avant un import ou une restauration sont listées avec les sauvegardes
-    locales et restaurables (restauration `source: 'locale'`, retour en arrière).
+    locales et restaurables (restauration `source: 'locale'`, retour en arrière). `db.backupNow` les écrit sans les secrets de ce serveur
+    (paramètres secrets des sauvegardes, codes de réinitialisation) : leur téléchargement n'en divulgue aucun ; les copies brutes écrites par
+    une version antérieure sont expurgées au démarrage (`db.load`, date de modification conservée).
+  - Les sauvegardes (`db.exportAll`) ne contiennent jamais de code de réinitialisation, et une restauration n'en reprend aucun.
   - Une sauvegarde **chiffrée** joint `<données>/cle-double-authentification.key` (`cleDoubleAuthentification`) ; la restauration la remet en
     place (`ctx.deuxFacteurs.rechargerCle()`) pour que les codes des applications d'authentification restent vérifiables sur un autre serveur.
     Une sauvegarde en clair ne la contient jamais.

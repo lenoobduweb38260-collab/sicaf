@@ -1178,7 +1178,7 @@
     const puces = el('div', { class: 'inline', style: { flexWrap: 'wrap', gap: '6px' } });
     function majPuces() {
       ui.vider(puces);
-      const puce = (texte, retirer) => el('span', { class: 'badge contour', style: { color: 'var(--primaire)', display: 'inline-flex', alignItems: 'center', gap: '4px' } }, texte, el('button', { type: 'button', class: 'btn-lien', style: { border: 0, background: 'none', cursor: 'pointer', color: 'inherit', padding: 0 }, title: 'Retirer ce filtre', onclick: retirer }, '×'));
+      const puce = (texte, retirer) => el('span', { class: 'badge contour', style: { color: 'var(--lien)', display: 'inline-flex', alignItems: 'center', gap: '4px' } }, texte, el('button', { type: 'button', class: 'btn-lien', style: { border: 0, background: 'none', cursor: 'pointer', color: 'inherit', padding: 0 }, title: 'Retirer ce filtre', onclick: retirer }, '×'));
       if (filtres.equipementId) {
         const o = ots.find((x) => String(x.equipementId) === filtres.equipementId);
         puces.appendChild(puce(`Équipement : ${o ? o.equipementNom : '#' + filtres.equipementId}`, () => { filtres.equipementId = ''; history.replaceState(null, '', '#/ot'); appliquer(); }));

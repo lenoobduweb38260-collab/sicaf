@@ -86,7 +86,7 @@
       thead .rh-col-personne, tfoot .rh-col-personne { z-index: 3; }
       .rh-matrice td.rh-col-personne, .rh-matrice th.rh-col-personne, .rh-cal td.rh-col-personne, .rh-cal th.rh-col-personne { text-align: left; width: 250px; min-width: 250px; max-width: 250px; }
       .rh-matrice th.rh-type { height: 132px; width: 46px; min-width: 46px; padding: 8px 2px; vertical-align: bottom; cursor: pointer; }
-      .rh-matrice th.rh-type:hover, .rh-matrice th.rh-type.actif { background: var(--primaire-clair); color: var(--primaire); }
+      .rh-matrice th.rh-type:hover, .rh-matrice th.rh-type.actif { background: var(--primaire-clair); color: var(--lien); }
       .rh-matrice th.rh-type > div { writing-mode: vertical-rl; transform: rotate(180deg); white-space: nowrap; margin: 0 auto; max-height: 118px; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 6px; }
       .rh-matrice td { text-align: center; padding: 3px 3px; height: 32px; }
       .rh-matrice td.rh-col-personne { padding: 3px 10px !important; }
@@ -96,14 +96,14 @@
       .rh-cellule:hover { filter: brightness(1.08); box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--bordure-2); }
       .rh-ajout { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 24px; border-radius: 6px; border: 1px dashed var(--bordure-2); color: var(--texte-2); background: transparent; cursor: pointer; opacity: 0; font-size: 15px; line-height: 1; padding: 0; }
       .rh-matrice tbody tr:hover .rh-ajout { opacity: .75; }
-      .rh-ajout:hover, .rh-ajout:focus-visible { opacity: 1 !important; color: var(--primaire); border-color: var(--primaire); }
+      .rh-ajout:hover, .rh-ajout:focus-visible { opacity: 1 !important; color: var(--lien); border-color: var(--primaire); }
       .rh-cal th, .rh-cal td { padding: 0; min-width: 24px; width: 24px; text-align: center; }
       .rh-cal thead th { height: 40px; font-size: 11px; line-height: 1.15; }
       .rh-cal thead th .rh-num { font-size: 12.5px; color: var(--texte); }
       .rh-cal td { height: 34px; }
       .rh-cal .we { background: var(--fond) !important; }
-      .rh-cal thead th.auj { background: var(--primaire-clair); color: var(--primaire); }
-      .rh-cal thead th.auj .rh-num { color: var(--primaire); }
+      .rh-cal thead th.auj { background: var(--primaire-clair); color: var(--lien); }
+      .rh-cal thead th.auj .rh-num { color: var(--lien); }
       .rh-cal td.auj { box-shadow: inset 2px 0 0 var(--primaire), inset -2px 0 0 var(--primaire); }
       .rh-cal td.rh-cliquable { cursor: pointer; }
       .rh-cal td.rh-cliquable:hover { background: var(--primaire-clair) !important; }
@@ -126,7 +126,7 @@
       .rh-competences > div { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 6px 0; border-bottom: 1px dashed var(--bordure); }
       .rh-editeur-comp { display: grid; gap: 6px; }
       .rh-editeur-comp .ligne { display: grid; grid-template-columns: minmax(0, 1fr) 170px 34px; gap: 6px; align-items: center; }
-      .rh-filtre-actif { display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px 3px 10px; border-radius: 14px; background: var(--primaire-clair); color: var(--primaire); font-size: 12.5px; font-weight: 600; }
+      .rh-filtre-actif { display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px 3px 10px; border-radius: 14px; background: var(--primaire-clair); color: var(--lien); font-size: 12.5px; font-weight: 600; }
       .rh-filtre-actif button { border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 15px; line-height: 1; padding: 0 6px; }
       .rh-separateur-titre { font-size: 12px; text-transform: uppercase; letter-spacing: .4px; color: var(--texte-2); font-weight: 700; margin: 4px 0 8px; }
     ` }));
@@ -163,6 +163,8 @@
   const luminance = (rgb) => { const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }; return 0.2126 * f(rgb[0]) + 0.7152 * f(rgb[1]) + 0.0722 * f(rgb[2]); };
   const contraste = (a, b) => { const la = luminance(a); const lb = luminance(b); return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05); };
   const cacheSombre = new Map();
+  /** Fond et texte d'une cellule colorée de la matrice : texte blanc ou foncé lisible (ui.couleursBadge). */
+  function celluleLisible(coul) { const c = ui.couleursBadge(coul); return c.texte ? { background: c.fond, color: c.texte } : { background: c.fond }; }
   function couleurSombre(coul) {
     if (cacheSombre.has(coul)) return cacheSombre.get(coul);
     const base = hexRgb(coul);
@@ -959,7 +961,7 @@
             if (c) {
               const titre = `${t.label}\n${c.intitule || ''}\nObtenue le ${fmt(c.dateObtention)}\n${c.dateExpiration ? `Expire le ${fmt(c.dateExpiration)} (${relatifJours(c.joursRestants)})` : 'Sans échéance'}`;
               const ouvrir = () => ouvrirHabilitationParId(c.id, basculer);
-              td.appendChild(el('span', { class: 'rh-cellule', style: { background: ETATS[c.etat].couleur }, title: titre, role: 'button', tabindex: 0, onclick: ouvrir, onkeydown: (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); ouvrir(); } } }, c.dateExpiration ? moisAnnee(c.dateExpiration) : '∞'));
+              td.appendChild(el('span', { class: 'rh-cellule', style: celluleLisible(ETATS[c.etat].couleur), title: titre, role: 'button', tabindex: 0, onclick: ouvrir, onkeydown: (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); ouvrir(); } } }, c.dateExpiration ? moisAnnee(c.dateExpiration) : '∞'));
             } else if (peutCreer() && !lectureSeule(p.secteurId) && p.modifiable !== false) {
               td.appendChild(el('button', { type: 'button', class: 'rh-ajout', title: `Saisir « ${t.label} » pour ${p.nomComplet}`, onclick: () => ouvrirHabilitation(null, { personnelId: p.id, personnelNom: p.nomComplet, typeCode: t.code, apres: basculer }) }, '+'));
             }

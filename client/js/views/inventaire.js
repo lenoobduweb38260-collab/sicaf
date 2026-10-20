@@ -165,8 +165,8 @@ table.tableau tr.inv-selectionnee td{background:var(--primaire-clair)}
 .inv-kpi-masque .kpi-valeur{font-size:16px}
 .kpi.inv-kpi-texte>div:last-child{min-width:0}
 .kpi.inv-kpi-texte .kpi-valeur{font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.inv-chevauchement{margin-top:6px;color:var(--alerte);font-size:12.5px}
-.inv-autres-inv{margin-top:10px;font-size:13px;color:var(--alerte);font-weight:600}
+.inv-chevauchement{margin-top:6px;color:var(--alerte-texte);font-size:12.5px}
+.inv-autres-inv{margin-top:10px;font-size:13px;color:var(--alerte-texte);font-weight:600}
 .inv-perimetre{background:var(--surface-2);border:1px solid var(--bordure);border-radius:8px;padding:10px 12px;font-size:13px}
 .inv-perimetre strong{font-size:15px}
 .inv-recap-chiffres{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px}

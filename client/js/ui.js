@@ -269,9 +269,70 @@
   }
 
   // ----- Badges -------------------------------------------------------------
+  /** Composantes [r, g, b] d'une couleur « #rgb », « #rrggbb » ou « rgb(r, g, b) » ; null sinon (variable CSS…). */
+  function rgbDe(coul) {
+    const s = String(coul || '').trim();
+    let m = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/i.exec(s);
+    if (m) return m.slice(1).map((x) => parseInt(x + x, 16));
+    m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(s);
+    if (m) return m.slice(1).map((x) => parseInt(x, 16));
+    m = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(s);
+    return m ? m.slice(1, 4).map(Number) : null;
+  }
+  /** Contraste (WCAG) entre deux couleurs [r, g, b]. */
+  function contrasteRgb(a, b) {
+    const lum = (rgb) => { const c = rgb.map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4); }); return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; };
+    const la = lum(a), lb = lum(b);
+    return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+  }
+  const BLANC = [255, 255, 255];
+  const TEXTE_FONCE = [17, 24, 39];
+  /**
+   * Couleurs d'un badge plein lisibles en petit texte (contraste d'au moins 4,5:1) quelle que soit la couleur choisie
+   * (listes de valeurs configurables) : texte blanc si le fond le permet, texte foncé sur un fond clair (ambre,
+   * jaune), sinon fond assombri juste assez sous le texte blanc (vert, cyan, violet…). Exposée (`ui.couleursBadge`) pour
+   * les pastilles colorées des vues (événements du planning, cellules d'une matrice) : `{ fond, texte }`, texte null = blanc.
+   */
+  function couleursBadge(coul) {
+    const fond = rgbDe(coul);
+    if (!fond) return { fond: coul, texte: null };
+    if (contrasteRgb(BLANC, fond) >= 4.5) return { fond: coul, texte: null };
+    if (contrasteRgb(TEXTE_FONCE, fond) >= 7) return { fond: coul, texte: `rgb(${TEXTE_FONCE.join(',')})` };
+    for (let f = 0.05; f < 1; f += 0.05) {
+      const x = fond.map((v) => Math.round(v * (1 - f)));
+      if (contrasteRgb(BLANC, x) >= 4.5) return { fond: `rgb(${x.join(',')})`, texte: null };
+    }
+    return { fond: `rgb(${TEXTE_FONCE.join(',')})`, texte: null };
+  }
+  /**
+   * Badge à contour (texte de la couleur choisie sur la surface) : teinte assombrie (thème clair) ou éclaircie (thème
+   * sombre) juste assez pour un contraste d'au moins 4,5:1 sur --surface et --fond / --surface-2 ; null si illisible.
+   */
+  function couleursContour(coul) {
+    const rgb = rgbDe(coul);
+    if (!rgb) return null;
+    const ajuster = (fonds, vers) => {
+      for (let f = 0; f <= 1.0001; f += 0.05) {
+        const x = rgb.map((v) => Math.round(v + (vers - v) * f));
+        if (fonds.every((fd) => contrasteRgb(x, fd) >= 4.5)) return `rgb(${x.join(',')})`;
+      }
+      return `rgb(${vers},${vers},${vers})`;
+    };
+    return { clair: ajuster([BLANC, [243, 244, 246]], 0), sombre: ajuster([[30, 41, 59], [39, 52, 73]], 255) };
+  }
   function badge(label, coul, opts = {}) {
     const b = el('span', { class: 'badge' + (coul ? ' couleur' : '') + (opts.contour ? ' contour' : '') + (opts.classe ? ' ' + opts.classe : ''), title: opts.titre }, label);
-    if (coul) { if (opts.contour) { b.style.color = coul; b.style.background = 'transparent'; } else b.style.background = coul; }
+    if (coul) {
+      if (opts.contour) {
+        b.style.background = 'transparent';
+        const c = couleursContour(coul);
+        if (c) { b.classList.add('contour-ajuste'); b.style.setProperty('--badge-texte-clair', c.clair); b.style.setProperty('--badge-texte-sombre', c.sombre); } else b.style.color = coul;
+      } else {
+        const c = couleursBadge(coul);
+        b.style.background = c.fond;
+        if (c.texte) b.style.color = c.texte;
+      }
+    }
     return b;
   }
   function badgeListe(nom, code, opts) {
@@ -289,9 +350,15 @@
     setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity 0.3s'; setTimeout(() => t.remove(), 300); }, duree || (type === 'erreur' ? 7000 : 3500));
     return t;
   }
+  /** Retire les notifications éphémères affichées (fin de session : rien ne reste pour la personne suivante). */
+  function fermerToasts() {
+    const cont = document.getElementById('toasts');
+    if (cont) vider(cont);
+  }
   function erreur(e) {
-    // Changement de mot de passe imposé : la fenêtre de changement est déjà affichée, aucun message en double
+    // Changement de mot de passe ou enrôlement imposé : la fenêtre correspondante est déjà affichée, aucun message en double
     if (e && e.details && e.details.changementMdpRequis) return;
+    if (e && e.details && e.details.deuxFacteursRequis && G().deuxFacteursRequis && G().deuxFacteursRequis()) return;
     toast((e && e.message) || String(e), 'erreur'); if (window.console) console.error(e);
   }
 
@@ -426,27 +493,45 @@
 
   // ----- Modales ------------------------------------------------------------
   const modales = [];
+  /** Éléments atteignables à la tabulation dans `racine` : affichés, actifs, sans tabindex négatif. */
+  function focalisables(racine) {
+    return Array.from(racine.querySelectorAll('a[href], button, input:not([type=hidden]), select, textarea, [tabindex], [contenteditable="true"]'))
+      .filter((e) => !e.disabled && e.tabIndex >= 0 && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden');
+  }
+  /** Élément focalisable et affiché ? */
+  const atteignable = (e) => !!(e && e.isConnected && typeof e.focus === 'function' && !e.disabled && e.getClientRects().length > 0);
+  /** Le focus est-il retombé sur la page (bouton désactivé ou retiré, fenêtre fermée) ? */
+  const focusPerdu = () => !document.activeElement || document.activeElement === document.body;
   /**
    * Fenêtre modale. `modifie()` (facultatif) : vrai si une saisie serait perdue ; une fermeture par le fond ou par
-   * Échap demande alors confirmation (les boutons Fermer / Annuler restent des choix explicites).
+   * Échap demande alors confirmation (les boutons Fermer / Annuler restent des choix explicites). `fermable: false`
+   * (ou `setFermable(false)`, ex. secret affiché une seule fois) : ni croix, ni fond, ni Échap, seulement les boutons.
+   * La tabulation reste dans la fenêtre du dessus et le focus revient à l'élément qui l'a ouverte à sa fermeture.
    */
   function modal({ titre, contenu, boutons, taille, onFermer, fermable = true, classe, modifie } = {}) {
+    // Élément qui ouvre la fenêtre : il reprend le focus à la fermeture
+    let declencheur = focusPerdu() ? null : document.activeElement;
     const corps = el('div', { class: 'modal-corps' });
     append(corps, typeof contenu === 'function' ? contenu() : contenu);
     const pied = el('div', { class: 'modal-pied' });
-    const boite = el('div', { class: 'modal' + (taille ? ' ' + taille : '') + (classe ? ' ' + classe : ''), role: 'dialog', 'aria-modal': 'true' });
+    const boite = el('div', { class: 'modal' + (taille ? ' ' + taille : '') + (classe ? ' ' + classe : ''), role: 'dialog', 'aria-modal': 'true', tabindex: '-1' });
     const fond = el('div', { class: 'modal-fond' }, boite);
     const api = {
       el: fond, boite, corps, pied, fermable,
       fermer(resultat) {
         if (!fond.parentNode) return;
+        const focusDedans = fond.contains(document.activeElement);
+        const dessus = modales[modales.length - 1] === api; // une fenêtre restée au-dessus garde le focus
+        // Fenêtre ouverte depuis celle-ci et restée ouverte (confirmation d'abandon) : elle rendra le focus à notre déclencheur
+        modales.forEach((m) => { if (m !== api && m._declencheurDans(fond)) m._heriterDeclencheur(declencheur); });
         fond.remove();
         const i = modales.indexOf(api); if (i >= 0) modales.splice(i, 1);
+        if (dessus && (focusDedans || focusPerdu())) rendreFocus();
         if (onFermer) onFermer(resultat);
       },
       /** Fermeture implicite (fond, Échap) : confirmation si la saisie en cours serait perdue. */
       async fermerSiPossible() {
-        if (api._confirmation) return;
+        if (api._confirmation || api.fermable === false) return;
         if (typeof modifie === 'function' && modifie()) {
           api._confirmation = true;
           const ok = await confirm({ titre: 'Abandonner la saisie ?', message: 'Les informations saisies dans cette fenêtre seront perdues.', okLabel: 'Abandonner', annulerLabel: 'Continuer la saisie', danger: true });
@@ -457,11 +542,38 @@
       },
       setTitre(t) { titreEl.textContent = t; },
       setBoutons(bs) { vider(pied); construireBoutons(bs); },
+      _declencheurDans: (zone) => !!declencheur && zone.contains(declencheur),
+      _heriterDeclencheur: (e) => { declencheur = e; },
+      /** Fenêtre fermable ou non par la croix, le fond et Échap. */
+      setFermable(v) {
+        api.fermable = !!v;
+        if (croix) croix.remove();
+        croix = api.fermable ? boutonCroix() : null;
+        if (croix) entete.appendChild(croix);
+      },
     };
+    const boutonCroix = () => el('button', { class: 'btn btn-icone', title: 'Fermer', 'aria-label': 'Fermer', onclick: () => api.fermer() }, icone('fermer'));
     const titreEl = el('h2', null, titre || '');
-    const entete = el('div', { class: 'modal-entete' }, titreEl, fermable ? el('button', { class: 'btn btn-icone', title: 'Fermer', onclick: () => api.fermer() }, icone('fermer')) : null);
+    let croix = fermable ? boutonCroix() : null;
+    const entete = el('div', { class: 'modal-entete' }, titreEl, croix);
     boite.appendChild(entete);
     boite.appendChild(corps);
+    /** Focus rendu à l'élément qui a ouvert la fenêtre, ou à la fenêtre restée dessous. */
+    function rendreFocus() {
+      if (atteignable(declencheur)) { declencheur.focus({ preventScroll: true }); return; }
+      const dessous = modales[modales.length - 1];
+      if (dessous) { const cible = focalisables(dessous.corps)[0] || focalisables(dessous.boite)[0] || dessous.boite; cible.focus({ preventScroll: true }); }
+    }
+    /**
+     * Après l'action d'un bouton : focus retombé sur la page (bouton désactivé pendant l'action, puis contenu remplacé)
+     * ramené dans la fenêtre, sur le premier champ en erreur, le bouton lui-même, le contenu ou le bouton principal.
+     */
+    function garderFocus(btn) {
+      if (!fond.parentNode || modales[modales.length - 1] !== api || !focusPerdu()) return;
+      const invalide = Array.from(boite.querySelectorAll('.champ.invalide input, .champ.invalide select, .champ.invalide textarea')).find(atteignable);
+      const cible = invalide || (atteignable(btn) ? btn : null) || focalisables(corps)[0] || pied.querySelector('.btn-primaire:not([disabled])') || focalisables(boite)[0] || boite;
+      cible.focus({ preventScroll: !!(cible === btn || cible === boite) });
+    }
     function construireBoutons(bs) {
       (bs || []).forEach((b) => {
         if (!b) return;
@@ -469,7 +581,7 @@
         btn.addEventListener('click', async () => {
           if (b.onClic) {
             btn.disabled = true;
-            try { const r = await b.onClic(api, btn); if (r !== false && b.fermer !== false) api.fermer(r); } catch (e) { erreur(e); } finally { btn.disabled = false; }
+            try { const r = await b.onClic(api, btn); if (r !== false && b.fermer !== false) api.fermer(r); } catch (e) { erreur(e); } finally { btn.disabled = false; garderFocus(btn); }
           } else api.fermer(b.valeur);
         });
         pied.appendChild(btn);
@@ -477,22 +589,36 @@
       if (pied.children.length) boite.appendChild(pied); else pied.remove();
     }
     construireBoutons(boutons);
-    if (fermable) {
-      fond.addEventListener('mousedown', (ev) => { if (ev.target === fond) api._fermerSurFond = true; else api._fermerSurFond = false; });
-      fond.addEventListener('mouseup', (ev) => { if (ev.target === fond && api._fermerSurFond) api.fermerSiPossible(); });
-    }
+    fond.addEventListener('mousedown', (ev) => { api._fermerSurFond = ev.target === fond; });
+    fond.addEventListener('mouseup', (ev) => { if (ev.target === fond && api._fermerSurFond && api.fermable !== false) api.fermerSiPossible(); });
     document.body.appendChild(fond);
     modales.push(api);
-    const focusable = corps.querySelector('input:not([type=hidden]):not([disabled]), select, textarea, button');
-    // Mise au point différée, sauf si la saisie a déjà commencé dans la fenêtre
-    if (focusable) setTimeout(() => { if (!boite.contains(document.activeElement)) focusable.focus(); }, 30);
+    // Mise au point différée (contenu éventuellement ajouté juste après l'ouverture), sauf si la saisie a déjà commencé
+    // dans la fenêtre : premier champ ou bouton du contenu, à défaut la fenêtre elle-même
+    setTimeout(() => {
+      if (!fond.parentNode || boite.contains(document.activeElement) || modales[modales.length - 1] !== api) return;
+      const cible = focalisables(corps).find((e) => e.matches('input, select, textarea, button')) || boite;
+      cible.focus({ preventScroll: cible === boite });
+    }, 30);
     return api;
   }
   document.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape' && modales.length) { const m = modales[modales.length - 1]; if (m.boite.querySelector('.modal-entete .btn-icone')) m.fermerSiPossible(); }
+    if (!modales.length) return;
+    const m = modales[modales.length - 1];
+    if (ev.key === 'Escape') { if (m.fermable !== false) m.fermerSiPossible(); return; }
+    // Tabulation confinée à la fenêtre du dessus (aria-modal) : du dernier élément au premier et inversement, sans
+    // passer par le menu ni l'en-tête restés derrière le fond
+    if (ev.key !== 'Tab' || ev.defaultPrevented || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    const liste = focalisables(m.boite);
+    const actif = document.activeElement;
+    if (!liste.length) { ev.preventDefault(); m.boite.focus({ preventScroll: true }); return; }
+    const premier = liste[0], dernier = liste[liste.length - 1];
+    if (!m.boite.contains(actif)) { ev.preventDefault(); (ev.shiftKey ? dernier : premier).focus(); }
+    else if (!ev.shiftKey && actif === dernier) { ev.preventDefault(); premier.focus(); }
+    else if (ev.shiftKey && (actif === premier || actif === m.boite)) { ev.preventDefault(); dernier.focus(); }
   });
-  /** Ferme toutes les modales ouvertes (changement de vue). */
-  function fermerModales() { modales.slice().forEach((m) => { if (m.fermable !== false) m.fermer(); }); }
+  /** Ferme les modales ouvertes (changement de vue) ; `toutes` : y compris les fenêtres non fermables (fin de session). */
+  function fermerModales(toutes) { modales.slice().reverse().forEach((m) => { if (toutes === true || m.fermable !== false) m.fermer(); }); }
 
   function confirm({ titre = 'Confirmation', message, okLabel = 'Confirmer', annulerLabel = 'Annuler', danger = false } = {}) {
     return new Promise((resolve) => {
@@ -537,9 +663,20 @@
    *   disabled, min, max, step, onChange(valeur, form), rendu(form) [type html], afficherSi(valeurs), lignes }
    * Types : texte, texte_long, nombre, date, datetime, heure, select, multiselect, cases, radio, booleen, interrupteur,
    *         couleur, mdp, email, tel, fichier, image, lecture, separateur, html, cache
+   * `entreeSoumet` : Entrée dans un champ envoie le formulaire (événement « submit ») même sans bouton d'envoi, ce que
+   * le navigateur ne fait pas de lui-même dès qu'il y a plusieurs champs (petits formulaires des fenêtres modales).
    */
-  function form({ champs = [], valeurs = {}, colonnes = 2, classe } = {}) {
+  function form({ champs = [], valeurs = {}, colonnes = 2, classe, entreeSoumet = false } = {}) {
     const formEl = el('form', { class: 'formulaire colonnes-' + colonnes + (classe ? ' ' + classe : ''), novalidate: true, autocomplete: 'off' });
+    if (entreeSoumet) {
+      formEl.addEventListener('keydown', (ev) => {
+        if (ev.key !== 'Enter' || ev.isComposing || ev.defaultPrevented || ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+        const t = ev.target;
+        if (!t || t.tagName !== 'INPUT' || ['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'image', 'color', 'range'].includes(t.type)) return;
+        ev.preventDefault(); // pas de soumission implicite en double pour un formulaire à un seul champ
+        formEl.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      });
+    }
     const controles = {};
     const defs = champs.filter(Boolean);
     const api = {
@@ -1300,7 +1437,7 @@
     formatDate, formatHeure, formatDateHeure, dateISO, dateHeureLocale, aujourdhui, formatNombre, formatMontant, formatDuree, relatif, joursEntre, initiales, parseDate,
     liste, itemListe, libelle, couleur, user, nomUser, secteur, nomSecteur, cheminSecteur, profil, nomProfil, secteursDuSiteCourant,
     optionsListe, optionsUsers, optionsSecteurs, optionsProfils,
-    badge, badgeListe, pastille, toast, erreur, copier, modal, fermerModales, confirm, prompt, champMdp, reglesMdp, robustesseMdp,
+    badge, badgeListe, pastille, couleursBadge, toast, fermerToasts, erreur, copier, modal, fermerModales, confirm, prompt, champMdp, reglesMdp, robustesseMdp,
     form, formModal, lireFichier, champsPersoDefs, champsPersoValeurs, champsPersoInitiaux, champsPersoAffichage,
     table, exportCsv, telecharger, imprimer, lancerImpression,
     pageEntete, bouton, vide, chargement, kpi, details, alerte, carte, onglets, arbre, avatar, lien, graphiqueBarres,

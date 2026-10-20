@@ -19,9 +19,10 @@ const { creerGestionnaire, comparerVersions, validerManifeste, nomSur } = requir
 const { manifeste } = require('../scripts/manifeste-maj');
 const tlsGmao = require('../server/tls');
 const { createApp } = require('../server/server');
-const { hashPassword } = require('../server/auth');
+const { hashPassword, verifyPassword } = require('../server/auth');
 
 const tmp = (p) => fs.mkdtempSync(path.join(os.tmpdir(), p));
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Charge un module de electron/ en remplaçant le module « electron » par un objet simulé. */
 function chargerAvecElectron(fichier, electron) {
@@ -207,9 +208,13 @@ describe('electron/main.js avec un Electron simulé', () => {
     let pret;
     const whenReady = new Promise((r) => { pret = r; });
     class BrowserWindow {
-      constructor(opts) { this.opts = opts; this.handlers = {}; journal.fenetres.push(this); this.webContents = { setWindowOpenHandler() {}, on() {}, session: { setPermissionRequestHandler() {} }, reload() {} }; }
-      loadURL(u) { journal.urls.push(u); }
-      loadFile(f, o) { journal.fichiers.push(f); journal.requetes.push((o && o.query) || {}); }
+      constructor(opts) {
+        this.opts = opts; this.handlers = {}; this.contenu = {}; this.chargements = []; journal.fenetres.push(this);
+        const fen = this;
+        this.webContents = { setWindowOpenHandler() {}, on(n, fn) { fen.contenu[n] = fn; }, session: { setPermissionRequestHandler() {} }, reload() {} };
+      }
+      loadURL(u) { journal.urls.push(u); this.url = u; }
+      loadFile(f, o) { journal.fichiers.push(f); journal.requetes.push((o && o.query) || {}); this.chargements.push((o && o.query) || {}); }
       once(n, fn) { this.handlers[n] = fn; }
       on(n, fn) { this.handlers[n] = fn; }
       show() {} hide() {} focus() {} maximize() {} isMaximized() { return false; } isMinimized() { return false; } restore() {}
@@ -763,6 +768,308 @@ describe('electron/main.js avec un Electron simulé', () => {
     assert.equal((await faux.handlers['bureau:recuperation-deverrouiller'](ev, CODE)).ok, true);
     assert.deepEqual(lireParametres(userData).verrouCode, { echecs: 0, bloqueJusqua: '' });
     await arreter(faux);
+  });
+
+  // ----- Cycle de vie du serveur intégré, assistant et messages ----------------------------------
+  const portAleatoire = () => 41000 + Math.floor(Math.random() * 4000);
+  const lireBase = (userData) => JSON.parse(fs.readFileSync(path.join(userData, 'data', 'gmao.json'), 'utf8'));
+  const compteAdmin = (base) => base.collections.users.find((u) => u.login === 'admin');
+  const NOUVEAU_MDP = 'Nouveau-Mdp-Bureau-2026!';
+  /** Espion sur createApp (main.js charge server/server.js à la demande) : instances créées, appels de stop() comptés. */
+  function espionnerServeurs(t) {
+    const mod = require('../server/server');
+    const original = mod.createApp;
+    const instances = [];
+    mod.createApp = (o) => {
+      const s = original(o);
+      s.arrets = 0;
+      const stop = s.stop;
+      s.stop = function () { s.arrets += 1; return stop.call(this); };
+      instances.push(s);
+      return s;
+    };
+    t.after(async () => {
+      mod.createApp = original;
+      for (const s of instances) if (!s.arrets) { try { await s.stop(); } catch (e) { /* déjà arrêtée */ } }
+    });
+    return instances;
+  }
+
+  test('échec d\'affichage de la fenêtre (poste seul) : « Rouvrir la GMAO » sans second serveur, aucune donnée écrasée, arrêt complet', async (t) => {
+    const instances = espionnerServeurs(t);
+    const userData = tmp('gmao-bureau-');
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port: portAleatoire(), partageReseau: false } });
+    const { faux, url } = await demarrerServeurBureau(userData);
+    const principale = faux.journal.fenetres[0];
+    // Chromium signale un échec de chargement de la fenêtre principale alors que le serveur tourne
+    principale.contenu['did-fail-load']({}, -21, 'ERR_NETWORK_CHANGED', url, true);
+    await attendre(() => faux.journal.fichiers.length === 1);
+    const q = faux.journal.requetes[0];
+    assert.match(q.erreur, /^Impossible d'ouvrir la GMAO : .+ \(code -21\)\.$/);
+    assert.doesNotMatch(q.erreur, /ERR_|Error/, 'aucun code Chromium brut');
+    assert.equal(q.reprise, 'rouvrir', 'serveur en service : la fenêtre est seulement rouverte');
+    assert.equal(principale.detruite, true);
+    const assistant = derniereFenetre(faux);
+    assert.equal(await faux.handlers['bureau:reessayer'](depuis(assistant)), true);
+    assert.deepEqual(faux.journal.urls, [url, url], 'même serveur, nouvelle fenêtre');
+    assert.equal(instances.length, 1, 'aucun second serveur sur la même base');
+    assert.equal(instances[0].arrets, 0);
+    await pause(10);
+    assert.equal(assistant.detruite, true, 'assistant fermé une fois la GMAO rouverte');
+    // Un changement de mot de passe reste écrit, même après une écriture périodique d'un module
+    const login = await requete(url, '/api/auth/login', { corps: { login: 'admin', password: 'admin' } });
+    assert.equal(login.status, 200);
+    assert.equal((await requete(url, '/api/auth/mot-de-passe', { corps: { ancien: 'admin', nouveau: NOUVEAU_MDP }, cookie: login.cookie })).status, 200);
+    instances[0].db.touch();
+    await arreter(faux);
+    assert.equal(instances[0].arrets, 1, 'serveur arrêté à la fermeture');
+    assert.ok(verifyPassword(NOUVEAU_MDP, compteAdmin(lireBase(userData)).passwordHash), 'nouveau mot de passe conservé sur le disque');
+  });
+
+  test('échec d\'affichage (serveur partagé) : fenêtre rouverte, récupération et journal opérationnels, données écrites à l\'arrêt', async (t) => {
+    const instances = espionnerServeurs(t);
+    const userData = tmp('gmao-bureau-');
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port: portAleatoire(), partageReseau: true } });
+    const { faux, url } = await demarrerServeurBureau(userData);
+    const fp = tlsGmao.empreinte(fs.readFileSync(path.join(userData, 'data', 'tls', 'certificat.pem'), 'utf8'));
+    faux.journal.fenetres[0].contenu['did-fail-load']({}, -324, 'ERR_EMPTY_RESPONSE', url, true);
+    await attendre(() => faux.journal.fichiers.length === 1);
+    assert.match(faux.journal.requetes[0].erreur, /réponse vide ou invalide \(code -324\)/);
+    assert.equal(await faux.handlers['bureau:reessayer'](depuis(derniereFenetre(faux))), true);
+    assert.equal(faux.journal.urls[1], url);
+    assert.equal(instances.length, 1, 'le serveur qui sert le réseau n\'est ni dupliqué ni « perdu »');
+    // Récupération d'urgence toujours disponible depuis la zone de notification
+    const { ev } = ouvrirRecuperation(faux);
+    assert.equal((await faux.handlers['bureau:recuperation-etat'](ev)).disponible, true);
+    // Échec du code du pôle informatique : toujours inscrit au journal d'activité
+    entreeMenu(faux, 'Paramètres de connexion (pôle informatique)…').click();
+    assert.equal((await faux.handlers['bureau:deverrouiller'](depuis(derniereFenetre(faux)), 'mauvais-code')).ok, false);
+    assert.ok(instances[0].db.list('audit', (a) => a.action === 'echec_connexion' && /paramètres de connexion/.test(a.details)).length, 'échec journalisé');
+    // Connexion d'un poste du réseau (écriture différée), puis arrêt : données écrites
+    const login = await requeteEpinglee(url + 'api/auth/login', fp, { method: 'POST', corps: { login: 'admin', password: 'admin' } });
+    assert.equal(login.status, 200);
+    faux.ev['before-quit']();
+    faux.ev['will-quit']();
+    faux.ev['window-all-closed']();
+    await attendre(() => faux.journal.quit > 0);
+    await pause(150);
+    assert.equal(instances[0].arrets, 1, 'serveur arrêté (minuteurs, écriture des données)');
+    assert.ok(compteAdmin(lireBase(userData)).derniereConnexion, 'connexion écrite dans gmao.json');
+  });
+
+  test('écoute refusée (EACCES, port réservé par Windows) : instance arrêtée, message en français, une seule instance après correction du port', async (t) => {
+    const instances = espionnerServeurs(t);
+    const net = require('net');
+    const listen = net.Server.prototype.listen;
+    t.after(() => { net.Server.prototype.listen = listen; });
+    const userData = tmp('gmao-bureau-');
+    const port = portAleatoire();
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port, partageReseau: false } });
+    net.Server.prototype.listen = function () {
+      net.Server.prototype.listen = listen;
+      process.nextTick(() => this.emit('error', Object.assign(new Error(`listen EACCES: permission denied 127.0.0.1:${port}`), { code: 'EACCES', syscall: 'listen' })));
+      return this;
+    };
+    const faux = fauxElectron(userData);
+    chargerMain(faux);
+    faux.demarrer();
+    await attendre(() => faux.journal.fichiers.length === 1, 10000);
+    const q = faux.journal.requetes[0];
+    assert.match(q.erreur, new RegExp(`^Le port ${port} est réservé par Windows ou bloqué sur ce poste`));
+    assert.doesNotMatch(q.erreur, /EACCES|listen|permission denied/);
+    assert.equal(q.reprise, undefined, 'rien ne tourne : « Réessayer »');
+    assert.equal(instances.length, 1);
+    assert.equal(instances[0].arrets, 1, 'instance jamais à l\'écoute arrêtée (base, minuteurs)');
+    const assistant = derniereFenetre(faux);
+    assert.equal((await faux.handlers['bureau:deverrouiller'](depuis(assistant), 'mauvais-code')).ok, false);
+    assert.equal(instances[0].db.list('audit', (a) => a.action === 'echec_connexion').length, 0, 'aucune écriture dans la base de l\'instance arrêtée');
+    // Le pôle informatique choisit un autre port : une seule instance en service
+    assert.equal((await faux.handlers['bureau:deverrouiller'](depuis(assistant), CODE)).ok, true);
+    const r = await faux.handlers['bureau:enregistrer'](depuis(assistant), { mode: 'serveur', serveur: { port: portAleatoire(), partageReseau: false } });
+    assert.equal(r.ok, true);
+    await attendre(() => faux.journal.urls.length === 1, 10000);
+    assert.equal(instances.length, 2);
+    assert.deepEqual(instances.map((s) => s.arrets), [1, 0]);
+    await pause(10);
+    assert.equal(assistant.detruite, true, 'assistant fermé une fois la GMAO ouverte');
+    await arreter(faux);
+    assert.deepEqual(instances.map((s) => s.arrets), [1, 1], 'toutes les instances arrêtées');
+  });
+
+  test('démarrage manqué (port occupé, partage réseau) : la relance montre l\'assistant, sa fermeture arrête l\'application', async (t) => {
+    const instances = espionnerServeurs(t);
+    const net = require('net');
+    const port = portAleatoire();
+    const occupant = net.createServer();
+    await new Promise((r) => occupant.listen(port, '0.0.0.0', r));
+    t.after(() => occupant.close());
+    const userData = tmp('gmao-bureau-');
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port, partageReseau: true }, demarrerAvecWindows: true });
+    const faux = fauxElectron(userData);
+    chargerMain(faux);
+    faux.demarrer();
+    await attendre(() => faux.journal.fichiers.length === 1, 10000);
+    assert.match(faux.journal.requetes[0].erreur, new RegExp(`^Le port ${port} est déjà utilisé sur ce poste par un autre programme`));
+    assert.deepEqual(instances.map((s) => s.arrets), [1]);
+    // Relance de l'exécutable : l'assistant revient au premier plan (aucune fenêtre supplémentaire)
+    const nb = faux.journal.fenetres.length;
+    faux.ev['second-instance']();
+    assert.equal(faux.journal.fenetres.length, nb);
+    // Fermeture de l'assistant : rien ne tourne, l'application s'arrête (jamais de processus invisible)
+    derniereFenetre(faux).close();
+    await attendre(() => faux.journal.quit > 0);
+    faux.ev['window-all-closed']();
+    await pause(30);
+    assert.ok(faux.journal.quit >= 1);
+  });
+
+  test('poste client démarré avec Windows, serveur injoignable : fermer l\'assistant arrête l\'application', async () => {
+    const userData = tmp('gmao-bureau-');
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'client', client: { url: 'http://127.0.0.1:1/' }, demarrerAvecWindows: true });
+    const faux = fauxElectron(userData);
+    chargerMain(faux);
+    faux.demarrer();
+    await attendre(() => faux.journal.fichiers.length === 1, 10000);
+    assert.equal(faux.journal.trays, 0);
+    assert.match(faux.journal.requetes[0].erreur, /Serveur GMAO injoignable/);
+    derniereFenetre(faux).close();
+    await attendre(() => faux.journal.quit > 0);
+  });
+
+  test('échec de chargement ou alerte de sécurité pendant que les paramètres sont ouverts : message affiché dans la même fenêtre', async (t) => {
+    espionnerServeurs(t);
+    const userData = tmp('gmao-bureau-');
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port: portAleatoire(), partageReseau: true } });
+    const { faux, url } = await demarrerServeurBureau(userData);
+    const principale = faux.journal.fenetres[0];
+    entreeMenu(faux, 'Paramètres de connexion (pôle informatique)…').click();
+    const assistant = derniereFenetre(faux);
+    assert.equal((await faux.handlers['bureau:deverrouiller'](depuis(assistant), CODE)).ok, true);
+    const nb = faux.journal.fenetres.length;
+    // Échec de chargement de la fenêtre principale : la page des paramètres est rechargée avec la cause
+    principale.contenu['did-fail-load']({}, -100, 'ERR_CONNECTION_CLOSED', url, true);
+    assert.equal(assistant.chargements.length, 2);
+    assert.match(assistant.chargements[1].erreur, /connexion au serveur GMAO a été interrompue ou refusée \(code -100\)/);
+    assert.equal(assistant.chargements[1].reprise, 'rouvrir');
+    assert.equal(faux.journal.fenetres.length, nb, 'même fenêtre, aucune autre ouverte');
+    assert.equal(principale.detruite, true);
+    assert.equal((await faux.handlers['bureau:parametres'](depuis(assistant))).verrouille, undefined, 'saisie du code conservée');
+    // « Rouvrir la GMAO », puis certificat refusé alors que les paramètres sont de nouveau ouverts : alerte affichée
+    assert.equal(await faux.handlers['bureau:reessayer'](depuis(assistant)), true);
+    await pause(10);
+    entreeMenu(faux, 'Paramètres de connexion (pôle informatique)…').click();
+    const autre = derniereFenetre(faux);
+    assert.notEqual(autre, assistant);
+    const nb2 = faux.journal.fenetres.length;
+    const pirate = tlsGmao.genererCertificat({ nomPoste: 'pirate' });
+    assert.equal(await verifier(faux, '127.0.0.1', pirate.certificat), -2);
+    await attendre(() => autre.chargements.length === 2);
+    assert.equal(autre.chargements[1].alerte, 'securite');
+    assert.match(autre.chargements[1].erreur, /certificat différent.*usurpation/);
+    assert.equal(faux.journal.fenetres.length, nb2, 'même fenêtre, rechargée avec l\'alerte');
+    await arreter(faux);
+  });
+
+  test('messages en français : dossier des données inaccessible, incident technique d\'un canal', async () => {
+    const userData = tmp('gmao-bureau-');
+    const fichier = path.join(userData, 'pas-un-dossier');
+    fs.writeFileSync(fichier, 'x');
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port: portAleatoire(), partageReseau: false, dossierDonnees: path.join(fichier, 'data') } });
+    const faux = fauxElectron(userData);
+    chargerMain(faux);
+    faux.demarrer();
+    await attendre(() => faux.journal.fichiers.length === 1, 10000);
+    const erreur = faux.journal.requetes[0].erreur;
+    assert.match(erreur, /^Le dossier des données « .*pas-un-dossier.data » n'est pas accessible \(un élément du chemin n'est pas un dossier\)/);
+    assert.doesNotMatch(erreur, /ENOTDIR|not a directory|mkdir/);
+    // Incident technique pendant un appel de l'assistant : message générique, détail au journal du poste
+    const assistant = derniereFenetre(faux);
+    assert.equal((await faux.handlers['bureau:deverrouiller'](depuis(assistant), CODE)).ok, true);
+    const pj = path.join(userData, 'parametres.json');
+    fs.rmSync(pj);
+    fs.mkdirSync(pj);
+    fs.writeFileSync(path.join(pj, 'occupe'), '');
+    await assert.rejects(() => faux.handlers['bureau:enregistrer'](depuis(assistant), { mode: 'serveur', serveur: { port: portAleatoire(), partageReseau: false } }),
+      (e) => /^Opération impossible sur ce poste/.test(e.message) && !/E[A-Z]{3,}|rename|Error/.test(e.message));
+    await assert.rejects(() => faux.handlers['bureau:tester-serveur']({ senderFrame: { url: 'https://pirate.example/' } }, 'x'), (e) => e.message === 'Appel non autorisé');
+  });
+
+  test('code du pôle informatique vide : refusé sans essai compté, sans délai ni journal', async (t) => {
+    espionnerServeurs(t);
+    const userData = tmp('gmao-bureau-');
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port: portAleatoire(), partageReseau: false }, verrouCode: { echecs: 6 } });
+    const { faux } = await demarrerServeurBureau(userData);
+    entreeMenu(faux, 'Paramètres de connexion (pôle informatique)…').click();
+    const ev = depuis(derniereFenetre(faux));
+    for (let i = 0; i < 3; i++) {
+      const t0 = Date.now();
+      const r = await faux.handlers['bureau:deverrouiller'](ev, '');
+      assert.deepEqual([r.ok, r.message], [false, 'Saisissez le code du pôle informatique']);
+      assert.ok(Date.now() - t0 < 300, 'aucun délai');
+    }
+    assert.equal(lireParametres(userData).verrouCode.echecs, 6, 'aucun essai compté');
+    const rec = ouvrirRecuperation(faux);
+    const r = await faux.handlers['bureau:recuperation-deverrouiller'](rec.ev, '');
+    assert.deepEqual([r.ok, r.bloque, r.message], [false, false, 'Saisissez le code du pôle informatique']);
+    assert.equal(lireParametres(userData).verrouCode.echecs, 6);
+    await arreter(faux);
+    const audit = lireBase(userData).collections.audit;
+    assert.ok(!audit.some((a) => a.action === 'echec_connexion' || a.action === 'blocage'), 'rien au journal d\'activité');
+    // Côté page : une saisie vide n'est pas envoyée, un seul essai à la fois
+    const html = fs.readFileSync(path.join(__dirname, '..', 'electron', 'demarrage.html'), 'utf8');
+    const fonction = html.slice(html.indexOf('async function deverrouiller()'), html.indexOf('B.deverrouiller(champ.value)'));
+    assert.match(fonction, /if \(bouton\.disabled\) return;/);
+    assert.match(fonction, /if \(!champ\.value\) \{[^}]*Saisissez le code du pôle informatique/);
+  });
+
+  test('certificat du serveur partagé : nouvelle clé signalée au pôle informatique, renouvellement à clé conservée seulement journalisé', async () => {
+    const userData = tmp('gmao-bureau-');
+    const tls = path.join(userData, 'data', 'tls');
+    new Parametres(userData).enregistrer({ configure: true, codeInformatique: hashPassword(CODE), mode: 'serveur', serveur: { port: portAleatoire(), partageReseau: true } });
+    const TITRE = 'Clé du certificat du serveur GMAO changée';
+    const alertes = (base) => base.collections.notifications.filter((n) => n.titre === TITRE);
+    const renouvellements = (base) => base.collections.audit.filter((a) => a.action === 'renouvellement');
+    let { faux } = await demarrerServeurBureau(userData);
+    const cle1 = lireParametres(userData).certificatServeur.empreinteCle;
+    assert.equal(cle1, tlsGmao.empreinteCle(fs.readFileSync(path.join(tls, 'certificat.pem'), 'utf8')), 'clé mémorisée');
+    await arreter(faux);
+    let base = lireBase(userData);
+    assert.match(renouvellements(base)[0].details, /^Certificat HTTPS du poste serveur créé \(première génération\)/);
+    assert.equal(alertes(base).length, 0, 'premier partage : aucune alerte');
+
+    // Clé privée corrompue (disque, antivirus, restauration partielle) : nouvelle clé, postes clients bloqués
+    fs.writeFileSync(path.join(tls, 'cle.pem'), 'corrompu');
+    ({ faux } = await demarrerServeurBureau(userData));
+    const cle2 = lireParametres(userData).certificatServeur.empreinteCle;
+    assert.notEqual(cle2, cle1);
+    const empreinte2 = tlsGmao.empreinte(fs.readFileSync(path.join(tls, 'certificat.pem'), 'utf8'));
+    await arreter(faux);
+    base = lireBase(userData);
+    const entree = renouvellements(base).find((a) => /^La clé du certificat HTTPS de ce poste serveur a changé \(fichier de la clé privée illisible ou corrompu\)/.test(a.details));
+    assert.ok(entree, 'changement de clé journalisé');
+    assert.equal(entree.entite, 'systeme');
+    assert.match(entree.userNom, /^Poste serveur /);
+    assert.ok(entree.details.includes(empreinte2), 'nouvelle empreinte citée');
+    const adminId = compteAdmin(base).id;
+    assert.ok(alertes(base).some((n) => n.userId === adminId && n.type === 'alerte' && n.message.includes(empreinte2)), 'pôle informatique prévenu');
+
+    // Certificat seul recréé (clé conservée) : journalisé, sans alerte
+    fs.rmSync(path.join(tls, 'certificat.pem'));
+    ({ faux } = await demarrerServeurBureau(userData));
+    await arreter(faux);
+    base = lireBase(userData);
+    assert.ok(renouvellements(base).some((a) => /^Certificat HTTPS du poste serveur renouvelé \(certificat absent\), clé conservée/.test(a.details)));
+    assert.equal(alertes(base).length, 1, 'aucune nouvelle alerte');
+    assert.equal(lireParametres(userData).certificatServeur.empreinteCle, cle2);
+
+    // Clé supprimée et mémoire du poste effacée : changement détecté grâce au certificat encore en place
+    new Parametres(userData).enregistrer({ certificatServeur: { empreinteCle: '' } });
+    fs.rmSync(path.join(tls, 'cle.pem'));
+    ({ faux } = await demarrerServeurBureau(userData));
+    await arreter(faux);
+    base = lireBase(userData);
+    assert.ok(renouvellements(base).some((a) => /a changé \(fichier de la clé privée absent\)/.test(a.details)));
+    assert.equal(alertes(base).length, 2);
   });
 });
 

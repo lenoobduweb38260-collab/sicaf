@@ -37,6 +37,43 @@ const RE_NOM_PIECE = /^[0-9a-f]{64}\.txt$/;
 const RE_REF_PIECE = /"\$pieceGmao":\s*"([0-9a-f]{64}\.txt)"/g;
 const estPiece = (v) => typeof v === 'string' && v.length >= SEUIL_PIECE && v.startsWith('data:');
 const JOUR_MS = 24 * 60 * 60 * 1000;
+/** Copies faites par backupNow (gmao-<motif>-<date ISO>.json : avant un import, avant une restauration, manuelle). */
+const RE_COPIE = /^gmao-[A-Za-z0-9_-]{1,60}-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.json$/;
+/** Indice rapide de secrets dans le texte d'une copie (contrôle complet après lecture). */
+const RE_INDICE_SECRET = /"(?:reinitialisation|motDePasseChiffrement|cleReception|cleReceptionDate)"\s*:|"destinations"\s*:\s*\[\s*\{/;
+
+/**
+ * Secrets propres à ce serveur, jamais recopiés hors de gmao.json (export complet, sauvegardes, copies du dossier
+ * backups) : secrets des sauvegardes (`config.sauvegardes` : clé de réception et sa date, mot de passe de chiffrement,
+ * destinations et leurs clés) et codes de réinitialisation en cours des comptes (`users[].reinitialisation`).
+ * Un import ou une restauration conserve de toute façon les paramètres de sauvegarde du serveur, et un code de
+ * réinitialisation ne vaut que pour le serveur et le moment où il a été remis.
+ * Les fonctions modifient l'objet reçu (copie) et renvoient vrai si elles ont retiré quelque chose.
+ */
+function retirerSecretsSauvegarde(config) {
+  const s = config && config.sauvegardes;
+  if (!s || typeof s !== 'object') return false;
+  let retire = false;
+  for (const k of ['cleReception', 'cleReceptionDate', 'motDePasseChiffrement']) {
+    if (Object.prototype.hasOwnProperty.call(s, k)) { delete s[k]; retire = true; }
+  }
+  if (!Array.isArray(s.destinations) || s.destinations.length) { s.destinations = []; retire = true; }
+  return retire;
+}
+function retirerCodesReinitialisation(data) {
+  const users = data && data.collections && data.collections.users;
+  if (!Array.isArray(users)) return false;
+  let retire = false;
+  for (const u of users) {
+    if (u && typeof u === 'object' && Object.prototype.hasOwnProperty.call(u, 'reinitialisation')) { delete u.reinitialisation; retire = true; }
+  }
+  return retire;
+}
+function expurger(data) {
+  const a = retirerSecretsSauvegarde(data && data.config);
+  const b = retirerCodesReinitialisation(data);
+  return a || b;
+}
 
 class Db {
   constructor(dataDir, options = {}) {
@@ -80,8 +117,40 @@ class Db {
         this.data = last ? this._normalize(this._lire(last)) : this._empty();
       }
     }
+    this._expurgerCopies();
     this._entretienQuotidien();
     return this;
+  }
+
+  /**
+   * Copies du dossier backups écrites par une version antérieure (copie brute de gmao.json) : secrets de ce serveur
+   * retirés une fois pour toutes (elles sont listées, restaurables et téléchargeables). Date de modification conservée.
+   */
+  _expurgerCopies() {
+    let noms = [];
+    try { noms = fs.readdirSync(this.backupDir).filter((f) => RE_COPIE.test(f)); } catch (e) { return 0; }
+    let n = 0;
+    for (const nom of noms) {
+      const chemin = path.join(this.backupDir, nom);
+      try {
+        const texte = fs.readFileSync(chemin, 'utf8');
+        if (!RE_INDICE_SECRET.test(texte)) continue;
+        const copie = JSON.parse(texte);
+        if (!expurger(copie)) continue;
+        const st = fs.statSync(chemin);
+        this._ecrireAtomique(chemin, JSON.stringify(copie, null, 1));
+        fs.utimesSync(chemin, st.atime, st.mtime);
+        n += 1;
+      } catch (e) { this.log(`Copie ${nom} : secrets non retirés (${e.message})`); }
+    }
+    return n;
+  }
+
+  /** Écrit un fichier en remplaçant l'ancien d'un seul coup (fichier temporaire puis renommage). */
+  _ecrireAtomique(chemin, texte) {
+    const tmp = chemin + '.tmp';
+    fs.writeFileSync(tmp, texte, 'utf8');
+    fs.renameSync(tmp, chemin);
   }
 
   /** Lit un fichier de base (gmao.json ou copie) et réintègre les pièces jointes conservées à part. */
@@ -197,14 +266,21 @@ class Db {
     return supprimees;
   }
 
-  /** Crée une sauvegarde manuelle et retourne son chemin. */
+  /**
+   * Copie de la base dans le dossier backups (manuelle, avant un import ou une restauration) et retourne son chemin.
+   * Copie de gmao.json (pièces jointes en références) sans les secrets de ce serveur (voir expurger) : ces copies sont
+   * listées, restaurables et téléchargeables. La copie quotidienne, qui sert au redémarrage sur un fichier endommagé,
+   * reste une copie exacte.
+   */
   backupNow(label = 'manuel') {
     if (this.inMemory) return null;
     this.saveNow();
     fs.mkdirSync(this.backupDir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const target = path.join(this.backupDir, `gmao-${label}-${stamp}.json`);
-    fs.copyFileSync(this.file, target);
+    const copie = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+    expurger(copie);
+    this._ecrireAtomique(target, JSON.stringify(copie, null, 1));
     return target;
   }
 
@@ -237,6 +313,8 @@ class Db {
     this.backupNow('avant-restauration');
     const ancienne = this.data;
     this.data = this._normalize(donnees);
+    // Aucun code de réinitialisation n'est repris d'une copie (un code annulé depuis redeviendrait valable)
+    retirerCodesReinitialisation(this.data);
     if (typeof options.conserver === 'function') options.conserver(ancienne, this.data);
     this._dirty = true;
     this.saveNow();
@@ -459,20 +537,34 @@ class Db {
 
   // ----- Export / import -------------------------------------------------
 
-  /** Copie complète (pièces jointes comprises) ; sans passer par une chaîne JSON unique (aucune limite de taille). */
-  exportAll() { return structuredClone(this.data); }
+  /**
+   * Copie complète (pièces jointes comprises) sans les secrets de ce serveur (voir expurger) ; sans passer par une
+   * chaîne JSON unique (aucune limite de taille). Sert aux sauvegardes.
+   */
+  exportAll() {
+    const copie = structuredClone(this.data);
+    expurger(copie);
+    return copie;
+  }
 
   /**
    * Écrit la base complète en JSON (pièces jointes comprises) morceau par morceau : `ecrire(chaine)` est appelé
    * pour chaque enregistrement, sans construire une chaîne unique (export de bases volumineuses) ; s'il renvoie une
    * promesse (flux saturé), l'écriture reprend après sa résolution.
-   * Options : `entete({ meta, config })` modifie la copie des métadonnées et de la configuration (ex. secrets retirés) ;
+   * Les secrets de ce serveur (voir expurger) ne sont jamais écrits.
+   * Options : `entete({ meta, config })` modifie la copie des métadonnées et de la configuration ;
    * `ligne(collection, enregistrement)` renvoie l'enregistrement à écrire (copie modifiée, jamais l'original modifié),
    * ou undefined pour l'omettre.
    */
   async exporterParMorceaux(ecrire, options = {}) {
     const entete = { meta: structuredClone(this.data.meta), config: structuredClone(this.data.config || {}) };
-    const collections = Object.entries(this.data.collections).map(([nom, rows]) => [nom, Array.isArray(rows) ? rows.slice() : []]);
+    retirerSecretsSauvegarde(entete.config);
+    const sansCode = (r) => {
+      if (!r || typeof r !== 'object' || !Object.prototype.hasOwnProperty.call(r, 'reinitialisation')) return r;
+      const { reinitialisation, ...reste } = r;
+      return reste;
+    };
+    const collections = Object.entries(this.data.collections).map(([nom, rows]) => [nom, Array.isArray(rows) ? (nom === 'users' ? rows.map(sansCode) : rows.slice()) : []]);
     if (typeof options.entete === 'function') options.entete(entete);
     const envoyer = async (texte) => { const r = ecrire(texte); if (r && typeof r.then === 'function') await r; };
     await envoyer('{"meta":' + JSON.stringify(entete.meta) + ',\n"config":' + JSON.stringify(entete.config) + ',\n"collections":{');
@@ -495,6 +587,8 @@ class Db {
   importAll(data) {
     if (!data || typeof data !== 'object' || !data.collections) throw new Error('Fichier d\'import invalide');
     if (!this.inMemory) this.backupNow('avant-import');
+    // Aucun code de réinitialisation n'est repris d'un fichier importé ou d'une sauvegarde restaurée
+    retirerCodesReinitialisation(data);
     this.data = this._normalize(this._reintegrerPieces(data));
     this._dirty = true;
     this._inventaire = null;
@@ -502,4 +596,4 @@ class Db {
   }
 }
 
-module.exports = { Db, COLLECTIONS, SEUIL_PIECE };
+module.exports = { Db, COLLECTIONS, SEUIL_PIECE, expurger };

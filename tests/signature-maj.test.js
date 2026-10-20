@@ -12,10 +12,11 @@ const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
+const { EventEmitter } = require('events');
 
 const maj = require('../electron/miseajour');
 const { creerGestionnaire, contenuSigne, verifierSignature, chargerClesPubliques, controlerAdresse, validerManifeste } = maj;
-const { manifeste, lireClePrivee } = require('../scripts/manifeste-maj');
+const { manifeste, lireClePrivee, nettoyerNotes } = require('../scripts/manifeste-maj');
 const generateur = require('../scripts/generer-cle-maj');
 
 const RACINE = path.resolve(__dirname, '..');
@@ -80,6 +81,51 @@ async function fetchSimule(u, o) {
   throw new Error(`Requête inattendue vers ${s}`);
 }
 
+/**
+ * net.request d'Electron simulé selon son contrat : les hôtes GitHub sont servis par le serveur local ; pour
+ * chaque réponse 3xx, l'événement « redirect » est émis et la redirection n'est suivie que si followRedirect()
+ * est appelé pendant l'événement (sinon erreur « Redirect was cancelled »). `hotes` reçoit chaque hôte contacté.
+ */
+function fauxNetRequest(hotes, journalOptions = []) {
+  return (options) => {
+    journalOptions.push(options);
+    const req = new EventEmitter();
+    const entetes = {};
+    let courante = null;
+    let abandon = false;
+    let attente = null;
+    req.setHeader = (k, v) => { entetes[k] = v; };
+    req.followRedirect = () => { if (!attente) throw new Error('followRedirect() hors de l\'événement « redirect »'); attente(); };
+    req.abort = () => { abandon = true; if (courante) courante.destroy(); };
+    const envoyer = (adresse) => {
+      const u = new URL(adresse);
+      hotes.push(u.hostname);
+      if (!['api.github.com', 'github.com', 'objects.githubusercontent.com'].includes(u.hostname) || u.protocol !== 'https:') {
+        process.nextTick(() => req.emit('error', new Error('net::ERR_NAME_NOT_RESOLVED')));
+        return;
+      }
+      courante = http.request(base + u.pathname + u.search, { method: options.method, headers: entetes }, (res) => {
+        if (abandon) { res.destroy(); return; }
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          const suivante = new URL(res.headers.location, adresse).toString();
+          let suivre = false;
+          attente = () => { suivre = true; };
+          try { req.emit('redirect', res.statusCode, options.method, suivante, res.headers); } finally { attente = null; }
+          if (abandon) return;
+          if (suivre) envoyer(suivante); else req.emit('error', new Error('Redirect was cancelled'));
+          return;
+        }
+        req.emit('response', res);
+      });
+      courante.on('error', (e) => { if (!abandon) req.emit('error', e); });
+      courante.end();
+    };
+    req.end = () => envoyer(options.url);
+    return req;
+  };
+}
+
 function gestionnaire(options = {}) {
   return creerGestionnaire(Object.assign({
     versionActuelle: '1.0.5',
@@ -104,7 +150,8 @@ before(async () => {
     }
     const dl = /^\/sicaf\/gmao\/releases\/download\/v[^/]+\/(.+)$/.exec(p);
     if (dl && dl[1] === 'latest.json') { res.setHeader('content-type', 'application/json'); return res.end(etat.latest); }
-    if (dl) { res.statusCode = 302; res.setHeader('location', `/stockage/${encodeURIComponent(dl[1])}`); return res.end(); }
+    if (dl) { res.statusCode = 302; res.setHeader('location', `${etat.redirectionVers || ''}/stockage/${encodeURIComponent(dl[1])}`); return res.end(); }
+    if (p === '/lent') return; // aucune réponse : délai dépassé côté poste
     if (p.startsWith('/stockage/') || (p.startsWith('/interne/') && p.endsWith('.exe'))) {
       const b = etat.exeServi || etat.exe;
       if (etat.sansLongueur) {
@@ -121,7 +168,7 @@ before(async () => {
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   base = `http://127.0.0.1:${srv.address().port}`;
 });
-after(() => srv.close());
+after(() => { srv.close(); if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections(); });
 
 // ---------------------------------------------------------------------------------------------------------------
 describe('Contenu signé et clés', () => {
@@ -369,6 +416,52 @@ describe('Hôtes de téléchargement GitHub', () => {
     await assert.rejects(() => gestionnaire({ fetch: redirige }).verifier(), /Redirection refusée/);
   });
 
+  test('réponse sans adresse finale (net.fetch d\'Electron) : refusée pour la source GitHub, jamais acceptée en silence', async () => {
+    construire();
+    // net.fetch d'Electron suit les redirections puis reconstruit la réponse : son adresse (url) est toujours vide
+    const sansAdresse = async (u, o) => { const r = await fetchSimule(u, o); return new Response(r.body, { headers: r.headers, status: r.status, statusText: r.statusText }); };
+    assert.equal(new Response('x').url, '');
+    await assert.rejects(() => gestionnaire({ fetch: sansAdresse }).verifier(), /adresse finale de la réponse est inconnue/);
+    const info = await gestionnaire().verifier();
+    const dl = tmp('gmao-telechargement-');
+    await assert.rejects(() => gestionnaire({ fetch: sansAdresse, dossierTelechargement: dl }).telecharger(info), /adresse finale de la réponse est inconnue/);
+    assert.deepEqual(fs.readdirSync(dl), []);
+    // Adresse web interne : aucun hôte imposé, la réponse est acceptée (signature exigée de la même façon)
+    const interne = await gestionnaire({ fetch: sansAdresse, config: { source: 'url', url: `${base}/interne/` } }).verifier();
+    assert.equal(interne.signatureVerifiee, true);
+  });
+
+  test('fetch à redirections contrôlées (net.request d\'Electron) : chaîne GitHub acceptée, autre hôte refusé avant toute requête', async () => {
+    const { exe } = construire();
+    etat.redirectionVers = 'https://objects.githubusercontent.com';
+    const hotes = [];
+    const options = [];
+    const fetchControle = maj.creerFetchControle(fauxNetRequest(hotes, options));
+    assert.equal(fetchControle.redirectionsControlees, true);
+    const dl = tmp('gmao-telechargement-');
+    const g = gestionnaire({ fetch: fetchControle, dossierTelechargement: dl });
+    const info = await g.verifier();
+    assert.equal(info.signatureVerifiee, true);
+    const fichier = await g.telecharger(info);
+    assert.ok(fs.readFileSync(fichier).equals(exe));
+    assert.deepEqual([...new Set(hotes)].sort(), ['api.github.com', 'github.com', 'objects.githubusercontent.com']);
+    assert.ok(options.every((o) => o.redirect === 'manual'), 'redirections jamais suivies sans contrôle');
+    // Redirection vers un hôte tiers, ou en clair : refusée, aucune requête vers cette adresse
+    for (const [vers, motif] of [['https://pirate.example', /Redirection refusée : Téléchargement refusé : l'hôte « pirate\.example »/], ['http://github.com', /Redirection refusée : .*HTTPS obligatoire/]]) {
+      etat.redirectionVers = vers;
+      hotes.length = 0;
+      await assert.rejects(() => g.telecharger(info), motif);
+      assert.deepEqual(hotes, ['github.com'], vers);
+      assert.deepEqual(fs.readdirSync(dl).filter((f) => f.endsWith('.partiel')), []);
+    }
+    // Réponse : adresse finale renseignée ; délai dépassé : requête interrompue
+    etat.redirectionVers = 'https://objects.githubusercontent.com';
+    const r = await fetchControle(`https://github.com/sicaf/gmao/releases/download/v${etat.version}/x.exe`, {});
+    assert.equal(r.url, 'https://objects.githubusercontent.com/stockage/x.exe');
+    await r.arrayBuffer();
+    await assert.rejects(() => fetchControle('https://api.github.com/lent', { signal: AbortSignal.timeout(80) }), (e) => e.name === 'TimeoutError');
+  });
+
   test('page de publication hors de GitHub ignorée (jamais ouverte)', async () => {
     construire();
     etat.page = 'file:///C:/Windows/System32/calc.exe';
@@ -590,7 +683,8 @@ describe('Workflow de construction Windows', () => {
     assert.match(yml, /MAJ_CLE_PRIVEE: \$\{\{ env\.PUBLICATION == 'oui' && secrets\.MAJ_CLE_PRIVEE \|\| '' \}\}/);
     assert.equal((yml.match(/secrets\.CSC_LINK/g) || []).length, 1);
     assert.equal((yml.match(/secrets\.CSC_KEY_PASSWORD/g) || []).length, 1);
-    assert.ok(yml.indexOf('secrets.CSC_LINK') > yml.indexOf('npm install'), 'certificat préparé après l\'installation des paquets npm');
+    assert.ok(yml.indexOf('secrets.CSC_LINK') > yml.indexOf('npm ci'), 'certificat préparé après l\'installation des paquets npm');
+    assert.ok(yml.indexOf('secrets.CSC_LINK') > yml.indexOf('npm install'));
     assert.match(yml, /echo "CSC_KEY_PASSWORD=" >> "\$GITHUB_ENV"/, 'mot de passe retiré après la construction');
     assert.match(yml, /^permissions:\n {2}contents: read/m);
     assert.equal((yml.match(/persist-credentials: false/g) || []).length, 2);
@@ -610,18 +704,113 @@ describe('Workflow de construction Windows', () => {
     assert.match(yml.slice(debut, yml.indexOf('uses: softprops', debut)), /continue-on-error: true/);
     assert.match(yml, /if: steps\.publication\.outcome == 'failure'/);
     assert.match(yml, /GITHUB_STEP_SUMMARY/);
-    assert.match(yml, /if: env\.PUBLICATION == 'oui'\n\s+# GitHub refuse/);
+    assert.match(yml, /\n  publication:\n(?: {4}.*\n)*? {4}if: needs\.tests\.outputs\.publication == 'oui'\n/);
   });
 
-  test('notes de version : lignes de mention retirées', () => {
-    const motif = /grep -viE '([^']+)'/.exec(yml)[1].replace('[[:space:]]', '\\s');
-    const re = new RegExp(motif, 'i');
+  /** Jobs du workflow : nom → texte du job (indentation de deux espaces). */
+  const jobs = (() => {
+    const corps = yml.slice(yml.indexOf('\njobs:\n') + 7);
+    const out = {};
+    for (const bloc of corps.split(/\n(?=  [a-z][\w-]*:\n)/)) {
+      const m = /^ {2}([a-z][\w-]*):\n/.exec(bloc.replace(/^\n/, ''));
+      if (m) out[m[1]] = bloc;
+    }
+    return out;
+  })();
+
+  test('secrets de signature dans l\'environnement protégé « publication », jamais pour une étiquette ou une autre branche', () => {
+    assert.deepEqual(Object.keys(jobs), ['tests', 'windows', 'publication']);
+    // Aucune étiquette ne déclenche de construction ni de publication (une étiquette se pose sur n'importe quel commit)
+    const declencheurs = yml.slice(yml.indexOf('\non:\n'), yml.indexOf('\npermissions:'));
+    assert.doesNotMatch(declencheurs, /tags/);
+    assert.doesNotMatch(yml, /refs\/tags/);
+    // Décision de publication : branche par défaut uniquement, hors [wip]
+    assert.match(jobs.tests, /publication: \$\{\{ \(github\.ref == format\('refs\/heads\/\{0\}', github\.event\.repository\.default_branch\) && !contains\(github\.event\.head_commit\.message, '\[wip\]'\)\) && 'oui' \|\| 'non' \}\}/);
+    // Tout job qui lit un secret utilise l'environnement protégé, et seulement pour une version publiée
+    for (const [nom, texte] of Object.entries(jobs)) {
+      if (!/secrets\./.test(texte)) continue;
+      assert.match(texte, /\n {4}environment: \$\{\{ needs\.tests\.outputs\.publication == 'oui' && 'publication' \|\| '' \}\}\n/, nom);
+      assert.match(texte, /\n {6}contents: read\n/, `${nom} : aucun droit d'écriture avec les secrets`);
+    }
+    assert.match(jobs.windows, /secrets\.MAJ_CLE_PRIVEE/);
+    // Le seul job qui peut écrire (Release) ne reçoit aucun secret et n'exécute ni le code du dépôt ni npm
+    assert.match(jobs.publication, /\n {6}contents: write\n/);
+    const sansCommentaires = jobs.publication.replace(/^\s*#.*$/gm, '');
+    assert.doesNotMatch(sansCommentaires, /secrets\.|actions\/checkout|\bnpm\b|\bnode\b|\bnpx\b/);
+    assert.ok(Object.entries(jobs).every(([nom, texte]) => nom === 'publication' || !/contents: write/.test(texte)));
+    const doc = fs.readFileSync(path.join(RACINE, 'docs', 'MISES-A-JOUR.md'), 'utf8');
+    assert.match(doc, /Settings › Environments › New environment/);
+    assert.match(doc, /Deployment branches and tags/);
+    assert.match(doc, /gh secret set MAJ_CLE_PRIVEE --env publication/);
+    assert.match(doc, /étiquettes `v\*`/);
+  });
+
+  test('chaîne de construction verrouillée : actions épinglées par empreinte, npm ci, publication refusée sans package-lock.json', () => {
+    const uses = yml.match(/^\s*(?:- )?uses: .+$/gm);
+    assert.ok(uses.length >= 6);
+    for (const u of uses) assert.match(u, /uses: [\w.-]+\/[\w.-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$/, u.trim());
+    // Étape d'installation exécutée avec un faux npm : npm ci si le fichier existe ; sinon échec pour une version publiée
+    const etape = /- name: Installation d'Electron[^\n]*\n {8}shell: bash\n {8}run: \|\n((?: {10}.*\n)+)/.exec(yml);
+    assert.ok(etape, 'étape d\'installation');
+    const script = etape[1].replace(/^ {10}/gm, '');
+    const essai = (avecVerrou, publication) => {
+      const d = tmp('gmao-ci-');
+      fs.mkdirSync(path.join(d, 'bin'));
+      fs.writeFileSync(path.join(d, 'bin', 'npm'), '#!/bin/sh\necho "npm $*" >> appels.txt\n', { mode: 0o755 });
+      if (avecVerrou) fs.writeFileSync(path.join(d, 'package-lock.json'), '{}');
+      const r = spawnSync('bash', ['-c', script], { cwd: d, encoding: 'utf8', env: envPropre({ PUBLICATION: publication, PATH: `${path.join(d, 'bin')}:${process.env.PATH}` }) });
+      const appels = fs.existsSync(path.join(d, 'appels.txt')) ? fs.readFileSync(path.join(d, 'appels.txt'), 'utf8').trim() : '';
+      return { statut: r.status, appels, sortie: r.stdout };
+    };
+    if (spawnSync('bash', ['-c', 'true']).status !== 0) return;
+    assert.deepEqual(essai(true, 'oui'), { statut: 0, appels: 'npm ci --no-audit --no-fund', sortie: '' });
+    const refus = essai(false, 'oui');
+    assert.equal(refus.statut, 1);
+    assert.equal(refus.appels, '', 'aucune installation');
+    assert.match(refus.sortie, /::error title=Dépendances non verrouillées::/);
+    const branche = essai(false, 'non');
+    assert.equal(branche.statut, 0);
+    assert.equal(branche.appels, 'npm install --no-audit --no-fund');
+    assert.match(branche.sortie, /::warning/);
+  });
+
+  test('notes de version nettoyées par scripts/manifeste-maj.js : en-têtes de fin et mentions d\'outils retirés', () => {
     const message = [
       'Planning : glisser-déposer des interventions', '', 'Détail : correction du calcul des charges.',
       'Co-Authored-By: Une Personne <personne@exemple.fr>', '  Signed-off-by: Autre Personne <autre@exemple.fr>',
       'Reviewed-by: Relecteur', 'Outil-Session: https://exemple.invalid/session_0123',
-    ];
-    const conserve = message.filter((l) => !re.test(l));
-    assert.deepEqual(conserve, ['Planning : glisser-déposer des interventions', '', 'Détail : correction du calcul des charges.']);
+    ].join('\n');
+    assert.equal(nettoyerNotes(message), 'Planning : glisser-déposer des interventions\n\nDétail : correction du calcul des charges.');
+    // Fusion « squash » reprenant la description d'une demande de fusion
+    const fusion = [
+      'Planning : glisser-déposer (#42)', '', '- déplacement des interventions', '- contrôle des chevauchements', '',
+      '🤖 Generated with [Outil](https://exemple.invalid/outil)', '', 'https://exemple.invalid/code/session_0123',
+      'Session: https://exemple.invalid/session_42', 'Généré avec [Outil](https://exemple.invalid/outil)', '',
+      'Co-Authored-By: Une Personne <p@exemple.fr>', 'Note: valeur',
+    ].join('\r\n');
+    assert.equal(nettoyerNotes(fusion), 'Planning : glisser-déposer (#42)\n\n- déplacement des interventions\n- contrôle des chevauchements');
+    // Texte ordinaire conservé : deux-points à la française, adresse dans une phrase, sujet seul
+    const ordinaire = 'Rapports : export mensuel\n\nVoir https://intranet.exemple.fr/gmao pour le détail.\nGénéré avec soin chaque mois.';
+    assert.equal(nettoyerNotes(ordinaire), ordinaire);
+    assert.equal(nettoyerNotes('Correctif: calcul des charges'), 'Correctif: calcul des charges', 'le sujet n\'est jamais un en-tête de fin');
+    // Ligne de commande : notes nettoyées dans le manifeste signé et, à l'identique, dans le texte de la publication
+    const dossier = tmp('gmao-dist-');
+    fs.writeFileSync(path.join(dossier, 'GMAO-SICAF-Setup-1.0.78.exe'), crypto.randomBytes(2048));
+    fs.writeFileSync(path.join(dossier, 'commit.txt'), fusion);
+    const r = spawnSync(process.execPath, [SCRIPT_MANIFESTE, dossier, '1.0.78', path.join(dossier, 'commit.txt'), path.join(dossier, 'notes.txt')], { encoding: 'utf8', env: envPropre({ MAJ_CLE_PRIVEE: '' }) });
+    assert.equal(r.status, 0, r.stderr);
+    const m = JSON.parse(fs.readFileSync(path.join(dossier, 'latest.json'), 'utf8'));
+    assert.equal(m.notes, nettoyerNotes(fusion));
+    assert.equal(fs.readFileSync(path.join(dossier, 'notes.txt'), 'utf8'), `${m.notes}\n`);
+    // Workflow : le texte de la publication est celui produit par le script, jamais le message brut
+    assert.match(yml, /run: node scripts\/manifeste-maj\.js dist "\$VERSION" notes-commit\.txt dist\/notes\.txt/);
+    assert.match(yml, /body_path: dist\/notes\.txt/);
+    assert.doesNotMatch(yml, /grep -v/);
+  });
+
+  test('limite documentée : rejeu d\'une version signée antérieure à la dernière publiée', () => {
+    const doc = fs.readFileSync(path.join(RACINE, 'docs', 'MISES-A-JOUR.md'), 'utf8');
+    assert.match(doc, /rejeu d'une version signée/);
+    assert.match(doc, /Version signée défectueuse ou vulnérable/);
   });
 });

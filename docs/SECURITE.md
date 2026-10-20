@@ -21,16 +21,27 @@ destinées au pôle informatique.
   du mot de passe initial, nouveau mot de passe différent de l'ancien.
 - **Changement imposé par le serveur** : tant qu'un mot de passe initial (si la configuration l'exige), réinitialisé,
   expiré ou défini par un administrateur n'a pas été changé, le serveur refuse toute opération autre que
-  l'authentification (aucune donnée de l'application, notifications comprises).
+  l'authentification (aucune donnée de l'application, notifications comprises). La réponse de connexion et l'amorçage
+  ne transmettent alors que le compte, ses droits et les règles du mot de passe : ni la liste des comptes, ni les
+  secteurs et profils, ni la configuration de l'application. Il en va de même tant qu'une double authentification
+  obligatoire n'a pas été activée.
 - **Historique** : les 5 derniers mots de passe (réglable de 0 à 24) sont refusés, en plus du mot de passe actuel ;
   seules leurs empreintes scrypt sont conservées.
-- **Expiration** (désactivée par défaut, 30 à 730 jours) avec rappel avant l'échéance ; l'activer ne fait pas expirer
-  d'un coup les comptes jamais changés (date de référence posée à la première évaluation).
+- **Expiration** (désactivée par défaut, 30 à 730 jours) avec rappel avant l'échéance (1 à 60 jours, toujours plus
+  court que la durée d'expiration) ; l'activer ne fait pas expirer d'un coup les comptes jamais changés (date de
+  référence posée à la première évaluation).
+- **Réglages contrôlés** : les réglages de sécurité d'une base importée ou restaurée, ou déjà enregistrée au démarrage,
+  sont ramenés au type et dans les bornes de l'écran Sécurité (une valeur illisible reprend sa valeur par défaut, une
+  expiration de moins de 30 jours est désactivée) : un fichier modifié à la main ne peut ni faire expirer tous les mots
+  de passe au bout de quelques jours, ni désactiver l'historique.
 - **Comptes créés par le pôle informatique** : sans mot de passe saisi, un mot de passe aléatoire conforme est
   généré et affiché une seule fois.
 - **Mot de passe oublié** : depuis l'écran de connexion, l'utilisateur adresse une demande au pôle informatique.
   La réponse est identique que le compte existe ou non (aucune énumération des identifiants), 5 demandes au plus
-  par poste en 15 minutes ; les gestionnaires du compte et son titulaire sont prévenus (au plus toutes les 30 minutes).
+  par poste en 15 minutes ; les gestionnaires du compte et son titulaire sont prévenus au plus toutes les 30 minutes,
+  sauf pour une demande venue d'un poste qui n'en avait pas encore fait : elle est signalée aussitôt (« plusieurs
+  postes différents »). Seuls les gestionnaires qui peuvent prendre le compte en main (voir plus bas) voient la demande,
+  la traitent ou la rejettent.
 - **Codes de réinitialisation** (recommandé plutôt qu'un mot de passe temporaire) : 8 caractères sans ambiguïté de
   lecture, à usage unique, valables 60 minutes par défaut, affichés une seule fois au pôle informatique ; seule leur
   empreinte scrypt est conservée ; annulés après 5 essais incorrects, par un changement de mot de passe, une nouvelle
@@ -55,8 +66,11 @@ destinées au pôle informatique.
   au journal d'activité et le pôle informatique est notifié. En plus, **20 échecs en 15 minutes depuis un même poste**,
   tous identifiants confondus (connexion, codes de vérification, codes de réinitialisation), bloquent ce poste 15 minutes
   avant tout calcul d'empreinte : un poste qui change d'identifiant à chaque essai ne peut ni saturer le journal ni
-  noyer les alertes (une seule alerte « Poste temporairement bloqué », regroupée). Les identifiants saisis sont cités dans
-  le journal et les alertes sans caractères de mise en forme (direction d'écriture, séparateurs de ligne).
+  noyer les alertes (une seule alerte « Poste temporairement bloqué », regroupée). Le poste serveur lui-même (adresses
+  locales 127.0.0.1 et ::1 : application en mode serveur, toutes les sessions Windows de ce PC) n'est pas soumis à cette
+  limite par poste, seulement au blocage par compte : d'où l'intérêt d'un poste serveur dédié, sans autres utilisateurs
+  (§8). Les identifiants saisis sont cités dans le journal et les alertes sans caractères de mise en forme (direction
+  d'écriture, séparateurs de ligne).
 - **Double authentification** (TOTP, applications Microsoft Authenticator, Google Authenticator, FreeOTP…) :
   facultative par défaut, ou obligatoire pour les comptes sensibles (administrateurs, gestion du système, des utilisateurs,
   des profils ou de la configuration) ou pour tous (Configuration › Général › Sécurité). La session n'est ouverte qu'après le
@@ -107,9 +121,13 @@ destinées au pôle informatique.
   notification › « Empreinte du certificat… », et dans Système & informatique › Réseau & postes) ; le poste n'accepte ensuite
   que ce certificat (épinglage, reconnu aussi par l'empreinte de sa clé lors d'un renouvellement). Une empreinte différente
   signifie une usurpation possible ou un poste serveur réinstallé : ne pas confirmer sans vérification.
-- **Fichiers reçus** : les secrets de sauvegarde (clés, mot de passe de chiffrement, destinations) ne figurent dans aucun
-  export ni aucune réponse ; un import ou une restauration contrôle le fichier (collections attendues, identifiants, au moins
-  un administrateur actif) avant de remplacer quoi que ce soit, conserve les paramètres de sauvegarde de ce serveur, et n'est
+- **Fichiers reçus** : les secrets de sauvegarde (clés, mot de passe de chiffrement, destinations) et les codes de
+  réinitialisation en cours ne figurent dans aucun export, aucune sauvegarde, aucune copie téléchargeable ou restaurable
+  du dossier `backups` (copies faites avant un import ou une restauration, copies manuelles) ni aucune réponse ; seule la
+  copie quotidienne de `backups`, qui sert au redémarrage sur un fichier endommagé et n'est jamais téléchargeable depuis
+  l'application, est une copie exacte de la base. Un import ou une restauration contrôle le fichier (collections attendues,
+  identifiants, au moins un administrateur actif) avant de remplacer quoi que ce soit, conserve les paramètres de sauvegarde
+  de ce serveur, ne reprend aucun code de réinitialisation, ramène les réglages de sécurité dans leurs bornes, et n'est
   possible qu'avec l'accès à tous les sites. Les routes brutes publiques (réception d'une sauvegarde) peuvent vérifier la clé
   avant de lire le corps (`avantCorps`).
 
@@ -129,7 +147,8 @@ destinées au pôle informatique.
   Compression, chiffrement AES-256-GCM optionnel (clé dérivée par scrypt), empreinte SHA-256 vérifiée.
 - **Réception** des sauvegardes d'un autre site protégée par une clé aléatoire (comparaison en temps constant,
   limitation des essais) ; les sauvegardes reçues ne sont jamais importées automatiquement.
-- Les secrets (clés, mots de passe de chiffrement, destinations) ne sont jamais envoyés à l'interface.
+- Les secrets (clés, mots de passe de chiffrement, destinations) ne sont jamais envoyés à l'interface ni écrits dans
+  les sauvegardes et les copies téléchargeables ; les sauvegardes ne contiennent jamais de code de réinitialisation.
 
 ## 7. Mises à jour
 
@@ -139,19 +158,26 @@ destinées au pôle informatique.
 - **Signature des mises à jour** : dès qu'une clé publique est configurée (`clePubliqueMaj` dans `package.json`, voir
   `docs/MISES-A-JOUR.md`), le manifeste de chaque version doit être signé avec la clé privée Ed25519 de l'entreprise ;
   un manifeste non signé ou mal signé est refusé, le retour à une version antérieure est interdit et, pour la source GitHub,
-  seuls les hôtes GitHub sont acceptés. Sans clé configurée, l'empreinte SHA-256 reste vérifiée.
+  seuls les hôtes GitHub sont acceptés. Sans clé configurée, l'empreinte SHA-256 de l'installateur est vérifiée dès que le
+  manifeste `latest.json` la publie (la chaîne de publication le produit toujours) ; une publication GitHub sans manifeste
+  est alors acceptée sur la seule taille de l'installateur.
+- **Aucune clé publique n'est intégrée à la version livrée** : tant que la procédure de `docs/MISES-A-JOUR.md` (sections 2
+  à 4) n'a pas été appliquée, aucun poste n'exige de signature. Sa mise en service est un prérequis du déploiement (§8).
 
 ## 8. Recommandations de déploiement
 
 1. **Poste serveur** : PC dédié ou serveur Windows, compte Windows réservé, disque chiffré (BitLocker), antivirus à
-   jour, onduleur.
+   jour, onduleur. Les connexions depuis ce poste ne sont pas limitées par poste (seulement par compte) : n'y ouvrez pas
+   de sessions Windows pour d'autres utilisateurs.
 2. **Réseau** : n'autorisez le port de la GMAO (8585 par défaut) dans le pare-feu Windows que pour le réseau privé
    de l'entreprise ; aucune exposition sur Internet.
 3. **Sauvegardes** : au moins une destination hors du poste serveur (NAS ou serveur d'un autre site), chiffrée ;
    testez une restauration chaque trimestre.
 4. **Comptes** : un compte nominatif par personne ; changez immédiatement le mot de passe initial de
    l'administrateur ; limitez le profil Pôle informatique à quelques personnes.
-5. **Signature de code** : pour éviter l'avertissement Windows SmartScreen, signez l'exécutable avec un certificat
+5. **Signature des mises à jour** (avant le premier déploiement) : générez la paire de clés, créez le secret
+   `MAJ_CLE_PRIVEE`, puis intégrez la clé publique (`docs/MISES-A-JOUR.md`, sections 2 à 4, dans cet ordre).
+6. **Signature de code** : pour éviter l'avertissement Windows SmartScreen, signez l'exécutable avec un certificat
    de signature de code de l'entreprise (voir `docs/MISES-A-JOUR.md`).
-6. **Revue régulière** : consultez le journal d'activité (échecs de connexion, blocages, suppressions) et la liste
+7. **Revue régulière** : consultez le journal d'activité (échecs de connexion, blocages, suppressions) et la liste
    des postes connectés.

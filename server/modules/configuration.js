@@ -4,14 +4,12 @@
  * listes de valeurs, champs personnalisés, numérotation, sauvegardes,
  * export / import complet, données de démonstration.
  */
-const { completer, configParDefaut, seed } = require('../seed');
+const { completer, configParDefaut, seed, MODES_DEUX_FACTEURS, BORNES_SECURITE, EXPIRATION_MDP_MIN_JOURS } = require('../seed');
 const { seedDemo: seedDemoTous } = require('./index');
 
 const nom = 'Configuration';
 
 const TYPES_CHAMPS = ['texte', 'texte_long', 'nombre', 'date', 'liste', 'booleen'];
-/** Modes de la double authentification (securite.deuxFacteurs). */
-const MODES_DEUX_FACTEURS = ['facultatif', 'obligatoire_sensibles', 'obligatoire_tous'];
 /** Quota global des pièces jointes (config.general.quotaPiecesJointesMo) : bornes. */
 const QUOTA_PIECES_MIN_MO = 50;
 const QUOTA_PIECES_MAX_MO = 4000;
@@ -295,40 +293,48 @@ function register(ctx) {
         return bs[k];
       };
       if (bs.deuxFacteurs !== undefined && !MODES_DEUX_FACTEURS.includes(bs.deuxFacteurs)) throw new HttpError(400, 'Mode de double authentification invalide (facultatif, obligatoire_sensibles ou obligatoire_tous)');
-      /** Entier dans les bornes (valeur actuelle si absent), sinon 400 avec un message explicite. */
-      const entier = (k, min, max, message) => {
+      /** Entier dans ses bornes (BORNES_SECURITE, valeur actuelle si absent), sinon 400 avec un message explicite. */
+      const entier = (k, message) => {
+        const [min, max] = BORNES_SECURITE[k];
         const n = lireEntier(bs[k]);
         if (n === null) return cfg.securite[k];
-        if (!Number.isInteger(n) || n < min || n > max) throw new HttpError(400, message);
+        if (!Number.isInteger(n) || n < min || n > max) throw new HttpError(400, message(min, max));
         return n;
       };
       /** Nombre ramené dans ses bornes (réglages historiques) ; une valeur qui n'est pas un nombre est refusée. */
-      const borne = (k, min, max, defaut, message) => {
+      const borne = (k, defaut, message) => {
+        const [min, max] = BORNES_SECURITE[k];
         const n = lireEntier(bs[k]);
         if (n === null) return cfg.securite[k] || defaut;
         if (!Number.isInteger(n)) throw new HttpError(400, message);
         return Math.min(max, Math.max(min, n || defaut));
       };
-      const expiration = entier('expirationMdpJours', 0, 730, 'Expiration du mot de passe : 0 (jamais) ou entre 30 et 730 jours');
-      if (expiration !== 0 && expiration < 30) throw new HttpError(400, 'Expiration du mot de passe : 0 (jamais) ou entre 30 et 730 jours');
+      const messageExpiration = `Expiration du mot de passe : 0 (jamais) ou entre ${EXPIRATION_MDP_MIN_JOURS} et ${BORNES_SECURITE.expirationMdpJours[1]} jours`;
+      const expiration = entier('expirationMdpJours', () => messageExpiration);
+      if (expiration !== 0 && expiration < EXPIRATION_MDP_MIN_JOURS) throw new HttpError(400, messageExpiration);
       cfg.securite = Object.assign({}, cfg.securite, {
-        longueurMinMdp: borne('longueurMinMdp', 8, 64, 10, 'Longueur minimale des mots de passe : nombre entier attendu'),
+        longueurMinMdp: borne('longueurMinMdp', 10, 'Longueur minimale des mots de passe : nombre entier attendu'),
         complexite: bool('complexite'),
         refuserCourants: bool('refuserCourants'),
         interdireIdentifiant: bool('interdireIdentifiant'),
         forcerChangementMdpInitial: bool('forcerChangementMdpInitial'),
         notifierBlocages: bool('notifierBlocages'),
-        inactiviteMinutes: borne('inactiviteMinutes', 5, 24 * 60, 60, 'Déconnexion après inactivité : nombre entier de minutes attendu'),
-        dureeSessionHeures: borne('dureeSessionHeures', 1, 72, 12, 'Durée maximale d\'une session : nombre entier d\'heures attendu'),
+        inactiviteMinutes: borne('inactiviteMinutes', 60, 'Déconnexion après inactivité : nombre entier de minutes attendu'),
+        dureeSessionHeures: borne('dureeSessionHeures', 12, 'Durée maximale d\'une session : nombre entier d\'heures attendu'),
         deuxFacteurs: bs.deuxFacteurs !== undefined ? bs.deuxFacteurs : (MODES_DEUX_FACTEURS.includes(cfg.securite.deuxFacteurs) ? cfg.securite.deuxFacteurs : 'facultatif'),
         // Mot de passe oublié, réinitialisation, expiration, historique
         motDePasseOublie: bool('motDePasseOublie'),
-        dureeCodeReinitialisationMinutes: entier('dureeCodeReinitialisationMinutes', 5, 1440, 'Durée de validité d\'un code de réinitialisation : entre 5 et 1440 minutes'),
+        dureeCodeReinitialisationMinutes: entier('dureeCodeReinitialisationMinutes', (min, max) => `Durée de validité d'un code de réinitialisation : entre ${min} et ${max} minutes`),
         reinitialisationAutonome: bool('reinitialisationAutonome'),
         expirationMdpJours: expiration,
-        rappelExpirationJours: entier('rappelExpirationJours', 1, 60, 'Rappel avant l\'expiration du mot de passe : entre 1 et 60 jours'),
-        historiqueMdp: entier('historiqueMdp', 0, 24, 'Historique des mots de passe : entre 0 et 24 mots de passe'),
+        rappelExpirationJours: entier('rappelExpirationJours', (min, max) => `Rappel avant l'expiration du mot de passe : entre ${min} et ${max} jours`),
+        historiqueMdp: entier('historiqueMdp', (min, max) => `Historique des mots de passe : entre ${min} et ${max} mots de passe`),
       });
+      // Un rappel aussi long que l'expiration s'afficherait en permanence, dès le lendemain d'un changement
+      const { expirationMdpJours: jours, rappelExpirationJours: rappel } = cfg.securite;
+      if (jours > 0 && rappel >= jours) {
+        throw new HttpError(400, `Rappel avant l'expiration du mot de passe : ${rappel} jours, il doit être inférieur à la durée d'expiration (${jours} jours)`);
+      }
     }
     if (b.numerotation) {
       for (const k of Object.keys(cfg.numerotation)) {

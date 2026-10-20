@@ -29,7 +29,7 @@
   function badgeDeuxFacteurs(u, detaille) {
     const d = u.deuxFacteurs || {};
     if (d.actif) {
-      return frag(ui.badge('Activée', '#16a34a', { titre: d.activeLe ? 'Depuis le ' + ui.formatDate(d.activeLe) : '' }),
+      return frag(ui.badge('Activée', '#15803d', { titre: d.activeLe ? 'Depuis le ' + ui.formatDate(d.activeLe) : '' }),
         detaille && d.activeLe ? el('span', { class: 'texte-2 texte-petit' }, ` depuis le ${ui.formatDate(d.activeLe)} · ${d.codesSecoursRestants} code(s) de secours restant(s)`) : null);
     }
     if (d.exige) return ui.badge('À activer (obligatoire)', '#f59e0b');
@@ -133,7 +133,8 @@
         const res = creation ? await api.post('/api/utilisateurs', body) : await api.put('/api/utilisateurs/' + existant.id, body);
         toast(creation ? 'Utilisateur créé' : 'Utilisateur enregistré', 'succes');
         if (res && res.motDePasseInitial) {
-          ui.modal({ titre: 'Mot de passe initial', taille: 'petite', contenu: frag(el('p', null, `Mot de passe généré pour ${res.login} :`), el('p', null, el('code', { style: { fontSize: '16px', userSelect: 'all' } }, res.motDePasseInitial)), el('p', { class: 'texte-2 texte-petit' }, 'Communiquez-le à l\'utilisateur de façon confidentielle : il ne sera plus affiché. Il devra le changer à sa première connexion.')), boutons: [{ label: 'Fermer' }] });
+          // Mot de passe affiché une seule fois : fermeture par « Fermer » seulement (ni fond ni Échap)
+          ui.modal({ titre: 'Mot de passe initial', taille: 'petite', fermable: false, contenu: frag(el('p', null, `Mot de passe généré pour ${res.login} :`), el('p', null, el('code', { style: { fontSize: '16px', userSelect: 'all' } }, res.motDePasseInitial)), el('p', { class: 'texte-2 texte-petit' }, 'Communiquez-le à l\'utilisateur de façon confidentielle : il ne sera plus affiché. Il devra le changer à sa première connexion.')), boutons: [{ label: 'Fermer', classe: 'btn-primaire' }] });
         }
         if (estMoi) await GMAO.refresh(false); else await GMAO.refreshRefs();
         if (apres) apres(res);
@@ -157,7 +158,7 @@
             el('span', null, `Demande de réinitialisation du mot de passe en attente (${ui.relatif(demande.derniereDemande)}${demande.repetitions > 1 ? `, ${demande.repetitions} demandes` : ''}).`),
             ui.bouton('Traiter', { classe: 'btn-sm btn-primaire', onClic: () => { m.fermer(); reinitialiserMdp(u, { demande, apres: () => { majDemandes(true); } }); } })) : null,
           ui.details([
-            { label: 'Identifiant', valeur: u.login }, { label: 'Statut', valeur: u.actif === false ? ui.badge('Désactivé', '#dc2626') : ui.badge('Actif', '#16a34a') },
+            { label: 'Identifiant', valeur: u.login }, { label: 'Statut', valeur: u.actif === false ? ui.badge('Désactivé', '#dc2626') : ui.badge('Actif', '#15803d') },
             { label: 'Fonction', valeur: u.fonction }, { label: 'Matricule', valeur: u.matricule },
             { label: 'E-mail', valeur: u.email ? el('a', { href: 'mailto:' + u.email }, u.email) : '' }, { label: 'Téléphone', valeur: u.telephone },
             { label: 'Profil', valeur: profil ? frag(ui.pastille(profil.couleur), `${profil.nom} (niveau ${profil.niveau})`) : '' },
@@ -258,10 +259,15 @@
     ui.imprimer(code ? 'Réinitialisation du mot de passe' : 'Mot de passe temporaire', html);
   }
 
-  /** Résultat affiché une seule fois : code (ou mot de passe temporaire) en grand, validité, copie, fiche imprimable. */
+  /**
+   * Résultat affiché une seule fois : code (ou mot de passe temporaire) en grand, validité, copie, fiche imprimable.
+   * Ni croix, ni clic sur le fond, ni Échap : seul « Fermer » referme la fenêtre (un clic involontaire ferait perdre le
+   * code, et il faudrait en générer un autre).
+   */
   function afficherResultat(m, u, r) {
     const code = r.mode === 'code';
     const valeur = code ? r.code : r.motDePasse;
+    m.setFermable(false);
     m.setTitre(code ? 'Code de réinitialisation' : 'Mot de passe temporaire');
     ui.vider(m.corps);
     m.corps.appendChild(frag(
@@ -300,7 +306,7 @@
       const radio = el('input', { type: 'radio', name: 'modeReinitialisation', value: valeur, id: 'f_mode_' + valeur, checked: valeur === mode });
       radio.addEventListener('change', () => { if (radio.checked) { mode = valeur; maj(); } });
       const carte = el('label', { class: 'choix-carte', for: 'f_mode_' + valeur }, radio,
-        el('div', null, el('div', { class: 'choix-titre' }, titre, recommande ? ui.badge('Recommandé', '#16a34a') : null), el('div', { class: 'texte-2 texte-petit' }, texte)));
+        el('div', null, el('div', { class: 'choix-titre' }, titre, recommande ? ui.badge('Recommandé', '#15803d') : null), el('div', { class: 'texte-2 texte-petit' }, texte)));
       cartes.push({ valeur, carte });
       return carte;
     };
@@ -346,9 +352,22 @@
   /** État du mot de passe dans la fiche (gestionnaires de comptes) : dernier changement, expiration, code actif. */
   function etatMotDePasse(u, recharger) {
     const mp = u.motDePasse || {};
+    const sc = GMAO.config.securite || {};
+    const joursExpiration = Math.floor(Number(sc.expirationMdpJours) || 0);
     const lignes = [el('div', null, mp.dateMdp ? `Modifié le ${ui.formatDateHeure(mp.dateMdp)}` : 'Jamais modifié')];
-    lignes.push(el('div', { class: mp.expireLe && Date.parse(mp.expireLe) < Date.now() ? 'texte-danger' : 'texte-2 texte-petit' }, mp.expireLe ? `Expire le ${ui.formatDate(mp.expireLe)}` : 'Sans expiration'));
-    if (mp.doitChanger) lignes.push(el('div', null, ui.badge('À changer à la prochaine connexion', '#f59e0b'), mp.raison && LIBELLES_RAISON[mp.raison] ? el('span', { class: 'texte-2 texte-petit' }, ` (${LIBELLES_RAISON[mp.raison]})`) : null));
+    if (mp.expireLe) {
+      const passe = Date.parse(mp.expireLe) < Date.now();
+      lignes.push(el('div', { class: passe ? 'texte-danger' : 'texte-2 texte-petit' }, `${passe ? 'Expiré' : 'Expire'} le ${ui.formatDate(mp.expireLe)}`));
+    } else if (joursExpiration > 0) {
+      // Expiration active sans date de référence (compte qui ne s'est pas reconnecté depuis son activation) : le serveur
+      // la pose à la prochaine connexion, rien n'expire d'un coup
+      lignes.push(el('div', { class: 'texte-2 texte-petit' }, `Expiration active (${joursExpiration} jours) : le délai démarre à la prochaine connexion`));
+    } else lignes.push(el('div', { class: 'texte-2 texte-petit' }, 'Sans expiration'));
+    // `doitChanger` est l'indicateur du compte : un mot de passe initial n'est imposé que si la configuration l'exige
+    // (même règle que le serveur, ctx.motsDePasse.changementImpose)
+    const impose = !!mp.doitChanger && (mp.raison !== 'initial' || sc.forcerChangementMdpInitial !== false);
+    if (impose) lignes.push(el('div', null, ui.badge('À changer à la prochaine connexion', '#f59e0b'), mp.raison && LIBELLES_RAISON[mp.raison] ? el('span', { class: 'texte-2 texte-petit' }, ` (${LIBELLES_RAISON[mp.raison]})`) : null));
+    else if (mp.doitChanger) lignes.push(el('div', { class: 'texte-2 texte-petit' }, 'Mot de passe initial : changement non imposé (Configuration › Sécurité)'));
     if (mp.codeActif) {
       lignes.push(el('div', { class: 'inline', style: { flexWrap: 'wrap' } },
         ui.badge(mp.codeOrigine === 'recuperation_urgence' ? 'Code de récupération d\'urgence actif' : 'Code de réinitialisation actif', '#2563eb'),
@@ -413,7 +432,7 @@
         corps.appendChild(el('h3', { class: 'mt' }, 'Demandes traitées ou rejetées'));
         corps.appendChild(ui.table({
           colonnes: [colUtilisateur, { cle: 'createdAt', label: 'Demande', rendu: (d) => el('div', null, ui.formatDateHeure(d.createdAt), d.repetitions > 1 ? el('div', { class: 'cellule-secondaire' }, `${d.repetitions} demandes`) : null) },
-            { cle: 'statut', label: 'Issue', rendu: (d) => el('div', null, d.statut === 'rejetee' ? ui.badge('Rejetée', '#dc2626') : ui.badge('Traitée', '#16a34a'),
+            { cle: 'statut', label: 'Issue', rendu: (d) => el('div', null, d.statut === 'rejetee' ? ui.badge('Rejetée', '#dc2626') : ui.badge('Traitée', '#15803d'),
               el('div', { class: 'cellule-secondaire' }, issueDemande(d)),
               d.motifRejet ? el('div', { class: 'cellule-secondaire message-demande' }, `Motif : ${d.motifRejet}`) : null) },
             colPoste, colMessage],
@@ -448,6 +467,24 @@
     }).catch((e) => { ui.vider(cont); cont.appendChild(ui.alerte(e.message, 'danger')); });
   }
 
+  /**
+   * Compteur du menu (demandes de réinitialisation en attente) sans attendre l'ouverture de la vue : dès la connexion,
+   * puis toutes les 5 minutes et, au plus une fois par minute, au changement de vue.
+   */
+  let derniereMajCompteur = 0;
+  async function majCompteurDemandes(force) {
+    if (!GMAO.user || GMAO.ecranImpose() || !GMAO.moduleVisible('utilisateurs') || !GMAO.can('utilisateurs', 'modifier')) return;
+    if (!force && Date.now() - derniereMajCompteur < 60000) return;
+    derniereMajCompteur = Date.now();
+    try {
+      demandesEnAttente = await api.get('/api/utilisateurs-demandes-mdp', null, { silent401: true });
+      GMAO.setNavBadge('utilisateurs', demandesEnAttente.length);
+    } catch (e) { /* silencieux : compteur seulement */ }
+  }
+  GMAO.onConnexion(() => majCompteurDemandes(true));
+  window.addEventListener('hashchange', () => majCompteurDemandes(false));
+  setInterval(() => majCompteurDemandes(false), 5 * 60 * 1000);
+
   GMAO.registerView('utilisateurs', {
     titre: 'Utilisateurs', icone: 'utilisateurs',
     async rendu(container, { params, query }) {
@@ -466,7 +503,7 @@
         cfg.afficherSuperieur !== false ? { cle: 'managerId', label: 'Supérieur', type: 'user' } : null,
         { cle: 'derniereConnexion', label: 'Dernière connexion', rendu: (u) => (u.derniereConnexion ? el('span', { title: ui.formatDateHeure(u.derniereConnexion) }, ui.relatif(u.derniereConnexion)) : el('span', { class: 'texte-2' }, 'jamais')), valeurTri: (u) => u.derniereConnexion || '' },
         { cle: 'deuxFacteurs', label: 'Double auth.', rendu: (u) => badgeDeuxFacteurs(u, false), valeurTri: (u) => (u.deuxFacteurs && u.deuxFacteurs.actif ? 0 : (u.deuxFacteurs && u.deuxFacteurs.exige ? 1 : 2)), aligner: 'centre' },
-        { cle: 'actif', label: 'Statut', rendu: (u) => (u.actif === false ? ui.badge('Désactivé', '#dc2626') : ui.badge('Actif', '#16a34a')), aligner: 'centre' },
+        { cle: 'actif', label: 'Statut', rendu: (u) => (u.actif === false ? ui.badge('Désactivé', '#dc2626') : ui.badge('Actif', '#15803d')), aligner: 'centre' },
       ].filter(Boolean);
 
       const tableau = ui.table({

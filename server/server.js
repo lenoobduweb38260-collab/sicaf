@@ -17,7 +17,7 @@ const csv = require('./csv');
 const auth = require('./auth');
 const totp = require('./totp');
 const perms = require('./permissions');
-const { seed } = require('./seed');
+const { seed, MODES_DEUX_FACTEURS } = require('./seed');
 const { loadModules } = require('./modules');
 
 const CLIENT_DIR = path.join(__dirname, '..', 'client');
@@ -621,8 +621,6 @@ function createApp(options = {}) {
   };
 }
 
-/** Modes de la double authentification (config.securite.deuxFacteurs). */
-const MODES_DEUX_FACTEURS = ['facultatif', 'obligatoire_sensibles', 'obligatoire_tous'];
 /** Modules dont le droit « Modifier » rend un compte sensible (en plus des administrateurs). */
 const MODULES_SENSIBLES = ['systeme', 'utilisateurs', 'profils', 'configuration'];
 const JETON_DEUX_FACTEURS_MS = 5 * 60 * 1000;        // validité d'une connexion en attente du code
@@ -1085,6 +1083,28 @@ function registerCoreRoutes(ctx) {
   function bootstrap(req) {
     // Expiration du mot de passe évaluée à la connexion et à chaque amorçage
     if (req.user) req.user = motsDePasse.evaluerExpiration(req.user, req);
+    const commun = {
+      user: auth.cleanUser(req.user),
+      permissions: req.perms,
+      deuxFacteurs: deuxFacteurs.etat(req.user, req.perms),
+      // État du mot de passe : { doitChanger (changement imposé), raison, dateMdp, expireLe, joursRestants, rappel, ancienRequis }
+      motDePasse: motsDePasse.infos(req.user, req.session),
+      catalogue: { modules: perms.MODULES, actions: perms.ACTIONS, portees: perms.PORTEES, modesSite: perms.MODES_SITE },
+      // Libellés du journal d'activité (actions, éléments) repris par les vues qui affichent un historique
+      libelles: { actions: ctx.libellesActions || {}, entites: ctx.libellesEntites || {} },
+      version: ctx.version,
+      serveur: { heure: new Date().toISOString() },
+    };
+    // Changement de mot de passe imposé ou double authentification à activer : seul l'écran imposé s'affiche. Aucune
+    // donnée de l'application (comptes, secteurs, profils, listes…) avant ; l'amorçage complet suit (GMAO.refresh).
+    if (req.user && (motsDePasse.changementImpose(req.user) || deuxFacteurs.enrolementRequis(req.user, req.perms))) {
+      const c = ctx.config();
+      return Object.assign(commun, {
+        config: { societe: c.societe || {}, general: c.general || {}, securite: c.securite || {} },
+        modules: [],
+        references: { secteurs: [], profils: [], users: [] },
+      });
+    }
     const config = db.getConfig();
     // Les secrets de sauvegarde ne sont jamais envoyés au navigateur
     if (config.sauvegardes) { delete config.sauvegardes.cleReception; delete config.sauvegardes.destinations; delete config.sauvegardes.motDePasseChiffrement; }
@@ -1094,21 +1114,7 @@ function registerCoreRoutes(ctx) {
     const profils = db.list('profils').map((p) => ({ id: p.id, nom: p.nom, niveau: p.niveau, couleur: p.couleur, secteurId: p.secteurId, estAdmin: !!p.estAdmin, portee: p.portee, actif: p.actif !== false,
       accesJournal: !!(p.estAdmin || (p.permissions && p.permissions.audit && p.permissions.audit.voir)) }));
     const users = db.list('users').map((u) => ({ id: u.id, login: u.login, nom: u.nom, prenom: u.prenom, profilId: u.profilId, secteurIds: u.secteurIds || [], siteAcces: u.siteAcces || [], managerId: u.managerId, actif: u.actif !== false, fonction: u.fonction || '' }));
-    return {
-      user: auth.cleanUser(req.user),
-      permissions: req.perms,
-      deuxFacteurs: deuxFacteurs.etat(req.user, req.perms),
-      // État du mot de passe : { doitChanger (changement imposé), raison, dateMdp, expireLe, joursRestants, rappel, ancienRequis }
-      motDePasse: motsDePasse.infos(req.user, req.session),
-      config,
-      modules,
-      catalogue: { modules: perms.MODULES, actions: perms.ACTIONS, portees: perms.PORTEES, modesSite: perms.MODES_SITE },
-      references: { secteurs, profils, users },
-      // Libellés du journal d'activité (actions, éléments) repris par les vues qui affichent un historique
-      libelles: { actions: ctx.libellesActions || {}, entites: ctx.libellesEntites || {} },
-      version: ctx.version,
-      serveur: { heure: new Date().toISOString() },
-    };
+    return Object.assign(commun, { config, modules, references: { secteurs, profils, users } });
   }
 
   /** Prévient le pôle informatique (droit Système › Modifier) d'un blocage de compte. */

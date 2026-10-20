@@ -6,6 +6,20 @@
 const { hashPassword } = require('./auth');
 const { MODULES, matriceVide } = require('./permissions');
 
+/** Modes de la double authentification (securite.deuxFacteurs). */
+const MODES_DEUX_FACTEURS = ['facultatif', 'obligatoire_sensibles', 'obligatoire_tous'];
+/**
+ * Réglages numériques de config.securite (nombres entiers) : bornes [min, max] de Configuration › Général › Sécurité.
+ * L'expiration vaut 0 (jamais) ou au moins EXPIRATION_MDP_MIN_JOURS jours ; le rappel reste inférieur à l'expiration.
+ */
+const BORNES_SECURITE = {
+  longueurMinMdp: [8, 64], inactiviteMinutes: [5, 24 * 60], dureeSessionHeures: [1, 72],
+  dureeCodeReinitialisationMinutes: [5, 1440], expirationMdpJours: [0, 730], rappelExpirationJours: [1, 60], historiqueMdp: [0, 24],
+};
+const EXPIRATION_MDP_MIN_JOURS = 30;
+/** Longueur minimale toujours appliquée par le contrôle des mots de passe (auth.validerMotDePasse). */
+const LONGUEUR_MDP_PLANCHER = 4;
+
 function configParDefaut() {
   const modules = {};
   for (const m of MODULES) modules[m.key] = { actif: true, label: '', ordre: m.ordre };
@@ -387,13 +401,38 @@ function migrerProfilsSysteme(db) {
 }
 
 /**
- * Initialise la base si nécessaire.
+ * Réglages « sécurité » enregistrés, importés ou restaurés : ramenés au type et dans les bornes de l'écran Sécurité,
+ * comme s'ils avaient été saisis (un fichier modifié à la main ne fait pas expirer tous les mots de passe au bout de
+ * 3 jours et ne désactive pas l'historique par une valeur illisible). Oui / non ou mode illisible : valeur par défaut ;
+ * nombre illisible, ou nul pour un réglage qui ne peut pas l'être : valeur par défaut (celle déjà appliquée à l'usage) ;
+ * autre nombre : entier ramené dans les bornes ; expiration de moins de 30 jours : désactivée ; rappel ramené sous la
+ * durée d'expiration. La longueur minimale garde le plancher du contrôle des mots de passe (LONGUEUR_MDP_PLANCHER).
+ */
+function normaliserSecurite(s, defaut) {
+  for (const [k, v] of Object.entries(defaut)) if (typeof v === 'boolean' && typeof s[k] !== 'boolean') s[k] = v;
+  if (!MODES_DEUX_FACTEURS.includes(s.deuxFacteurs)) s.deuxFacteurs = defaut.deuxFacteurs;
+  for (const [k, [min, max]] of Object.entries(BORNES_SECURITE)) {
+    const bas = k === 'longueurMinMdp' ? LONGUEUR_MDP_PLANCHER : min;
+    const v = s[k];
+    const n = typeof v === 'number' ? v : (typeof v === 'string' && /^\s*-?\d+\s*$/.test(v) ? Number(v) : NaN);
+    s[k] = !Number.isFinite(n) || (n === 0 && bas > 0) ? defaut[k] : Math.min(max, Math.max(bas, Math.trunc(n)));
+  }
+  if (s.expirationMdpJours < EXPIRATION_MDP_MIN_JOURS) s.expirationMdpJours = 0;
+  if (s.expirationMdpJours > 0 && s.rappelExpirationJours >= s.expirationMdpJours) s.rappelExpirationJours = s.expirationMdpJours - 1;
+  return s;
+}
+
+/**
+ * Initialise la base si nécessaire (démarrage, après un import ou une restauration).
  * @param {Db} db
  * @param {{adminPassword?:string}} options
  */
 function seed(db, options = {}) {
-  // Configuration : complète les clés manquantes
-  db.setConfig(completer(db.getConfig(), configParDefaut()));
+  // Configuration : complète les clés manquantes ; réglages « sécurité » contrôlés
+  const defaut = configParDefaut();
+  const cfg = completer(db.getConfig(), defaut);
+  normaliserSecurite(cfg.securite, defaut.securite);
+  db.setConfig(cfg);
 
   // Profils
   if (db.count('profils') === 0) {
@@ -482,4 +521,4 @@ function seed(db, options = {}) {
   db.saveNow();
 }
 
-module.exports = { seed, configParDefaut, profilsParDefaut, secteursParDefaut, completer };
+module.exports = { seed, configParDefaut, profilsParDefaut, secteursParDefaut, completer, normaliserSecurite, MODES_DEUX_FACTEURS, BORNES_SECURITE, EXPIRATION_MDP_MIN_JOURS };

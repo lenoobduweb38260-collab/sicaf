@@ -295,10 +295,14 @@ function register(ctx) {
   }, { perm: ['utilisateurs', 'modifier'] });
 
   // ----- Demandes de réinitialisation faites depuis l'écran de connexion -----
-  /** Demande avec le compte concerné, si l'appelant peut le voir et le gérer (jamais sa propre demande). */
+  /**
+   * Demande avec le compte concerné, si l'appelant peut le voir et en prendre la main (jamais sa propre demande) :
+   * même règle que les destinataires de la demande (ctx.motsDePasse.gestionnaires) et que la remise d'un code. Un
+   * gestionnaire qui ne pourrait pas réinitialiser le compte ne voit donc pas la demande et ne peut pas la rejeter.
+   */
   function demandeTraitable(req, d) {
     const u = d ? db.get('users', d.userId) : null;
-    if (!u || u.id === req.user.id || !visible(req, u, true) || !gerable(req, u)) return null;
+    if (!u || u.id === req.user.id || !visible(req, u, true) || !gerable(req, u) || perms.depassementsGestion(db, req.perms, u).length) return null;
     return u;
   }
   const presenterDemande = (d, u) => {

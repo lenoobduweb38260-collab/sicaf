@@ -49,6 +49,9 @@ const DEFAUTS = {
     echecs: 0,                 // essais incorrects consécutifs du code du pôle informatique
     bloqueJusqua: '',          // fin du blocage de la saisie du code (date ISO), vide sans blocage
   },
+  certificatServeur: {
+    empreinteCle: '',          // empreinte de la clé du certificat du serveur partagé au dernier démarrage (changement signalé)
+  },
 };
 
 function cloner(o) { return JSON.parse(JSON.stringify(o)); }
@@ -105,6 +108,7 @@ function normaliser(p) {
   out.verrouCode.echecs = entier(v.echecs, 0, 1000, 0);
   const fin = typeof v.bloqueJusqua === 'string' ? Date.parse(v.bloqueJusqua) : NaN;
   out.verrouCode.bloqueJusqua = Number.isFinite(fin) ? new Date(fin).toISOString() : '';
+  out.certificatServeur.empreinteCle = normaliserEmpreinte((src.certificatServeur || {}).empreinteCle);
   // Un mode client sans adresse n'est pas utilisable : retour à l'assistant
   if (out.mode === 'client' && !out.client.url) out.configure = false;
   return out;

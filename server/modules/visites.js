@@ -16,10 +16,12 @@
  * - Résultat (conclusion, note, certificat), documents (programme, rapport d'audit, certificats ;
  *   10 Mo maximum), historique, exports CSV (visites, registre des visiteurs, plan d'actions).
  *
- * Données personnelles : le téléphone, l'e-mail, la pièce d'identité et le véhicule des visiteurs ne
- * sont transmis qu'aux gestionnaires de la visite (droit « modifier ») — la pièce d'identité n'est
- * communiquée en clair que sur la fiche individuelle du visiteur — et sont anonymisés au-delà de
- * config.visites.conserverVisiteursJours (tâche quotidienne et purge à la demande, droit « valider »).
+ * Données personnelles : le téléphone, l'e-mail, la pièce d'identité et le véhicule des visiteurs, ainsi
+ * que l'e-mail et le téléphone du contact de l'organisme, ne sont transmis qu'aux gestionnaires de la
+ * visite (droit « modifier ») — la pièce d'identité n'est communiquée en clair que sur la fiche
+ * individuelle du visiteur — et sont anonymisés au-delà de config.visites.conserverVisiteursJours
+ * (tâche quotidienne et purge à la demande, droit « valider »). Un compte désigné dans une visite
+ * (hôte, participant, accompagnateur, responsable) doit être dans le périmètre de l'auteur.
  *
  * Portée : règle commune (ctx.canSee sur le secteur visité). L'hôte, les participants, les
  * accompagnateurs et les responsables d'actions ou de préparation voient en plus la visite qui les
@@ -32,9 +34,11 @@
  * Événements émis  : 'visite:creee' ({ visite }), 'visite:statut' ({ visite, ancien, nouveau }),
  *                    'visite:arrivee' ({ visite, visiteur }), 'visite:depart' ({ visite, visiteur })
  * Événements écoutés : 'ot:cree' (lien OT des actions dont la demande est convertie),
- *                    'demande:cloturee' (l'action liée passe « réalisée », à vérifier)
+ *                    'demande:cloturee' (l'action liée passe « réalisée », à vérifier),
+ *                    'demande:refusee' (responsable prévenu ; une nouvelle demande peut être créée)
  */
 const crypto = require('crypto');
+const { csvLigne } = require('../csv');
 
 const nom = 'Audits & visites';
 const MODULE = 'visites';
@@ -92,18 +96,14 @@ function frDateHeure(iso) {
 }
 function frHeure(iso) { const d = new Date(iso); return !iso || Number.isNaN(d.getTime()) ? '' : `${pad(d.getHours())}:${pad(d.getMinutes())}`; }
 
-/** Cellule CSV : séparateur « ; », guillemets, neutralisation des formules (=, +, -, @) à l'ouverture dans un tableur. */
-function csvCellule(v) {
-  let s = v == null ? '' : String(v);
-  s = s.replace(/\r\n|\r|\n/g, ' ');
-  if (/^[=+\-@\t]/.test(s) && !/^-?\d+([.,]\d+)?$/.test(s)) s = '\'' + s;
-  return /[";]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
-
-/** Nombre entier strictement positif ou null. */
+/**
+ * Nombre entier strictement positif ou null : un nombre entier, ou une chaîne en écriture décimale
+ * (jamais l'hexadécimal, l'exposant ni un booléen).
+ */
 function entierPositif(v) {
-  if (typeof v === 'boolean' || v === null || v === undefined || v === '') return null;
-  const n = Number(v);
+  let n = null;
+  if (typeof v === 'number') n = v;
+  else if (typeof v === 'string' && /^\s*\d{1,12}\s*$/.test(v)) n = Number(v);
   return Number.isInteger(n) && n > 0 && n < 1e12 ? n : null;
 }
 
@@ -111,6 +111,8 @@ function nomVisiteur(x) { return `${x.prenom || ''} ${x.nom || ''}`.trim() || 'V
 
 function register(ctx) {
   const { router, db, HttpError, perms } = ctx;
+  // Libellés français des actions propres au module dans le journal d'activité (et son export)
+  if (ctx.libellesActions) Object.assign(ctx.libellesActions, { arrivee: 'Arrivée d\'un visiteur', depart: 'Départ d\'un visiteur', liaison: 'Liaison à une demande d\'intervention' });
 
   // ----- Configuration et listes ----------------------------------------------------------------
   /** Paramètres du module, bornés (la configuration peut contenir des valeurs hors limites). */
@@ -222,7 +224,8 @@ function register(ctx) {
    * @param {Function} [estIntervenant] (roles, visite) → vrai si une personne concernée peut faire l'opération
    */
   function getVisible(req, id, estIntervenant) {
-    const v = db.get(ENTITE, id);
+    const n = entierPositif(String(id == null ? '' : id));
+    const v = n ? db.get(ENTITE, n) : null;
     if (!v || !visibleLecture(req, v)) throw new HttpError(404, 'Visite introuvable');
     if (!req.ecriture || interventionPossible(req, v, estIntervenant)) return v;
     if (secteurLectureSeule(req, v)) throw new HttpError(403, 'Ce site est accessible en lecture seule pour vous : modification impossible');
@@ -244,10 +247,10 @@ function register(ctx) {
 
   // ----- Validation des entrées -------------------------------------------------------------------
   function objet(b) { return b && typeof b === 'object' && !Array.isArray(b) && !Buffer.isBuffer(b) ? b : {}; }
+  /** Champ texte : une chaîne (absent ou null : vide) ; booléens, nombres, tableaux et objets refusés. */
   function texte(v, max, libelleChamp, options = {}) {
     if (v === undefined || v === null) v = '';
-    if (typeof v === 'number' || typeof v === 'boolean') v = String(v);
-    if (typeof v !== 'string') throw new HttpError(400, `${libelleChamp} : valeur invalide`);
+    if (typeof v !== 'string') throw new HttpError(400, `${libelleChamp} : valeur invalide (texte attendu)`);
     let s = options.multiligne
       ? v.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
       : v.replace(/[\u0000-\u001F\u007F]/g, ' ');
@@ -307,23 +310,35 @@ function register(ctx) {
     if (typeof code !== 'string' || !l.some((x) => x.code === code)) throw new HttpError(400, `${libelleChamp} invalide : « ${String(code).slice(0, 40)} »`);
     return code;
   }
-  /** Utilisateur actif (un utilisateur désactivé déjà enregistré reste accepté tel quel). */
+  /**
+   * Utilisateur actif désigné dans une visite (hôte, participant, accompagnateur, responsable). Un compte déjà
+   * enregistré reste accepté tel quel (même désactivé) ; un compte nouvellement désigné doit être dans le
+   * périmètre de l'auteur (options.req) : la désignation lui ouvre la visite, ses visiteurs et leurs coordonnées.
+   */
   function utilisateur(v, libelleChamp, options = {}) {
     if (v === undefined || v === null || v === '') { if (options.requis) throw new HttpError(400, `${libelleChamp} : champ obligatoire`); return null; }
     const id = entierPositif(v);
     const u = id ? db.get('users', id) : null;
     if (!u) throw new HttpError(400, `${libelleChamp} : utilisateur introuvable`);
-    if (u.actif === false && Number(options.actuel) !== u.id) throw new HttpError(400, `${libelleChamp} : le compte de ${ctx.nomUser(u.id)} est désactivé`);
+    if (options.actuel != null && Number(options.actuel) === u.id) return u.id;
+    if (u.actif === false) throw new HttpError(400, `${libelleChamp} : le compte de ${ctx.nomUser(u.id)} est désactivé`);
+    if (options.req) verifierPerimetreUtilisateur(options.req, u);
     return u.id;
   }
-  function listeUtilisateurs(v, libelleChamp, actuels) {
+  /** Compte visible par l'auteur (règle commune ctx.utilisateurVisible, en écriture) ; administrateur et portée « tous » exceptés. */
+  function verifierPerimetreUtilisateur(req, u) {
+    const p = req.perms || {};
+    if (p.estAdmin || p.portee === 'tous') return;
+    if (!ctx.utilisateurVisible(req.user, p, u, true)) throw new HttpError(403, `${ctx.nomUser(u.id)} n'est pas dans votre périmètre : vous ne pouvez pas le désigner pour cette visite`);
+  }
+  function listeUtilisateurs(v, libelleChamp, actuels, req) {
     if (v === undefined || v === null || v === '') return [];
     if (!Array.isArray(v)) throw new HttpError(400, `${libelleChamp} : liste attendue`);
     if (v.length > MAX_PARTICIPANTS) throw new HttpError(400, `${libelleChamp} : ${MAX_PARTICIPANTS} personnes au maximum`);
     const deja = new Set((actuels || []).map(Number));
     const out = [];
     for (const x of v) {
-      const id = utilisateur(x, libelleChamp, { actuel: deja.has(Number(x)) ? Number(x) : null });
+      const id = utilisateur(x, libelleChamp, { actuel: deja.has(Number(x)) ? Number(x) : null, req });
       if (id != null && !out.includes(id)) out.push(id);
     }
     return out;
@@ -453,10 +468,19 @@ function register(ctx) {
     }
     return r;
   }
+  /** Code du statut « refusée » des demandes (liste configurée, résolue par le module Demandes). */
+  function statutDemandeRefusee() {
+    const sd = ctx.services.demandes;
+    let code = null;
+    try { code = sd && sd.STATUTS ? sd.STATUTS.refusee : null; } catch (e) { code = null; }
+    return code || 'refusee';
+  }
+  function demandeEstRefusee(demandeId) { const d = db.get('demandes', demandeId); return !!d && d.statut === statutDemandeRefusee(); }
   function infoDemande(req, a) {
     if (a.demandeId == null) return null;
     const d = db.get('demandes', a.demandeId);
-    const base = { id: a.demandeId, numero: a.demandeNumero || (d ? d.numero : ''), existe: !!d };
+    // refusee : une nouvelle demande peut être créée pour l'action (indicateur transmis sans le détail de la demande)
+    const base = { id: a.demandeId, numero: a.demandeNumero || (d ? d.numero : ''), existe: !!d, refusee: !!d && d.statut === statutDemandeRefusee() };
     if (!d || !perms.can(req.perms, 'demandes', 'voir') || !ctx.canSee(req, d)) return base;
     const out = Object.assign(base, { statut: d.statut, titre: d.titre, visible: true });
     const otId = a.otId != null ? a.otId : d.otId;
@@ -469,20 +493,44 @@ function register(ctx) {
       final: cx.finauxAction.has(a.statut), enRetard: estEnRetard(a, cx), demande: infoDemande(req, a),
     });
   }
+  /** Équipement d'un constat tel que transmis : numéro et nom seulement s'il est visible du lecteur. */
+  function equipementConstat(req, c) {
+    if (c.equipementId == null || !db.get('equipements', c.equipementId)) return null;
+    const e = equipementVisible(req, c.equipementId);
+    return e ? { id: e.id, numero: e.numero, nom: e.nom } : { masque: true, numero: '', nom: 'Équipement hors de votre périmètre' };
+  }
   function constatPublic(req, c, cx) {
-    const e = c.equipementId != null ? db.get('equipements', c.equipementId) : null;
     return Object.assign({}, c, {
       secteurNom: c.secteurId != null ? cheminSecteur(c.secteurId) : '',
-      equipement: e ? { id: e.id, numero: e.numero, nom: e.nom } : null,
+      equipement: equipementConstat(req, c),
       createdByNom: ctx.nomUser(c.createdBy), ouvert: constatOuvert(c, cx), estNc: cx.nc.has(c.typeCode),
       actions: (c.actions || []).map((a) => actionPublique(req, a, cx)),
     });
   }
   function documentMeta(d) { return { id: d.id, nom: d.nom, type: d.type, taille: d.taille, categorie: d.categorie, description: d.description || '', date: d.date, userId: d.userId, userNom: ctx.nomUser(d.userId) }; }
+  /**
+   * Plan 3D lisible par la requête (droit plans › voir et règle de lecture du module Plans : service
+   * ctx.services.plans.visible s'il est publié, sinon la même règle — portée commune en consultation, ou accès
+   * à un secteur couvert par le plan, dans le site affiché).
+   */
+  function planLisible(req, plan) {
+    if (!plan || !req.perms || !perms.can(req.perms, 'plans', 'voir')) return false;
+    const sp = ctx.services.plans;
+    if (sp && typeof sp.visible === 'function') return !!sp.visible(req, plan);
+    if (ctx.canSee(Object.assign({}, req, { ecriture: false }), plan)) return true;
+    const p = req.perms;
+    if (plan.secteurId == null) return true;
+    const sid = Number(plan.secteurId);
+    if (Array.isArray(p.siteFiltre) && !p.siteFiltre.includes(sid)) return false;
+    if (p.portee === 'tous') return false;
+    const accessibles = new Set([].concat(p.secteurIds || [], p.secteurIdsLecture || []).map(Number));
+    return accessibles.size > 0 && perms.secteursDescendants(db, [sid]).some((id) => accessibles.has(Number(id)));
+  }
   function planInfo(req, v) {
     if (v.planId == null || !perms.can(req.perms, 'plans', 'voir')) return null;
     const p = db.get('plans', v.planId);
     if (!p) return null;
+    if (!planLisible(req, p)) return { id: p.id, masque: true, numero: '', nom: 'Plan 3D hors de votre périmètre', objets: [] };
     const ids = new Set((v.objetIds || []).map(String));
     return { id: p.id, numero: p.numero, nom: p.nom, objets: (p.objets || []).filter((o) => ids.has(String(o.id))).map((o) => ({ id: o.id, nom: o.nom || '', type: o.type })) };
   }
@@ -505,8 +553,12 @@ function register(ctx) {
     const d = droits(req, v);
     const coordonnees = d.modifier || d.accueil;
     const zones = (v.zonesVisitees || []).map((id) => { const s = secteur(id); return { id: Number(id), nom: s ? s.nom : '#' + id, chemin: cheminSecteur(id), couleur: s ? s.couleur || '' : '' }; });
+    // Contact de l'organisme (personne physique) : e-mail et téléphone réservés, comme ceux des visiteurs, aux gestionnaires
+    const contact = v.contactOrganisme || {};
     return Object.assign(resume(v, cx), {
-      contactOrganisme: Object.assign({ nom: '', email: '', telephone: '' }, v.contactOrganisme || {}),
+      contactOrganisme: coordonnees
+        ? { nom: contact.nom || '', email: contact.email || '', telephone: contact.telephone || '', anonymiseLe: contact.anonymiseLe || null }
+        : { nom: contact.nom || '' },
       programme: v.programme || '',
       participants: (v.participantsUserIds || []).map((id) => ({ id, nom: ctx.nomUser(id) })),
       zones, planId: v.planId == null ? null : v.planId, objetIds: v.objetIds || [], plan: planInfo(req, v),
@@ -530,16 +582,35 @@ function register(ctx) {
       visiteurId: x.id, nom: x.nom, prenom: x.prenom || '', societe: x.societe || '', fonction: x.fonction || '',
       accompagnateurUserId: x.accompagnateurUserId == null ? null : x.accompagnateurUserId, accompagnateurNom: ctx.nomUser(x.accompagnateurUserId),
       badgeNumero: x.badgeNumero || '', charteAcceptee: !!x.charteAcceptee, epiFournis: x.epiFournis || [],
+      pieceIdentiteRenseignee: !!x.pieceIdentite, // indicateur seul : la pièce n'est lue que sur la fiche du visiteur
       arrivee: x.arrivee || null, depart: x.depart || null, etat: x.depart ? 'parti' : (x.arrivee ? 'present' : 'attendu'),
     };
   }
-  function ligneAction(req, v, c, a, cx) {
+  /**
+   * Opérations possibles sur une ligne du plan d'actions, calculées comme les routes : avancement (gestionnaire,
+   * ou responsable de l'action hors site en lecture seule), vérification (droit valider), demande d'intervention.
+   */
+  function droitsAction(req, v, a, d, cx) {
+    const ouverte = v.statut !== cx.SV.annulee;
+    const gestion = d.modifier;
+    const responsable = Number(a.responsableUserId) === req.user.id && !d.lectureSeule && !horsSiteAffiche(req, v);
+    const final = cx.finauxAction.has(a.statut);
+    const demandeRefusee = a.demandeId != null && demandeEstRefusee(a.demandeId);
+    return {
+      gestion: ouverte && gestion,
+      avancement: ouverte && (gestion || (responsable && !final)),
+      verifier: ouverte && d.valider && a.statut === cx.SA.realisee,
+      demande: ouverte && gestion && !final && (a.demandeId == null || !db.get('demandes', a.demandeId) || demandeRefusee) && perms.can(req.perms, 'demandes', 'creer'),
+    };
+  }
+  function ligneAction(req, v, c, a, cx, d) {
     return Object.assign(actionPublique(req, a, cx), {
       visiteId: v.id, visiteNumero: v.numero, visiteTitre: v.titre, visiteTypeCode: v.typeCode, visiteStatut: v.statut, organisme: v.organisme || '',
       secteurId: c.secteurId != null ? Number(c.secteurId) : (v.secteurId == null ? null : Number(v.secteurId)),
       siteNom: nomSite(c.secteurId != null ? c.secteurId : v.secteurId),
       constatId: c.id, constatTypeCode: c.typeCode, exigence: c.exigence || '', constatDescription: String(c.description || '').slice(0, 300),
       actionId: a.id, hoteUserId: v.hoteUserId,
+      droits: droitsAction(req, v, a, d || droits(req, v), cx),
     });
   }
 
@@ -563,6 +634,8 @@ function register(ctx) {
     const contact = objet(b.contactOrganisme === undefined ? (existant ? existant.contactOrganisme : {}) : b.contactOrganisme);
     if (b.contactOrganisme !== undefined && b.contactOrganisme !== null && typeof b.contactOrganisme !== 'object') throw new HttpError(400, 'Contact de l\'organisme invalide');
     out.contactOrganisme = { nom: texte(contact.nom, 120, 'Le nom du contact'), email: email(contact.email, 'L\'e-mail du contact'), telephone: telephone(contact.telephone, 'Le téléphone du contact') };
+    const anonymise = existant && existant.contactOrganisme ? existant.contactOrganisme.anonymiseLe : null;
+    if (anonymise && !out.contactOrganisme.email && !out.contactOrganisme.telephone) out.contactOrganisme.anonymiseLe = anonymise;
 
     out.dateDebut = dateHeure(val('dateDebut'), 'La date de début', true);
     const fin = val('dateFin');
@@ -571,8 +644,8 @@ function register(ctx) {
     if (Date.parse(out.dateFin) - Date.parse(out.dateDebut) > DUREE_MAX_JOURS * 86400000) throw new HttpError(400, `Une visite ne peut pas durer plus de ${DUREE_MAX_JOURS} jours`);
 
     const hote = val('hoteUserId');
-    out.hoteUserId = hote === undefined ? req.user.id : utilisateur(hote, 'L\'hôte (responsable de l\'accueil)', { actuel: existant ? existant.hoteUserId : null });
-    out.participantsUserIds = listeUtilisateurs(val('participantsUserIds'), 'Participants', existant ? existant.participantsUserIds : []).filter((id) => id !== out.hoteUserId);
+    out.hoteUserId = hote === undefined ? req.user.id : utilisateur(hote, 'L\'hôte (responsable de l\'accueil)', { actuel: existant ? existant.hoteUserId : null, req });
+    out.participantsUserIds = listeUtilisateurs(val('participantsUserIds'), 'Participants', existant ? existant.participantsUserIds : [], req).filter((id) => id !== out.hoteUserId);
     out.programme = texte(val('programme'), 20000, 'Le programme', { multiligne: true });
 
     // Zones visitées : secteurs du même site que le secteur visité
@@ -580,6 +653,17 @@ function register(ctx) {
     if (zonesBrutes !== undefined && zonesBrutes !== null && !Array.isArray(zonesBrutes)) throw new HttpError(400, 'Zones visitées : liste attendue');
     if ((zonesBrutes || []).length > MAX_ZONES) throw new HttpError(400, `Zones visitées : ${MAX_ZONES} au maximum`);
     const siteVisite = siteDe(secteurId);
+    // Changement de site : les constats doivent porter sur des secteurs et équipements du nouveau site
+    if (existant && siteVisite != null && siteVisite !== siteDe(actuel)) {
+      const sites = new Set();
+      const horsSite = (existant.constats || []).filter((c) => {
+        const e = c.equipementId != null ? db.get('equipements', c.equipementId) : null;
+        const autres = [c.secteurId, e ? e.secteurId : null].filter((s) => s != null && siteDe(Number(s)) !== siteVisite);
+        for (const s of autres) sites.add(nomSite(Number(s)) || cheminSecteur(Number(s)));
+        return autres.length > 0;
+      });
+      if (horsSite.length) throw new HttpError(400, `Le site visité ne peut pas être changé : ${horsSite.length} constat(s) portent sur un secteur ou un équipement d'un autre site (${Array.from(sites).filter(Boolean).join(', ') || 'site inconnu'}) ; retirez d'abord leur secteur et leur équipement, puis réaffectez-les sur le nouveau site`);
+    }
     out.zonesVisitees = [];
     for (const z of zonesBrutes || []) {
       const id = secteurExistant(z, 'Zone visitée');
@@ -587,13 +671,16 @@ function register(ctx) {
       if (!out.zonesVisitees.includes(id)) out.zonesVisitees.push(id);
     }
 
-    // Plan 3D (module Plans) : référence en lecture seule, objets du plan uniquement
+    // Plan 3D (module Plans) : référence en lecture seule, objets du plan uniquement ; un nouveau plan doit être
+    // lisible par l'auteur (même réponse qu'un plan inexistant : aucune énumération des plans)
     const planBrut = val('planId');
     out.planId = null; out.objetIds = [];
     if (planBrut !== undefined && planBrut !== null && planBrut !== '') {
       const pid = entierPositif(planBrut);
       const plan = pid ? db.get('plans', pid) : null;
-      if (!plan) throw new HttpError(400, 'Plan 3D introuvable');
+      const inchange = !!plan && !!existant && existant.planId != null && Number(existant.planId) === plan.id;
+      const lisible = !!plan && planLisible(req, plan);
+      if (!plan || (!inchange && !lisible)) throw new HttpError(400, 'Plan 3D introuvable');
       if (siteVisite != null && plan.secteurId != null && siteDe(plan.secteurId) !== siteVisite) throw new HttpError(400, 'Le plan 3D choisi ne concerne pas le site visité');
       out.planId = plan.id;
       const objets = val('objetIds');
@@ -605,6 +692,8 @@ function register(ctx) {
         if (!/^[\w-]{1,60}$/.test(s) || !existants.has(s)) throw new HttpError(400, 'Objet du plan 3D introuvable');
         if (!out.objetIds.includes(s)) out.objetIds.push(s);
       }
+      const avant = (existant && existant.objetIds || []).map(String);
+      if (!lisible && (out.objetIds.length !== avant.length || out.objetIds.some((o) => !avant.includes(o)))) throw new HttpError(403, 'Le plan 3D de cette visite est hors de votre périmètre : ses objets ne peuvent pas être modifiés');
     }
 
     // Résultat de l'audit
@@ -621,16 +710,16 @@ function register(ctx) {
     return out;
   }
 
-  function validerPreparation(b, existant) {
+  function validerPreparation(req, b, existant) {
     const val = (k) => (b[k] === undefined ? (existant ? existant[k] : undefined) : b[k]);
     return {
       libelle: texte(val('libelle'), 200, 'Le point de préparation', { requis: true }),
-      responsableUserId: utilisateur(val('responsableUserId'), 'Le responsable', { actuel: existant ? existant.responsableUserId : null }),
+      responsableUserId: utilisateur(val('responsableUserId'), 'Le responsable', { actuel: existant ? existant.responsableUserId : null, req }),
       echeance: dateJour(val('echeance'), 'L\'échéance'),
     };
   }
 
-  function validerVisiteur(b, existant, cfg) {
+  function validerVisiteur(req, b, existant, cfg) {
     const val = (k) => (b[k] === undefined ? (existant ? existant[k] : undefined) : b[k]);
     const out = {
       nom: texte(val('nom'), 80, 'Le nom du visiteur', { requis: true }),
@@ -642,7 +731,7 @@ function register(ctx) {
       // Minimisation des données : la pièce d'identité n'est conservée que si la configuration la demande
       pieceIdentite: cfg.demanderPieceIdentite ? texte(val('pieceIdentite'), 60, 'La pièce d\'identité') : '',
       vehicule: texte(val('vehicule'), 40, 'Le véhicule (immatriculation)'),
-      accompagnateurUserId: utilisateur(val('accompagnateurUserId'), 'L\'accompagnateur', { actuel: existant ? existant.accompagnateurUserId : null }),
+      accompagnateurUserId: utilisateur(val('accompagnateurUserId'), 'L\'accompagnateur', { actuel: existant ? existant.accompagnateurUserId : null, req }),
       epiFournis: listeEpi(val('epiFournis')),
     };
     if (b.charteAcceptee !== undefined) {
@@ -665,10 +754,12 @@ function register(ctx) {
     let secteurId = null;
     if (eqBrut !== undefined && eqBrut !== null && eqBrut !== '') {
       const id = entierPositif(eqBrut);
-      const e = id ? equipementVisible(req, id) : null;
-      if (!e) throw new HttpError(400, 'Équipement introuvable ou hors de votre portée');
-      out.equipementId = e.id;
-      secteurId = e.secteurId == null ? null : Number(e.secteurId);
+      // Équipement déjà rattaché : conservé tel quel, même hors de la portée de l'auteur ou supprimé depuis
+      const inchange = id != null && !!existant && existant.equipementId != null && Number(existant.equipementId) === id;
+      const e = id ? (inchange ? db.get('equipements', id) : equipementVisible(req, id)) : null;
+      if (!e && !inchange) throw new HttpError(400, 'Équipement introuvable ou hors de votre portée');
+      out.equipementId = id;
+      secteurId = e ? (e.secteurId == null ? null : Number(e.secteurId)) : (existant.secteurId == null ? null : Number(existant.secteurId));
     } else {
       const s = val('secteurId');
       secteurId = s === undefined || s === null || s === '' ? null : secteurExistant(s, 'Secteur du constat');
@@ -679,22 +770,26 @@ function register(ctx) {
     return out;
   }
 
-  function validerAction(b, existant, cx, gestion) {
+  function validerAction(req, b, existant, cx, gestion) {
     const val = (k) => (b[k] === undefined ? (existant ? existant[k] : undefined) : b[k]);
     const out = {};
     if (gestion) {
       out.libelle = texte(val('libelle'), 300, 'L\'action', { requis: true });
-      out.responsableUserId = utilisateur(val('responsableUserId'), 'Le responsable de l\'action', { requis: true, actuel: existant ? existant.responsableUserId : null });
+      out.responsableUserId = utilisateur(val('responsableUserId'), 'Le responsable de l\'action', { requis: true, actuel: existant ? existant.responsableUserId : null, req });
       out.echeance = dateJour(val('echeance'), 'L\'échéance');
     }
     out.commentaire = texte(val('commentaire'), 2000, 'Le commentaire', { multiligne: true });
     const statut = b.statut === undefined ? (existant ? existant.statut : cx.SA.a_faire) : codeListe('statutsAction', b.statut, 'Statut de l\'action', false);
     if (statut === cx.SA.verifiee && (!existant || existant.statut !== statut)) throw new HttpError(400, 'La vérification de l\'efficacité se fait par l\'action « Vérifier l\'efficacité » (droit Valider)');
     if (existant && existant.statut === cx.SA.verifiee && statut !== existant.statut) throw new HttpError(400, 'Cette action a été vérifiée : sa vérification ne peut être annulée que par une nouvelle vérification');
+    // Action close (vérifiée ou abandonnée) : décision du gestionnaire, que le responsable ne peut ni annuler ni retoucher
+    if (!gestion && existant && cx.finauxAction.has(existant.statut)) throw new HttpError(403, 'Seul un gestionnaire de la visite peut rouvrir ou modifier une action close');
     if (!gestion && cx.finauxAction.has(statut) && (!existant || existant.statut !== statut)) throw new HttpError(403, 'Seul un gestionnaire de la visite peut abandonner une action');
     out.statut = statut;
-    if (statut === cx.SA.realisee) out.dateRealisation = dateJour(b.dateRealisation, 'La date de réalisation') || (existant && existant.dateRealisation) || aujourdhui();
-    else if (b.dateRealisation !== undefined) out.dateRealisation = dateJour(b.dateRealisation, 'La date de réalisation');
+    const realisation = b.dateRealisation === undefined ? null : dateJour(b.dateRealisation, 'La date de réalisation');
+    if (realisation && realisation > aujourdhui()) throw new HttpError(400, 'La date de réalisation ne peut pas être dans le futur');
+    if (statut === cx.SA.realisee) out.dateRealisation = realisation || (existant && existant.dateRealisation) || aujourdhui();
+    else if (b.dateRealisation !== undefined) out.dateRealisation = realisation;
     else if (!existant) out.dateRealisation = null;
     return out;
   }
@@ -704,7 +799,7 @@ function register(ctx) {
     if (v.statut === cx.SV.annulee) throw new HttpError(400, 'Cette visite est annulée : réouvrez-la pour la modifier');
   }
   function trouver(arr, id, message) {
-    const n = Number(id);
+    const n = entierPositif(typeof id === 'number' ? id : String(id == null ? '' : id));
     const i = (arr || []).findIndex((x) => Number(x.id) === n);
     if (i < 0) throw new HttpError(404, message);
     return i;
@@ -744,6 +839,7 @@ function register(ctx) {
     const limite = /^\d{4}-\d{2}-\d{2}$/.test(q.echeanceAvant || '') ? q.echeanceAvant : null;
     for (const v of portee(req, db.list(ENTITE))) {
       if (q.visiteId && Number(q.visiteId) !== v.id) continue;
+      let d = null;
       for (const c of v.constats || []) {
         if (q.typeCode && c.typeCode !== q.typeCode) continue;
         for (const a of c.actions || []) {
@@ -752,7 +848,8 @@ function register(ctx) {
           if (resp && Number(a.responsableUserId) !== resp) continue;
           if (q.echeance === 'retard' && !estEnRetard(a, cx)) continue;
           if (limite && (!a.echeance || a.echeance > limite)) continue;
-          const ligne = ligneAction(req, v, c, a, cx);
+          d = d || droits(req, v);
+          const ligne = ligneAction(req, v, c, a, cx, d);
           if (ids && !(ligne.secteurId != null && ids.has(ligne.secteurId))) continue;
           out.push(ligne);
         }
@@ -768,8 +865,10 @@ function register(ctx) {
     for (const v of portee(req, db.list(ENTITE))) {
       const debut = jourLocal(v.dateDebut); const fin = jourLocal(v.dateFin || v.dateDebut);
       const duJour = debut <= jour && jour <= fin && v.statut !== annulee;
+      // Accueil possible (arrivée, départ) : mêmes conditions que les routes (site en lecture seule exclu)
+      const accueil = (v.visiteurs || []).length ? droits(req, v).accueil : false;
       for (const x of v.visiteurs || []) {
-        const l = ligneRegistre(v, x);
+        const l = Object.assign(ligneRegistre(v, x), { droits: { accueil } });
         if (duJour || (x.arrivee && jourLocal(x.arrivee) === jour)) attendus.push(l);
         if (x.arrivee && !x.depart) presents.push(l);
       }
@@ -825,7 +924,7 @@ function register(ctx) {
 
   // ----- Exports CSV ---------------------------------------------------------------------------------
   function envoyerCsv(res, nomFichier, entetes, lignes) {
-    const contenu = '﻿' + [entetes].concat(lignes).map((l) => l.map(csvCellule).join(';')).join('\r\n');
+    const contenu = '﻿' + [entetes].concat(lignes).map(csvLigne).join('\r\n');
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${nomFichier}-${aujourdhui()}.csv"`, 'Cache-Control': 'no-store' });
     res.end(contenu);
   }
@@ -885,12 +984,12 @@ function register(ctx) {
     const prepBrute = b.preparation === undefined || b.preparation === null ? [] : b.preparation;
     if (!Array.isArray(prepBrute)) throw new HttpError(400, 'Préparation : liste attendue');
     if (prepBrute.length > MAX_PREPARATION) throw new HttpError(400, `Préparation : ${MAX_PREPARATION} points au maximum`);
-    const preparation = prepBrute.map((p) => Object.assign({ id: nouvelId(etat) }, validerPreparation(objet(p), null), { fait: booleen(objet(p).fait), faitLe: booleen(objet(p).fait) ? new Date().toISOString() : null, faitPar: booleen(objet(p).fait) ? req.user.id : null }));
+    const preparation = prepBrute.map((p) => Object.assign({ id: nouvelId(etat) }, validerPreparation(req, objet(p), null), { fait: booleen(objet(p).fait), faitLe: booleen(objet(p).fait) ? new Date().toISOString() : null, faitPar: booleen(objet(p).fait) ? req.user.id : null }));
     const visBruts = b.visiteurs === undefined || b.visiteurs === null ? [] : b.visiteurs;
     if (!Array.isArray(visBruts)) throw new HttpError(400, 'Visiteurs : liste attendue');
     if (visBruts.length > MAX_VISITEURS) throw new HttpError(400, `Visiteurs : ${MAX_VISITEURS} au maximum`);
     const pris = badgesUtilises();
-    const visiteurs = visBruts.map((x) => Object.assign({ id: nouvelId(etat), charteAcceptee: false, charteAccepteeLe: null }, validerVisiteur(objet(x), null, cfg), { arrivee: null, depart: null, badgeNumero: nouveauBadge(pris) }));
+    const visiteurs = visBruts.map((x) => Object.assign({ id: nouvelId(etat), charteAcceptee: false, charteAccepteeLe: null }, validerVisiteur(req, objet(x), null, cfg), { arrivee: null, depart: null, badgeNumero: nouveauBadge(pris) }));
     const v = db.insert(ENTITE, Object.assign(data, {
       numero: numeroUnique(), statut, preparation, visiteurs, constats: [], documents: [], sequence: etat.sequence,
       motifAnnulation: '', dateCloture: null, rappelEnvoye: null, createdBy: req.user.id,
@@ -943,7 +1042,9 @@ function register(ctx) {
     if (statut === v.statut) throw new HttpError(400, `La visite est déjà au statut « ${libelle('statutsVisite', statut)} »`);
     const finalAvant = cx.finauxVisite.has(v.statut);
     const finalApres = cx.finauxVisite.has(statut);
-    if (finalAvant && !finalApres) ctx.requirePerm(req, MODULE, 'valider'); // réouverture d'une visite clôturée ou annulée
+    // Toute sortie d'un statut final (réouverture, ou passage d'« annulée » à « terminée » qui rendrait la
+    // visite de nouveau modifiable) est réservée au droit valider
+    if (finalAvant) ctx.requirePerm(req, MODULE, 'valider');
     const motif = texte(b.motif, 1000, 'Le motif', { multiligne: true });
     if (statut === cx.SV.annulee && !motif) throw new HttpError(400, 'Le motif d\'annulation est obligatoire');
     let visiteurs = v.visiteurs || [];
@@ -957,8 +1058,7 @@ function register(ctx) {
       departs = presents.length;
     }
     const patch = { statut, visiteurs, dateCloture: finalApres ? new Date().toISOString() : null };
-    if (statut === cx.SV.annulee) patch.motifAnnulation = motif;
-    else if (!finalApres) patch.motifAnnulation = '';
+    patch.motifAnnulation = statut === cx.SV.annulee ? motif : '';
     const maj = enregistrer(req, v, patch, 'statut', `${libelle('statutsVisite', v.statut)} → ${libelle('statutsVisite', statut)}${motif ? ' — ' + motif : ''}${departs ? ` (départ enregistré pour ${departs} visiteur(s) présent(s))` : ''}`, 'statut');
     const message = statut === cx.SV.annulee ? `« ${maj.titre} » prévue ${periodeTexte(maj)} est annulée${motif ? ' : ' + motif : ''}` : `« ${maj.titre} » (${periodeTexte(maj)}) : ${libelle('statutsVisite', v.statut)} → ${libelle('statutsVisite', statut)}`;
     notifier(req, equipeVisite(maj), { titre: `Visite ${maj.numero} : ${libelle('statutsVisite', statut)}`, message, lien: lienVisite(maj), type: statut === cx.SV.annulee ? 'alerte' : 'info' });
@@ -976,7 +1076,7 @@ function register(ctx) {
     const preparation = cloner(v.preparation);
     if (preparation.length + elements.length > MAX_PREPARATION) throw new HttpError(400, `Préparation : ${MAX_PREPARATION} points au maximum`);
     const etat = { sequence: v.sequence };
-    const ajoutes = elements.map((e) => Object.assign({ id: nouvelId(etat) }, validerPreparation(objet(e), null), { fait: false, faitLe: null, faitPar: null, alerteRetard: null }));
+    const ajoutes = elements.map((e) => Object.assign({ id: nouvelId(etat) }, validerPreparation(req, objet(e), null), { fait: false, faitLe: null, faitPar: null, alerteRetard: null }));
     const maj = enregistrer(req, v, { preparation: preparation.concat(ajoutes), sequence: etat.sequence }, 'preparation', `Préparation : ${ajoutes.map((p) => p.libelle).join(' ; ').slice(0, 300)}`);
     for (const p of ajoutes) if (p.responsableUserId != null) notifier(req, [p.responsableUserId], { titre: `Visite ${maj.numero} : préparation`, message: `« ${p.libelle} » vous est confié${p.echeance ? ' pour le ' + frJour(p.echeance) : ''} (visite « ${maj.titre} » ${periodeTexte(maj)})`, lien: lienVisite(maj, 'preparation'), type: 'info' });
     return detail(req, maj);
@@ -997,7 +1097,7 @@ function register(ctx) {
       for (const k of Object.keys(b)) if (k !== 'fait') throw new HttpError(403, 'Seul l\'état « fait » de vos points de préparation peut être mis à jour');
     }
     const avant = Object.assign({}, p);
-    if (gestion && (b.libelle !== undefined || b.responsableUserId !== undefined || b.echeance !== undefined)) Object.assign(p, validerPreparation(b, p));
+    if (gestion && (b.libelle !== undefined || b.responsableUserId !== undefined || b.echeance !== undefined)) Object.assign(p, validerPreparation(req, b, p));
     if (b.fait !== undefined) { const f = booleen(b.fait); if (f !== !!p.fait) { p.fait = f; p.faitLe = f ? new Date().toISOString() : null; p.faitPar = f ? req.user.id : null; } }
     if (JSON.stringify(avant) === JSON.stringify(p)) return detail(req, v);
     const maj = enregistrer(req, v, { preparation }, 'preparation', `Préparation « ${p.libelle} »${avant.fait !== p.fait ? (p.fait ? ' : fait' : ' : à refaire') : ' modifiée'}`);
@@ -1029,7 +1129,7 @@ function register(ctx) {
     const visiteurs = cloner(v.visiteurs);
     if (visiteurs.length >= MAX_VISITEURS) throw new HttpError(400, `Visiteurs : ${MAX_VISITEURS} au maximum`);
     const etat = { sequence: v.sequence };
-    const x = Object.assign({ id: nouvelId(etat), charteAcceptee: false, charteAccepteeLe: null }, validerVisiteur(objet(req.body), null, cfgVisites()), { arrivee: null, depart: null, badgeNumero: nouveauBadge() });
+    const x = Object.assign({ id: nouvelId(etat), charteAcceptee: false, charteAccepteeLe: null }, validerVisiteur(req, objet(req.body), null, cfgVisites()), { arrivee: null, depart: null, badgeNumero: nouveauBadge() });
     const maj = enregistrer(req, v, { visiteurs: visiteurs.concat([x]), sequence: etat.sequence }, 'visiteur', `Visiteur ajouté : ${nomVisiteur(x)}${x.societe ? ' (' + x.societe + ')' : ''}`);
     if (x.accompagnateurUserId != null) notifier(req, [x.accompagnateurUserId], { titre: `Visite ${maj.numero} : accompagnement`, message: `Vous accompagnerez ${nomVisiteur(x)}${x.societe ? ' (' + x.societe + ')' : ''} lors de « ${maj.titre} » ${periodeTexte(maj)}`, lien: lienVisite(maj, 'visiteurs'), type: 'info' });
     return detail(req, maj);
@@ -1042,7 +1142,7 @@ function register(ctx) {
     const i = trouver(visiteurs, req.params.vid, 'Visiteur introuvable');
     const avant = visiteurs[i];
     if (avant.anonymiseLe) throw new HttpError(400, 'Les données de ce visiteur ont été anonymisées (conservation limitée) : modification impossible');
-    const x = Object.assign({}, avant, validerVisiteur(objet(req.body), avant, cfgVisites()));
+    const x = Object.assign({}, avant, validerVisiteur(req, objet(req.body), avant, cfgVisites()));
     visiteurs[i] = x;
     const maj = enregistrer(req, v, { visiteurs }, 'visiteur', `Visiteur modifié : ${nomVisiteur(x)}`);
     if (x.accompagnateurUserId != null && Number(x.accompagnateurUserId) !== Number(avant.accompagnateurUserId)) notifier(req, [x.accompagnateurUserId], { titre: `Visite ${maj.numero} : accompagnement`, message: `Vous accompagnerez ${nomVisiteur(x)}${x.societe ? ' (' + x.societe + ')' : ''} lors de « ${maj.titre} » ${periodeTexte(maj)}`, lien: lienVisite(maj, 'visiteurs'), type: 'info' });
@@ -1086,12 +1186,15 @@ function register(ctx) {
     }
     if (b.vehicule !== undefined) x.vehicule = texte(b.vehicule, 40, 'Le véhicule (immatriculation)');
     if (b.epiFournis !== undefined) x.epiFournis = listeEpi(b.epiFournis);
-    if (b.accompagnateurUserId !== undefined && b.accompagnateurUserId !== null && b.accompagnateurUserId !== '') x.accompagnateurUserId = utilisateur(b.accompagnateurUserId, 'L\'accompagnateur', { actuel: x.accompagnateurUserId });
+    if (b.accompagnateurUserId !== undefined && b.accompagnateurUserId !== null && b.accompagnateurUserId !== '') x.accompagnateurUserId = utilisateur(b.accompagnateurUserId, 'L\'accompagnateur', { actuel: x.accompagnateurUserId, req });
     if (x.accompagnateurUserId == null && cfg.accompagnementObligatoire) {
       if (v.hoteUserId == null) throw new HttpError(400, 'L\'accompagnement des visiteurs est obligatoire : désignez un accompagnateur');
       x.accompagnateurUserId = Number(v.hoteUserId);
     }
     x.arrivee = horodatage(b.horodatage, 'Heure d\'arrivée');
+    // Même fenêtre que le contrôle du jour : au plus tôt la veille du premier jour de la visite (registre de sécurité)
+    const auPlusTot = new Date(debut + 'T00:00:00');
+    if (Date.parse(x.arrivee) < auPlusTot.getTime()) throw new HttpError(400, `Heure d'arrivée : antérieure à la visite (prévue ${periodeTexte(v)}) ; au plus tôt le ${frJour(debut)}`);
     x.arriveePar = req.user.id;
     if (!x.badgeNumero) x.badgeNumero = nouveauBadge();
     const patch = { visiteurs };
@@ -1166,10 +1269,13 @@ function register(ctx) {
 
   router.delete('/api/visites/:id/constats/:cid', async (req) => {
     const v = getVisible(req, req.params.id);
-    verifierModifiable(v, contexte());
+    const cx = contexte();
+    verifierModifiable(v, cx);
     const constats = cloner(v.constats);
     const i = trouver(constats, req.params.cid, 'Constat introuvable');
     if ((constats[i].actions || []).some((a) => a.demandeId != null)) throw new HttpError(400, 'Ce constat a une action liée à une demande d\'intervention : il ne peut pas être supprimé (traçabilité)');
+    // Même règle que la suppression d'une action : une efficacité vérifiée ne s'efface qu'avec le droit supprimer
+    if ((constats[i].actions || []).some((a) => a.statut === cx.SA.verifiee)) ctx.requirePerm(req, MODULE, 'supprimer');
     const [sup] = constats.splice(i, 1);
     return detail(req, enregistrer(req, v, { constats }, 'constat', `Constat supprimé (${libelle('typesConstat', sup.typeCode)}${sup.exigence ? ', ' + sup.exigence : ''}, ${(sup.actions || []).length} action(s))`));
   }, { perm: [MODULE, 'modifier'] });
@@ -1191,7 +1297,7 @@ function register(ctx) {
     const c = constats[trouver(constats, req.params.cid, 'Constat introuvable')];
     if (c.actions.length >= MAX_ACTIONS) throw new HttpError(400, `Actions : ${MAX_ACTIONS} au maximum par constat`);
     const etat = { sequence: v.sequence };
-    const a = Object.assign({ id: nouvelId(etat) }, validerAction(objet(req.body), null, cx, true), { demandeId: null, demandeNumero: '', otId: null, verifiePar: null, dateVerification: null, commentaireVerification: '', alerteRetard: null, createdBy: req.user.id, createdAt: new Date().toISOString() });
+    const a = Object.assign({ id: nouvelId(etat) }, validerAction(req, objet(req.body), null, cx, true), { demandeId: null, demandeNumero: '', otId: null, verifiePar: null, dateVerification: null, commentaireVerification: '', alerteRetard: null, createdBy: req.user.id, createdAt: new Date().toISOString() });
     c.actions.push(a);
     const maj = enregistrer(req, v, { constats, sequence: etat.sequence }, 'action', `Action ajoutée : « ${a.libelle} » (responsable : ${ctx.nomUser(a.responsableUserId)}${a.echeance ? ', échéance ' + frJour(a.echeance) : ''})`, 'affectation');
     notifier(req, [a.responsableUserId], { titre: `Action à mener — visite ${maj.numero}`, message: `« ${a.libelle} »${a.echeance ? ' pour le ' + frJour(a.echeance) : ''} (constat : ${libelle('typesConstat', c.typeCode)}${c.exigence ? ', ' + c.exigence : ''})`, lien: lienVisite(maj, 'constats'), type: 'info' });
@@ -1211,7 +1317,7 @@ function register(ctx) {
       for (const k of Object.keys(b)) if (!['statut', 'commentaire', 'dateRealisation'].includes(k)) throw new HttpError(403, 'Seuls le statut, le commentaire et la date de réalisation de vos actions peuvent être mis à jour');
     }
     const avant = Object.assign({}, a);
-    const nouvelle = Object.assign({}, a, validerAction(b, a, cx, gestion));
+    const nouvelle = Object.assign({}, a, validerAction(req, b, a, cx, gestion));
     if (nouvelle.echeance !== avant.echeance) nouvelle.alerteRetard = null;
     c.actions[ai] = nouvelle;
     const changes = [];
@@ -1276,7 +1382,8 @@ function register(ctx) {
     verifierModifiable(v, cx);
     const { constats, c, a, ai } = trouverAction(v, req.params.cid, req.params.aid);
     if (cx.finauxAction.has(a.statut)) throw new HttpError(400, 'Cette action est clôturée : aucune demande ne peut plus en être créée');
-    if (a.demandeId != null && db.get('demandes', a.demandeId)) throw new HttpError(409, `Une demande d'intervention est déjà liée à cette action : ${a.demandeNumero || a.demandeId}`);
+    // Une demande refusée ne bloque pas l'action : une nouvelle demande peut être créée (l'ancienne reste à l'historique)
+    if (a.demandeId != null && db.get('demandes', a.demandeId) && !demandeEstRefusee(a.demandeId)) throw new HttpError(409, `Une demande d'intervention est déjà liée à cette action : ${a.demandeNumero || a.demandeId}`);
     const b = objet(req.body);
     const description = texte(b.description, 5000, 'La description', { multiligne: true })
       || [`Action issue de la visite ${v.numero} « ${v.titre} »${v.organisme ? ' (' + v.organisme + ')' : ''}.`,
@@ -1301,8 +1408,12 @@ function register(ctx) {
     }
     if (!demande || demande.id == null) throw new HttpError(500, 'La demande d\'intervention n\'a pas pu être créée');
     const brute = db.get('demandes', demande.id) || demande;
-    c.actions[ai] = Object.assign({}, a, { demandeId: brute.id, demandeNumero: brute.numero || '', otId: brute.otId == null ? null : brute.otId, statut: a.statut === cx.SA.a_faire ? cx.SA.en_cours : a.statut });
-    const maj = enregistrer(req, v, { constats }, 'demande', `Demande d'intervention ${brute.numero || brute.id} créée pour l'action « ${a.libelle} »`, 'liaison');
+    const precedente = a.demandeId != null ? { id: a.demandeId, numero: a.demandeNumero || '', statut: (db.get('demandes', a.demandeId) || {}).statut || '', remplaceeLe: new Date().toISOString() } : null;
+    c.actions[ai] = Object.assign({}, a, {
+      demandeId: brute.id, demandeNumero: brute.numero || '', otId: brute.otId == null ? null : brute.otId, statut: a.statut === cx.SA.a_faire ? cx.SA.en_cours : a.statut,
+      demandesPrecedentes: precedente ? (a.demandesPrecedentes || []).concat([precedente]).slice(-20) : (a.demandesPrecedentes || []),
+    });
+    const maj = enregistrer(req, v, { constats }, 'demande', `Demande d'intervention ${brute.numero || brute.id} créée pour l'action « ${a.libelle} »${precedente ? ` (remplace la demande refusée ${precedente.numero || precedente.id})` : ''}`, 'liaison');
     notifier(req, [a.responsableUserId], { titre: `Demande ${brute.numero || ''} créée — visite ${maj.numero}`, message: `Une demande d'intervention a été créée pour votre action « ${a.libelle} »`, lien: lienVisite(maj, 'constats'), type: 'info' });
     return { demande: { id: brute.id, numero: brute.numero, statut: brute.statut, otId: brute.otId == null ? null : brute.otId }, visite: detail(req, maj) };
   }, { perm: [MODULE, 'modifier'], maxBody: CORPS_MAX });
@@ -1390,14 +1501,15 @@ function register(ctx) {
   // ----- Protection des données personnelles (anonymisation) ------------------------------------------------------
   /**
    * Anonymise le téléphone, l'e-mail, la pièce d'identité et le véhicule des visiteurs des visites terminées
-   * depuis plus de `jours` jours (personnes encore présentes exclues). Les noms restent au registre.
+   * depuis plus de `jours` jours (personnes encore présentes exclues), ainsi que l'e-mail et le téléphone du
+   * contact de l'organisme. Les noms restent au registre.
    */
   function purger(options = {}, req) {
     const jours = options.jours === undefined || options.jours === null ? cfgVisites().conserverVisiteursJours : Number(options.jours);
     const reference = options.maintenant ? Date.parse(options.maintenant) : Date.now();
     const limite = reference - jours * 86400000;
     const maintenant = new Date().toISOString();
-    let nbVisites = 0; let nbVisiteurs = 0;
+    let nbVisites = 0; let nbVisiteurs = 0; let nbContacts = 0;
     const candidates = req ? db.list(ENTITE).filter((v) => ecritureComplete(req, v)) : db.list(ENTITE);
     for (const v of candidates) {
       const fin = Date.parse(v.dateFin || v.dateDebut);
@@ -1410,21 +1522,27 @@ function register(ctx) {
         n++;
         return Object.assign({}, x, { telephone: '', email: '', pieceIdentite: '', vehicule: '', anonymiseLe: maintenant });
       });
-      if (!n) continue;
+      const contact = v.contactOrganisme || {};
+      const contactAPurger = !!(contact.email || contact.telephone);
+      if (!n && !contactAPurger) continue;
+      const patch = { visiteurs };
+      if (contactAPurger) { patch.contactOrganisme = Object.assign({}, contact, { email: '', telephone: '', anonymiseLe: maintenant }); nbContacts++; }
       nbVisites++; nbVisiteurs += n;
-      enregistrer(req || null, v, { visiteurs }, 'anonymisation', `Coordonnées de ${n} visiteur(s) anonymisées (conservation ${jours} jour(s))`, 'purge');
+      const quoi = [n ? `de ${n} visiteur(s)` : '', contactAPurger ? 'du contact de l\'organisme' : ''].filter(Boolean).join(' et ');
+      enregistrer(req || null, v, patch, 'anonymisation', `Coordonnées ${quoi} anonymisées (conservation ${jours} jour(s))`, 'purge');
     }
-    return { jours, visites: nbVisites, visiteurs: nbVisiteurs };
+    return { jours, visites: nbVisites, visiteurs: nbVisiteurs, contacts: nbContacts };
   }
   router.post('/api/visites/purger', async (req) => {
     const b = objet(req.body);
     let jours;
     if (b.jours !== undefined && b.jours !== null && b.jours !== '') {
-      jours = Number(b.jours);
+      // Nombre entier, ou chaîne en écriture décimale (ni exposant, ni hexadécimal)
+      jours = typeof b.jours === 'number' ? b.jours : (typeof b.jours === 'string' && /^\s*\d{1,4}\s*$/.test(b.jours) ? Number(b.jours) : NaN);
       if (!Number.isInteger(jours) || jours < 0 || jours > 3650) throw new HttpError(400, 'Durée de conservation invalide (0 à 3650 jours)');
     }
     const r = purger({ jours }, req);
-    ctx.audit(req, 'purge', ENTITE, null, `Anonymisation des visiteurs : ${r.visiteurs} visiteur(s) dans ${r.visites} visite(s) (conservation ${r.jours} jour(s))`);
+    ctx.audit(req, 'purge', ENTITE, null, `Anonymisation des visiteurs : ${r.visiteurs} visiteur(s)${r.contacts ? ` et ${r.contacts} contact(s) d'organisme` : ''} dans ${r.visites} visite(s) (conservation ${r.jours} jour(s))`);
     return r;
   }, { perm: [MODULE, 'valider'], maxBody: CORPS_MAX });
 
@@ -1468,7 +1586,8 @@ function register(ctx) {
     }
     if (options.anonymiser !== false) {
       resultat.anonymisation = purger({ maintenant: ref.toISOString() });
-      if (resultat.anonymisation.visiteurs) ctx.audit(null, 'purge', ENTITE, null, `Anonymisation automatique : ${resultat.anonymisation.visiteurs} visiteur(s) dans ${resultat.anonymisation.visites} visite(s)`);
+      const an = resultat.anonymisation;
+      if (an.visites) ctx.audit(null, 'purge', ENTITE, null, `Anonymisation automatique : ${an.visiteurs} visiteur(s)${an.contacts ? ` et ${an.contacts} contact(s) d'organisme` : ''} dans ${an.visites} visite(s)`);
     }
     return resultat;
   }
@@ -1506,6 +1625,21 @@ function register(ctx) {
     const ot = data && (data.ot || data);
     if (!ot || ot.demandeId == null) return;
     majActionsLiees(ot.demandeId, (a) => (a.otId == null ? { otId: ot.id } : null), `Ordre de travail ${ot.numero || ot.id} créé depuis la demande liée`);
+  });
+  /** Demande liée refusée : l'action reste ouverte, son responsable est prévenu et peut faire créer une nouvelle demande. */
+  ctx.on('demande:refusee', (d) => {
+    if (!d || d.id == null) return;
+    const cx = contexte();
+    const motif = String(d.motifRefus || '').slice(0, 200);
+    for (const v of db.list(ENTITE, (x) => (x.constats || []).some((c) => (c.actions || []).some((a) => Number(a.demandeId) === Number(d.id))))) {
+      const concernees = [];
+      for (const c of v.constats || []) for (const a of c.actions || []) if (Number(a.demandeId) === Number(d.id) && !cx.finauxAction.has(a.statut)) concernees.push(a);
+      if (!concernees.length) continue;
+      const maj = enregistrer(null, v, {}, 'demande', `Demande ${d.numero || d.id} refusée${motif ? ' : ' + motif : ''} — action « ${concernees.map((a) => a.libelle).join(' », « ').slice(0, 200)} » à reprendre (nouvelle demande possible)`);
+      for (const a of concernees) {
+        notifier(null, [a.responsableUserId, maj.hoteUserId], { titre: `Demande ${d.numero || ''} refusée — visite ${maj.numero}`, message: `La demande d'intervention liée à l'action « ${a.libelle} » a été refusée${motif ? ' : ' + motif : ''}. L'action reste ouverte : une nouvelle demande peut être créée.`, lien: lienVisite(maj, 'constats'), type: 'alerte' });
+      }
+    }
   });
   ctx.on('demande:cloturee', (d) => {
     if (!d || d.id == null) return;
@@ -1742,4 +1876,4 @@ function seedDemo(ctx) {
   return `5 visites (audit client à venir, certification ISO 9001 terminée avec plan d'actions, inspection ICPE${VAL ? ' à Valréas' : ''}, visite client du jour, visite fournisseur)${comptes}`;
 }
 
-module.exports = { nom, register, seedDemo, csvCellule, pdfSimple };
+module.exports = { nom, register, seedDemo, pdfSimple };
